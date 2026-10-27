@@ -1,5 +1,15 @@
 # Changelog
 
+- **2026-10-27** -- `9002` (this fork, rbb-dev): a prompt pass in flight shows on `/health` and `/metrics`. Until now
+  a pass reported nothing before it ended (`prefill_tokens_per_second` read 0 for the whole pass, then the pass's speed
+  for 2 s). The dsv41 prefill loop stores its rows after each 2,048-row chunk (one atomic store); `/health`'s
+  `live.prefill_tokens_per_second` is the running pass's speed so far, `live.prompt_pass` its tokens, and `/metrics`
+  adds `prompt_tokens_computed_total` and `prompt_pass_tokens_{computed,total,resumed}`. Prefill unchanged within
+  noise (131,331 tokens: 3,343-3,556 tok/s with, 3,419 without); replies byte-identical (`validate.py`, 8 of 8).
+- **2026-10-27** -- `9001` (this fork, rbb-dev): a request without `max_tokens` is served. The server clamped its
+  reply to the whole window less the prompt, which the lanes then refused (`PromptTooLong`, HTTP 500) at any prompt
+  size: they need `ROUND_ROWS + 2` more rows, in whole 2,048-row chunks. The server is now told that usable window
+  (1,048,526 at the defaults); asking for more than fits is a 400 that names the most a request may ask.
 - **2026-10-26** -- `0026` (knapcio): the RDMA rings' queue pairs take the port's active MTU (`ibv_query_port`,
   capped at 4096) as their path MTU instead of a fixed 4096. On a switched fabric whose Ethernet MTU is 1500 the RoCE
   active MTU is 1024, and with the fixed 4096 every request failed (`RDMA=1`); with the port's MTU it serves. On a

@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: rbb-dev <37469229+rbb-dev@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 13:04:46 +1100
+Subject: [PATCH] dsv41: the server's context window is what a stream holds, so
+ a request with no max_tokens is served
+
+The lanes place a stream only when prompt + max_new + round_rows + 2, in whole 2,048-row chunks, fits ctx_cap
+(lanes.zig prefillFn). The server was told the whole window and clamped a request that sent no max_tokens to
+exactly window - prompt, which the lanes then refused (PromptTooLong, HTTP 500): every request without max_tokens
+failed (2026-10-27: a 1,577-token tool call, 9 times). rows.zig holds both rules; native.zig reports
+usableRows(ctx_cap, round_rows, chunk) and native/cuda.zig gives it to the server as its context window when the
+family reports one (other families unchanged). A request with no max_tokens now gets every token left; one that
+asks for more than fits is refused by the server (HTTP 400, with the most it may ask).
+
+Tests: rows.zig: the server's room fits the lanes exactly at every prompt size and one token more does not, for
+several windows and round sizes; 1,048,576 tokens with 48-row rounds = 1,048,526. The dsv41 suite (LLVM, x86_64):
+120 pass, 1 fails, the same 1 as without this commit (draft chances, 0.547 vs 0.5).
+---
+ zig/src/families/dsv41/dsv41.zig  |  2 ++
+ zig/src/families/dsv41/lanes.zig  |  4 +++-
+ zig/src/families/dsv41/native.zig |  6 +++++-
+ zig/src/families/dsv41/rows.zig   | 35 +++++++++++++++++++++++++++++++
+ zig/src/native/cuda.zig           |  5 ++++-
+ 5 files changed, 49 insertions(+), 3 deletions(-)
+ create mode 100644 zig/src/families/dsv41/rows.zig
+
+diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
+index 97fd785..d8ddb22 100644
+--- a/zig/src/families/dsv41/dsv41.zig
++++ b/zig/src/families/dsv41/dsv41.zig
+@@ -53,6 +53,7 @@ pub const draft = @import("draft.zig");
+ pub const sampling = @import("sampling.zig");
+ pub const model = @import("model.zig");
+ pub const lanes = @import("lanes.zig");
++pub const rows = @import("rows.zig");
+ 
+ test {
+     // every declaration of every file, so functions no test calls are still compiled
+@@ -104,4 +105,5 @@ test {
+     refAll(sampling);
+     refAll(model);
+     refAll(lanes);
++    refAll(rows);
+ }
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index fb93cf0..ab900d0 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -16,6 +16,7 @@
+ const std = @import("std");
+ const lanes = @import("lanes");
+ const model = @import("model.zig");
++const fit = @import("rows.zig");
+ const round = @import("round.zig");
+ const draft = @import("draft.zig");
+ const sampling = @import("sampling.zig");
+@@ -475,7 +476,8 @@ pub const Lanes = struct {
+         const ids = s.prompt();
+         const len = ids.len;
+         if (len == 0) return error.EmptyPrompt;
+-        const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
++        // rows.zig: the server's context window is fit.usableRows of the same numbers, so a request it admits fits here
++        const size = fit.streamRows(len, s.max_new, m.eng.round_rows, model.chunk_rows);
+         if (size > m.ctx_cap) return error.PromptTooLong;
+         if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
+         const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index aa6672e..6044cca 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -39,6 +39,7 @@ const cuda = @import("cuda");
+ const lanes = @import("lanes");
+ const model = @import("model.zig");
+ const lanes_mod = @import("lanes.zig");
++const rows_mod = @import("rows.zig");
+ const round = @import("round.zig");
+ const link = @import("link.zig");
+ const rank_cache = @import("rank_cache.zig");
+@@ -73,6 +74,9 @@ pub const Loaded = struct {
+     snaps: ?Snaps = null,
+     /// Images in requests (the server renders their placeholders; the tower runs on this rank).
+     vision: ?lanes.stream.Vision = null,
++    /// The most prompt plus reply tokens a stream holds (rows.usableRows: the window less a decode round's rows): the
++    /// server's context window, so a request with no max_tokens gets all of it and one that asks too much is refused there.
++    usable_window: ?u32 = null,
+ };
+ 
+ pub const Snaps = struct {
+@@ -173,7 +177,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     // the pool is the model's (preallocated): a stream takes no device memory of its own
+     const L = lanes_mod.Lanes;
+     const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn };
+-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
++    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .usable_window = @as(u32, @intCast(rows_mod.usableRows(st.m.ctx_cap, st.m.eng.round_rows, model.chunk_rows))) };
+ }
+ 
+ fn deinitFn(ptr: *anyopaque) void {
+diff --git a/zig/src/families/dsv41/rows.zig b/zig/src/families/dsv41/rows.zig
+new file mode 100644
+index 0000000..b726938
+--- /dev/null
++++ b/zig/src/families/dsv41/rows.zig
+@@ -0,0 +1,35 @@
++//! A stream's rows in the lane pool: what a prompt plus its reply takes, and so the most a request may use. The lanes
++//! check `streamRows(...) <= ctx_cap` when they place a stream (lanes.zig prefillFn); the server is told
++//! `usableRows(...)` as its context window and admits a request only when prompt + reply tokens fit it (server/chat.zig
++//! prepare). The two must agree: before mgllm 0027 the server was told the whole window, clamped a request that sent no
++//! max_tokens to exactly that, and the lanes then refused it (round_rows + 2 rows short, every time).
++const std = @import("std");
++
++/// Rows a stream takes: its prompt, its reply budget, the rows a decode round adds (drafts of every stream together,
++/// `round_rows`, and 2), in whole prompt chunks of `chunk` rows.
++pub fn streamRows(prompt: usize, max_new: usize, round_rows: usize, chunk: usize) usize {
++    return std.mem.alignForward(usize, prompt + max_new + round_rows + 2, chunk);
++}
++
++/// The most prompt plus reply tokens a stream holds in a `ctx_cap`-row window: the server's context window.
++pub fn usableRows(ctx_cap: usize, round_rows: usize, chunk: usize) usize {
++    const whole = std.mem.alignBackward(usize, ctx_cap, chunk); // streamRows rounds up to whole chunks
++    return if (whole > round_rows + 2) whole - round_rows - 2 else 0;
++}
++
++test "the window the server is told is exactly what a stream holds" {
++    const chunk = 2048;
++    for ([_]usize{ 1_048_576, 1_048_575, 262_144, 8192 }) |cap| for ([_]usize{ 1, 48, 64 }) |rows| {
++        const u = usableRows(cap, rows, chunk);
++        for ([_]usize{ 1, 1577, u / 2, u - 1 }) |prompt| {
++            try std.testing.expect(streamRows(prompt, u - prompt, rows, chunk) <= cap); // the whole room fits
++            try std.testing.expect(streamRows(prompt, u - prompt + 1, rows, chunk) > cap); // one token more does not
++        }
++    };
++}
++
++test "the running engine: a 1,048,576-token window with 48-row rounds holds 1,048,526" {
++    try std.testing.expectEqual(@as(usize, 1_048_526), usableRows(1_048_576, 48, 2048));
++    // a client's request (10-27): 1,577 prompt tokens, no max_tokens; the server gives it every token left
++    try std.testing.expect(streamRows(1577, usableRows(1_048_576, 48, 2048) - 1577, 48, 2048) <= 1_048_576);
++}
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index c37f635..4c9353b 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -377,7 +377,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     };
+     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
+     const vision: ?api.Vision = if (@hasField(@TypeOf(loaded), "vision")) loaded.vision else null;
+-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .efforts = familyEfforts(F), .vision = vision }, .{ .ctx = loaded.ctx, .text = F.explain });
++    // mgllm 0027: the server's window is what a stream holds when the family says (its lanes add a round's rows to every
++    // stream); else the configured window, as before
++    const usable: i64 = if (@hasField(@TypeOf(loaded), "usable_window")) (if (loaded.usable_window) |u| @min(window, @as(i64, u)) else window) else window;
++    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(usable), .startup = h.startup, .efforts = familyEfforts(F), .vision = vision }, .{ .ctx = loaded.ctx, .text = F.explain });
+     opened = true;
+     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+ }

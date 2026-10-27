@@ -56,6 +56,8 @@ rank's rendezvous address). Full list: [Credits](#credits) and [`CREDITS.md`](CR
 (Hector's) -- see [What the patches change](#what-the-patches-change) and [Credits](#credits) for who found or
 shaped each specific fix along the way.
 
+**This fork** adds two patches, `9001` and `9002`, by [rbb-dev](https://github.com/rbb-dev): see [`FORK.md`](FORK.md).
+
 ## Contents
 
 - [Performance](#performance)
@@ -342,6 +344,8 @@ measurements and rationale: [`CHANGELOG.md`](CHANGELOG.md); authorship: [`CREDIT
 | `0024` | Mia's AI Lab | `TF_DS_DRAFT_ROW_MS` | Draft rows priced at a measured constant instead of the round table (mixed; kept for later) |
 | `0025` | Mia's AI Lab | `TF_DS_IDX_SHARD` (on, this cluster) | Indexer scores and picks only its own owned quarter of rows |
 | `0026` | knapcio | -- (on) | RDMA queue pairs use the port's active MTU (capped at 4096) instead of a fixed 4096, so RDMA works on a switch whose Ethernet MTU is 1500 |
+| `9001` | rbb-dev (this fork) | -- (on) | The server is told the window a stream really holds (1,048,526 at the defaults): a request without `max_tokens` is served with every token left, and one asking for more than fits gets a 400 instead of a 500 |
+| `9002` | rbb-dev (this fork) | -- (on) | A prompt pass in flight shows on `/health` (`live.prompt_pass`; `prefill_tokens_per_second` is its speed so far) and `/metrics` (`prompt_tokens_computed_total`, `prompt_pass_tokens_*`) |
 
 ## Repository layout
 

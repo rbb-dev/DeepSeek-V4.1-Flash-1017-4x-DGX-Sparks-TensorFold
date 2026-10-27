@@ -1,0 +1,490 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: rbb-dev <37469229+rbb-dev@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 16:57:19 +1100
+Subject: [PATCH] lanes: a prompt pass in flight shows on /health and /metrics,
+ its tokens and speed so far
+
+A long prompt's pass runs inside its admission and reported nothing until it ended: /health's
+prefill_tokens_per_second read 0 for the whole pass (70 s at 200K tokens) and showed the pass's speed only for
+the 2 s after it, so a dashboard never saw a prefill running. Now the backend stores the rows it has passed after
+each chunk (Stream.progress: one atomic store a 2,048-row chunk, no lock, no GPU wait; dsv41 is the first backend
+to do it) and the lane host reports the pass while it runs:
+- /health live: prefill_tokens_per_second is the running pass's speed so far (the last pass's for 2 s after, as
+  before); prompt_pass = {computed, total, resumed, seconds} (null between passes); prompt_tokens_computed_total.
+- /metrics: tensorfold:prompt_tokens_computed_total (a counter, the running pass's tokens included: its rate is the
+  prefill speed; a pass that fails or is cancelled keeps what it computed, so it never goes back), and the gauges
+  prompt_pass_tokens_computed, _total and _resumed (0 between passes).
+An engine that reports no passes (other families) leaves /health as it was and adds no /metrics family.
+
+Tests: stream.zig (only computed rows count, never resumed ones); lane_host_test (a pass's progress mid-pass
+through the fake backend, which now reports its chunks; the counter after the pass, and after a pass cancelled at
+its 4th chunk); live.zig and metrics.zig (the fields and families, and none for an engine without passes). Each
+new test was seen to fail with its code broken. Server suite 67 + 31 pass; zig build test as before (dsv41's
+debug build stops on prompt.zig's genSetReg, direct_io's O_DIRECT test fails on WSL); engine-check: aarch64
+tensorfold-native builds, dsv41 suite (LLVM) 120 pass, 1 fails, the same 1 as without this commit.
+---
+ zig/src/core/engine_api.zig      | 20 +++++++
+ zig/src/core/lane_host.zig       | 55 ++++++++++++++++++-
+ zig/src/core/lane_host_test.zig  | 90 ++++++++++++++++++++++++++++++++
+ zig/src/core/lanes/fake.zig      |  4 ++
+ zig/src/core/lanes/stream.zig    | 46 ++++++++++++++++
+ zig/src/families/dsv41/lanes.zig |  3 ++
+ zig/src/server/live.zig          | 54 +++++++++++++++++++
+ zig/src/server/metrics.zig       | 33 ++++++++++++
+ 8 files changed, 304 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 0d8b53c..87c1902 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -192,6 +192,26 @@ pub const Status = struct {
+     streams: usize = 0,
+     /// Generated tokens held by live streams, excluding their prompts.
+     generation_tokens: u64 = 0,
++    /// The prompt pass running now; null when none runs or the engine does not follow one.
++    prompt_pass: ?PromptPass = null,
++    /// Prompt tokens computed by prompt passes (not restored from kept states), the running pass's so far included;
++    /// null when the engine does not count them. Its rate is the prefill speed, a pass in flight included.
++    prompt_tokens_computed: ?u64 = null,
++};
++
++/// A prompt pass in flight: the tokens it has computed, those it computes in all (its prompt less the tokens it
++/// resumed), the tokens it resumed from a kept state, and the seconds since its request was admitted.
++pub const PromptPass = struct {
++    computed: u64,
++    total: u64,
++    resumed: u64,
++    seconds: f64,
++
++    /// Its tokens a second so far; null before its first chunk is done.
++    pub fn rate(p: PromptPass) ?f64 {
++        if (p.computed == 0 or p.seconds <= 0) return null;
++        return @as(f64, @floatFromInt(p.computed)) / p.seconds;
++    }
+ };
+ 
+ pub const SubmitError = error{ Closed, Busy };
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 6c8572e..cf3bafe 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -54,6 +54,14 @@ pub const LaneHost = struct {
+     // Track D: a round run between an admitting job's prompt chunks failed (its error): once the prompt's pass has
+     // unwound, every admitted job fails with it, as after any failed round
+     between_failed: ?[]const u8 = null,
++    // the prompt pass the engine thread runs now (one at a time: a pass runs inside its admission), for /health and
++    // /metrics while it runs: the backend stores its rows in `pass` after each chunk, without the lock; the other
++    // fields are written and read under the lock
++    pass: lanes.stream.Progress = .{},
++    pass_len: u32 = 0,
++    pass_began: i96 = 0,
++    pass_on: bool = false,
++    computed: u64 = 0, // prompt tokens computed by the passes that ended
+ 
+     const Mark = struct { at: i96, tokens: u64 };
+     const full_retry_ns: i96 = std.time.ns_per_s;
+@@ -180,17 +188,59 @@ pub const LaneHost = struct {
+         }
+         const n = @min(stream_tokens.len, h.live_tokens.items.len);
+         @memcpy(stream_tokens[0..n], h.live_tokens.items[0..n]);
++        const held = if (now - h.prefill_at <= window_ns) h.prefill_rate else 0;
++        const pass = h.passNow(now);
+         out.* = .{
+             .running = @intCast(h.admitted.items.len),
+             .waiting = @intCast(h.queued.items.len),
+             .decode_tokens_per_second = @as(f64, @floatFromInt(tokens)) / 2.0,
+-            .prefill_tokens_per_second = if (now - h.prefill_at <= window_ns) h.prefill_rate else 0,
++            // a pass in flight: its speed so far; else the last pass's, for 2 s after it ended
++            .prefill_tokens_per_second = if (pass) |p| p.rate() orelse held else held,
+             .preemptions = 0,
+             .streams = n,
+             .generation_tokens = h.live_generated,
++            .prompt_pass = pass,
++            .prompt_tokens_computed = h.computed + (if (pass) |p| p.computed else 0),
+         };
+     }
+ 
++    /// The running pass as the HTTP threads report it (the lock held); null when none runs.
++    fn passNow(h: *LaneHost, now: i96) ?api.PromptPass {
++        if (!h.pass_on) return null;
++        const r = h.pass.read();
++        const resumed = @min(r.from, h.pass_len);
++        return .{
++            .computed = r.at -| r.from,
++            .total = h.pass_len - resumed,
++            .resumed = resumed,
++            .seconds = @as(f64, @floatFromInt(@max(0, now - h.pass_began))) / 1e9,
++        };
++    }
++
++    /// The engine thread starts `job`'s prompt pass (addStream next): it shows on /health and /metrics until passEnd.
++    fn passBegin(h: *LaneHost, job: *Job, began: i96) void {
++        h.lock();
++        defer h.unlock();
++        h.pass.begin(0);
++        h.pass_len = @intCast(job.request.prompt.len);
++        h.pass_began = began;
++        h.pass_on = true;
++        job.stream.progress = &h.pass;
++    }
++
++    /// The pass ended (addStream returned): what it computed joins the total, as the backend reported it, or on
++    /// success at least the prompt less the tokens it resumed (a backend that reports nothing), so the counter never
++    /// goes back from what /metrics showed while the pass ran.
++    fn passEnd(h: *LaneHost, job: *Job, ok: bool) void {
++        h.lock();
++        defer h.unlock();
++        const seen: u64 = h.pass.computed();
++        h.computed += if (ok) @max(seen, @as(u64, job.request.prompt.len -| job.stream.cached)) else seen;
++        h.pass_on = false;
++        h.pass.begin(0);
++        job.stream.progress = null;
++    }
++
+     fn memoryFn(ctx: *anyopaque, reset_peak: bool) ?Memory {
+         const source = self(ctx).memory orelse return null;
+         return source.read(source.ctx, reset_peak);
+@@ -425,7 +475,9 @@ pub const LaneHost = struct {
+         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
+         job.began = began;
+         if (h.loneFits(job)) return h.runLone(job, began);
++        h.passBegin(job, began);
+         h.core.addStream(&job.stream) catch |e| {
++            h.passEnd(job, false);
+             if (h.between_failed) |msg| {
+                 // a round between this prompt's chunks failed: this job and every admitted one end with its error
+                 h.between_failed = null;
+@@ -437,6 +489,7 @@ pub const LaneHost = struct {
+             if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
+             return h.drop(job, h.words(e));
+         };
++        h.passEnd(job, true);
+         h.prefilled(job, began);
+         const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+         if (now - began >= long_pass_ns) {
+diff --git a/zig/src/core/lane_host_test.zig b/zig/src/core/lane_host_test.zig
+index 061a871..dcef6e9 100644
+--- a/zig/src/core/lane_host_test.zig
++++ b/zig/src/core/lane_host_test.zig
+@@ -213,3 +213,93 @@ test "after a long prompt pass, a stream near its max_tokens ends before the nex
+     // the first request (64 tokens: within finish_left) ended before the second's first token
+     try std.testing.expect(seq.a_done.? < seq.b_first.?);
+ }
++
++test "a prompt pass in flight shows its progress, and what it computed stays counted when it ends or is cancelled" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    try host.start();
++    defer host.stop();
++    const e = host.engine();
++    // what /health and /metrics read while the pass runs: the fake's hook runs at a chunk's start, on the engine
++    // thread, after the chunks before it reported their rows
++    const Look = struct {
++        engine: api.Engine,
++        at: usize,
++        seen: ?api.Status = null,
++        cancel: ?Id = null,
++        fn call(ctx: *anyopaque, _: *lanes.Stream, chunk: usize) void {
++            const l: *@This() = @ptrCast(@alignCast(ctx));
++            if (chunk != l.at) return;
++            var st: api.Status = .{};
++            l.engine.status(&st, &.{});
++            l.seen = st;
++            if (l.cancel) |id| l.engine.cancel(id);
++        }
++    };
++    const Box = struct {
++        mutex: std.Io.Mutex = .init,
++        done: ?Reason = null,
++        fn event(ctx: *anyopaque, _: Id, ev: *const Event) void {
++            const b: *@This() = @ptrCast(@alignCast(ctx));
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            switch (ev.*) {
++                .finished => |f| b.done = f.reason,
++                else => {},
++            }
++        }
++        fn wait(b: *@This()) Reason {
++            while (true) {
++                b.mutex.lockUncancelable(std.testing.io);
++                const d = b.done;
++                b.mutex.unlock(std.testing.io);
++                if (d) |r| return r;
++                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++            }
++        }
++    };
++    var idle: api.Status = .{};
++    e.status(&idle, &.{});
++    try std.testing.expect(idle.prompt_pass == null);
++    try std.testing.expectEqual(@as(?u64, 0), idle.prompt_tokens_computed);
++
++    const prompt = [_]u32{ 8, 6, 7, 5, 3, 0, 9, 2, 1, 4 };
++    const request: Request = .{ .prompt = &prompt, .max_tokens = 1 };
++    var look: Look = .{ .engine = e, .at = 2 };
++    target.prefill_chunks = 5; // two tokens a chunk
++    target.prefill_hook = Look.call;
++    target.prefill_hook_ctx = &look;
++    var first: Box = .{};
++    try e.submit(1, &request, .{ .ctx = &first, .event = Box.event });
++    try std.testing.expectEqual(Reason.length, first.wait());
++    const mid = look.seen.?;
++    const pass = mid.prompt_pass.?;
++    try std.testing.expectEqual(@as(u64, 4), pass.computed); // chunks 0 and 1
++    try std.testing.expectEqual(@as(u64, 10), pass.total);
++    try std.testing.expectEqual(@as(u64, 0), pass.resumed);
++    try std.testing.expectEqual(@as(?u64, 4), mid.prompt_tokens_computed);
++    try std.testing.expect(mid.prefill_tokens_per_second > 0); // the pass's speed so far, not 0 until it ends
++    var after: api.Status = .{};
++    e.status(&after, &.{});
++    try std.testing.expect(after.prompt_pass == null);
++    try std.testing.expectEqual(@as(?u64, 10), after.prompt_tokens_computed);
++
++    // cancelled at its fourth chunk: the six tokens it computed stay in the counter, which never goes back
++    look.at = 3;
++    look.cancel = 2;
++    var second: Box = .{};
++    try e.submit(2, &request, .{ .ctx = &second, .event = Box.event });
++    try std.testing.expectEqual(Reason.cancelled, second.wait());
++    try std.testing.expectEqual(@as(?u64, 16), look.seen.?.prompt_tokens_computed);
++    var end: api.Status = .{};
++    e.status(&end, &.{});
++    try std.testing.expect(end.prompt_pass == null);
++    try std.testing.expectEqual(@as(?u64, 16), end.prompt_tokens_computed);
++}
+diff --git a/zig/src/core/lanes/fake.zig b/zig/src/core/lanes/fake.zig
+index bf22de2..1969361 100644
+--- a/zig/src/core/lanes/fake.zig
++++ b/zig/src/core/lanes/fake.zig
+@@ -108,10 +108,14 @@ pub const Fake = struct {
+         if (got.found_existing) freeLane(x.gpa, got.value_ptr);
+         got.value_ptr.* = .{};
+         const chunks = if (x.prefill_chunks == 0) 1 else x.prefill_chunks;
++        // the rows a backend reports as its chunks finish (Stream.progress): from the kept state's end, evenly
++        const resumed: usize = if (s.reuse.saved != null) s.reuse.at else 0;
++        if (s.progress) |p| p.begin(resumed);
+         for (0..chunks) |chunk| {
+             x.prefill_count += 1;
+             if (x.prefill_hook) |hook| hook(x.prefill_hook_ctx.?, s, chunk);
+             if (s.isCancelled()) return error.Cancelled;
++            if (s.progress) |p| p.reach(resumed + (s.prompt_len - resumed) * (chunk + 1) / chunks);
+         }
+         const h = &got.value_ptr.history;
+         s.cached = 0;
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index 0d30eca..9a835ce 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -97,6 +97,37 @@ pub const BetweenHook = struct {
+     ready: *const fn (ptr: *anyopaque) bool, // whether `run` would run a round (another stream is live)
+ };
+ 
++/// A prompt pass's rows while it runs, for the threads that report it (the lane host's /health and /metrics): the
++/// backend stores where the pass starts (`from`: the rows it resumed) and, after each chunk, the rows it has passed
++/// (`at`); a reader loads `at` first, so it never counts rows the pass resumed as computed.
++pub const Progress = struct {
++    from: std.atomic.Value(u32) = .init(0),
++    at: std.atomic.Value(u32) = .init(0),
++
++    /// The pass starts at `rows` (restored from a kept state); none computed yet.
++    pub fn begin(p: *Progress, rows: usize) void {
++        p.from.store(@intCast(rows), .monotonic);
++        p.at.store(@intCast(rows), .release);
++    }
++
++    /// The pass has passed `rows` of its prompt.
++    pub fn reach(p: *Progress, rows: usize) void {
++        p.at.store(@intCast(rows), .release);
++    }
++
++    /// The rows the pass resumed and the rows it has passed, as one reading.
++    pub fn read(p: *const Progress) struct { from: u32, at: u32 } {
++        const at = p.at.load(.acquire);
++        return .{ .from = p.from.load(.monotonic), .at = at };
++    }
++
++    /// Rows the pass has computed so far (not resumed).
++    pub fn computed(p: *const Progress) u32 {
++        const r = p.read();
++        return r.at -| r.from;
++    }
++};
++
+ /// Drafts the backend holds for the stream's next round; a tree keeps its tokens and parents on the host.
+ pub const Held = struct {
+     count: u32,
+@@ -167,6 +198,7 @@ pub const Stream = struct {
+     reuse: Reuse = .{},
+     images: []const Image = &.{},
+     between: ?BetweenHook = null, // the host's round between this stream's prompt chunks (a backend may call it)
++    progress: ?*Progress = null, // the host's view of this stream's prompt pass (a backend stores its rows per chunk)
+     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
+     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
+     context: std.ArrayList(u32) = .empty,
+@@ -393,3 +425,17 @@ test "loop guard fires, closes thinking, and latches once" {
+     _ = try s.commit(gpa, &.{8});
+     try std.testing.expect(!s.finished and s.loop_period.? == 1);
+ }
++
++test "a prompt pass's progress counts the rows it computes, never the ones it resumed" {
++    var p: Progress = .{};
++    try std.testing.expectEqual(@as(u32, 0), p.computed());
++    p.begin(4096); // a kept state's 4,096 rows restored: none computed yet
++    try std.testing.expectEqual(@as(u32, 0), p.computed());
++    p.reach(6144);
++    p.reach(8192);
++    try std.testing.expectEqual(@as(u32, 4096), p.computed());
++    p.begin(0); // the next pass, from the prompt's start
++    try std.testing.expectEqual(@as(u32, 0), p.computed());
++    p.reach(2048);
++    try std.testing.expectEqual(@as(u32, 2048), p.computed());
++}
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index ab900d0..fcbe877 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -595,6 +595,8 @@ pub const Lanes = struct {
+             start = sn.at;
+             s.cached = @intCast(sn.at);
+         }
++        // /health and /metrics follow the pass from here: one atomic store a chunk, no lock, no GPU wait
++        if (s.progress) |p| p.begin(start);
+         // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
+         // kept prompt), each at the chunk end at or before it
+         const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
+@@ -615,6 +617,7 @@ pub const Lanes = struct {
+             }
+             head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
+             start += n;
++            if (s.progress) |p| p.reach(start);
+             if (s.images.len == 0) if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
+             // Track D (TF_DS_PREFILL_YIELD=1): a round of the other live streams before the next chunk. The prompt's
+             // chunks and their boundaries are the same (its state between chunks is its extent's rows and its slot's,
+diff --git a/zig/src/server/live.zig b/zig/src/server/live.zig
+index d3942f3..b988c18 100644
+--- a/zig/src/server/live.zig
++++ b/zig/src/server/live.zig
+@@ -21,6 +21,19 @@ pub fn snapshot(a: Allocator, engine: api.Engine) Allocator.Error!json.Value {
+     try o.put(a, "waiting", try json.intValue(a, status.waiting));
+     try o.put(a, "decode_tokens_per_second", .{ .float = round1(status.decode_tokens_per_second) });
+     try o.put(a, "prefill_tokens_per_second", .{ .float = round1(status.prefill_tokens_per_second) });
++    // an engine that follows its prompt passes: the one in flight (null between passes; while it runs, the prefill
++    // speed above is its speed so far) and the prompt tokens the passes computed
++    if (status.prompt_tokens_computed) |n| {
++        if (status.prompt_pass) |p| {
++            const q = try json.newObject(a);
++            try q.put(a, "computed", try json.intValue(a, p.computed));
++            try q.put(a, "total", try json.intValue(a, p.total));
++            try q.put(a, "resumed", try json.intValue(a, p.resumed));
++            try q.put(a, "seconds", .{ .float = round1(p.seconds) });
++            try o.put(a, "prompt_pass", .{ .object = q });
++        } else try o.put(a, "prompt_pass", .null);
++        try o.put(a, "prompt_tokens_computed_total", try json.intValue(a, n));
++    }
+     return .{ .object = o };
+ }
+ 
+@@ -104,3 +117,44 @@ test "status line" {
+     var buf: [256]u8 = undefined;
+     try std.testing.expectEqualStrings("[tensorfold] 3 connections (1 waiting) \u{b7} decode 142 tok/s \u{b7} prefill 1,210 tok/s", line(&buf, .{ .running = 2, .waiting = 1, .decode_tokens_per_second = 142.2, .prefill_tokens_per_second = 1210.4 }));
+ }
++
++test "/health's live block shows the prompt pass in flight, or null" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const Stub = struct {
++        st: api.Status,
++        fn info(_: *anyopaque) api.Info {
++            return .{};
++        }
++        fn submit(_: *anyopaque, _: api.Id, _: *const api.Request, _: api.Sink) api.SubmitError!void {
++            unreachable;
++        }
++        fn cancel(_: *anyopaque, _: api.Id) void {}
++        fn status(ctx: *anyopaque, out: *api.Status, _: []u32) void {
++            const s: *@This() = @ptrCast(@alignCast(ctx));
++            out.* = s.st;
++        }
++        fn memory(_: *anyopaque, _: bool) ?api.Memory {
++            return null;
++        }
++        fn engine(s: *@This()) api.Engine {
++            return .{ .ctx = s, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
++        }
++    };
++    var stub: Stub = .{ .st = .{ .running = 1, .prefill_tokens_per_second = 2930.04, .prompt_pass = .{ .computed = 61_440, .total = 120_000, .resumed = 8192, .seconds = 20.97 }, .prompt_tokens_computed = 1_000_000 } };
++    const busy = try snapshot(arena.allocator(), stub.engine());
++    const p = busy.get("prompt_pass").?;
++    try std.testing.expectEqualStrings("61440", p.get("computed").?.int);
++    try std.testing.expectEqualStrings("120000", p.get("total").?.int);
++    try std.testing.expectEqualStrings("8192", p.get("resumed").?.int);
++    try std.testing.expectEqual(@as(f64, 21.0), p.get("seconds").?.float);
++    try std.testing.expectEqual(@as(f64, 2930.0), busy.get("prefill_tokens_per_second").?.float);
++    try std.testing.expectEqualStrings("1000000", busy.get("prompt_tokens_computed_total").?.int);
++    stub.st.prompt_pass = null;
++    const idle = try snapshot(arena.allocator(), stub.engine());
++    try std.testing.expect(idle.get("prompt_pass").? == .null);
++    stub.st.prompt_tokens_computed = null; // an engine that does not follow its passes: /health as before
++    const other = try snapshot(arena.allocator(), stub.engine());
++    try std.testing.expect(other.get("prompt_tokens_computed_total") == null);
++    try std.testing.expect(other.get("prompt_pass") == null);
++}
+diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
+index 7d748cc..6d14c51 100644
+--- a/zig/src/server/metrics.zig
++++ b/zig/src/server/metrics.zig
+@@ -113,6 +113,13 @@ pub const Metrics = struct {
+         try gauge(w, "requests_waiting", "gauge", "Requests queued or held until a lane is free.", status.waiting);
+         try gauge(w, "generation_tokens_running", "gauge", "Generated tokens held by live streams.", status.generation_tokens);
+         try gauge(w, "prompt_tokens_total", "counter", "Prompt tokens of finished requests.", snap.prompt);
++        if (status.prompt_tokens_computed) |n| {
++            const p: api.PromptPass = status.prompt_pass orelse .{ .computed = 0, .total = 0, .resumed = 0, .seconds = 0 };
++            try gauge(w, "prompt_tokens_computed_total", "counter", "Prompt tokens computed by prompt passes (not restored from kept states), the running pass's so far included: its rate is the prefill speed.", n);
++            try gauge(w, "prompt_pass_tokens_computed", "gauge", "Tokens the prompt pass running now has computed; 0 between passes.", p.computed);
++            try gauge(w, "prompt_pass_tokens_total", "gauge", "Tokens the prompt pass running now computes in all (its prompt less the tokens it resumed); 0 between passes.", p.total);
++            try gauge(w, "prompt_pass_tokens_resumed", "gauge", "Tokens the prompt pass running now resumed from a kept state; 0 between passes.", p.resumed);
++        }
+         try gauge(w, "generation_tokens_total", "counter", "Generated tokens of finished requests.", snap.generation);
+         const live = streams[0..@min(status.streams, streams.len)];
+         try family(w, "kv_cache_usage_ratio", "gauge", "Tokens in a stream cache divided by that stream's context window.");
+@@ -268,6 +275,32 @@ test "render exposes live counters, rounds, prefill and TPOT without cache famil
+     try std.testing.expect(std.mem.indexOf(u8, known.written(), "tensorfold:device_memory_peak_bytes 8589934592\n") != null);
+ }
+ 
++test "render shows the prompt pass in flight and the computed prompt tokens, when the engine counts them" {
++    const gpa = std.testing.allocator;
++    var m: Metrics = .{ .gpa = gpa };
++    var stub: RenderStub = .{};
++    var none: std.Io.Writer.Allocating = .init(gpa);
++    defer none.deinit();
++    try m.render(std.testing.io, &none.writer, stub.engine(), 4096);
++    try std.testing.expect(std.mem.indexOf(u8, none.written(), "prompt_tokens_computed_total") == null); // not counted
++    try std.testing.expect(std.mem.indexOf(u8, none.written(), "prompt_pass_tokens") == null);
++    stub.status_value.prompt_tokens_computed = 1_234_567;
++    var idle: std.Io.Writer.Allocating = .init(gpa);
++    defer idle.deinit();
++    try m.render(std.testing.io, &idle.writer, stub.engine(), 4096);
++    try std.testing.expect(std.mem.indexOf(u8, idle.written(), "tensorfold:prompt_tokens_computed_total 1234567\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, idle.written(), "tensorfold:prompt_pass_tokens_computed 0\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, idle.written(), "tensorfold:prompt_pass_tokens_total 0\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, idle.written(), "tensorfold:prompt_pass_tokens_resumed 0\n") != null);
++    stub.status_value.prompt_pass = .{ .computed = 61_440, .total = 120_000, .resumed = 8192, .seconds = 20.97 };
++    var busy: std.Io.Writer.Allocating = .init(gpa);
++    defer busy.deinit();
++    try m.render(std.testing.io, &busy.writer, stub.engine(), 4096);
++    try std.testing.expect(std.mem.indexOf(u8, busy.written(), "tensorfold:prompt_pass_tokens_computed 61440\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, busy.written(), "tensorfold:prompt_pass_tokens_total 120000\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, busy.written(), "tensorfold:prompt_pass_tokens_resumed 8192\n") != null);
++}
++
+ test "metrics snapshot allocation failure releases the mutex" {
+     const io = std.testing.io;
+     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});

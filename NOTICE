@@ -49,3 +49,8 @@ PyAV
 
 NVIDIA PyTorch container (nvcr.io/nvidia/pytorch:26.07-py3)
   The image's base, under NVIDIA's container license and its components' own licenses.
+
+This fork (https://github.com/rbb-dev/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold)
+  adds zig/patches/9001-mgllm-usable-window.patch and zig/patches/9002-mgllm-live-prefill.patch, by rbb-dev under the
+  Apache License, Version 2.0, and the notes about them (FORK.md, and entries in README.md, CHANGELOG.md and
+  CREDITS.md). FORK.md states what they change.

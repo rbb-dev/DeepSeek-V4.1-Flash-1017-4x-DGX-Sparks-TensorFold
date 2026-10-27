@@ -54,6 +54,7 @@ DGX Sparks. Almost everything that makes it work was built by others. Its own wo
 | `0017`-`0024` | Mia's AI Lab | the decode plan: G0.1-G0.3, tracks A2/B/C/D/A3 |
 | `0025` | Mia's AI Lab | WP6(b), the indexer's own row-sharding |
 | `0026` | knapcio | the RDMA queue pairs' path MTU from the port's active MTU |
+| `9001`-`9002` | rbb-dev (this fork) | the server's usable window; the prompt pass in flight on `/health` and `/metrics` |
 
 The per-patch notes below also credit everyone who helped find or shape a specific fix along the way -- Hector's
 reviewer, Codex and Grok's live-bug diagnosis and design reviews, an outside reviewer's observation -- without
@@ -175,6 +176,13 @@ Contributed by knapcio ([knapcio](https://github.com/knapcio)):
   MikroTik CRS812 whose ports keep the default Ethernet MTU 1500. The idea is BertholomusAI's
   [TensorFold#12](https://github.com/bertholomus/TensorFold/pull/12) (negotiated MTU), ported to this recipe's engine
   pin for the local endpoint only.
+
+Added by this fork, [rbb-dev/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold](https://github.com/rbb-dev/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold),
+listed in [`FORK.md`](FORK.md):
+
+- `9001` (the server's context window is what a stream holds, so a request without `max_tokens` is served) and
+  `9002` (a prompt pass in flight on `/health` and `/metrics`): by [rbb-dev](https://github.com/rbb-dev), developed
+  with [Claude Code](https://claude.com/claude-code).
 
 ## Chat template
 
