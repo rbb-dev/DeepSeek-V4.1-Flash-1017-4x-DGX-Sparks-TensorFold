@@ -89,7 +89,7 @@ ensure_nfs_volume() {
     die "$h's docker volume $NFS_VOLUME is ${have%% *} from ${have#* }, not :$NFS_PATH from $server: remove it there (docker volume rm $NFS_VOLUME) or set NFS_VOLUME / NFS_PATH / $(wvar NFS_SERVER "$i")"
   fi
 }
-worker_nfs() { local i=$1; shift; worker "$i" "docker run --rm --network none --entrypoint '$1' -v '$NFS_VOLUME:/hf:ro' '$BASE_IMAGE' $(printf '%q ' "${@:2}")"; }
+worker_nfs() { local i=$1; shift; worker "$i" "docker run --rm --network none --entrypoint '$1' -v '$NFS_VOLUME:/hf:ro' '$IMAGE' $(printf '%q ' "${@:2}")"; }
 
 # link_info <peer address>: this node's side of the link to <peer>: "<address> <netdev> <rdma device> <gid index>".
 # The netdev and source address come from the route to the peer; the RDMA device from sysfs; the GID index is the

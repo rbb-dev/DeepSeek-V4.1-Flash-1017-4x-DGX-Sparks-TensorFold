@@ -63,3 +63,16 @@ snapshot_rev() { echo fixture; }
                 self.assertEqual(code, 0, out)
                 self.assertIn('runtime-only', record.read_text().splitlines())
                 self.assertNotIn('base-missing', record.read_text().splitlines())
+
+    def test_nfs_mount_check_needs_no_base_image(self):
+        # worker_nfs is prepare.sh's first container on a worker's NFS volume: it must not pull the build base either.
+        docker = self.tmp / 'bin/docker'
+        docker.write_text('#!' + BASH + r'''
+printf '%s\n' "$@" >> "$SIM/utility-args"
+[[ " $* " != *' base-missing '* ]] || exit 42
+[[ " $* " == *' runtime-only '* ]] || exit 43
+''')
+        docker.chmod(0o755)
+        code, out = self.bash('worker_nfs 1 true\n', {'IMAGE': 'runtime-only', 'BASE_IMAGE': 'base-missing'})
+        self.assertEqual(code, 0, out)
+        self.assertIn('runtime-only', (self.sim / 'utility-args').read_text().splitlines())
