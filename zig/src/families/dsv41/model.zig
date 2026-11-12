@@ -10,6 +10,7 @@ const cuda = @import("cuda");
 const engine_api = @import("engine_api");
 const Config = @import("config.zig").Config;
 const rank_cache = @import("rank_cache.zig");
+const dio = @import("core").direct_io;
 
 /// The words of the start's refusal when a retired name is set in the environment (null: none is): "TF_DS_ROCI_DECODE no longer exists:
 /// Rocinante is the only transport".
@@ -153,6 +154,12 @@ pub const Options = struct {
     kv_growth_set: bool = false, // the operator gave it: else the role's measured default (kv_pool.defaultGrowth)
     kv_vmm: bool = false, // TF_DS_KV_VMM=1 (--kv-vmm): the pool's planes in a virtual-memory reservation (kv_vmm.zig)
 };
+
+/// TF_DS_DIRECT_WEIGHTS=0: the weights read through the page cache, as before (default: past it, O_DIRECT).
+pub fn directWeights() bool {
+    const v = std.c.getenv("TF_DS_DIRECT_WEIGHTS") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
 
 /// TF_DS_2D_GU=parity (the served switch): the 2D split's experts with half the gate / up blocks a pair and the ninth by
 /// expert parity (plan.Split.parity); the rank cache must be one written for it.
@@ -2440,6 +2447,10 @@ pub const Model = struct {
         errdefer m.ix.deinit();
         m.cache_file = try m.cache_dir.openFile(io, cache_name, .{});
         errdefer m.cache_file.close(io);
+        // the weights read past the page cache (O_DIRECT where the file system takes it, NFS too): read buffered, the
+        // rank's 80 GB file stays in this node's page cache after the load, and the start drops it again first
+        var direct: ?dio.File = if (directWeights()) try dio.File.open(try std.fs.path.joinZ(a, &.{ o.cache_dir, cache_name })) else null;
+        defer if (direct) |*f| f.close();
         var sp = try prompt2d.split(role, o.world);
         if (std.c.getenv("TF_DS_DUMP")) |dd| {
             prompt.dump_dir = std.mem.span(dd);

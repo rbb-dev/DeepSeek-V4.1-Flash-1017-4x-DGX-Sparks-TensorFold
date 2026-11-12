@@ -431,7 +431,8 @@ pub const Weights = struct {
 
 /// Where entries come from: the lane's rank cache file, or the checkpoint read by the split.
 pub const Source = union(enum) {
-    cache: struct { file: std.Io.File, index: *const rank_cache.Index, io: std.Io },
+    // `direct`: the same file opened for reads past the page cache (O_DIRECT; Model.open's), else every read buffered
+    cache: struct { file: std.Io.File, index: *const rank_cache.Index, io: std.Io, direct: ?dio.File = null },
     shards: *const checkpoint.Shards,
 
     pub fn size(s: Source, key: []const u8) !usize {
@@ -463,15 +464,17 @@ pub fn strips(src: []const u8, out: []u8, kt: usize, nt: usize, tile: usize) voi
     };
 }
 
-/// Fills `buf` from `f` at the aligned offset `base`, in direct reads of at most `piece` (aligned) bytes.
-fn readWhole(f: dio.File, buf: dio.Buffer, base: u64, piece: usize) !void {
-    var done: usize = 0;
-    while (done < buf.len) {
-        const n = @min(buf.len - done, piece);
-        _ = try f.read(@alignCast(buf[done..][0..n]), base + done, n);
-        done += n;
+/// One entry of a pack (an expert's six tensors): its key and where its bytes go, from the pack's start.
+const PackRead = struct {
+    key_buf: [256]u8 = undefined,
+    key_len: usize = 0,
+    at: usize = 0,
+    offset: u64 = 0, // in the rank cache
+
+    fn key(r: *const PackRead) []const u8 {
+        return r.key_buf[0..r.key_len];
     }
-}
+};
 
 const Loader = struct {
     gpa: std.mem.Allocator,
@@ -489,6 +492,20 @@ const Loader = struct {
     w8_saved: u64 = 0,
     // tests: each upload's bytes kept on the host in place of a device buffer (the address returned: its index + 1)
     host_uploads: ?*std.ArrayList([]u8) = null,
+    // Direct reads (the source's direct file): the file's entries come in its own order (plan.wants is the loader's),
+    // so one read fills a window of the file that serves the entries after it; an entry wider than the window is
+    // read alone. A read a small entry (the experts' scales: tens of thousands of them) would make each wait. The
+    // entry a window ends inside starts the next one, which keeps what the old one holds of it and reads only what
+    // follows: a pass in the file's order reads each byte once (readPack keeps an expert's pieces in that order; an
+    // entry before the window's start is a whole new window). 256 MiB: the kept heads, moved in memory, are a quarter
+    // of what 64 MiB windows would move.
+    window: usize = 256 << 20, // the window's bytes (4 KiB aligned)
+    win: dio.Buffer = &.{}, // the file's bytes [win_at, win_at + win_len)
+    win_at: u64 = 0,
+    win_len: usize = 0,
+    dbuf: dio.Buffer = &.{}, // an entry wider than the window, grown to the widest one's aligned span
+    direct_reads: u64 = 0,
+    direct_bytes: u64 = 0,
     entries: u64 = 0, // entries asked for (entry)
     // the drafter's four-way parts while its blocks load (TF_DS_DRAFT_4WAY): keys the rank cache lacks derived
     derive: ?Derive = null,
@@ -496,8 +513,46 @@ const Loader = struct {
     fn deinit(L: *Loader) void {
         L.host.deinit(L.gpa);
         L.aux.deinit(L.gpa);
-        if (L.span_buf) |b| std.heap.page_allocator.free(b);
-        if (L.direct) |*f| f.close();
+        if (L.win.len > 0) L.gpa.free(L.win);
+        if (L.dbuf.len > 0) L.gpa.free(L.dbuf);
+    }
+
+    /// Entry `e` of the source's direct file `f` (data up to `data_end`): from the window, else a new window from its
+    /// page on (keeping what the old window holds from that page), else (wider than the window) read alone.
+    fn direct(L: *Loader, f: dio.File, e: rank_cache.Entry, data_end: u64) ![]u8 {
+        const len: usize = @intCast(e.bytes);
+        if (e.offset >= L.win_at and e.offset + e.bytes <= L.win_at + L.win_len) return L.win[@intCast(e.offset - L.win_at)..][0..len];
+        const need = dio.span(e.offset, len);
+        if (need > L.window) {
+            if (L.dbuf.len < need) {
+                if (L.dbuf.len > 0) L.gpa.free(L.dbuf);
+                L.dbuf = &.{};
+                L.dbuf = try L.gpa.alignedAlloc(u8, .fromByteUnits(dio.alignment), need);
+            }
+            const got = try f.read(L.dbuf, e.offset, len);
+            L.direct_reads += 1;
+            L.direct_bytes += len;
+            return got;
+        }
+        if (L.win.len == 0) L.win = try L.gpa.alignedAlloc(u8, .fromByteUnits(dio.alignment), L.window);
+        // from the entry's page to the window's end or the data's (the entry fits: its span is at most the window)
+        const at = std.mem.alignBackward(u64, e.offset, dio.alignment);
+        const n: usize = @intCast(@min(L.window, data_end - at));
+        // the entry runs past the window it starts in: that window's bytes from its page on stay (moved to the front;
+        // the window's end is page-aligned, as only a window cut short by the data's end is not, and none runs past it)
+        const end = L.win_at + L.win_len;
+        const keep: usize = if (L.win_len > 0 and at >= L.win_at and at < end and end % dio.alignment == 0) @intCast(end - at) else 0;
+        if (keep > 0) std.mem.copyForwards(u8, L.win[0..keep], L.win[@intCast(at - L.win_at)..][0..keep]);
+        L.win_len = 0; // (a read that fails leaves no window)
+        if (n > keep) {
+            const rest: dio.Buffer = @alignCast(L.win[keep..]);
+            _ = try f.read(rest, at + keep, n - keep);
+            L.direct_reads += 1;
+            L.direct_bytes += n - keep;
+        }
+        L.win_at = at;
+        L.win_len = n;
+        return L.win[@intCast(e.offset - at)..][0..len];
     }
 
     fn upload(L: *Loader, name: []const u8, bytes: []const u8) !u64 {
@@ -529,23 +584,11 @@ const Loader = struct {
         };
     }
 
-    fn readSpan(L: *Loader, lo: u64, hi: u64) !void {
-        const c = switch (L.src) {
-            .cache => |c| c,
-            .shards => return,
-        };
-        if (hi <= lo or hi - lo > max_span) return;
-        if (L.direct == null) {
-            var path: [64]u8 = undefined;
-            L.direct = try dio.File.open(try std.fmt.bufPrintSentinel(&path, "/proc/self/fd/{d}", .{c.file.handle}, 0));
-        }
-        const base = std.mem.alignBackward(u64, lo, dio.alignment);
-        const need = dio.span(lo, @intCast(hi - lo));
-        if (L.span_buf == null or L.span_buf.?.len < need) {
-            if (L.span_buf) |b| std.heap.page_allocator.free(b);
-            L.span_buf = null;
-            L.span_buf = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(dio.alignment), need);
+    /// The entry's bytes, valid until the next entry. With the source's direct file they come past the page cache
+    /// (an 80 GB rank file read buffered fills it, on a worker over NFS too, and the start must drop it again).
+    fn entry(L: *Loader, key: []const u8) ![]u8 {
         L.entries += 1;
+        switch (L.src) {
             .cache => |c| {
                 const e = try L.cacheEntry(c.index, key);
                 if (c.direct) |f| return L.direct(f, e, c.index.data_end);
@@ -553,15 +596,32 @@ const Loader = struct {
                 if (try c.file.readPositionalAll(c.io, L.host.items, e.offset) != L.host.items.len) return error.ShortRead;
                 return L.host.items;
             },
+            .shards => {},
         }
         try L.host.resize(L.gpa, try L.src.size(key));
         try L.src.read(key, L.host.items);
         return L.host.items;
     }
 
-    fn endSpan(L: *Loader) void {
-        L.span = &.{};
+    /// A pack's entries, each to `dst.upload(at, bytes)`, read in the rank cache's order: a window of it then serves an
+    /// expert's pieces in one pass, where the pack's own order (w1, w3, s1, s3, each main then rest; the cache holds
+    /// each main piece with its scales, the rest pieces last) steps back wherever a window ends inside an expert, and
+    /// each step back reads a whole window again.
+    fn readPack(L: *Loader, reads: []PackRead, dst: anytype) !void {
+        switch (L.src) {
+            .cache => |c| for (reads) |*r| {
                 r.offset = (try L.cacheEntry(c.index, r.key())).offset;
+            },
+            .shards => for (reads) |*r| {
+                r.offset = 0;
+            },
+        }
+        std.sort.insertion(PackRead, reads, {}, struct {
+            fn lt(_: void, x: PackRead, y: PackRead) bool {
+                return x.offset < y.offset;
+            }
+        }.lt);
+        for (reads) |*r| try dst.upload(r.at, try L.entry(r.key()));
     }
 
     /// plain(name, dtype).cuda(): the entry as it is.
@@ -775,13 +835,21 @@ const Loader = struct {
         errdefer buf.free();
         const tabs = try L.gpa.alloc(u64, 6 * e_count); // [j][e]: w1, w3, s1, s3, w2, s2
         defer L.gpa.free(tabs);
+        var reads: [10]PackRead = undefined; // an expert's pieces: two each of w1, w3, s1, s3, one of w2, s2
         const slens = try L.gpa.alloc([3]u64, e_count); // every expert's s1, s3 and s2 bytes as packed
         defer L.gpa.free(slens);
         var at: usize = 0;
+        for (0..e_count) |e| {
+            var nr: usize = 0;
+            for (0..6) |j| {
                 tabs[j * e_count + e] = buf.ptr + at;
                 var len_j: usize = 0;
                 for (pieces(&pbuf, j, e < n, gu, rest, owner[e] == 1, dcols, half)) |pc| {
+                    const r = &reads[nr];
+                    r.key_len = (try plan.partKey(&r.key_buf, try name(&nb, p, e, n, pc.proj), pc.cols, pc.rows, pc.part)).len;
+                    r.at = at + len_j;
                     len_j += try L.size(r.key());
+                    nr += 1;
                 }
                 switch (j) {
                     2 => slens[e][0] = len_j,
@@ -790,6 +858,9 @@ const Loader = struct {
                     else => {},
                 }
                 at += std.mem.alignForward(usize, len_j, 256);
+            }
+            try L.readPack(reads[0..nr], &buf);
+        }
         try L.w.buffers.append(L.gpa, buf);
         try L.w.named.append(L.gpa, .{ .name = try std.fmt.allocPrint(L.gpa, "{s}.ffn.experts.native", .{p}), .ptr = buf.ptr, .len = total });
         L.w.bytes += total;
@@ -1273,6 +1344,7 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, src: Source, c: Confi
         if (c.format == .native and draftHeadFp8()) w.dspark.?.head8 = try L.headFp8(vr);
     }
     if (L.span_bytes > 0) std.log.info("rank cache: {d:.1} GiB of expert entries read whole in {d:.1} s", .{ @as(f64, @floatFromInt(L.span_bytes)) / (1 << 30), @as(f64, @floatFromInt(L.span_ns)) / 1e9 });
+    if (L.direct_reads > 0) std.log.info("dsv41: weights read past the page cache: {d} reads, {d:.1} GiB", .{ L.direct_reads, @as(f64, @floatFromInt(L.direct_bytes)) / (1 << 30) });
     if (woa_w8) std.log.info("TF_DS_WOA_W8=1: wo_a from its FP8 rows on {d} of {d} layers ({d:.1} MB of bf16 rows not loaded){s}{s}", .{ L.w8_layers, L.w8_layers + L.w8_kept, @as(f64, @floatFromInt(L.w8_saved)) / 1e6, if (L.w8_why != null) "; the others keep their rows: " else "", L.w8_why orelse "" });
     return w;
 }
@@ -1503,7 +1575,181 @@ test "strips: each 128-column block's tiles in k order" {
     try std.testing.expectEqualSlices(u8, &want, &out);
 }
 
-test "rank cache span: entries read whole come back byte for byte, the rest one by one" {
+test "the rank cache's entries read past the page cache equal the buffered reads, at any offset and length" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // bytes of a pattern no two nearby offsets share, the entries at offsets aligned or not, short and long
+    var body: [5 * 4096 + 333]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = @truncate(i * 7 + i / 251 + 3);
+    try tmp.dir.writeFile(io, .{ .sub_path = "rank0of4-x.bin", .data = &body });
+    // (an index tiles its data: each entry starts where the one before ends)
+    const json =
+        \\[["a", "uint8", [5000], 0, 5000], ["b", "uint8", [3192], 5000, 3192], ["c", "uint8", [4096], 8192, 4096],
+        \\ ["d", "uint8", [8000], 12288, 8000], ["e", "uint8", [1], 20288, 1], ["f", "uint8", [524], 20289, 524]]
+    ;
+    var ix = try rank_cache.parseIndex(gpa, json, body.len);
+    defer ix.deinit();
+    var file = try tmp.dir.openFile(io, "rank0of4-x.bin", .{});
+    defer file.close(io);
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, ".zig-cache/tmp/{s}/rank0of4-x.bin", .{tmp.sub_path}, 0);
+    var direct = try dio.File.open(path);
+    defer direct.close();
+    try std.testing.expect(direct.direct); // the test's file system takes O_DIRECT (else this test proves nothing)
+    var w: Weights = .{ .gpa = gpa };
+    const src: Source = .{ .cache = .{ .file = file, .index = &ix, .io = io, .direct = direct } };
+    // the default window holds the whole file: one read serves every entry
+    var L: Loader = .{ .gpa = gpa, .d = undefined, .src = src, .w = &w };
+    defer L.deinit();
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f", "a" }) |key| {
+        const e = ix.get(key).?;
+        try std.testing.expectEqualSlices(u8, body[e.offset..][0..e.bytes], try L.entry(key));
+    }
+    try std.testing.expectEqual(@as(u64, 1), L.direct_reads);
+    try std.testing.expectEqual(@as(usize, 0), L.host.capacity); // every read went past the page cache
+    // two pages of window: it moves on as the entries pass its end, back for an earlier one; an entry wider than it
+    // is read alone and leaves it where it is
+    var S: Loader = .{ .gpa = gpa, .d = undefined, .src = src, .w = &w, .window = 2 * dio.alignment };
+    defer S.deinit();
+    const Step = struct { key: []const u8, reads: u64 };
+    for ([_]Step{
+        .{ .key = "a", .reads = 1 }, // [0, 8192)
+        .{ .key = "b", .reads = 1 }, // ends at 8192: inside
+        .{ .key = "c", .reads = 2 }, // [8192, 16384)
+        .{ .key = "d", .reads = 3 }, // [12288, 20480)
+        .{ .key = "e", .reads = 3 },
+        .{ .key = "f", .reads = 4 }, // [16384, the data's end)
+        .{ .key = "a", .reads = 5 }, // back to [0, 8192)
+        .{ .key = "b", .reads = 5 },
+    }) |st| {
+        const e = ix.get(st.key).?;
+        try std.testing.expectEqualSlices(u8, body[e.offset..][0..e.bytes], try S.entry(st.key));
+        try std.testing.expectEqual(st.reads, S.direct_reads);
+    }
+    var T: Loader = .{ .gpa = gpa, .d = undefined, .src = src, .w = &w, .window = dio.alignment };
+    defer T.deinit();
+    for ([_]Step{ .{ .key = "e", .reads = 1 }, .{ .key = "d", .reads = 2 }, .{ .key = "e", .reads = 2 } }) |st| {
+        const e = ix.get(st.key).?;
+        try std.testing.expectEqualSlices(u8, body[e.offset..][0..e.bytes], try T.entry(st.key));
+        try std.testing.expectEqual(st.reads, T.direct_reads);
+    }
+    try std.testing.expectEqual(@as(u64, 4096 + 8000), T.direct_bytes); // the bytes read: e's window page, then d alone
+    // a source without its direct file reads the same bytes buffered
+    var B: Loader = .{ .gpa = gpa, .d = undefined, .src = .{ .cache = .{ .file = file, .index = &ix, .io = io } }, .w = &w };
+    defer B.deinit();
+    for ([_][]const u8{ "d", "b" }) |key| {
+        const e = ix.get(key).?;
+        try std.testing.expectEqualSlices(u8, body[e.offset..][0..e.bytes], try B.entry(key));
+    }
+    try std.testing.expectEqual(@as(u64, 0), B.direct_reads);
+}
+
+test "a pass through the rank cache in its order reads each byte once: a new window keeps what the old one holds" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var body: [5 * 4096 + 333]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = @truncate(i * 7 + i / 251 + 3);
+    try tmp.dir.writeFile(io, .{ .sub_path = "rank0of4-x.bin", .data = &body });
+    const json =
+        \\[["a", "uint8", [5000], 0, 5000], ["b", "uint8", [3192], 5000, 3192], ["c", "uint8", [4096], 8192, 4096],
+        \\ ["d", "uint8", [8000], 12288, 8000], ["e", "uint8", [1], 20288, 1], ["f", "uint8", [524], 20289, 524]]
+    ;
+    var ix = try rank_cache.parseIndex(gpa, json, body.len);
+    defer ix.deinit();
+    var file = try tmp.dir.openFile(io, "rank0of4-x.bin", .{});
+    defer file.close(io);
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, ".zig-cache/tmp/{s}/rank0of4-x.bin", .{tmp.sub_path}, 0);
+    var direct = try dio.File.open(path);
+    defer direct.close();
+    try std.testing.expect(direct.direct);
+    var w: Weights = .{ .gpa = gpa };
+    // two pages of window: d [12288, 20288) runs past [8192, 16384), f [20289, 20813) past [12288, 20480)
+    var S: Loader = .{ .gpa = gpa, .d = undefined, .src = .{ .cache = .{ .file = file, .index = &ix, .io = io, .direct = direct } }, .w = &w, .window = 2 * dio.alignment };
+    defer S.deinit();
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f" }) |key| {
+        const e = ix.get(key).?;
+        try std.testing.expectEqualSlices(u8, body[e.offset..][0..e.bytes], try S.entry(key));
+    }
+    // each byte once (the window restarted at d's and f's page read [12288, 16384) and [16384, 20480) twice: 29,005)
+    try std.testing.expectEqual(@as(u64, body.len), S.direct_bytes);
+    try std.testing.expectEqual(@as(u64, 4), S.direct_reads);
+    // back to an earlier entry: a whole new window; then on, keeping the tail again
+    for ([_][]const u8{ "a", "d", "f" }) |key| {
+        const e = ix.get(key).?;
+        try std.testing.expectEqualSlices(u8, body[e.offset..][0..e.bytes], try S.entry(key));
+    }
+    try std.testing.expectEqual(@as(u64, body.len + 8192 + 8192 + 333), S.direct_bytes);
+}
+
+test "an expert's pack reads its entries in the rank cache's order: each byte once, each piece in its place" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // two experts as the rank cache holds them (the Python loader's order: w1 and w3 main pieces with their scales, w2,
+    // then the rest pieces); the pack wants w1, w3, s1, s3 (each main then rest), w2, s2
+    const parts = [_][]const u8{ "w1m", "s1m", "w3m", "s3m", "w2", "s2", "w1r", "s1r", "w3r", "s3r" };
+    const sizes = [_]usize{ 1800, 100, 1800, 100, 2100, 120, 450, 30, 450, 30 };
+    const pack = [_]usize{ 0, 6, 2, 7, 1, 8, 3, 9, 4, 5 }; // parts[pack[k]] is the pack's k-th piece
+    var body: [2 * 6980]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = @truncate(i * 13 + i / 241 + 5);
+    try tmp.dir.writeFile(io, .{ .sub_path = "rank0of4-x.bin", .data = &body });
+    var json: std.ArrayList(u8) = .empty;
+    defer json.deinit(gpa);
+    var off: usize = 0;
+    try json.append(gpa, '[');
+    for (0..2) |x| for (parts, sizes) |part, n| {
+        try json.print(gpa, "{s}[\"x{d}.{s}\", \"uint8\", [{d}], {d}, {d}]", .{ if (off > 0) ", " else "", x, part, n, off, n });
+        off += n;
+    };
+    try json.append(gpa, ']');
+    var ix = try rank_cache.parseIndex(gpa, json.items, body.len);
+    defer ix.deinit();
+    var file = try tmp.dir.openFile(io, "rank0of4-x.bin", .{});
+    defer file.close(io);
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, ".zig-cache/tmp/{s}/rank0of4-x.bin", .{tmp.sub_path}, 0);
+    var direct = try dio.File.open(path);
+    defer direct.close();
+    var w: Weights = .{ .gpa = gpa };
+    // two pages of window: the first ends inside the first expert (its w2), the second inside the second
+    var S: Loader = .{ .gpa = gpa, .d = undefined, .src = .{ .cache = .{ .file = file, .index = &ix, .io = io, .direct = direct } }, .w = &w, .window = 2 * dio.alignment };
+    defer S.deinit();
+    const Host = struct {
+        bytes: []u8,
+        fn upload(h: *@This(), at: usize, b: []const u8) !void {
+            @memcpy(h.bytes[at..][0..b.len], b);
+        }
+    };
+    var out: [6980]u8 = undefined;
+    for (0..2) |x| {
+        var reads: [10]PackRead = undefined;
+        var at: usize = 0;
+        for (pack, 0..) |pi, k| {
+            const key = try std.fmt.bufPrint(&reads[k].key_buf, "x{d}.{s}", .{ x, parts[pi] });
+            reads[k].key_len = key.len;
+            reads[k].at = at;
+            at += sizes[pi];
+        }
+        var host: Host = .{ .bytes = &out };
+        try S.readPack(&reads, &host);
+        // each piece where the pack wants it
+        at = 0;
+        for (pack) |pi| {
+            var kb: [32]u8 = undefined;
+            const e = ix.get(try std.fmt.bufPrint(&kb, "x{d}.{s}", .{ x, parts[pi] })).?;
+            try std.testing.expectEqualSlices(u8, body[e.offset..][0..e.bytes], out[at..][0..sizes[pi]]);
+            at += sizes[pi];
+        }
+    }
+    // each byte once (in the pack's order the reads step back where a window ends inside an expert: whole windows again)
+    try std.testing.expectEqual(@as(u64, body.len), S.direct_bytes);
+}
 
 test "the drafter's stages load four ways only as decided, on a 2D node with the checkpoint's own weights" {
     // (TF_DS_DRAFT_4WAY: Model.open sets draft_4way before the load; plan.zig's listing, the rank files, unchanged)

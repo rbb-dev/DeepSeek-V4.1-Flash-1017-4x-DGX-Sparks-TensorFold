@@ -41,6 +41,7 @@
 //!                                               bounded by TF_DS_RING_WORD_DEADLINE_MS (default 120,000) and the abort word,
 //!                                               and a ring no sequence reaches is poisoned; the same bytes, one line at
 //!                                               the start; every rank alike
+//!   TF_DS_DIRECT_WEIGHTS=0                      the weights read through the page cache (default: past it, O_DIRECT)
 //!   TF_DS_RDMA_WFE=1                            each RDMA proxy with nothing in flight naps on its doorbell (Arm WFET,
 //!                                               at most 50 us a nap) instead of reading it in a loop, on a ring with
 //!                                               no relays and a CPU with WFET (one line at the start says which); a
