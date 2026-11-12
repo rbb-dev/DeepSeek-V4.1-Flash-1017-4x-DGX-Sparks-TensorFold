@@ -1,7 +1,7 @@
 """Check a running server end to end: text, thinking, tool calls, an image, a video, a long prompt, and that greedy
 replies sent several at once equal the same replies sent one at a time.
 
-    python3 tools/validate.py [base url, default http://127.0.0.1:8888] [--model NAME] [--save FILE] [--compare FILE]
+    python3 tools/validate.py [base url, default http://127.0.0.1:8888] [--model NAME] [--save FILE] [--compare FILE] [--key-file FILE]
 
 --save writes every greedy reply to FILE; --compare checks them against a FILE saved earlier (a server started with
 DRAFTS=0, say: drafted replies must equal undrafted ones). Needs only the Python standard library, and PyAV for the
@@ -36,8 +36,23 @@ COMPARE = arg("--compare", None)
 failed = []
 
 
+def first_key(path):
+    """The first key of an API key file ("label: key" lines or bare keys, # comments), as the engine reads its own."""
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                return line.split(":", 1)[1].strip() if ":" in line else line
+    sys.exit(f"{path} holds no key")
+
+
+# --key-file: for a server with API keys (start.sh's API_KEY_FILE), every request carries its first key
+KEY_FILE = arg("--key-file", None)
+HEADERS = {"content-type": "application/json", **({"authorization": f"Bearer {first_key(KEY_FILE)}"} if KEY_FILE else {})}
+
+
 def post(body, timeout=900):
-    req = urllib.request.Request(URL + "/v1/chat/completions", json.dumps(body).encode(), {"content-type": "application/json"})
+    req = urllib.request.Request(URL + "/v1/chat/completions", json.dumps(body).encode(), HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.load(r)

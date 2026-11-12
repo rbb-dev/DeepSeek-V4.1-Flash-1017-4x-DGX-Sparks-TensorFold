@@ -474,7 +474,7 @@ pub const Server = struct {
     }
 
     /// The key gate before any route: 401 for a gated path without a valid key (``Authenticated._authenticate``).
-    fn authenticate(srv: *Server, conn: *http_conn.Conn, a: Allocator) bool {
+    pub fn authenticate(srv: *Server, conn: *http_conn.Conn, a: Allocator) bool {
         const keys = srv.keys orelse return true;
         if (std.mem.eql(u8, conn.method, "OPTIONS") or !keys.enabled()) return true;
         conn.key_label = keys.match(a, single(conn, "Authorization"), single(conn, "x-api-key"));

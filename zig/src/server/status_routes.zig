@@ -10,9 +10,12 @@ const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
 /// With keys on, health names nothing about the model.
+/// With keys on, health names nothing about the model to a request without a valid key; a key holder (a dashboard's
+/// key) gets the whole answer. An engine that cannot serve (a fault it cannot recover from) answers 503, keys on or off.
 pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
     if (srv.keys) |k| if (k.enabled()) return conn.sendJson(200, "{\"status\": \"ok\"}");
     routes.sendValue(conn, a, 200, try openHealth(srv, a, std.mem.indexOf(u8, conn.path, "reset_peak=1") != null));
+    if (srv.keys) |k| if (k.enabled() and conn.key_label == null) return conn.sendJson(200, "{\"status\": \"ok\"}");
 }
 
 /// The open health body: model, lanes, memory and live counts, then whichever of release, backend and GPU it knows.
