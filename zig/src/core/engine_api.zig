@@ -808,7 +808,16 @@ pub const CacheStats = struct {
     };
 };
 
+/// Whether the engine's backend can still serve, read on HTTP threads without touching the device (LaneHost.health).
+pub const HealthSource = struct {
+    ctx: *anyopaque,
+    read: *const fn (ctx: *anyopaque) bool,
+};
+
 pub const Status = struct {
+    /// False after a fault the engine cannot recover from (its GPU context lost): it serves nothing more and refuses
+    /// new requests; /health answers 503 until it is restarted.
+    healthy: bool = true,
     /// Requests in prefill or decode, and those waiting for a lane.
     running: u32 = 0,
     waiting: u32 = 0,

@@ -128,6 +128,12 @@ fn pool(a: Allocator, io: std.Io, ctx: *const cuda.Context, problem: *[]const u8
     return .{ .free = free, .total = total, .reserve = reserve, .limit = limit, .unified = unified };
 }
 
+/// The lane host's health source: no sticky fault on the GPU context (read without a driver call).
+fn contextHealthy(ctx: *anyopaque) bool {
+    const c: *const cuda.Context = @ptrCast(@alignCast(ctx));
+    return c.fault() == 0;
+}
+
 fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
     const u = cuda.usage(reset_peak);
     return .{ .active = u.device, .cache = 0, .peak = u.peak };
@@ -225,6 +231,7 @@ const Host = struct {
         errdefer h.core.deinit();
         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
+        h.host.health = if (h.gpu) |g| .{ .ctx = &g.ctx, .read = contextHealthy } else null;
         h.host.explain = explain;
         if (h.cache) |*store| h.host.cache = store;
         if (h.quiet != null) h.host.quiet = .{ .ctx = h, .check = quietCheck };

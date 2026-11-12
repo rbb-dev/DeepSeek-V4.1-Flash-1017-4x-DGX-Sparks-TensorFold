@@ -60,6 +60,7 @@ test {
     _ = @import("server_init_test.zig");
     _ = @import("decisions.zig");
     _ = @import("decisions_test.zig");
+    _ = @import("health_ready_test.zig");
     _ = @import("admin.zig");
     _ = @import("admin_test.zig");
     _ = @import("admin_requests.zig");

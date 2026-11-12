@@ -763,11 +763,42 @@ test "after a long prompt pass, a stream near its max_tokens ends before the nex
     };
     var unused: u8 = 0;
     var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_hook = Slow.hook, .prefill_hook_ctx = &unused };
+
+test "a backend that cannot serve any more: status says so and every new request is refused, nothing queued" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{}, 1, 0);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
     defer target.deinit();
     var clock: lanes.fake.FixedClock = .{};
     var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
     defer core.deinit();
-    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 1 });
+    const Source = struct {
+        ok: bool = true,
+        fn read(ctx: *anyopaque) bool {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            return s.ok;
+        }
+    };
+    var source: Source = .{};
+    host.health = .{ .ctx = &source, .read = Source.read };
+    const e = host.engine();
+    var status: api.Status = .{};
+    e.status(&status, &.{});
+    try std.testing.expect(status.healthy);
+    source.ok = false; // (a sticky device fault, as the CUDA context reports it)
+    e.status(&status, &.{});
+    try std.testing.expect(!status.healthy);
+    const Never = struct {
+        fn event(_: *anyopaque, _: Id, _: *const Event) void {
+            @panic("a refused request hears nothing");
+        }
+    };
+    const req: Request = .{ .prompt = &.{ 1, 2, 3 }, .max_tokens = 1 };
+    try std.testing.expectError(error.Closed, e.submit(1, &req, .{ .ctx = &source, .event = Never.event }));
+    try std.testing.expectEqual(@as(usize, 0), host.queued.items.len);
+}
     try host.start();
     defer host.stop();
     const Seq = struct {

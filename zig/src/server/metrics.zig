@@ -257,6 +257,7 @@ pub const Metrics = struct {
             for ([_][]const u8{ "argmax", "keys", "candidates", "merged", "flagged", "whole" }, hr) |name, n| try w.print("{s}decode_rounds_by_head_path_total{{path=\"{s}\"}} {d}\n", .{ prefix, name, n });
         }
         if (status.draft_vocab) |v| try draftVocabFamilies(w, v);
+        try gauge(w, "healthy", "gauge", "1 while the engine can serve; 0 after a fault it cannot recover from (its GPU context lost): it refuses requests until it is restarted.", @intFromBool(status.healthy));
         // under its standard name, as Prometheus' client libraries publish it: dashboards date a restart by it
         if (snap.started_unix > 0) try w.print("# HELP process_start_time_seconds Start time of the process since unix epoch in seconds.\n# TYPE process_start_time_seconds gauge\nprocess_start_time_seconds {d}\n", .{snap.started_unix});
         if (status.cache) |c| try cacheFamilies(w, c);

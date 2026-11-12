@@ -67,6 +67,7 @@ pub const LaneHost = struct {
     graph_fallbacks: ?*const std.atomic.Value(u64) = null, // the backend's failed graph captures (read at any time)
     head_rounds: ?*const [6]std.atomic.Value(u64) = null, // the backend's decode rounds by the head's path (read at any time)
     draft_vocab: ?*const api.DraftVocabCounters = null, // the backend's drafter on a pruned vocabulary (read at any time)
+    health: ?api.HealthSource = null, // whether the backend can still serve (read at any time; null: always)
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
     // the request at the queue's front waits for room in the backend's pool (its prompt pass refused ContextFull while
     // other streams ran): admitted again once fewer than this many streams are active, or at full_retry (a backend
@@ -444,7 +445,7 @@ pub const LaneHost = struct {
         job.* = .{ .host = h, .id = id, .request = request, .sink = sink };
         h.mutex.lockUncancelable(h.io);
         defer h.mutex.unlock(h.io);
-        if (h.closing or h.stale) {
+        if (h.closing or !h.healthy()) {
             h.gpa.destroy(job);
             return error.Closed;
         }
@@ -468,7 +469,16 @@ pub const LaneHost = struct {
         h.wake.signal(h.io);
     }
 
-    fn memoryFn(ctx: *anyopaque, reset_peak: bool) ?api.Memory {
+    /// Whether the backend can still serve (its health source; a lost GPU context cannot).
+    fn healthy(h: *const LaneHost) bool {
+        const src = h.health orelse return true;
+        return src.read(src.ctx);
+    }
+
+    fn statusFn(ctx: *anyopaque, out: *Status, stream_tokens: []u32) void {
+        const h = self(ctx);
+        h.mutex.lockUncancelable(h.io);
+        defer h.mutex.unlock(h.io);
         // the engine thread refreshes what the lock guards only for a reader: ask, and wait (a round or a turn at most) for the answer
         if (h.thread != null and !h.closing and h.engine_tid.load(.acquire) != 0 and h.engine_tid.load(.acquire) != std.Thread.getCurrentId()) {
             const gen = h.tele_gen;
@@ -493,6 +503,8 @@ pub const LaneHost = struct {
             running += job.progress.computed();
         };
         out.* = .{
+            .healthy = h.healthy(),
+            .running = @intCast(h.admitted.items.len),
             .waiting = @intCast(h.queued.items.len + h.waitingCount()),
             .decode_tokens_per_second = @as(f64, @floatFromInt(tokens)) / 2.0,
             // a pass in flight: its speed now (the done rows' rise over the last few seconds; before two marks, its speed so far);

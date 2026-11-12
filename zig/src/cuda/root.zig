@@ -58,6 +58,7 @@ test {
     _ = abi;
     _ = aot;
     _ = segments;
+    _ = @import("context_health.zig");
     _ = @import("qmmf.zig");
     _ = @import("fp8.zig");
     _ = carveout;

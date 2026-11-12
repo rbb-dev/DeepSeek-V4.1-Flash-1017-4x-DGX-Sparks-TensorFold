@@ -3,7 +3,7 @@
 const std = @import("std");
 const abi = @import("abi.zig");
 
-pub const Error = error{ DriverUnavailable, MissingSymbol, CudaFailed, OutOfDeviceMemory, NotReady, NotFound, Invalid };
+pub const Error = error{ DriverUnavailable, MissingSymbol, CudaFailed, CudaContextLost, OutOfDeviceMemory, OutOfMemory, NotReady, NotFound, Invalid };
 
 pub const Driver = struct {
     lib: std.DynLib,
@@ -52,7 +52,11 @@ pub const Driver = struct {
     pub fn check(self: *const Driver, res: abi.Result, what: []const u8) Error!void {
         if (res == abi.success) return;
         if (res == abi.error_not_ready) return error.NotReady;
+        @import("context_health.zig").observe(self, res); // (before the log line: readers see a lost context at once)
         std.log.err("{s}: {s} ({d}) {s}", .{ what, self.errorName(res), res, self.errorText(res) });
+        return errorOf(res);
+    }
+
     /// The one place a synchronous host-to-device copy is issued (a source-scan test holds every call site of the engine to it). `loc` is the caller's @src(), comptime: nothing of it
     /// costs anything when the copy succeeds; a failure logs the call site, both ends and the length (copyFailed).
     pub inline fn copyHtoD(self: *const Driver, comptime loc: std.builtin.SourceLocation, dst: abi.DevicePtr, src: ?*const anyopaque, bytes: usize) Error!void {
@@ -109,6 +113,17 @@ pub const Driver = struct {
         return std.fmt.bufPrint(buf, "allocation 0x{x} + {d} bytes, offset {d}, {s}", .{ base, size, off, if (off + bytes > size) "the copy LEAVES it" else "the copy stays inside it" }) catch "allocation";
     }
 
+    /// `check` without its log line: a sticky fault is kept for the context's health all the same.
+    pub fn result(self: *const Driver, res: abi.Result) Error!void {
+        if (res == abi.success) return;
+        if (res == abi.error_not_ready) return error.NotReady;
+        @import("context_health.zig").observe(self, res);
+        return errorOf(res);
+    }
+
+    /// The error a failed call returns.
+    pub fn errorOf(res: abi.Result) Error {
+        if (@import("context_health.zig").sticky(res)) return error.CudaContextLost;
         return switch (res) {
             2 => error.OutOfDeviceMemory,
             abi.error_not_found => error.NotFound,

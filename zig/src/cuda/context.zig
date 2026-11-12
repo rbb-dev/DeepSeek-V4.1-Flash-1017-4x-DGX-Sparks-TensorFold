@@ -4,6 +4,8 @@ const std = @import("std");
 const abi = @import("abi.zig");
 const Driver = @import("driver.zig").Driver;
 const Error = @import("driver.zig").Error;
+const health = @import("context_health.zig");
+
 /// TF_DS_CUDA_SCHED: how the primary context's host threads wait in a synchronize call. Unset, empty or white space:
 /// the driver's default, and no flag call is made. `auto`, `spin`, `yield`, `blocking` (the thread sleeps until the GPU
 /// signals), surrounding white space ignored. Any other text is refused at the ranks' settings exchange. Every tool
@@ -166,6 +168,7 @@ pub const Context = struct {
         errdefer _ = d.api.cuDevicePrimaryCtxRelease_v2(dev);
         try d.check(d.api.cuCtxSetCurrent(ctx), "cuCtxSetCurrent");
         errdefer _ = d.api.cuCtxSetCurrent(null);
+        try health.retain(d);
         return .{ .d = d, .device = dev, .handle = ctx };
     }
 
@@ -173,7 +176,14 @@ pub const Context = struct {
     pub fn deinit(self: *Context) void {
         _ = self.d.api.cuCtxSynchronize();
         _ = self.d.api.cuDevicePrimaryCtxRelease_v2(self.device);
+        health.release(self.d);
         self.* = undefined;
+    }
+
+    /// The sticky fault a call on this context reported (0: none): it serves nothing more. No driver call, so any
+    /// thread may ask.
+    pub fn fault(self: *const Context) abi.Result {
+        return health.fault(self.d);
     }
 
     /// Makes the context current on another thread before it calls the driver.

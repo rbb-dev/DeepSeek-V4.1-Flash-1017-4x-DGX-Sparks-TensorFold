@@ -2313,8 +2313,15 @@ fn refusalKeepsRanksInStep(err: anyerror) bool {
 /// and when the error is this rank's alone the transport fails at once, since the other ranks wait for outputs this rank
 /// skipped.
 fn refusedExchange(m: anytype, err: anyerror) error{GpuContextFailed}!void {
+    return refusedExchangeSaying(m, err, std.log.err);
+}
+
+/// `refusedExchange` with the error line's writer a parameter: the zig test runner fails a test that logs at err level, so a test of
+/// the decision (which ranks end, which go on) passes a writer that says nothing; the engine passes std.log.err.
+fn refusedExchangeSaying(m: anytype, err: anyerror, comptime say: anytype) error{GpuContextFailed}!void {
     refused(err);
     if (!refusalKeepsRanksInStep(err)) {
+        say("follow: {s} on a primitive that carries exchanges is this rank's alone: failing the transport so every rank says so now", .{@errorName(err)});
         m.failExchanges();
         // A GPU fault (an illegal address, a trap) leaves this rank's context running nothing more, and the lanes' failure
         // only reaches the ranks through the NIC: a follower whose context failed ends, so its link closes and rank 0's watch
@@ -3597,6 +3604,12 @@ test "R4: the Engram worker is joined, or on its own reader, before a round foll
 }
 
 test "a CUDA failure that left the follower's context failed ends the follower, every other refusal does not" {
+    const quiet = struct {
+        fn say(comptime fmt: []const u8, args: anytype) void {
+            _ = fmt;
+            _ = args;
+        }
+    }.say; // (the runner fails a test that logs at err level)
     const CtxProbe = struct {
         failed: bool,
         asked: usize = 0,
@@ -3610,14 +3623,18 @@ test "a CUDA failure that left the follower's context failed ends the follower, 
         }
     };
     var gone: CtxProbe = .{ .failed = true };
+    try std.testing.expectError(error.GpuContextFailed, refusedExchangeSaying(&gone, error.CudaFailed, quiet));
     try std.testing.expectEqual(@as(usize, 1), gone.failed_lanes); // (the lanes fail first: the other ranks are told by the abort)
     var alive: CtxProbe = .{ .failed = false }; // a failed call the context survived: the lanes fail, the follower goes on
+    try refusedExchangeSaying(&alive, error.CudaFailed, quiet);
     try std.testing.expectEqual(@as(usize, 1), alive.asked);
     try std.testing.expectEqual(@as(usize, 1), alive.failed_lanes);
     var other: CtxProbe = .{ .failed = true }; // an error this rank alone raises, but no GPU fault: the context is not asked
+    try refusedExchangeSaying(&other, error.OutOfDeviceMemory, quiet);
     try std.testing.expectEqual(@as(usize, 0), other.asked);
     try std.testing.expectEqual(@as(usize, 1), other.failed_lanes);
     var step: CtxProbe = .{ .failed = true }; // rank 0 refuses these at the same step: nothing fails, nobody is asked
+    try refusedExchangeSaying(&step, error.BadChunk, quiet);
     try std.testing.expectEqual(@as(usize, 0), step.asked);
     try std.testing.expectEqual(@as(usize, 0), step.failed_lanes);
 }
