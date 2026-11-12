@@ -21,6 +21,7 @@ const lanes = @import("lanes");
 const instr = @import("instr.zig");
 const model = @import("model.zig");
 const where = @import("where.zig");
+const fit = @import("rows.zig");
 const round = @import("round.zig");
 const draft = @import("draft.zig");
 const prompt = @import("prompt.zig");
@@ -1236,7 +1237,8 @@ pub const Lanes = struct {
         const ids = s.prompt();
         const len = ids.len;
         if (len == 0) return error.EmptyPrompt;
-        const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
+        // rows.zig: the server's context window is fit.usableRows of the same numbers, so a request it admits fits here
+        const size = fit.streamRows(len, s.max_new, m.eng.round_rows, model.chunk_rows);
         if (size > m.ctx_cap) return error.PromptTooLong;
         releaseFn(self, s);
         const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;

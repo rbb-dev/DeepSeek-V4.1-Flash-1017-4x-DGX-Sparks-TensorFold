@@ -69,6 +69,7 @@ pub const spill_start = @import("spill_start.zig");
 pub const spill_state = @import("spill_state.zig");
 /// The SSD tier on rank 0: the prompt cache's Tier over core/spill's store.
 pub const spill_tier = @import("spill_tier.zig");
+pub const rows = @import("rows.zig");
 /// tf-dsv41-rows-replay's pass sizes and, at each, the nodes' quarters, the planes' offsets and a control's row.
 /// The decode rounds' one-line-per-64-rounds instrument.
 pub const instr = @import("instr.zig");
@@ -163,6 +164,7 @@ test {
     refAll(head_cand);
     refAll(model);
     refAll(lanes);
+    refAll(rows);
     refAll(instr);
     refAll(ring_watch);
     refAll(where);

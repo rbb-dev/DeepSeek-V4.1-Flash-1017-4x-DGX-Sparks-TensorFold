@@ -475,6 +475,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     if (@hasField(@TypeOf(loaded), "quiet")) h.quiet = loaded.quiet;
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
     const vision: ?api.LaneVision = if (@hasField(@TypeOf(loaded), "lane_vision")) loaded.lane_vision else null;
+    // the server's window is what a stream holds when the family says (its lanes add a round's rows to every
+    // stream); else the configured window, as before
+    const usable: i64 = if (@hasField(@TypeOf(loaded), "usable_window")) (if (loaded.usable_window) |u| @min(window, @as(i64, u)) else window) else window;
     // the family's resume grid: a prompt step's rows between two rounds at the default cadence (the scheduling facts)
     const resume_rows: u32 = if (@hasField(@TypeOf(loaded), "grid")) loaded.grid else 0;
     // the rows a prompt step may run between two rounds while a stream decodes (0: the resume rows)

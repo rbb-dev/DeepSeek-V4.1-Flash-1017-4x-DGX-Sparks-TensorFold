@@ -265,6 +265,7 @@ const cuda = @import("cuda");
 const lanes = @import("lanes");
 const model = @import("model.zig");
 const lanes_mod = @import("lanes.zig");
+const rows_mod = @import("rows.zig");
 const round = @import("round.zig");
 const link = @import("link.zig");
 const rank_cache = @import("rank_cache.zig");
@@ -358,6 +359,9 @@ pub const Loaded = struct {
     snaps: ?Snaps = null,
     /// Images in requests (the server renders their placeholders; the tower runs on this rank).
     lane_vision: ?lanes.stream.LaneVision = null,
+    /// The most prompt plus reply tokens a stream holds (rows.usableRows: the window less a decode round's rows): the
+    /// server's context window, so a request with no max_tokens gets all of it and one that asks too much is refused there.
+    usable_window: ?u32 = null,
     /// The SSD tier (the prompt cache's Tier) when it opened; null otherwise (`spill_state` says why).
     tier: ?api.prompt_cache.Tier = null,
     /// The prompt cache's native rules with the tier: Rules.grid (the prompt chunk) and Rules.window (the replay).
