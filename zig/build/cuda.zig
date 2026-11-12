@@ -159,10 +159,12 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("exlr8_frozen", b.createModule(.{ .root_source_file = b.path("zig/tests/fixtures/exlr8/frozen.zig"), .target = target, .optimize = optimize }));
     runner.addImport("exlr8_frozen_dense", b.createModule(.{ .root_source_file = b.path("zig/tests/fixtures/exlr8/frozen_dense.zig"), .target = target, .optimize = optimize }));
     for (exlr8_build.denseModules(b, target, optimize, exlr8, exlr8_tests[0])) |m| runner.addImport(m.name, m.module);
-    const glm_cuda = glmCuda(b, target, optimize, cuda, mods.core, mods.lanes, mods.heat);
-    runner.addImport("glm_cuda", glm_cuda);
     const runner_exe = b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner });
     b.installArtifact(runner_exe);
+    // tf-spill-fill, its own step: a synthetic full spill store (core/spill/fill_main.zig); no GPU
+    const spill_fill = b.createModule(.{ .root_source_file = b.path("zig/src/core/spill/fill_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    spill_fill.addImport("core", mods.core);
+    b.step("tf-spill-fill", "A synthetic full spill store, for timing one: tf-spill-fill fill|probe").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-spill-fill", .root_module = spill_fill }), .{}).step);
     // DeepSeek-V4.1 (our port): the TP split plan against the lane's rank cache index, no GPU
     const ds_check = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/check_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     ds_check.addImport("dsv41", engines(b, target, optimize, cuda, mods.core, mods.lanes, mods.nemotron, mods.heat).dsv41);
@@ -175,14 +177,6 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     ds_load.addImport("dsv41", ds_check.import_table.get("dsv41").?);
     ds_load.addImport("cuda", cuda);
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-load", .root_module = ds_load }));
-    const ds_comm = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/comm_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
-    ds_comm.addImport("dsv41", ds_check.import_table.get("dsv41").?);
-    ds_comm.addImport("cuda", cuda);
-    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-comm", .root_module = ds_comm }));
-    const ds_layer = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/layer_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
-    ds_layer.addImport("dsv41", ds_check.import_table.get("dsv41").?);
-    ds_layer.addImport("cuda", cuda);
-    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-layer", .root_module = ds_layer }));
     // the RDMA ring across real nodes (rdma.zig): rendezvous, gathers at each row count, every float checked
     const ds_rdma = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/rdma_bench_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     ds_rdma.addImport("dsv41", ds_check.import_table.get("dsv41").?);
@@ -300,13 +294,15 @@ fn radioModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
 fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, heat: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module, dsv41: *std.Build.Module } {
     // DeepSeek-V4.1-Flash (our port): its module reads the runtime and the lane core, as Nemotron's does
+    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
     const dsv41 = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/dsv41.zig"), .target = target, .optimize = optimize, .link_libc = true });
     dsv41.addImport("cuda", cuda);
     dsv41.addImport("lanes", lanes);
     dsv41.addImport("core", core);
+    // the prompt cache's Tier and its types (spill_tier.zig: the SSD tier on rank 0)
+    dsv41.addImport("engine_api", api);
     // the RDMA ring's verbs (rdma.zig)
     dsv41.addImport("fabric", b.createModule(.{ .root_source_file = b.path("zig/src/fabric/fabric.zig"), .target = target, .optimize = optimize, .link_libc = true }));
-    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
     const mod = b.createModule(.{
         .root_source_file = b.path("zig/src/native/cuda.zig"),
         .target = target,
@@ -392,9 +388,6 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     }
     // the tokenizer's own tests (memo, steps, regex, unicode) run here: no other test binary reaches them
     for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, lfm2Module(b, host, .debug, cuda, mods.core), mods.radio, mods.heat, mods.tokenizer, native_modules.api, native, native_modules.dsv41, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
-    // the GLM-5.3-Flash CUDA family's host side
-    const glm = glmCuda(b, host, .debug, cuda, mods.core, mods.lanes, mods.heat);
-    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm })).step);
     // the shares a GLM-5.3-Flash rank takes (cluster/canon.zig against the Python family's)
     const shares = b.createModule(.{ .root_source_file = b.path("zig/src/cluster/canon_glm_test.zig"), .target = host, .optimize = .debug });
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = shares })).step);
@@ -402,10 +395,6 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     const parse_tests = b.createModule(.{ .root_source_file = b.path("zig/src/server/tool_parse_test.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = native_modules.api }, .{ .name = "tokenizer", .module = mods.tokenizer }, .{ .name = "template", .module = template } } });
     _ = @import("server.zig").addTo(b, parse_tests, host, .debug);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = parse_tests })).step);
-    const neighbor = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/neighbor.zig"), .target = host, .optimize = .debug, .link_libc = true });
-    neighbor.addImport("cuda", cuda);
-    neighbor.addImport("fabric", native_modules.dsv41.import_table.get("fabric").?);
-    b.step("test-dsv41-neighbor", "Host checks of TP4 neighbor transport (no GPU or verbs)").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = neighbor })).step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);

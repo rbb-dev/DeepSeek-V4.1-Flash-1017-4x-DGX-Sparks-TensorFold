@@ -13,8 +13,9 @@ const Value = json.Value;
 const Cx = errors.Cx;
 
 /// With image input, `ids` holds each image's tokens, `images` the images and `cache_key` the prompt the cache matches;
-/// a lane-vision engine's images are `lane_images`, spans of its image token.
-pub const Rendered = struct { ids: []const u32, history_len: usize = 0, rewind_len: usize = 0, images: []const api.Image = &.{}, cache_key: []const u32 = &.{}, lane_images: []const api.LaneImage = &.{} };
+/// a lane-vision engine's images are `lane_images`, spans of its image token, and `media` each one's span and full
+/// payload digest (the durable tier's identity of it; the cache key's ids derive from the digest).
+pub const Rendered = struct { ids: []const u32, history_len: usize = 0, rewind_len: usize = 0, images: []const api.Image = &.{}, cache_key: []const u32 = &.{}, lane_images: []const api.LaneImage = &.{}, media: []const api.prompt_cache.Media = &.{} };
 
 /// Where lessons decide to act on a reply: the row before the generation prompt's `<think>`, else before its last.
 pub fn decideOf(srv: *const Server, ids: []const u32) u32 {
@@ -96,7 +97,7 @@ pub fn replySpans(srv: *Server, cx: *Cx, prompt: []const u32) errors.Refused![]c
     if (srv.eos.len == 0) return &.{};
     var probe: Cx = .{ .a = cx.a }; // a template that refuses the probe leaves the request without spans, not failed
     const openers = [2][]const u32{ generationPrompt(srv, &probe, false) catch &.{}, generationPrompt(srv, &probe, true) catch &.{} };
-    var spans: std.ArrayList([2]u32) = .empty;
+    var found: std.ArrayList([2]u32) = .empty;
     var i: usize = 0;
     while (i < prompt.len) {
         var start: ?usize = null;
@@ -107,10 +108,10 @@ pub fn replySpans(srv: *Server, cx: *Cx, prompt: []const u32) errors.Refused![]c
         };
         const first = start orelse break;
         const end = std.mem.indexOfAnyPos(u32, prompt, first, srv.eos) orelse break;
-        try spans.append(cx.a, .{ @intCast(first), @intCast(end + 1) });
+        try found.append(cx.a, .{ @intCast(first), @intCast(end + 1) });
         i = end + 1;
     }
-    return spans.items;
+    return found.items;
 }
 
 /// A request's prompt: raw text or ids for a completion, else the chat template's, with its history length.
@@ -129,12 +130,12 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
     if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
     // lane-vision images: the history's length is counted in the expanded prompt, and the cache keys the pictures by their content
     if (input.lane_images.len > 0) {
+        const r = try spans(srv, cx, prompt, input.lane_images, history_len);
+        return imageCache(r, if (std.c.getenv("TF_DS_IMAGE_CACHE")) |v| std.mem.span(v) else null);
     }
     // --vision: placeholders expanded to image tokens before the window, chunks and cache see it; no rewind kept
     if (try images.expand(srv.info.vision, if (srv.config.vision_urls) images.Fetch.network(srv.io) else null, srv.text, cx, input.messages, prompt, history_len)) |x| return .{ .ids = x.ids, .history_len = x.history_len, .images = x.images, .cache_key = x.cache_key };
-    const count = if (input.messages == .array) input.messages.array.len else 0;
-    const rewind_len = if (srv.info.prompt_cache) rewindLen(srv, cx, input.messages, count, input.tools, prompt, thinking, effort) else 0; // one more render
-    return .{ .ids = prompt, .history_len = history_len, .rewind_len = rewind_len };
+    return .{ .ids = prompt, .history_len = history_len }; // (no rewind state: the lane host keeps none; rewindLen is available)
 }
 
 /// Where the latest user message's text starts (of the first `real_count`): the prompt and a probe there agree to it.
@@ -156,11 +157,24 @@ pub fn rewindLen(srv: *Server, cx: *Cx, messages: Value, real_count: usize, tool
     return if (i < prompt.len) i else 0;
 }
 
-/// Each image placeholder of the rendered prompt as its image's span (the lane-vision family's prepare: the span's
-/// length and the payload the engine reads), the images in prompt order.
-fn laneSpans(srv: *Server, cx: *Cx, ids: []const u32, history_len: usize, lane_images: []const []const u8) errors.Refused!Rendered {
-    const vision = srv.info.lane_vision orelse return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
-    return placeSpans(cx, vision, ids, history_len, lane_images);
+/// TF_DS_IMAGE_CACHE=0 (`setting`): pictures keep nothing and resume nothing (no key: the cache refuses such a
+/// request; no media: the tier keeps and finds nothing). Unset or any other value: `r` as it is.
+fn imageCache(r: Rendered, setting: ?[]const u8) Rendered {
+    if (api.prompt_cache.imageCacheOn(setting)) return r;
+    var off = r;
+    off.cache_key = &.{};
+    off.media = &.{};
+    off.history_len = 0;
+    return off;
+}
+
+/// One picture of `tokens` positions from `at` in the expanded prompt: its cache ids (prompt_cache.pictureId over the
+/// payload's SHA-256) appended to `key`, and its span with the full digest to `media` (the tier's identity).
+fn pictureKey(a: std.mem.Allocator, key: *std.ArrayList(u32), media: *std.ArrayList(api.prompt_cache.Media), at: u32, tokens: u32, payload: []const u8) error{OutOfMemory}!void {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    try media.append(a, .{ .start = at, .len = tokens, .digest = digest });
+    for (0..tokens) |j| try key.append(a, api.prompt_cache.pictureId(&digest, @intCast(j)));
 }
 
 /// Each image placeholder of the rendered prompt as its image's span (the lane-vision family's prepare: the span's length and
@@ -172,6 +186,7 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, lane_images: []const []const u
     const vision = srv.info.lane_vision orelse return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
     var out: std.ArrayList(u32) = .empty;
     var key: std.ArrayList(u32) = .empty;
+    var media: std.ArrayList(api.prompt_cache.Media) = .empty;
     var placed: std.ArrayList(api.LaneImage) = .empty;
     var history_len: usize = 0;
     for (ids, 0..) |id, i| {
@@ -189,82 +204,11 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, lane_images: []const []const u
             error.BadImage => return cx.refuse(problem),
         };
         try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload });
+        try pictureKey(cx.a, &key, &media, @intCast(out.items.len), prep.tokens, prep.payload);
         try out.appendNTimes(cx.a, vision.token, prep.tokens);
-        try spellRows(cx.a, &key, prep.payload, prep.tokens);
     }
     if (placed.items.len != lane_images.len) return cx.refuse("image input: the prompt holds fewer image placeholders than images");
-    return .{ .ids = out.items, .lane_images = placed.items, .cache_key = key.items, .history_len = if (history_len > 0) history_end else 0 };
-}
-
-/// A lane image's span as the cache key spells it, in image_key.zig's words: its first two rows carry 62 bits of its
-/// payload's Blake3 digest whole (the payload is what the engine reads: one payload, one span of rows), the others a
-/// hash of those bits and the row. (Blake3: a few milliseconds for the largest payload, and no crafted collisions.)
-fn spellRows(a: std.mem.Allocator, key: *std.ArrayList(u32), payload: []const u8, tokens: u32) !void {
-    var d: [32]u8 = undefined;
-    std.crypto.hash.Blake3.hash(payload, &d, .{});
-    const h = std.mem.readInt(u64, d[0..8], .little) & ((1 << 62) - 1);
-    for (0..tokens) |j| try key.append(a, switch (j) {
-        0 => image_key.open(h),
-        1 => image_key.close(h),
-        else => image_key.row(h, j),
-    });
-}
-
-test "a lane image's key words name its payload and their rows, past every vocabulary's ids" {
-    const a = std.testing.allocator;
-    var one: std.ArrayList(u32) = .empty;
-    defer one.deinit(a);
-    var same: std.ArrayList(u32) = .empty;
-    defer same.deinit(a);
-    var other: std.ArrayList(u32) = .empty;
-    defer other.deinit(a);
-    try spellRows(a, &one, "the same pixels", 64);
-    try spellRows(a, &same, "the same pixels", 64);
-    try spellRows(a, &other, "other pixels", 64);
-    try std.testing.expectEqual(@as(usize, 64), one.items.len);
-    try std.testing.expectEqualSlices(u32, one.items, same.items);
-    try std.testing.expect(one.items[0] != other.items[0] or one.items[1] != other.items[1]); // the digest's 62 bits whole
-    try std.testing.expect(!std.mem.eql(u32, one.items[2..], other.items[2..]));
-    for (one.items) |id| try std.testing.expect(id >= 0x8000_0000);
-    try std.testing.expect(one.items[2] != one.items[3]);
-}
-
-test "lane images: each placeholder its span, the key one word a position, the history past its images" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const Three = struct { // each image three rows, its payload its bytes
-        fn prepare(_: *anyopaque, al: std.mem.Allocator, bytes: []const u8, _: *[]const u8) api.LaneVision.PrepareError!api.LaneVision.Prepared {
-            return .{ .tokens = 3, .payload = try al.dupe(u8, bytes) };
-        }
-    };
-    var dummy: u8 = 0;
-    const v: api.LaneVision = .{ .ctx = &dummy, .placeholder = "<image>", .token = 7, .prepare = Three.prepare };
-    var cx: Cx = .{ .a = a };
-    // a history [1, 2, image A, 4] then this turn's [image B, 5]
-    const ids = [_]u32{ 1, 2, 7, 4, 7, 5 };
-    const x = try placeSpans(&cx, v, &ids, 4, &.{ "A", "B" });
-    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 7, 7, 7, 4, 7, 7, 7, 5 }, x.ids);
-    try std.testing.expectEqual(@as(usize, 6), x.history_len);
-    try std.testing.expectEqual(@as(usize, 2), x.lane_images.len);
-    try std.testing.expectEqual(@as(u32, 2), x.lane_images[0].at);
-    try std.testing.expectEqual(@as(u32, 6), x.lane_images[1].at);
-    try std.testing.expectEqual(x.ids.len, x.cache_key.len);
-    var rows_a: std.ArrayList(u32) = .empty;
-    try spellRows(a, &rows_a, "A", 3);
-    var rows_b: std.ArrayList(u32) = .empty;
-    try spellRows(a, &rows_b, "B", 3);
-    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, x.cache_key[0..2]);
-    try std.testing.expectEqualSlices(u32, rows_a.items, x.cache_key[2..5]);
-    try std.testing.expectEqual(@as(u32, 4), x.cache_key[5]);
-    try std.testing.expectEqualSlices(u32, rows_b.items, x.cache_key[6..9]);
-    try std.testing.expectEqual(@as(u32, 5), x.cache_key[9]);
-    // another first image: the same ids, a key that parts at the image
-    const y = try placeSpans(&cx, v, &ids, 4, &.{ "C", "B" });
-    try std.testing.expectEqualSlices(u32, x.ids, y.ids);
-    try std.testing.expectEqual(@as(?usize, 2), std.mem.indexOfDiff(u32, x.cache_key, y.cache_key));
-    // no history: none kept past the images either
-    try std.testing.expectEqual(@as(usize, 0), (try placeSpans(&cx, v, &ids, 0, &.{ "A", "B" })).history_len);
+    return .{ .ids = out.items, .lane_images = placed.items, .cache_key = key.items, .media = media.items, .history_len = history_len };
 }
 
 /// A reusable system prefix, found with a probe in place of the first user message; zero below 512 tokens.
@@ -285,4 +229,42 @@ pub fn systemPrefixLen(srv: *Server, cx: *Cx, messages: Value, tools: []const Va
     var shared: usize = 0;
     while (shared < @min(prompt_ids.len, other.len) and prompt_ids[shared] == other[shared]) shared += 1;
     return if (shared >= 512) shared else 0;
+}
+
+test "a picture's cache ids and media: its span and full SHA-256, the ids made from the digest (9014)" {
+    const a = std.testing.allocator;
+    var key: std.ArrayList(u32) = .empty;
+    defer key.deinit(a);
+    var media: std.ArrayList(api.prompt_cache.Media) = .empty;
+    defer media.deinit(a);
+    try key.appendSlice(a, &.{ 11, 12 });
+    try pictureKey(a, &key, &media, 2, 3, "picture one");
+    try key.append(a, 13);
+    try pictureKey(a, &key, &media, 6, 2, "picture two");
+    var d1: [32]u8 = undefined;
+    var d2: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("picture one", &d1, .{});
+    std.crypto.hash.sha2.Sha256.hash("picture two", &d2, .{});
+    try std.testing.expectEqual(@as(usize, 2), media.items.len);
+    try std.testing.expectEqual(api.prompt_cache.Media{ .start = 2, .len = 3, .digest = d1 }, media.items[0]);
+    try std.testing.expectEqual(api.prompt_cache.Media{ .start = 6, .len = 2, .digest = d2 }, media.items[1]);
+    const pid = api.prompt_cache.pictureId;
+    try std.testing.expectEqualSlices(u32, &.{ 11, 12, pid(&d1, 0), pid(&d1, 1), pid(&d1, 2), 13, pid(&d2, 0), pid(&d2, 1) }, key.items);
+    try std.testing.expect(api.prompt_cache.mediaKeys(key.items, key.items.len, media.items)); // what the tier checks
+}
+
+test "TF_DS_IMAGE_CACHE=0 keeps no picture key, no media and no history; unset or any other value keeps them" {
+    const m = [_]api.prompt_cache.Media{.{ .start = 0, .len = 1, .digest = @splat(0) }};
+    const r: Rendered = .{ .ids = &.{ 1, 2 }, .history_len = 1, .cache_key = &.{ 3, 4 }, .media = &m };
+    const off = imageCache(r, "0");
+    try std.testing.expectEqual(@as(usize, 0), off.cache_key.len);
+    try std.testing.expectEqual(@as(usize, 0), off.media.len);
+    try std.testing.expectEqual(@as(usize, 0), off.history_len);
+    try std.testing.expectEqual(@as(usize, 2), off.ids.len);
+    for ([_]?[]const u8{ null, "1", "" }) |v| {
+        const on = imageCache(r, v);
+        try std.testing.expectEqual(@as(usize, 2), on.cache_key.len);
+        try std.testing.expectEqual(@as(usize, 1), on.media.len);
+        try std.testing.expectEqual(@as(usize, 1), on.history_len);
+    }
 }

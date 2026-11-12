@@ -201,7 +201,10 @@ pub fn main(init: std.process.Init) !u8 {
         };
         // rank 0 stopping stops this rank too (a wait on it inside an exchange would never end)
         m.watchPeers() catch |err| std.debug.print("dsv41: rank {d} cannot watch rank 0: {s}\n", .{ o.rank, @errorName(err) });
-        dsv41.lanes.follow(gpa, m) catch |err| {
+        // a store of its own when every rank keeps one (TF_DS_SSD_EVERY_RANK): this rank's TF_DS_SPILL_* settings, the same as rank 0's
+        var spill_buf: [256]u8 = undefined;
+        const mirror = dsv41.native.followerTierFromEnv(gpa, io, &ctx, m, o.model_dir, init.environ_map, &spill_buf);
+        dsv41.lanes.follow(gpa, m, mirror) catch |err| {
             // (on stderr too: rank 0's log then names this rank, and this line says why)
             std.debug.print("dsv41: rank {d} stopped following rank 0: {s}\n", .{ o.rank, @errorName(err) });
             try w.print("{{\"rank\": {d}, \"follow\": \"{s}\"}}\n", .{ o.rank, @errorName(err) });

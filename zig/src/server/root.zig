@@ -49,8 +49,8 @@ test {
     _ = @import("media_fetch.zig");
     _ = @import("videos.zig");
     _ = @import("stream_preflight_test.zig");
+    _ = @import("stop_test.zig");
     _ = @import("sse_keepalive_test.zig");
-    _ = @import("stream_dsml_test.zig");
     _ = @import("logprobs_test.zig");
     _ = @import("late_system_test.zig");
     _ = @import("effort_values_test.zig");
@@ -61,6 +61,7 @@ test {
     _ = @import("decisions.zig");
     _ = @import("decisions_test.zig");
     _ = @import("prepare_gate.zig");
+    _ = @import("prompt.zig");
     _ = @import("text_memo_test.zig");
     _ = @import("chat.zig");
     _ = @import("systemone.zig");

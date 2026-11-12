@@ -127,6 +127,9 @@ pub const flags = [_]Flag{
     .{ .name = "--cortheon", .kind = .store_true, .native = true },
 };
 
+/// The prompt cache's disk tier settings (CUDA builds bind the tier; engine_api.Spill reads them).
+const spill_env = if (cuda_build) api.Spill.env_names else [_][]const u8{};
+
 /// The variables this binary honours as the Python engine does, then the CUDA build's.
 pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_NO_LIVE", "TENSORFOLD_SEED_SALT", "TENSORFOLD_REQUEST_LOG", "TENSORFOLD_NO_UPDATE_CHECK", "HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE", "BRAVE_SEARCH_API_KEY" } ++
     (if (cuda_build) [_][]const u8{ "TF_CUDA_DEVICE", "TF_CUDA_SEGMENTS", "TENSORFOLD_CUDA_KERNELS", "TENSORFOLD_MEMORY_RESERVE_GIB", "TENSORFOLD_CUDA_MEMORY_LIMIT_GB" } else [_][]const u8{});
@@ -476,6 +479,7 @@ pub fn capabilities(w: *std.Io.Writer, e: Engines) !void {
     }
     try w.writeAll("}}, \"env\": [");
     // (the prepare gate's floor is the server's own: prepare_gate.zig)
+    for (env ++ prepare_gate.env ++ spill_env, 0..) |name, i| try w.print("{s}\"{s}\"", .{ if (i > 0) ", " else "", name });
     try w.writeAll("]}\n");
 }
 

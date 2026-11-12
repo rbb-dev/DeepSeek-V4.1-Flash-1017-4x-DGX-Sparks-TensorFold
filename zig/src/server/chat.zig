@@ -131,7 +131,9 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     // floor they wait for the ones in flight (prepare_gate), and hold the reservation until prepare returns
     const ticket = try srv.gate.enter(io, srv.gate.need(promptBytes(input)), gone);
     defer srv.gate.leave(io, ticket);
+    const rendering = nowNs(io);
     const rendered = try prompt_mod.prepare(srv, cx, input, thinking, effort);
+    srv.metrics.notePrepare(io, @as(f64, @floatFromInt(@max(0, nowNs(io) - rendering))) / 1e9);
     if (gone.check()) return error.Cancelled;
     if (rendered.ids.len == 0) return cx.refuse("rendered prompt is empty");
     const window: i64 = srv.info.context_window;
@@ -153,6 +155,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     var request: api.Request = .{
         .prompt = rendered.ids,
         .lane_images = rendered.lane_images,
+        .cache_media = rendered.media,
         .max_tokens = @intCast(@min(limit, std.math.maxInt(u32))),
         .sampling = sampling,
         .eos = if (stops_opt.ignore_eos) &.{} else srv.eos,

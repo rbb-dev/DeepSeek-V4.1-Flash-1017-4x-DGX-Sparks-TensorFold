@@ -68,6 +68,7 @@ pub const Metrics = struct {
     decode: Histogram = .{},
     prefill: Histogram = .{},
     tpot: TpotHistogram = .{},
+    prepare: TpotHistogram = .{}, // each request's render and tokenization (its pictures prepared too)
     requests: std.ArrayList(struct { key: []const u8, status: u16, count: u64 }) = .empty,
     /// The stats line (TENSORFOLD_STATS_EVERY): when the last one went out (null: lines off), and the totals then.
     line_at: ?i96 = null,
@@ -97,6 +98,13 @@ pub const Metrics = struct {
         if (decode) |d| m.decode.observe(d);
         if (prefill) |p| m.prefill.observe(p);
         if (tpot) |t| m.tpot.observe(t);
+    }
+
+    /// A request's prompt rendered and tokenized, its pictures prepared, in `took` seconds.
+    pub fn notePrepare(m: *Metrics, io: std.Io, took: f64) void {
+        m.mutex.lockUncancelable(io);
+        defer m.mutex.unlock(io);
+        m.prepare.observe(took);
     }
 
     /// A finished request's head chains by depth (api.Stats.depths).
@@ -205,6 +213,7 @@ pub const Metrics = struct {
         try byPlan(w, "mtp_drafted_by_plan_total", "Draft tokens verified on finished requests, by the plan of their round's window (copy, head).", snap.plans, "drafted");
         try byPlan(w, "mtp_accepted_by_plan_total", "Draft tokens kept on finished requests, by the plan of their round's window (copy, head).", snap.plans, "accepted");
         try histogram(w, "request_prefill_seconds", "Seconds a finished request's prompt pass took.", snap.prefill);
+        try histogram(w, "request_prepare_seconds", "Seconds a request's prompt took to render and tokenize, its pictures prepared too, before it reached the engine.", snap.prepare);
         try processGauges(w, process.read());
         if (engine.memory(false)) |mem| {
             try gauge(w, "device_memory_bytes", "gauge", "Device memory the engine holds now: weights, caches and live streams; only where the backend counts it (CUDA).", mem.active);
@@ -233,8 +242,99 @@ pub const Metrics = struct {
             for ([_][]const u8{ "argmax", "keys", "candidates", "merged", "flagged", "whole" }, hr) |name, n| try w.print("{s}decode_rounds_by_head_path_total{{path=\"{s}\"}} {d}\n", .{ prefix, name, n });
         }
         if (status.draft_vocab) |v| try draftVocabFamilies(w, v);
+        if (status.cache) |c| try cacheFamilies(w, c);
+        if (engine.info().spill) |si| if (si.settings.asked) try spillFamilies(w, si, status.spill);
     }
 };
+
+/// The disk tier asked for: tensorfold:spill_on (1 while on), tensorfold:spill_state{state,reason} 1 (the cause when
+/// off; /metrics stays open when API keys are on, so the dashboards read the cause here), and every setting as
+/// tensorfold:spill_setting{name} with the derived room_gib.
+pub fn spillFamilies(w: *std.Io.Writer, si: api.SpillInfo, now: ?api.SpillState) !void {
+    const s = si.settings;
+    const st = s.stateOf(now);
+    try gauge(w, "spill_on", "gauge", "1 while the prompt cache's disk tier is on; 0 while it opens or is off (spill_state names the cause).", @intFromBool(st.state == .on));
+    try family(w, "spill_state", "gauge", "The disk tier's state (opening, on, off) and, when off, its cause; always 1.");
+    try w.print("{s}spill_state{{state=\"{s}\",reason=\"", .{ prefix, @tagName(st.state) });
+    try labelText(w, st.reason());
+    try w.writeAll("\"} 1\n");
+    try family(w, "spill_setting", "gauge", "The disk tier's settings as the engine took them (TF_DS_SPILL_*, TF_SPILL_*), and room_gib = (1 + keep_builds) x gib + min_free_gib.");
+    try w.print("{s}spill_setting{{name=\"gib\"}} {d}\n", .{ prefix, s.gib });
+    inline for (api.Spill.ints) |n| try w.print("{s}spill_setting{{name=\"{s}\"}} {d}\n", .{ prefix, n.field, @field(s, n.field) });
+    inline for (api.Spill.floats) |n| try w.print("{s}spill_setting{{name=\"{s}\"}} {d}\n", .{ prefix, n.field, @field(s, n.field) });
+    try w.print("{s}spill_setting{{name=\"room_gib\"}} {d}\n", .{ prefix, s.roomGib() });
+    if (si.staging_min_bytes) |b| try w.print("{s}spill_setting{{name=\"staging_min_bytes\"}} {d}\n", .{ prefix, b });
+}
+
+/// A Prometheus label value: backslash, double quote and newline escaped.
+fn labelText(w: *std.Io.Writer, t: []const u8) !void {
+    for (t) |c| switch (c) {
+        '\\' => try w.writeAll("\\\\"),
+        '"' => try w.writeAll("\\\""),
+        '\n' => try w.writeAll("\\n"),
+        else => try w.writeByte(c),
+    };
+}
+
+/// The prompt cache's counters (its tier or grouping on): the GLM engine's names for continuation, then
+/// tensorfold:prompt_cache_* and the tier's tensorfold:spill_*{rank="N"}.
+pub fn cacheFamilies(w: *std.Io.Writer, c: api.CacheStats) !void {
+    const H = api.CacheStats.help;
+    try gauge(w, "chats_continued", "counter", H.chats_continued, c.chats_continued);
+    try gauge(w, "chats_continued_prefill_tokens", "counter", H.chats_continued_prefill_tokens, c.chats_continued_prefill_tokens);
+    const info = @typeInfo(api.CacheStats).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| if (T == u64) {
+        try gauge(w, "prompt_cache_" ++ name, comptime kindOf(&api.CacheStats.gauges, name), @field(H, name), @field(c, name));
+    };
+    if (c.spill) |rc| { // every rank's, labelled (the disk tiers are per rank)
+        const T = api.prompt_cache.TierCounts;
+        inline for (@typeInfo(T).@"struct".field_names) |name| {
+            try family(w, "spill_" ++ name, comptime kindOf(&T.gauges, name), @field(T.help, name));
+            for (rc.slice(), 0..) |t, r| try w.print("{s}spill_{s}{{rank=\"{d}\"}} {d}\n", .{ prefix, name, r, @field(t, name) });
+        }
+    }
+    try timeFamilies(w, c.times);
+}
+
+/// The tier's call timings: tensorfold:spill_time_seconds{call} (a histogram on the log2 bounds of
+/// prompt_cache.Timing), and the p50, p99 and max of each call as gauges (estimated within one bucket).
+fn timeFamilies(w: *std.Io.Writer, t: api.prompt_cache.TierTimes) !void {
+    const H = api.prompt_cache.TierTimes.help;
+    const fields = @typeInfo(api.prompt_cache.TierTimes).@"struct".field_names;
+    try w.print("# HELP {s}spill_time_seconds Seconds the disk tier's calls took, by call:", .{prefix});
+    inline for (fields) |name| try w.print(" {s}: {s}", .{ name, @field(H, name) });
+    try w.print("\n# TYPE {s}spill_time_seconds histogram\n", .{prefix});
+    var buf: [40]u8 = undefined;
+    inline for (fields) |name| {
+        const x = @field(t, name);
+        var cumulative: u64 = 0;
+        for (x.buckets[0..api.Timing.edges], 0..) |b, i| {
+            cumulative += b;
+            try w.print("{s}spill_time_seconds_bucket{{call=\"{s}\",le=\"{s}\"}} {d}\n", .{ prefix, name, seconds(&buf, api.Timing.bound(i)), cumulative });
+        }
+        try w.print("{s}spill_time_seconds_bucket{{call=\"{s}\",le=\"+Inf\"}} {d}\n", .{ prefix, name, x.count });
+        try w.print("{s}spill_time_seconds_sum{{call=\"{s}\"}} {s}\n", .{ prefix, name, seconds(&buf, x.sum_ns) });
+        try w.print("{s}spill_time_seconds_count{{call=\"{s}\"}} {d}\n", .{ prefix, name, x.count });
+    }
+    inline for (.{ .{ "p50", 0.5 }, .{ "p99", 0.99 } }) |q| {
+        try family(w, "spill_time_" ++ q[0] ++ "_seconds", "gauge", "The disk tier's calls: the " ++ q[0] ++ " of spill_time_seconds, estimated as its bucket's bound (at most the max).");
+        inline for (fields) |name| try w.print("{s}spill_time_{s}_seconds{{call=\"{s}\"}} {s}\n", .{ prefix, q[0], name, seconds(&buf, @field(t, name).quantile(q[1])) });
+    }
+    try family(w, "spill_time_max_seconds", "gauge", "The disk tier's calls: the longest of spill_time_seconds.");
+    inline for (fields) |name| try w.print("{s}spill_time_max_seconds{{call=\"{s}\"}} {s}\n", .{ prefix, name, seconds(&buf, @field(t, name).max_ns) });
+}
+
+/// Nanoseconds as seconds, to the nanosecond, without trailing zeros.
+fn seconds(buf: []u8, ns: u64) []const u8 {
+    if (ns == 0) return "0";
+    return trimmed(buf, @as(f64, @floatFromInt(ns)) / 1e9, 9);
+}
+
+fn kindOf(comptime gauges: []const []const u8, comptime name: []const u8) []const u8 {
+    @setEvalBranchQuota(100_000);
+    for (gauges) |g| if (std.mem.eql(u8, g, name)) return "gauge";
+    return "counter";
+}
 
 fn family(w: *std.Io.Writer, name: []const u8, kind: []const u8, help: []const u8) !void {
     try w.print("# HELP {s}{s} {s}\n# TYPE {s}{s} {s}\n", .{ prefix, name, help, prefix, name, kind });
@@ -391,6 +491,21 @@ test "metrics record rounds prefill and per-token timing" {
     defer out.deinit();
     try histogram(&out.writer, "request_prefill_seconds", "prefill", m.prefill);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "request_prefill_seconds_sum 0.25") != null);
+}
+
+test "a request's front: the seconds its prompt took to render and tokenize, on the per-token scale" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    m.notePrepare(std.testing.io, 0.012);
+    m.notePrepare(std.testing.io, 0.9);
+    var stub: RenderStub = .{};
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
+    const body = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:request_prepare_seconds_count 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:request_prepare_seconds_bucket{le=\"0.015\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:request_prepare_seconds_sum 0.912") != null);
 }
 
 const RenderStub = struct {
@@ -585,6 +700,7 @@ test "render counts failed graph captures only for an engine that counts them" {
     try std.testing.expect(std.mem.indexOf(u8, some.written(), "# TYPE tensorfold:graph_fallbacks_total counter\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, some.written(), "tensorfold:graph_fallbacks_total 3\n") != null);
 }
+
 test "render counts decode rounds by the head's path only for an engine that counts them" {
     const gpa = std.testing.allocator;
     var m: Metrics = .{ .gpa = gpa };
@@ -639,6 +755,123 @@ test "render counts the drafter's pruned-list passes, its guard's tokens and mis
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, out, "# HELP tensorfold:draft_vocab_"));
 }
 
+test "cache families: present only with the cache's counters, every field with its kind and help" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    var stub: RenderStub = .{};
+    var plain: std.Io.Writer.Allocating = .init(gpa);
+    defer plain.deinit();
+    try m.render(std.testing.io, &plain.writer, stub.engine(), 4096);
+    for ([_][]const u8{ "chats_continued", "prompt_cache_", "spill_" }) |name| try std.testing.expect(std.mem.indexOf(u8, plain.written(), name) == null);
+    var ranks: api.prompt_cache.RankCounts = .{ .n = 2 };
+    ranks.ranks[0] = .{ .writes_committed = 9, .staging_peak = 7 };
+    ranks.ranks[1] = .{ .writes_committed = 8, .crc_errors = 1 };
+    stub.status_value.cache = .{ .chats_continued = 1, .restores_active = 2, .service_refused = 4, .spill = ranks };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
+    const body = out.written();
+    for ([_][]const u8{
+        "tensorfold:chats_continued 1\n",
+        "# TYPE tensorfold:prompt_cache_restores_active gauge\n",
+        "tensorfold:prompt_cache_restores_active 2\n",
+        "# TYPE tensorfold:prompt_cache_disk_hits_committed counter\n",
+        "# TYPE tensorfold:prompt_cache_service_refused counter\n",
+        "tensorfold:prompt_cache_service_refused 4\n",
+        "tensorfold:spill_writes_committed{rank=\"0\"} 9\n",
+        "tensorfold:spill_writes_committed{rank=\"1\"} 8\n",
+        "tensorfold:spill_crc_errors{rank=\"1\"} 1\n",
+        "# TYPE tensorfold:spill_staging_peak gauge\n",
+    }) |line| try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
+}
+
+test "spill families: the tier's state with its cause and its settings, only when the tier was asked for" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    var stub: RenderStub = .{};
+    var plain: std.Io.Writer.Allocating = .init(gpa);
+    defer plain.deinit();
+    try m.render(std.testing.io, &plain.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, plain.written(), "spill_") == null);
+    stub.info_value.spill = .{ .settings = .{ .asked = true, .off = "TF_DS_SPILL_GIB=\"x\": GiB" } };
+    var off: std.Io.Writer.Allocating = .init(gpa);
+    defer off.deinit();
+    try m.render(std.testing.io, &off.writer, stub.engine(), 4096);
+    for ([_][]const u8{
+        "# TYPE tensorfold:spill_on gauge\n",
+        "tensorfold:spill_on 0\n",
+        "tensorfold:spill_state{state=\"off\",reason=\"TF_DS_SPILL_GIB=\\\"x\\\": GiB\"} 1\n",
+    }) |line| std.testing.expect(std.mem.indexOf(u8, off.written(), line) != null) catch |e| {
+        std.debug.print("missing {s} in:\n{s}\n", .{ line, off.written() });
+        return e;
+    };
+    stub.info_value.spill = .{ .settings = .{ .asked = true, .dir = "/spill", .gib = 256 } };
+    stub.status_value.spill = .{ .state = .on };
+    var on: std.Io.Writer.Allocating = .init(gpa);
+    defer on.deinit();
+    try m.render(std.testing.io, &on.writer, stub.engine(), 4096);
+    for ([_][]const u8{
+        "tensorfold:spill_on 1\n",
+        "tensorfold:spill_state{state=\"on\",reason=\"\"} 1\n",
+        "tensorfold:spill_setting{name=\"gib\"} 256\n",
+        "tensorfold:spill_setting{name=\"turns\"} 4\n",
+        "tensorfold:spill_setting{name=\"room_gib\"} 562\n",
+    }) |line| std.testing.expect(std.mem.indexOf(u8, on.written(), line) != null) catch |e| {
+        std.debug.print("missing {s} in:\n{s}\n", .{ line, on.written() });
+        return e;
+    };
+}
+
+test "the one store's tier counters render under rank 0, v3's landing, probe and direct-I/O counters with them" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    var stub: RenderStub = .{};
+    var ranks: api.prompt_cache.RankCounts = .{ .n = 1 };
+    ranks.ranks[0] = .{ .direct_refused = 2, .landings_failed = 1, .probe_failed = 1, .landing_bytes = 64 };
+    stub.status_value.cache = .{ .spill = ranks };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
+    for ([_][]const u8{
+        "tensorfold:spill_direct_refused{rank=\"0\"} 2\n",
+        "tensorfold:spill_landings_failed{rank=\"0\"} 1\n",
+        "tensorfold:spill_probe_failed{rank=\"0\"} 1\n",
+        "tensorfold:spill_landing_bytes{rank=\"0\"} 64\n",
+        "# TYPE tensorfold:spill_landings counter\n",
+    }) |line| std.testing.expect(std.mem.indexOf(u8, out.written(), line) != null) catch |e| {
+        std.debug.print("missing {s}\n", .{line});
+        return e;
+    };
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "rank=\"1\"") == null);
+}
+
+test "the tier's call timings render as one histogram labelled by call, with p50, p99 and max gauges" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    var stub: RenderStub = .{};
+    var c: api.CacheStats = .{};
+    c.times.lookup.observe(5000);
+    c.times.land_piece.observe(3 << 20);
+    stub.status_value.cache = c;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
+    for ([_][]const u8{
+        "# TYPE tensorfold:spill_time_seconds histogram\n",
+        "tensorfold:spill_time_seconds_bucket{call=\"lookup\",le=\"0.000004096\"} 0\n",
+        "tensorfold:spill_time_seconds_bucket{call=\"lookup\",le=\"0.000008192\"} 1\n",
+        "tensorfold:spill_time_seconds_bucket{call=\"lookup\",le=\"+Inf\"} 1\n",
+        "tensorfold:spill_time_seconds_sum{call=\"lookup\"} 0.000005\n",
+        "tensorfold:spill_time_seconds_count{call=\"lookup\"} 1\n",
+        "tensorfold:spill_time_seconds_count{call=\"probe\"} 0\n",
+        "tensorfold:spill_time_p50_seconds{call=\"land_piece\"} 0.003145728\n",
+        "tensorfold:spill_time_p99_seconds{call=\"lookup\"} 0.000005\n",
+        "tensorfold:spill_time_max_seconds{call=\"lookup\"} 0.000005\n",
+    }) |line| std.testing.expect(std.mem.indexOf(u8, out.written(), line) != null) catch |e| {
+        std.debug.print("missing {s}\n", .{line});
+        return e;
+    };
+}
 
 test "render counts finished requests' rounds by plan: copied continuations and the head's drafts, verified and kept" {
     const gpa = std.testing.allocator;

@@ -61,6 +61,11 @@ pub const sampling = @import("sampling.zig");
 pub const head_cand = @import("head_cand.zig");
 pub const model = @import("model.zig");
 pub const lanes = @import("lanes.zig");
+pub const spill_start = @import("spill_start.zig");
+/// The spill tier's state layout and packing.
+pub const spill_state = @import("spill_state.zig");
+/// The SSD tier on rank 0: the prompt cache's Tier over core/spill's store.
+pub const spill_tier = @import("spill_tier.zig");
 /// tf-dsv41-rows-replay's pass sizes and, at each, the nodes' quarters, the planes' offsets and a control's row.
 /// A decode ring's progress watchdog.
 pub const ring_watch = @import("ring_watch.zig");
@@ -177,5 +182,35 @@ test {
     _ = @import("kset_test.zig");
     _ = @import("any_check.zig");
     refAll(replay_runner);
+    refAll(spill_state);
+    refAll(model.Model.SpillDev);
+    refAll(spill_state.Packer(model.Model.SpillDev));
+    _ = &model.Model.spillLayout;
+    _ = &model.Model.spillGenerations;
+    _ = &model.Model.spillPacker;
+    _ = &model.Model.resetEngramAhead;
+    _ = &model.Model.spillCheckResumed;
+    _ = &model.Model.spillRefPlanes;
+    _ = @import("spill_state_native_test.zig");
+    refAll(@import("land.zig"));
+    _ = @import("land_test.zig");
     _ = @import("ring_hotpath_test.zig");
+    refAll(@import("spill_identity.zig"));
+    _ = @import("spill_identity_test.zig");
+    refAll(@import("probe.zig"));
+    refAll(spill_tier);
+    refAll(spill_tier.Leader(model.Model.SpillDev));
+    _ = @import("spill_tier_test.zig");
+    refAll(@import("spill_open.zig"));
+    _ = @import("spill_open_test.zig");
+    refAll(@import("spill_start.zig"));
+    _ = @import("spill_start_test.zig");
+    _ = @import("probe_test.zig");
+    refAll(@import("spill_sync.zig"));
+    _ = @import("spill_sync_test.zig");
+    refAll(@import("spill_wire.zig"));
+    refAll(@import("spill_mirror.zig"));
+    refAll(@import("spill_mirror.zig").Mirror(model.Model.SpillDev));
+    _ = @import("spill_mirror_test.zig");
+    _ = &native.followerTier;
 }

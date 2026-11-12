@@ -143,11 +143,28 @@ pub fn wholePass(f: ?Facts, start: usize, pass_from: usize, filling_pass: bool, 
     return !x.decoding or (x.rounds_beside != 0 and x.step_rows >= pass_rows);
 }
 
+/// Called between prompt chunks after the chunk's mark hook, the GPU's queue holding the chunk (the decode plan's Track
+/// D, resumable prefill): the host's turn to run a round of the streams already decoding, so one prompt's pass stops
+/// nobody's decode for its whole length. An error ends this prompt's pass.
+pub const BetweenHook = struct {
+    ptr: *anyopaque,
+    run: *const fn (ptr: *anyopaque) anyerror!void,
     ready: *const fn (ptr: *anyopaque) bool, // whether `run` would run a round (another stream is live): `next == .round`
+    /// The host's other turn at the same boundary, after the round part whether or not it ran: its parked work's
+    /// service (the disk tier's restores, staged writes, deferred retries). Null: the host has none.
+    tier: ?Service = null,
     /// What follows the step just issued (asked at its end). Null: the host has no plan to tell.
     next: ?*const fn (ptr: *anyopaque) Next = null,
     /// The host's facts for this prompt's next step (asked at its start). Null: none, and passRows gives the resume rows.
     facts: ?*const fn (ptr: *anyopaque) Facts = null,
+
+    /// No round, no Engram read: called without joining the read-ahead; it cannot fail the pass. `ptr` is the hook's.
+    pub const Service = struct {
+        wanted: *const fn (ptr: *anyopaque) bool, // whether `run` has work now
+        run: *const fn (ptr: *anyopaque) void,
+    };
+};
+
 /// A backend that issues work ahead of the device (the host returns while the kernels still run) gates the count: `gate`
 /// holds `generation << 32 | rows` the device has finished, and a reader counts no more than that.
     gen: std.atomic.Value(u32) = .init(0),
@@ -291,6 +308,7 @@ pub const Stream = struct {
     decide: ?u32 = null,
     untaught: bool = false,
     images: []const Image = &.{},
+    between: ?BetweenHook = null, // the host's round between this stream's prompt chunks (a backend may call it)
     key: []const u32 = &.{},
     lane_images: []const LaneImage = &.{},
     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)

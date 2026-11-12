@@ -48,6 +48,9 @@ pub const Conn = struct {
     hook: ?StatusHook = null,
     broken: bool = false,
     quiet_log: bool = false,
+    /// The server's stop: readable once it stops (Server.endIdle). Polled beside the socket only while the connection
+    /// waits idle for its next request, which then ends as closed; null: that wait lasts its idle_ms.
+    wake: ?posix.fd_t = null,
 
     pub fn init(gpa: Allocator, fd: posix.socket_t, peer: []const u8) !Conn {
         return .{ .fd = fd, .peer = peer, .gpa = gpa, .buf = try gpa.alloc(u8, 2 * max_line + 8192) };
@@ -58,7 +61,8 @@ pub const Conn = struct {
         c.out.deinit(c.gpa);
     }
 
-    fn fill(c: *Conn, timeout_ms: i32) IoError!usize {
+    /// The socket's next bytes, waiting at most `timeout_ms`; with `wake`, the server's stop ends the wait as Closed.
+    fn fill(c: *Conn, timeout_ms: i32, wake: ?posix.fd_t) IoError!usize {
         if (c.start == c.end) {
             c.start = 0;
             c.end = 0;
@@ -67,9 +71,13 @@ pub const Conn = struct {
             c.end -= c.start;
             c.start = 0;
         }
-        var fds = [_]posix.pollfd{.{ .fd = c.fd, .events = posix.POLL.IN, .revents = 0 }};
-        const ready = posix.poll(&fds, timeout_ms) catch return error.Closed;
+        var fds = [_]posix.pollfd{
+            .{ .fd = c.fd, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = wake orelse -1, .events = posix.POLL.IN, .revents = 0 },
+        };
+        const ready = posix.poll(fds[0..if (wake != null) 2 else 1], timeout_ms) catch return error.Closed;
         if (ready == 0) return error.Timeout;
+        if (fds[1].revents != 0) return error.Closed; // the server stops: an idle connection ends here
         const got = posix.read(c.fd, c.buf[c.end..]) catch return error.Closed;
         c.end += got;
         return got;
@@ -77,8 +85,14 @@ pub const Conn = struct {
 
     /// ``rfile.readline(limit)``: through the newline, ``limit`` bytes, or what is left before EOF.
     pub fn readLine(c: *Conn, a: Allocator, limit: usize, timeout_ms: i32) (IoError || Allocator.Error)![]u8 {
+        return c.readLineWoken(a, limit, timeout_ms, null);
+    }
+
+    /// readLine whose first wait, while nothing of the line has come, also ends at the server's stop (`wake`).
+    fn readLineWoken(c: *Conn, a: Allocator, limit: usize, timeout_ms: i32, wake: ?posix.fd_t) (IoError || Allocator.Error)![]u8 {
         var line: std.ArrayList(u8) = .empty;
         var wait = timeout_ms;
+        var stop = wake;
         while (true) {
             const avail = c.buf[c.start..c.end];
             const scan = avail[0..@min(avail.len, limit - line.items.len)];
@@ -90,8 +104,9 @@ pub const Conn = struct {
             try line.appendSlice(a, scan);
             c.start += scan.len;
             if (line.items.len >= limit) return line.items;
-            if (try c.fill(wait) == 0) return line.items;
+            if (try c.fill(wait, if (line.items.len == 0) stop else null) == 0) return line.items;
             wait = c.timeouts.read_ms;
+            stop = null;
         }
     }
 
@@ -99,7 +114,7 @@ pub const Conn = struct {
     pub fn readExact(c: *Conn, a: Allocator, list: *std.ArrayList(u8), n: usize) (IoError || Allocator.Error)!usize {
         var want = n;
         while (want > 0) {
-            if (c.start == c.end and try c.fill(c.timeouts.read_ms) == 0) break;
+            if (c.start == c.end and try c.fill(c.timeouts.read_ms, null) == 0) break;
             const take = @min(want, c.end - c.start);
             try list.appendSlice(a, c.buf[c.start .. c.start + take]);
             c.start += take;
@@ -163,11 +178,13 @@ pub const Conn = struct {
         return n;
     }
 
-    /// Reads and parses one request head; error replies are sent here, as ``parse_request`` sends them.
+    /// Reads and parses one request head; error replies are sent here, as ``parse_request`` sends them. `idle`: the
+    /// connection waits for its next request (idle_ms), and the server's stop (`wake`) ends that wait as closed.
     pub fn readRequest(c: *Conn, a: Allocator, idle: bool) Allocator.Error!Outcome {
         c.key_label = null;
         c.counted = false;
         const raw = c.readLine(a, max_line + 1, if (idle) c.timeouts.idle_ms else c.timeouts.read_ms) catch |e| switch (e) {
+        const raw = c.readLineWoken(a, max_line + 1, if (idle) c.timeouts.idle_ms else c.timeouts.read_ms, if (idle) c.wake else null) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 c.close = true;
@@ -466,6 +483,44 @@ fn htmlEscape(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
         else => try out.append(a, ch),
     };
     return out.items;
+}
+
+test "the server's stop ends an idle wait at once, and never cuts a request already arriving" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var sock: [2]posix.fd_t = undefined; // the server's end, the client's
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sock));
+    defer for (sock) |fd| {
+        _ = posix.system.close(fd);
+    };
+    var stop: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), posix.system.pipe(&stop));
+    defer for (stop) |fd| {
+        _ = posix.system.close(fd);
+    };
+    var conn = try Conn.init(gpa, sock[0], "test");
+    defer conn.deinit();
+    conn.timeouts.idle_ms = 10_000;
+    conn.wake = stop[0];
+    const Client = struct {
+        // the request line, then the stop, then the request's headers
+        fn run(client: posix.fd_t, wake: posix.fd_t) void {
+            _ = posix.system.write(client, "GET /health HTTP/1.1\r\n", 22);
+            std.Io.sleep(std.testing.io, .fromMilliseconds(200), .awake) catch {};
+            _ = posix.system.write(wake, "x", 1);
+            std.Io.sleep(std.testing.io, .fromMilliseconds(200), .awake) catch {};
+            _ = posix.system.write(client, "Host: t\r\n\r\n", 11);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Client.run, .{ sock[1], stop[1] });
+    try std.testing.expectEqual(Outcome.ready, try conn.readRequest(arena.allocator(), true));
+    t.join();
+    try std.testing.expectEqualStrings("t", conn.header("Host") orelse "(none: the stop cut the head)");
+    // the next idle wait, the stop set: closed at once, not after idle_ms
+    const began = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
+    try std.testing.expectEqual(Outcome.closed, try conn.readRequest(arena.allocator(), true));
+    try std.testing.expect(std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - began < std.time.ns_per_s);
 }
 
 test "versions and repr" {

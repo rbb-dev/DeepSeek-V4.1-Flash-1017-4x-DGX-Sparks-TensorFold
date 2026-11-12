@@ -10,6 +10,7 @@ const listener_mod = @import("listener.zig");
 const model_text = @import("model_text.zig");
 const server_mod = @import("server.zig");
 const prepare_gate = @import("prepare_gate.zig");
+const clock = @import("clock.zig");
 const recall_routes = @import("recall_routes.zig");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
@@ -79,9 +80,104 @@ pub const Setup = struct {
     forget_fail: u32 = 0,
     /// Called once the socket listens, with its port (tests read it).
     on_listen: ?*const fn (port: u16) void = null,
+    /// The engine's orderly close (api.Opened.quiesce), run at the stop before the connection wait; null: the engine is
+    /// closed only after the server.
+    quiesce: ?Quiesce = null,
     /// Recall's record, attached to the engine already (--recall); null: off.
     recall: ?*api.recall_store.Store = null,
 };
+
+/// TENSORFOLD_CLOSE_MS's default: above a disk tier's flush at the stop (TF_SPILL_FLUSH_MS, 15,000) and below the
+/// recipe's 30 s stop timeout less the 2 s connection wait.
+pub const default_close_ms: u32 = 20_000;
+
+/// The engine's orderly close at a stop (api.Opened.quiesce): every request ends and the engine's own last work runs
+/// (a family's followers hear done), with nothing freed that the connection threads still call.
+pub const Quiesce = struct {
+    call: *const fn (ctx: *anyopaque) void,
+    ctx: *anyopaque,
+};
+
+/// Tests: Closer.run finds no thread to run the orderly close on (as a process at its thread limit).
+pub var test_no_thread: bool = false;
+
+/// The engine's orderly close on a thread of its own, so a hung engine cannot hold the stop past its bound.
+pub const Closer = struct {
+    /// Its thread, left running when the close outlasts its bound (the process then ends without joining it).
+    thread: ?std.Thread = null,
+    returned: std.Io.Event = .unset,
+
+    fn body(c: *Closer, io: std.Io, q: Quiesce) void {
+        q.call(q.ctx);
+        c.returned.set(io);
+    }
+
+    /// Runs `q` and waits for it at most `ms`: true once it returned (its thread joined, or run here when no thread
+    /// could be made); false past the bound (the thread left in `thread`, still running).
+    pub fn run(c: *Closer, io: std.Io, q: Quiesce, ms: u32) bool {
+        const began = clock.nowNs(io);
+        const spawned = if (@import("builtin").is_test and test_no_thread) error.SystemResources else std.Thread.spawn(.{}, body, .{ c, io, q });
+        c.thread = spawned catch |e| {
+            // here then, unbounded by TENSORFOLD_CLOSE_MS (the tier's flush keeps its own bound; the recipe's stop
+            // timeout bounds the rest): ending without it would lose the flush and leave the followers waiting
+            log.line("stop: no thread for the engine's orderly close ({s}): running it on this one", .{@errorName(e)});
+            q.call(q.ctx);
+            log.line("stop: the engine closed in {d} ms", .{@divTrunc(clock.nowNs(io) - began, std.time.ns_per_ms)});
+            return true;
+        };
+        const end = began + @as(i96, ms) * std.time.ns_per_ms;
+        while (!c.returned.isSet()) {
+            const left = end - clock.nowNs(io);
+            if (left <= 0) break;
+            c.returned.waitTimeout(io, .{ .duration = .{ .raw = .fromNanoseconds(left), .clock = .awake } }) catch {};
+        }
+        if (!c.returned.isSet()) {
+            log.line("stop: the engine did not close within {d} ms (TENSORFOLD_CLOSE_MS): ending without its orderly close", .{ms});
+            return false;
+        }
+        c.thread.?.join();
+        c.thread = null;
+        log.line("stop: the engine closed in {d} ms", .{@divTrunc(clock.nowNs(io) - began, std.time.ns_per_ms)});
+        return true;
+    }
+};
+
+/// How a stop ended. clean: the engine closed (or has no orderly close) and every connection ended, so the caller
+/// may free the server and the engine. forced: the caller ends the process without freeing what is still read.
+pub const Stopped = enum { clean, forced };
+
+/// What a stop runs besides the server.
+pub const Stop = struct {
+    quiesce: ?Quiesce = null,
+    /// TENSORFOLD_CLOSE_MS: the engine's orderly close is waited for at most this long (0: none runs at the stop; the
+    /// engine is closed after the connections end).
+    close_ms: u32 = default_close_ms,
+    /// The live line, ended after the engine's close.
+    ticker: ?*live.Ticker = null,
+    closer: Closer = .{},
+};
+
+/// The stop, once the accept loop has ended: the listener closed, the idle keep-alive connections ended, the engine's
+/// orderly close (bounded by close_ms, on its own thread), the live line ended, then up to 2 s for the replies still
+/// open (each ends once the close has ended its request) to end.
+pub fn stopServing(io: std.Io, srv: *server_mod.Server, lis: listener_mod.Listener, stop: *Stop) Stopped {
+    lis.close();
+    srv.endIdle();
+    const closed = if (stop.quiesce) |q| (stop.close_ms == 0 or stop.closer.run(io, q, stop.close_ms)) else true;
+    if (stop.ticker) |t| t.finish();
+    var waited: u32 = 0;
+    while (srv.open_connections.load(.acquire) > 0 and waited < 40) : (waited += 1) std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+    const open = srv.open_connections.load(.acquire);
+    if (open > 0) log.line("stop: {d} connection{s} still open after 2 s: ending without freeing what they read", .{ open, if (open == 1) "" else "s" });
+    return if (closed and open == 0) .clean else .forced;
+}
+
+/// TENSORFOLD_CLOSE_MS: unset or empty is the default; anything but a whole number of milliseconds is refused.
+fn closeMs(text: ?[]const u8) error{Invalid}!u32 {
+    const t = std.mem.trim(u8, text orelse return default_close_ms, " ");
+    if (t.len == 0) return default_close_ms;
+    return std.fmt.parseInt(u32, t, 10) catch error.Invalid;
+}
 
 fn env(s: Setup, name: []const u8) ?[]const u8 {
     const m = s.environ orelse return null;
@@ -116,6 +212,11 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         std.debug.print("tensorfold: TF_SSE_KEEPALIVE_S: seconds, a number >= 0\n", .{});
         return 1;
     };
+    const close_ms = closeMs(env(s, "TENSORFOLD_CLOSE_MS")) catch {
+        std.debug.print("tensorfold: TENSORFOLD_CLOSE_MS={s}: a whole number of milliseconds the engine's orderly close may take at a stop (0: none before the connections end)\n", .{env(s, "TENSORFOLD_CLOSE_MS").?});
+        return 1;
+    };
+    const keepalive_ms_s: u32 = if (env(s, "TENSORFOLD_SSE_KEEPALIVE")) |t| std.fmt.parseInt(u32, std.mem.trim(u8, t, " "), 10) catch {
         std.debug.print("tensorfold: TENSORFOLD_SSE_KEEPALIVE={s}: whole seconds (0: off)\n", .{t});
         return 1;
     } else 0;
@@ -153,7 +254,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .loop_guard = args.loop_guard,
         .loop_windows = loop_windows,
         .keep_warm_s = args.keep_warm,
-        .sse_keepalive_ms = std.math.mul(u32, keepalive_s, 1000) catch std.math.maxInt(u32),
+        .sse_keepalive_ms = std.math.mul(u32, keepalive_ms_s, 1000) catch std.math.maxInt(u32),
         .stats_every_s = stats_every,
         .default_sampling = s.sampling,
         .use_drafts = !args.no_drafts,
@@ -201,6 +302,12 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
     if (s.on_listen) |f| f(port);
     const window = srv.info.context_window;
     if (srv.info.startup.len > 0) log.line("{s}", .{srv.info.startup});
+    if (srv.info.spill) |si| if (si.settings.asked) {
+        var spill_line: [2048]u8 = undefined;
+        var sw: std.Io.Writer = .fixed(&spill_line);
+        si.settings.describe(&sw) catch {};
+        log.line("{s}", .{sw.buffered()});
+    };
     const now = std.Io.Clock.awake.now(io).toNanoseconds();
     const loaded = if (s.started > 0) @as(f64, @floatFromInt(now - s.started)) / 1e9 else 0;
     var window_text: [24]u8 = undefined;
@@ -224,12 +331,9 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
     if (drawing) ticker.start();
     const accept = std.Thread.spawn(.{}, server_mod.Server.serve, .{ srv, lis, &stop_requested }) catch return 1;
     accept.join();
-    lis.close();
-    if (drawing) ticker.finish();
-    var waited: u32 = 0;
-    while (srv.open_connections.load(.acquire) > 0 and waited < 40) : (waited += 1) std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
-    s.engine.drain(); // kept states waiting for disk are written (under the engine's deadline) before the process ends
-    if (srv.open_connections.load(.acquire) > 0) std.process.exit(0); // replies still open: end without freeing what they read
+    var stop: Stop = .{ .quiesce = s.quiesce, .close_ms = close_ms, .ticker = if (drawing) &ticker else null };
+    // the engine still closing, or replies still open: end without freeing what they read (exit 0 either way)
+    if (stopServing(io, srv, lis, &stop) == .forced) std.process.exit(0);
     return 0;
 }
 
@@ -280,6 +384,14 @@ fn shownSampling(a: Allocator, sampling: ?json.Value) []const u8 {
         parts.append(a, std.fmt.allocPrint(a, "{s} {s}", .{ k, text }) catch return "greedy") catch return "greedy";
     }
     return std.mem.join(a, ", ", parts.items) catch "greedy";
+}
+
+test "TENSORFOLD_CLOSE_MS: unset or empty is 20,000 ms, a whole number is taken as given, anything else is refused" {
+    try std.testing.expectEqual(@as(u32, 20_000), try closeMs(null));
+    try std.testing.expectEqual(@as(u32, 20_000), try closeMs(" "));
+    try std.testing.expectEqual(@as(u32, 15_000), try closeMs("15000"));
+    try std.testing.expectEqual(@as(u32, 0), try closeMs("0"));
+    for ([_][]const u8{ "-1", "20s", "1e4", "4294967296" }) |bad| try std.testing.expectError(error.Invalid, closeMs(bad));
 }
 
 test "the targets are the hard limit, or the fallbacks under an unlimited one" {

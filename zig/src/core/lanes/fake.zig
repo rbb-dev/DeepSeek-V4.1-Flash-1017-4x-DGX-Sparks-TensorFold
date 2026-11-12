@@ -60,6 +60,9 @@ pub const Fake = struct {
     prefill_hook_ctx: ?*anyopaque = null,
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
     refuse_full: usize = 0, // prefill refuses this many times with error.ContextFull while another lane is live
+    /// TF_DS_PREFILL_YIELD=1's stand-in: between two chunks the host's round part runs (Stream.between, when it says a
+    /// round would run); its tier part runs at every boundary it is wanted, with or without this.
+    yield_rounds: bool = false,
     /// The chunked backend's steps sized by the host's facts (stream.passRows over this grid) and a pass length without
     /// marks; each step logged in `steps` with its facts (read after prefill_hook) and, short of the prompt's end, the
     /// host's next. Null: four rows a step, nothing logged.
@@ -203,6 +206,15 @@ pub const Fake = struct {
         if (got.found_existing) freeLane(x.gpa, got.value_ptr);
         got.value_ptr.* = .{};
         const chunks = if (x.prefill_chunks == 0) 1 else x.prefill_chunks;
+        // the kept state's tokens stand in for the prompt's first `at`, in place before the first chunk as a real
+        // backend restores it: the host may report the state at the first boundary and a keep there may free it
+        s.cached = 0;
+        if (s.reuse.saved) |saved| {
+            const kept: *std.ArrayList(u32) = @ptrCast(@alignCast(saved));
+            try got.value_ptr.history.appendSlice(x.gpa, kept.items);
+            s.cached = s.reuse.at;
+        }
+        const resumed: usize = s.cached;
         for (0..chunks) |chunk| {
             x.prefill_count += 1;
             s.fill_at.store(@intCast(s.prompt_len * (chunk + 1) / chunks), .monotonic);
@@ -240,7 +252,14 @@ pub const Fake = struct {
             const kept: *std.ArrayList(u32) = @ptrCast(@alignCast(saved));
             try h.appendSlice(x.gpa, kept.items);
             s.cached = s.reuse.at;
+            // the host's turn between two chunks, as dsv41's prompt pass offers it: the prefill yield's round (TF_DS_PREFILL_YIELD's
+            // stand-in, when a round would run), then the tier's service whether or not the round ran
+            if (chunk + 1 < chunks) if (s.between) |b| {
+                if (x.yield_rounds and b.ready(b.ptr)) try b.run(b.ptr);
+                if (b.tier) |t| if (t.wanted(b.ptr)) t.run(b.ptr);
+            };
         }
+        const h = &x.lane(s).history; // (looked up again: the host's turns between chunks ran other streams' rounds)
         for (s.prompt()[h.items.len..], h.items.len + 1..) |t, at| {
             try h.append(x.gpa, t);
             if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(at));
@@ -410,6 +429,107 @@ pub const FixedClock = struct {
         return 6.0 + @as(f64, @floatFromInt(c.calls % 7)) * 0.5;
     }
 };
+
+/// A BetweenHook that counts the host's turns between a fake prompt pass's chunks (both parts, and their asks).
+const Turns = struct {
+    ready: bool = true, // the round part would run a round (another stream is live)
+    wanted: bool = true, // the tier part has work
+    rounds: usize = 0,
+    services: usize = 0,
+    asked_ready: usize = 0,
+
+    fn of(ptr: *anyopaque) *Turns {
+        return @ptrCast(@alignCast(ptr));
+    }
+    fn readyFn(ptr: *anyopaque) bool {
+        of(ptr).asked_ready += 1;
+        return of(ptr).ready;
+    }
+    fn round(ptr: *anyopaque) anyerror!void {
+        of(ptr).rounds += 1;
+    }
+    fn wantedFn(ptr: *anyopaque) bool {
+        return of(ptr).wanted;
+    }
+    fn service(ptr: *anyopaque) void {
+        of(ptr).services += 1;
+    }
+    fn hook(t: *Turns, with_tier: bool) @import("stream.zig").BetweenHook {
+        return .{ .ptr = t, .run = round, .ready = readyFn, .tier = if (with_tier) .{ .wanted = wantedFn, .run = service } else null };
+    }
+};
+
+test "the fake offers the host's turn between chunks: the round part with yield_rounds when a round would run, the tier part wherever it is wanted, neither after the last chunk" {
+    const gpa = std.testing.allocator;
+    const prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
+    const Case = struct { yield: bool, ready: bool, wanted: bool, tier: bool, chunks: usize, rounds: usize, services: usize };
+    for ([_]Case{
+        .{ .yield = false, .ready = true, .wanted = true, .tier = true, .chunks = 4, .rounds = 0, .services = 3 }, // the prefill yield off: the tier part still runs
+        .{ .yield = true, .ready = true, .wanted = true, .tier = true, .chunks = 4, .rounds = 3, .services = 3 }, // both, at each of the 3 boundaries
+        .{ .yield = true, .ready = false, .wanted = true, .tier = true, .chunks = 4, .rounds = 0, .services = 3 }, // no other stream: no round, the service still
+        .{ .yield = true, .ready = true, .wanted = false, .tier = true, .chunks = 4, .rounds = 3, .services = 0 }, // nothing pending: no service
+        .{ .yield = true, .ready = true, .wanted = true, .tier = false, .chunks = 4, .rounds = 3, .services = 0 }, // a host without a tier part
+        .{ .yield = true, .ready = true, .wanted = true, .tier = true, .chunks = 1, .rounds = 0, .services = 0 }, // one chunk: no boundary
+    }) |c| {
+        var x: Fake = .{ .gpa = gpa, .prefill_chunks = c.chunks, .yield_rounds = c.yield };
+        defer x.deinit();
+        var turns: Turns = .{ .ready = c.ready, .wanted = c.wanted };
+        var s = try Stream.init(gpa, .{ .id = "s", .prompt = &prompt, .max_new = 1 });
+        defer s.deinit(gpa);
+        s.between = turns.hook(c.tier);
+        try x.backend().prefill(&s);
+        x.backend().release(&s);
+        try std.testing.expectEqual(c.rounds, turns.rounds);
+        try std.testing.expectEqual(c.services, turns.services);
+        if (!c.yield) try std.testing.expectEqual(@as(usize, 0), turns.asked_ready); // the prefill yield off asks nothing of the round part
+    }
+}
+
+test "a kept state is in place before the fake's first chunk: a host that reports it (and frees it) at the first boundary still resumes it" {
+    const gpa = std.testing.allocator;
+    const prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
+    // the host's turn between chunks: at the first boundary it reports the restored state (LaneHost.reported nulls
+    // Stream.reuse.saved) and a keep's room evicts it (its copy freed)
+    const Report = struct {
+        fake: *Fake,
+        s: *Stream,
+        boundaries: usize = 0,
+        fn of(ptr: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn no(_: *anyopaque) bool {
+            return false;
+        }
+        fn noRound(_: *anyopaque) anyerror!void {}
+        fn yes(_: *anyopaque) bool {
+            return true;
+        }
+        fn service(ptr: *anyopaque) void {
+            const r = of(ptr);
+            r.boundaries += 1;
+            if (r.s.reuse.saved) |saved| {
+                r.s.reuse.saved = null;
+                r.fake.drop(saved);
+            }
+        }
+    };
+    var x: Fake = .{ .gpa = gpa, .prefill_chunks = 3 };
+    defer x.deinit();
+    var s = try Stream.init(gpa, .{ .id = "s", .prompt = &prompt, .max_new = 1 });
+    defer s.deinit(gpa);
+    const kept = try gpa.create(std.ArrayList(u32)); // the fake's state of the prompt's first 4 tokens: that history
+    kept.* = .empty;
+    try kept.appendSlice(gpa, prompt[0..4]);
+    s.reuse = .{ .saved = kept, .at = 4 };
+    var report: Report = .{ .fake = &x, .s = &s };
+    s.between = .{ .ptr = &report, .run = Report.noRound, .ready = Report.no, .tier = .{ .wanted = Report.yes, .run = Report.service } };
+    try x.backend().prefill(&s);
+    defer x.backend().release(&s);
+    try std.testing.expectEqual(@as(usize, 2), report.boundaries);
+    try std.testing.expect(s.reuse.saved == null); // reported, and gone
+    try std.testing.expectEqual(@as(u32, 4), s.cached); // the pass resumed the kept state all the same
+    try std.testing.expectEqualSlices(u32, &prompt, x.lane(&s).history.items); // its 4 tokens, then the rest
+}
 
 test "with no hook every pass is at most the resume rows" {
     const gpa = std.testing.allocator;

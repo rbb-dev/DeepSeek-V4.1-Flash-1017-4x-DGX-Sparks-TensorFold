@@ -36,6 +36,8 @@ pub fn openHealth(srv: *Server, a: Allocator, reset_peak: bool) !Value {
         if (mem.limit) |limit| try memory.put(a, "limit", try json.intValue(a, limit));
     }
     try o.put(a, "memory", .{ .object = memory });
+    if (status.cache) |c| try putCache(a, o, c);
+    if (srv.info.spill) |si| try putSpill(a, o, si, status.spill);
     try o.put(a, "live", try live.snapshot(a, srv.engine));
     const ident = srv.config.identity;
     for ([_][2][]const u8{
@@ -45,6 +47,73 @@ pub fn openHealth(srv: *Server, a: Allocator, reset_peak: bool) !Value {
     }) |field|
         if (field[1].len > 0) try o.put(a, field[0], .{ .string = field[1] });
     return .{ .object = o };
+}
+
+/// The prompt cache's counters, when its tier or grouping is on: the GLM engine's top-level names (chats_continued,
+/// chats_continued_prefill_tokens), then every
+/// counter under prompt_cache, the tier's own under prompt_cache.spill (an array, one object per rank, rank 0 first).
+pub fn putCache(a: Allocator, o: *json.Object, c: api.CacheStats) Allocator.Error!void {
+    try o.put(a, "chats_continued", try json.intValue(a, c.chats_continued));
+    try o.put(a, "chats_continued_prefill_tokens", try json.intValue(a, c.chats_continued_prefill_tokens));
+    const pc = try json.newObject(a);
+    const info = @typeInfo(api.CacheStats).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| if (T == u64) try pc.put(a, name, try json.intValue(a, @field(c, name)));
+    if (c.spill) |rc| {
+        const ranks = rc.slice();
+        const arr = try a.alloc(json.Value, ranks.len);
+        for (ranks, arr, 0..) |t, *v, r| {
+            const sp = try json.newObject(a);
+            try sp.put(a, "rank", try json.intValue(a, r));
+            inline for (@typeInfo(@TypeOf(t)).@"struct".field_names) |name| try sp.put(a, name, try json.intValue(a, @field(t, name)));
+            v.* = .{ .object = sp };
+        }
+        try pc.put(a, "spill", .{ .array = arr });
+    }
+    const times = try json.newObject(a); // the tier's call timings, each call's count, p50, p99, max and sum (ns)
+    inline for (@typeInfo(api.prompt_cache.TierTimes).@"struct".field_names) |name| {
+        const x = @field(c.times, name);
+        const t = try json.newObject(a);
+        try t.put(a, "count", try json.intValue(a, x.count));
+        try t.put(a, "p50_ns", try json.intValue(a, x.quantile(0.5)));
+        try t.put(a, "p99_ns", try json.intValue(a, x.quantile(0.99)));
+        try t.put(a, "max_ns", try json.intValue(a, x.max_ns));
+        try t.put(a, "sum_ns", try json.intValue(a, x.sum_ns));
+        try times.put(a, name, .{ .object = t });
+    }
+    try pc.put(a, "times", .{ .object = times });
+    try o.put(a, "prompt_cache", .{ .object = pc });
+}
+
+/// The disk tier under "spill", when it was asked for: its state ("on", "opening" or "off: <cause>"), every setting,
+/// the room its file system needs with the formula, and the staging minimum when the family knows it.
+pub fn putSpill(a: Allocator, o: *json.Object, si: api.SpillInfo, now: ?api.SpillState) Allocator.Error!void {
+    const s = si.settings;
+    if (!s.asked) return;
+    const sp = try json.newObject(a);
+    const st = s.stateOf(now);
+    try sp.put(a, "state", .{ .string = switch (st.state) {
+        .on => "on",
+        .opening => "opening",
+        .off => try std.fmt.allocPrint(a, "off: {s}", .{st.reason()}),
+    } });
+    const set = try json.newObject(a);
+    if (s.dir) |d| try set.put(a, "dir", .{ .string = d });
+    try set.put(a, "gib", .{ .float = s.gib });
+    inline for (api.Spill.ints) |n| try set.put(a, n.field, try json.intValue(a, @field(s, n.field)));
+    inline for (api.Spill.floats) |n| try set.put(a, n.field, .{ .float = @field(s, n.field) });
+    var io_buf: [8]u8 = undefined;
+    try set.put(a, "ioprio", .{ .string = try a.dupe(u8, s.ioprioText(&io_buf)) });
+    try set.put(a, "image_cache", .{ .bool = s.image_cache });
+    try sp.put(a, "settings", .{ .object = set });
+    try sp.put(a, "room_gib", .{ .float = s.roomGib() });
+    var room: std.Io.Writer.Allocating = .init(a);
+    s.roomFormula(&room.writer) catch return error.OutOfMemory;
+    try sp.put(a, "room", .{ .string = room.written() });
+    if (si.staging_min_bytes) |b| {
+        try sp.put(a, "staging_min_mib", try json.intValue(a, (b + (1 << 20) - 1) >> 20));
+        try sp.put(a, "staging", .{ .string = si.staging_formula });
+    }
+    try o.put(a, "spill", .{ .object = sp });
 }
 
 pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
@@ -282,4 +351,86 @@ test "stats snapshot's memory carries a configured limit and omits none" {
     const without = try statsSnapshot(arena.allocator(), .{}, .{ .active = 5, .peak = 9 }, 0, 0, 0, 0, 0);
     // no limit configured: the key stays out
     try std.testing.expect(without.object.get("memory").?.object.get("limit") == null);
+}
+
+test "health's prompt cache counters: the GLM names on top, every counter below, the tier's under spill" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const o = try json.newObject(a);
+    var ranks: api.prompt_cache.RankCounts = .{ .n = 2 };
+    ranks.ranks[0].points = 5;
+    ranks.ranks[1].points = 4;
+    try putCache(a, o, .{ .chats_continued = 1, .disk_hits_committed = 3, .service_refused = 2, .spill = ranks });
+    try std.testing.expectEqualStrings("1", o.get("chats_continued").?.int);
+    const pc = o.get("prompt_cache").?.object;
+    try std.testing.expectEqualStrings("3", pc.get("disk_hits_committed").?.int);
+    try std.testing.expectEqualStrings("2", pc.get("service_refused").?.int);
+    const spill = pc.get("spill").?.array;
+    try std.testing.expectEqual(@as(usize, 2), spill.len);
+    try std.testing.expectEqualStrings("5", spill[0].object.get("points").?.int);
+    try std.testing.expectEqualStrings("1", spill[1].object.get("rank").?.int);
+    try std.testing.expectEqualStrings("4", spill[1].object.get("points").?.int);
+    const none = try json.newObject(a);
+    try putCache(a, none, .{});
+    try std.testing.expect(none.get("prompt_cache").?.object.get("spill") == null);
+}
+
+test "health's disk tier: its state with the cause when off, every setting and the derived room with its formula" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [256]u8 = undefined;
+    const Env = struct {
+        pairs: []const [2][]const u8,
+        pub fn get(e: @This(), name: [:0]const u8) ?[]const u8 {
+            for (e.pairs) |p| if (std.mem.eql(u8, p[0], name)) return p[1];
+            return null;
+        }
+    };
+    const bad = api.Spill.fromEnv(Env{ .pairs = &.{.{ "TF_DS_SPILL_GIB", "x" }} }, &buf);
+    const off = try json.newObject(a);
+    try putSpill(a, off, .{ .settings = bad }, null);
+    try std.testing.expectEqualStrings("off: TF_DS_SPILL_GIB=x: GiB, more than 0 up to 1048576", off.get("spill").?.object.get("state").?.string);
+    var buf2: [256]u8 = undefined;
+    const good = api.Spill.fromEnv(Env{ .pairs = &.{ .{ "TF_DS_SPILL_GIB", "256" }, .{ "TF_DS_SPILL_DIR", "/spill" } } }, &buf2);
+    const opening = try json.newObject(a);
+    try putSpill(a, opening, .{ .settings = good }, null);
+    try std.testing.expectEqualStrings("opening", opening.get("spill").?.object.get("state").?.string);
+    const failed = try json.newObject(a);
+    try putSpill(a, failed, .{ .settings = good }, api.SpillState.offFor("the store did not open in TF_DS_SPILL_OPEN_MS=300000"));
+    try std.testing.expectEqualStrings("off: the store did not open in TF_DS_SPILL_OPEN_MS=300000", failed.get("spill").?.object.get("state").?.string);
+    const o = try json.newObject(a);
+    try putSpill(a, o, .{ .settings = good, .staging_min_bytes = 45 << 20, .staging_formula = "smalls 4 x small 6 MiB + restores 2 x 2 blocks of 5 MiB + 1 write block of 1 MiB" }, .{ .state = .on });
+    const sp = o.get("spill").?.object;
+    try std.testing.expectEqualStrings("on", sp.get("state").?.string);
+    const set = sp.get("settings").?.object;
+    try std.testing.expectEqualStrings("/spill", set.get("dir").?.string);
+    try std.testing.expectEqual(@as(f64, 256), set.get("gib").?.float);
+    try std.testing.expectEqualStrings("4", set.get("turns").?.int);
+    try std.testing.expectEqualStrings("be/7", set.get("ioprio").?.string);
+    try std.testing.expectEqual(@as(f64, 562), sp.get("room_gib").?.float);
+    try std.testing.expectEqualStrings("(1 + keep_builds 1) x gib 256 + min_free_gib 50 = 562 GiB", sp.get("room").?.string);
+    try std.testing.expectEqualStrings("45", sp.get("staging_min_mib").?.int);
+    try std.testing.expectEqualStrings("smalls 4 x small 6 MiB + restores 2 x 2 blocks of 5 MiB + 1 write block of 1 MiB", sp.get("staging").?.string);
+    const none = try json.newObject(a);
+    try putSpill(a, none, .{ .settings = .{} }, null); // not asked: nothing
+    try std.testing.expect(none.get("spill") == null);
+}
+
+test "health's tier timings: each call's count, p50, p99, max and sum in nanoseconds, under prompt_cache.times" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const o = try json.newObject(a);
+    var c: api.CacheStats = .{};
+    c.times.keep.observe(5000);
+    try putCache(a, o, c);
+    const keep = o.get("prompt_cache").?.object.get("times").?.object.get("keep").?.object;
+    try std.testing.expectEqualStrings("1", keep.get("count").?.int);
+    try std.testing.expectEqualStrings("5000", keep.get("p50_ns").?.int);
+    try std.testing.expectEqualStrings("5000", keep.get("p99_ns").?.int);
+    try std.testing.expectEqualStrings("5000", keep.get("max_ns").?.int);
+    try std.testing.expectEqualStrings("5000", keep.get("sum_ns").?.int);
+    try std.testing.expectEqualStrings("0", o.get("prompt_cache").?.object.get("times").?.object.get("probe").?.object.get("count").?.int);
 }

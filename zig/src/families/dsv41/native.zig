@@ -235,11 +235,23 @@ const round = @import("round.zig");
 const link = @import("link.zig");
 const rank_cache = @import("rank_cache.zig");
 const vision_mod = @import("vision.zig");
+const api = @import("engine_api");
+const core = @import("core");
+const prompt = @import("prompt.zig");
+const prompt2d = @import("prompt2d.zig");
+const tri_index = @import("tri_index.zig");
 const tri_attn = @import("tri_attn.zig");
 const tri_hc = @import("tri_hc.zig");
 const mx = @import("mx.zig");
 const weights = @import("weights.zig");
+const spill_state = @import("spill_state.zig");
 const config = @import("config.zig");
+const spill_tier = @import("spill_tier.zig");
+const spill_sync = @import("spill_sync.zig");
+const spill_mirror = @import("spill_mirror.zig");
+const spill_start = @import("spill_start.zig");
+const spill_open = @import("spill_open.zig");
+const spill_identity = @import("spill_identity.zig");
 
 pub const model_type = "deepseek_v41";
 pub const formats: []const []const u8 = &.{"exl3-mul1"};
@@ -282,10 +294,16 @@ pub const prompt_rows: u32 = 4096;
 /// The served lane's reasoning effort numbers (text.zig): the server passes each name and the template hears its number.
 pub const efforts = @import("text.zig").efforts;
 
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false }; // slide: no learner here
+pub const Options = struct {
+    context: usize,
+    drafts: bool,
+    segments: usize = 1,
+    /// The SSD tier's settings (engine_api.Spill.fromEnv, parsed once by the server; not asked: off).
+    spill: api.Spill = .{},
+};
 
 /// A lone drafted stream's own driver: decodes it until it finishes (false) or `yield` hands it over (true).
-pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool, resumed: bool) anyerror!bool;
+pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
 
 /// What the native server drives: the lane backend, the facts its round loop reads, and how to free it.
 pub const Loaded = struct {
@@ -305,13 +323,26 @@ pub const Loaded = struct {
     snaps: ?Snaps = null,
     /// Images in requests (the server renders their placeholders; the tower runs on this rank).
     lane_vision: ?lanes.stream.LaneVision = null,
+    /// The SSD tier (the prompt cache's Tier) when it opened; null otherwise (`spill_state` says why).
+    tier: ?api.prompt_cache.Tier = null,
+    /// The prompt cache's native rules with the tier: Rules.grid (the prompt chunk) and Rules.window (the replay).
+    grid: u32 = 0,
+    replay: u32 = 0,
     /// The rows a prompt pass may run while a stream decodes (TF_DS_PASS_BESIDE; the host's step rows). 0: the grid.
     beside: u32 = 0,
     /// The rounds that follow each long prompt step while a stream decodes (TF_DS_ROUNDS_BESIDE; 0: unset).
     rounds: u32 = 0,
+    /// The tier's state at the start and its settings with what the family derives (null: not asked).
+    spill_state: ?api.SpillState = null,
+    spill_info: ?api.SpillInfo = null,
     /// The host's order for prompt passes while several prompts fill together (the family's switches, applied by rank
     /// 0's lane host).
     fill: api.fill_order.Policy = .{},
+    /// Whether the model's stream is free of a CUDA graph capture (the lane host's service fence), with `ctx`.
+    quiet: ?*const fn (ctx: *anyopaque) bool = null,
+    /// The orderly close, once the host's engine thread has ended (no request left, no frame in flight): the followers
+    /// hear done and end. It frees nothing; deinit after it does not repeat it (null: deinit alone tells them).
+    finish: ?*const fn (*anyopaque) void = null,
     /// The other streams' rounds between two pieces of a prompt pass (TF_FILL_ROUNDS; 0 while passes run whole).
     fill_rounds: u32 = 0,
 };
@@ -322,10 +353,10 @@ pub const Snaps = struct {
     save: *const fn (*anyopaque, ?*anyopaque, u32) anyerror!*anyopaque,
     restore: *const fn (*anyopaque, ?*anyopaque, *anyopaque) anyerror!void,
     drop: *const fn (*anyopaque, *anyopaque) void,
-    /// Whether a kept state restores for a prompt of this many tokens, and whether it still holds its rows.
-    resumes: *const fn (*anyopaque, *anyopaque, u32) bool,
-    live: *const fn (*anyopaque, *anyopaque) bool,
+    /// Rows a resumed prompt pass must still run past a kept state (core/prompt_cache Rules.window).
     tail: u32 = 0,
+    /// Whether a kept state still restores (Lanes.usable): given with the SSD tier only.
+    usable: ?*const fn (*anyopaque, *anyopaque, u32) bool = null,
 };
 
 /// The rank's model and the backend over it (what `open` hands the server, freed by `deinit`).
@@ -334,6 +365,50 @@ const State = struct {
     m: *model.Model,
     lanes: lanes_mod.Lanes,
     vision: ?*vision_mod.Vision = null,
+    // the SSD tier (rank 0): its pinned staging (made before the pool is sized), a staging slot's events, the store's
+    // open (abandoned past TF_DS_SPILL_OPEN_MS: then staging, events and the open's context live until the process
+    // ends, the opener's thread closing the store it finally opens)
+    staging: ?cuda.HostBuffer = null,
+    events: []cuda.Event = &.{},
+    abandoned: bool = false,
+    spill_state: ?api.SpillState = null,
+    spill_info: ?api.SpillInfo = null,
+    staging_formula: [200]u8 = undefined,
+    off_buf: [160]u8 = undefined,
+
+    /// The tier off for this start, the cause named (/health spill.state).
+    fn off(st: *State, comptime fmt: []const u8, args: anytype) void {
+        const why = std.fmt.bufPrint(&st.off_buf, fmt, args) catch fmt;
+        st.spill_state = api.SpillState.offFor(why);
+        std.log.warn("dsv41 spill: the SSD tier is off for this start: {s}", .{why});
+    }
+};
+
+/// What the store's open (on the opener's thread) needs; it outlives an abandoned opener.
+const OpenCtx = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    m: *model.Model,
+    layout: spill_state.StateLayout,
+    settings: spill_tier.Settings,
+    compat: spill_tier.Digest,
+    max_tokens: u32,
+    staging: []align(4096) u8,
+    events: []cuda.Event,
+    rank: u32 = 0,
+
+    fn open(ctx: *anyopaque) anyerror!*lanes_mod.SpillTier.S {
+        const oc: *OpenCtx = @ptrCast(@alignCast(ctx));
+        var gens = try oc.m.spillGenerations(oc.gpa);
+        return lanes_mod.SpillTier.S.create(oc.gpa, oc.io, .{ .m = oc.m }, oc.layout, gens, oc.settings, oc.rank, oc.compat, oc.max_tokens, oc.staging, oc.events, .{}) catch |e| {
+            gens.deinit(oc.gpa);
+            return e;
+        };
+    }
+
+    fn close(_: *anyopaque, side: *lanes_mod.SpillTier.S) void {
+        side.destroy();
+    }
 };
 
 fn getenv(name: [:0]const u8) ?[]const u8 {
@@ -384,7 +459,27 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (window < o.context) return error.BadWindow;
     const st = try gpa.create(State);
     errdefer gpa.destroy(st);
-    st.gpa = gpa;
+    st.* = .{ .gpa = gpa, .m = undefined, .lanes = undefined };
+    // the SSD tier's decisions from its settings alone, and its pinned staging out of memory before the pool is sized
+    // (the tier never refuses the start: every problem from here is an off reason on /health)
+    const pre = spill_start.before(o.spill, world);
+    var tier_settings = pre.settings;
+    if (pre.asked) {
+        st.spill_info = .{ .settings = o.spill };
+        st.spill_state = if (pre.off) |why| api.SpillState.offFor(why) else .{ .state = .opening };
+    }
+    if (tier_settings) |ts| st.staging = cuda.HostBuffer.alloc(ctx.d, @intCast(ts.stagingBytes())) catch |e| blk: {
+        tier_settings = null;
+        st.off("its pinned staging (TF_DS_SPILL_STAGING_MIB={d}): {s}", .{ ts.staging_mib, @errorName(e) });
+        break :blk null;
+    };
+    errdefer if (st.staging) |*b| b.free();
+    if (st.staging) |b| if (@intFromPtr(b.bytes.ptr) % 4096 != 0) {
+        st.staging.?.free();
+        st.staging = null;
+        tier_settings = null;
+        st.off("its pinned staging is not 4 KiB aligned", .{});
+    };
     // the copy settings need nothing from the model: a bad one refuses the start before the weights load
     const copies = !lanes_mod.noCopies(getenv("TF_DS_NO_COPIES"));
     const copy_match = lanes_mod.copyMatch(getenv("TF_DS_COPY_MATCH")) orelse return error.BadCopyMatch;
@@ -415,6 +510,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .round_rows = if (getenv("TF_DS_ROUND_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadRoundRows else round.default_rows,
         .round_ms = if (getenv("TF_DS_ROUND_MS")) |v| lanes_mod.parseMs(std.heap.page_allocator, v) catch return error.BadRoundMs else null,
         .streams = if (getenv("TF_DS_STREAMS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadStreams else model.max_streams_default,
+        .land_slots = if (tier_settings != null) pre.land_slots else 0,
     });
     errdefer st.m.close();
     st.lanes = lanes_mod.Lanes.init(gpa, st.m);
@@ -439,11 +535,23 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     st.lanes.vision = st.vision;
     // the pool is the model's (preallocated): a stream takes no device memory of its own
     const L = lanes_mod.Lanes;
-    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .resumes = L.snapResumesFn, .live = L.snapLiveFn };
+    var snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .tail = @intCast(st.m.cfg.window) };
+    if (tier_settings) |ts| tierStart(st, io, ctx, dir, ts, o.spill, world);
+    errdefer tierStop(st);
+    var tier: ?api.prompt_cache.Tier = null;
+    if (st.lanes.spill) |t| {
+        tier = t.tier();
+        snaps.usable = L.usableFn;
+    }
     try st.lanes.idleRdma(); // park even before the first API request
     // a follower that stops stops this server too, with a line that names it, instead of a wait on it for good
     st.m.watchPeers() catch |err| std.log.warn("dsv41: rank 0 cannot watch its followers: {s}", .{@errorName(err)});
     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .lane_vision = if (st.vision) |v| v.hook() else null, .usable_window = @as(u32, @intCast(rows_mod.usableRows(st.m.ctx_cap, st.m.eng.round_rows, model.chunk_rows))), .tier = tier, .grid = model.chunk_rows, .beside = prompt2d.pass_beside_asked, .rounds = prompt2d.rounds_beside_asked, .replay = @intCast(st.m.cfg.window), .spill_state = st.spill_state, .spill_info = st.spill_info, .fill = prompt2d.prompt_order, .quiet = quietFn, .finish = finishFn };
+}
+
+/// Rank 0's SSD tier: the layout and the staging plan, a staging slot's events, the store's name from every rank's
+/// weights and the common inputs, the store opened on its own thread within TF_DS_SPILL_OPEN_MS, then the landing,
+/// the start probe and the Leader on the lanes. Any problem turns the tier off, named; it never refuses the start.
 /// The math switches in effect for the SSD tier's store name: the 2D node's agreed flags (all off without one), the
 /// indexer's score rows, the pair sums' zero, the replay floor and the native kernels' switches in effect (all off
 /// without them).
@@ -498,12 +606,277 @@ pub fn tierMath(two: ?*const prompt2d.Two, k: ?*const mx.Kernels) spill_start.Ma
     };
 }
 
+/// The store's name from the common inputs and every rank's weight digest (the start-up exchange's: Model.weights): the
+/// same on every rank that started from the same checkpoint, kit and switches. Null name: why not, written into `buf`.
+const Named = union(enum) { name: spill_tier.Digest, why: []const u8 };
+
+fn storeNameFor(io: std.Io, ctx: *const cuda.Context, m: *model.Model, dir: []const u8, layout: *const spill_state.StateLayout, world: u32, buf: *[160]u8) Named {
+    var texts: spill_start.Texts = .{};
+    var model_dir = std.Io.Dir.cwd().openDir(io, dir, .{}) catch |e| return .{ .why = std.fmt.bufPrint(buf, "the checkpoint folder: {s}", .{@errorName(e)}) catch "the checkpoint folder" };
+    defer model_dir.close(io);
+    var kit_dir = std.Io.Dir.cwd().openDir(io, getenv("TF_DS_KIT") orelse "", .{}) catch |e| return .{ .why = std.fmt.bufPrint(buf, "the kit folder (TF_DS_KIT): {s}", .{@errorName(e)}) catch "the kit folder" };
+    defer kit_dir.close(io);
     const math = tierMath(if (m.two) |*t| t else null, if (m.mxk) |*x| x else null);
+    const facts: spill_start.Facts = .{
+        .model = model_dir,
+        .kit = kit_dir,
+        .token_map = getenv("TF_DS_TOKEN_MAP"),
+        .driver = @intCast(@max(ctx.d.version() catch 0, 0)),
+        .capability = ctx.capability() catch 0,
+        .layout = layout.digest(),
+        .namespace_version = core.spill.format.namespace_version,
+        .state_version = spill_state.format_version,
+    };
+    const common = spill_start.common(io, api.ProcessEnv{}, facts, math, &texts) catch |e| return .{ .why = std.fmt.bufPrint(buf, "the store's name: {s}", .{@errorName(e)}) catch "the store's name" };
+    var missing: spill_identity.Missing = .{};
+    const name = spill_identity.name(common, m.weights[0..world], &missing) catch {
+        var mb: [120]u8 = undefined;
+        return .{ .why = std.fmt.bufPrint(buf, "the store's name: {s}", .{missing.text(&mb)}) catch "the store's name" };
+    };
+    return .{ .name = name };
+}
+
+/// Rank 0's tier start. With a store on every rank (TF_DS_SSD_EVERY_RANK) every rank enters one reconcile exactly once, so a
+/// start that ends early on rank 0 abstains for it: the followers' reconcile then returns and no store is touched.
+fn tierStart(st: *State, io: std.Io, ctx: *const cuda.Context, dir: []const u8, s: spill_tier.Settings, sp: api.Spill, world: u32) void {
+    var reconciled = false;
+    tierStartInner(st, io, ctx, dir, s, sp, world, &reconciled);
     if (world > 1 and !reconciled) abstainBare(st.gpa, st.m);
+}
+
+/// A rank without a usable store takes part in the reconcile by abstaining, once.
+fn abstainBare(gpa: std.mem.Allocator, m: *model.Model) void {
+    const host = m.comm.host.star orelse return;
+    var p = spill_sync.Peer.init(gpa, host, m.rank, spill_sync.nullDisk());
+    defer p.deinit();
+    _ = spill_sync.abstain(&p) catch {};
+}
+
+fn tierStartInner(st: *State, io: std.Io, ctx: *const cuda.Context, dir: []const u8, s: spill_tier.Settings, sp: api.Spill, world: u32, reconciled: *bool) void {
+    const gpa = st.gpa;
+    const m = st.m;
+    const layout = m.spillLayout() catch |e| return st.off("the state layout: {s}", .{@errorName(e)});
+    const min = spill_start.stagingMin(&layout, s.smalls, s.restores, &st.staging_formula);
+    if (st.spill_info) |*si| {
+        si.staging_min_bytes = min.bytes;
+        si.staging_formula = min.formula;
+    }
     if (world > 1) {
+        var pb: [160]u8 = undefined;
+        if (spill_start.probeTokens(sp.probe_tokens, model.chunk_rows, rows_mod.usableRows(m.ctx_cap, m.eng.round_rows, model.chunk_rows), &pb)) |why| return st.off("{s}", .{why});
+    }
+    const plan = spill_tier.stagingPlan(s, &layout) catch return st.off("TF_DS_SPILL_STAGING_MIB={d}: below the {d} MiB this layout needs ({s})", .{ s.staging_mib, (min.bytes + (1 << 20) - 1) >> 20, min.formula });
+    st.events = spillEvents(gpa, ctx, spill_tier.eventCount(plan)) catch |e| return st.off("its events: {s}", .{@errorName(e)});
+    var nb: [160]u8 = undefined;
+    const name = switch (storeNameFor(io, ctx, m, dir, &layout, world, &nb)) {
+        .name => |n| n,
+        .why => |w| return st.off("{s}", .{w}),
+    };
+    // the store opened on its own thread; the start waits at most TF_DS_SPILL_OPEN_MS for it
+    const oc = gpa.create(OpenCtx) catch |e| return st.off("{s}", .{@errorName(e)});
+    oc.* = .{ .gpa = gpa, .io = io, .m = m, .layout = layout, .settings = s, .compat = spill_tier.storeCompat(name, &layout), .max_tokens = @intCast(@min(m.pool_cap, std.math.maxInt(u32))), .staging = @alignCast(st.staging.?.bytes), .events = st.events };
+    const compat = oc.compat;
+    const opener = spill_open.Opener(lanes_mod.SpillTier.S).start(gpa, io, oc, OpenCtx.open, OpenCtx.close) catch |e| {
+        gpa.destroy(oc);
+        return st.off("its opener: {s}", .{@errorName(e)});
+    };
+    var rb: [120]u8 = undefined;
+    const side = switch (opener.wait(@as(u64, sp.open_ms) * std.time.ns_per_ms)) {
+        .opened => |x| x,
+        .failed => |e| {
+            gpa.destroy(oc);
+            return st.off("{s}", .{spill_open.reason(.{ .failed = e }, sp.open_ms, &rb)});
+        },
+        .timeout => {
+            st.abandoned = true; // oc, the staging and the events stay: the opener's thread still reads them
+            return st.off("{s}", .{spill_open.reason(.timeout, sp.open_ms, &rb)});
+        },
+    };
+    gpa.destroy(oc);
+    // the landing's probe (and, without a store on every rank, the landing; followers made their pools from
+    // Settings.land_slots), then the start probe: every rank's bytes of one fixed prompt's state compared before the tier
+    // serves anything
+    var probe_ns: ?u64 = null; // the start probe's time, to /metrics through the Leader once it exists
+    var boot: [16]u8 = undefined;
+    io.random(&boot);
+    if (world > 1) {
+        st.lanes.startLanding(@as(usize, sp.land_piece_mib) << 20, sp.probe_rows) catch |e| {
+            side.destroy();
+            return st.off("the landing: {s}", .{@errorName(e)});
+        };
+    }
+    // the Leader owns the store from here (its end closes it)
+    const t = lanes_mod.SpillTier.create(gpa, side, st.lanes.spillFamily(), s, boot) catch |e| {
+        side.destroy();
+        st.lanes.stopLanding();
+        return st.off("its Leader: {s}", .{@errorName(e)});
+    };
+    if (world > 1) {
+        // the four stores made one: an entry survives only if all four hold it, equal (every other entry is deleted)
+        const cfg = spill_mirror.cfgDigest(compat, s);
+        const star = m.comm.host.star orelse {
+            t.destroy();
+            st.lanes.stopLanding();
+            return st.off("the four stores need the start-up links (TF_DS_SSD_EVERY_RANK)", .{});
+        };
+        var p0 = spill_sync.Peer.init(gpa, star, 0, t.syncDisk());
+        defer p0.deinit();
+        p0.cfg = cfg;
+        reconciled.* = true;
+        const rec = spill_sync.reconcile(&p0) catch |e| {
+            t.destroy();
+            st.lanes.stopLanding();
+            return st.off("the four stores could not be made one: {s}", .{@errorName(e)});
+        };
+        t.enableSync(star, cfg, &p0) catch |e| {
+            t.destroy();
+            st.lanes.stopLanding();
+            return st.off("the four stores: {s}", .{@errorName(e)});
+        };
+        t.armFault(prompt2d.ssd_fault.armed(0));
+        std.log.info("dsv41 spill: the four stores reconciled: {d} entr{s} held by all four, {d} deleted", .{ rec.kept, if (rec.kept == 1) "y" else "ies", rec.deleted });
+    }
+    if (world > 1) {
+        var seed: u64 = undefined;
+        io.random(std.mem.asBytes(&seed));
+        var t0: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t0);
+        const verdict = st.lanes.probeStart(sp.probe_tokens, seed) catch |e| spill_tier.ProbeVerdict{ .failed = e };
+        var t1: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t1);
+        if (verdict != .busy) probe_ns = @intCast(@max((t1.sec - t0.sec) * std.time.ns_per_s + (t1.nsec - t0.nsec), 0));
+        switch (verdict) {
+            .same, .busy => {},
+            .differs => |rank| {
+                t.destroy();
+                st.lanes.stopLanding();
+                return st.off("the start probe: rank {d}'s bytes differ from rank 0's (TF_DS_SPILL_PROBE_TOKENS={d})", .{ rank, sp.probe_tokens });
+            },
+            .failed => |e| {
+                t.destroy();
+                st.lanes.stopLanding();
+                return st.off("the start probe could not run: {s}", .{@errorName(e)});
+            },
+        }
+    }
+    if (probe_ns) |ns| t.noteProbe(ns);
+    st.lanes.spill = t;
+    st.spill_state = .{ .state = .on };
+    var fault_buf: [48]u8 = undefined;
     if (world > 1)
         std.log.info("dsv41 spill: the SSD tier is on: a store on every rank under {s} ({d} GiB, staging {d} MiB; a restore is read by each rank from its own disk, no landing); TF_DS_SSD_FAULT {s}", .{ s.dir, s.gib, s.stagingBytes() >> 20, prompt2d.ssd_fault.text(&fault_buf) });
+}
+
+/// A follower's tier when every rank keeps its own store: its Side opened over its own directory, wrapped in a Mirror, and the
+/// ranks' reconcile entered once (rank 0's tierStart enters it too, abstaining on every path that ends early). Null: no
+/// tier here, whatever the cause (this rank abstained, or the ranks refused each other); rank 0 is then told to turn it off.
+pub fn followerTierFromEnv(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, m: *model.Model, dir: []const u8, env: anytype, buf: []u8) ?*lanes_mod.FollowMirror {
+    return followerTier(gpa, io, ctx, m, dir, api.Spill.fromEnv(env, buf));
+}
+
+pub fn followerTier(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, m: *model.Model, dir: []const u8, sp: api.Spill) ?*lanes_mod.FollowMirror {
     if (m.world < 2 or m.lead.land_slots == 0) return null;
+    const star = m.comm.host.star orelse return null;
+    const mirror = openFollowerStore(gpa, io, ctx, m, dir, sp, star) catch |e| {
+        std.log.warn("dsv41 spill: rank {d} abstains from the four stores: {s}", .{ m.rank, @errorName(e) });
+        var p = spill_sync.Peer.init(gpa, star, m.rank, spill_sync.nullDisk());
+        defer p.deinit();
+        _ = spill_sync.abstain(&p) catch {};
+        return null;
+    };
+    var fault_buf: [48]u8 = undefined;
+    mirror.arm(prompt2d.ssd_fault.armed(m.rank));
+    const rec = mirror.reconcile() catch |e| {
+        std.log.warn("dsv41 spill: rank {d}: the four stores could not be made one: {s}", .{ m.rank, @errorName(e) });
+        _ = mirror.close();
+        return null;
+    };
+    std.log.info("dsv41 spill: rank {d}: a store of its own under {s}: {d} entr{s} held by all four, {d} deleted; TF_DS_SSD_FAULT {s}", .{ m.rank, sp.dir orelse "", rec.kept, if (rec.kept == 1) "y" else "ies", rec.deleted, prompt2d.ssd_fault.text(&fault_buf) });
+    return mirror;
+}
+
+fn openFollowerStore(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, m: *model.Model, dir: []const u8, sp: api.Spill, star: spill_sync.Star) !*lanes_mod.FollowMirror {
+    const pre = spill_start.before(sp, m.world);
+    const s = pre.settings orelse return error.NoSpillSettings;
+    const layout = try m.spillLayout();
+    const plan = try spill_tier.stagingPlan(s, &layout);
+    var staging = try cuda.HostBuffer.alloc(ctx.d, @intCast(s.stagingBytes()));
+    errdefer staging.free();
+    if (@intFromPtr(staging.bytes.ptr) % 4096 != 0) return error.StagingNotAligned;
+    const events = try spillEvents(gpa, ctx, spill_tier.eventCount(plan));
+    var nb: [160]u8 = undefined;
+    const name = switch (storeNameFor(io, ctx, m, dir, &layout, m.world, &nb)) {
+        .name => |n| n,
+        .why => |w| {
+            std.log.warn("dsv41 spill: rank {d}: {s}", .{ m.rank, w });
+            return error.NoStoreName;
+        },
+    };
+    const compat = spill_tier.storeCompat(name, &layout);
+    const oc = try gpa.create(OpenCtx);
+    oc.* = .{ .gpa = gpa, .io = io, .m = m, .layout = layout, .settings = s, .compat = compat, .max_tokens = @intCast(@min(m.pool_cap, std.math.maxInt(u32))), .staging = @alignCast(staging.bytes), .events = events, .rank = m.rank };
+    const opener = try spill_open.Opener(lanes_mod.SpillTier.S).start(gpa, io, oc, OpenCtx.open, OpenCtx.close);
+    const side = switch (opener.wait(@as(u64, sp.open_ms) * std.time.ns_per_ms)) {
+        .opened => |x| x,
+        .failed => |e| {
+            gpa.destroy(oc);
+            return e;
+        },
+        .timeout => return error.StoreOpenTimeout, // (the opener's thread still reads oc, the staging and the events: left to it)
+    };
+    gpa.destroy(oc);
+    // (the staging and the events live for the process: the store's close is bounded and may leave threads reading them)
+    return lanes_mod.FollowMirror.create(gpa, side, star, m.rank, undefined, spill_mirror.cfgDigest(compat, s));
+}
+
+/// The tier's end (deinit, or a start failing after it): the Leader first (the store closed within what is left of
+/// the stop's flush bound), the landing's buffers, then the events and the staging, kept when the opener was
+/// abandoned or the store's close gave up on a disk call (those threads may read them until the process exits).
+/// Nothing here enters a collective: after the orderly close the followers have heard done.
+fn tierStop(st: *State) void {
+    const clean = if (st.lanes.spill) |t| t.close() else true;
+    st.lanes.spill = null;
+    st.lanes.stopLanding();
+    if (st.abandoned or !clean) return;
+    for (st.events) |*e| e.deinit();
+    if (st.events.len > 0) st.gpa.free(st.events);
+    st.events = &.{};
+    if (st.staging) |*b| b.free();
+    st.staging = null;
+}
+
+/// One reusable event a staging slot (spill_tier.eventCount).
+fn spillEvents(gpa: std.mem.Allocator, ctx: *const cuda.Context, n: usize) ![]cuda.Event {
+    const evs = try gpa.alloc(cuda.Event, n);
+    var made: usize = 0;
+    errdefer {
+        for (evs[0..made]) |*e| e.deinit();
+        gpa.free(evs);
+    }
+    for (evs) |*e| {
+        e.* = try cuda.Event.init(ctx.d, false);
+        made += 1;
+    }
+    return evs;
+}
+
+/// Loaded.quiet: no CUDA graph capture in progress on the model's stream (a driver error reads as quiet: the fence
+/// then rests on the lane host's own round and chunk rules).
+fn quietFn(ctx: *anyopaque) bool {
+    const st: *State = @ptrCast(@alignCast(ctx));
+    const status = cuda.graph.captureStatus(st.m.stream) catch return true;
+    return status == .none;
+}
+
+/// Loaded.finish: the followers hear done (their logs end "followed": true); the model and the lanes stay for deinit.
+fn finishFn(ptr: *anyopaque) void {
+    const st: *State = @ptrCast(@alignCast(ptr));
+    // a landing still in flight is aborted while the followers listen (after done no frame reaches them); the lane
+    // host's flush has ended the tier's restores by now, so this is the safety net
+    if (st.lanes.lander) |*l| l.abort();
+    st.lanes.finish();
+}
+
 /// The work this engine ran eagerly after a CUDA graph capture failed on a rank (every rank runs it so, and counts
 /// alike; /metrics shows rank 0's); null without graphs.
 pub fn graphFallbacks(ctx: *anyopaque) ?*const std.atomic.Value(u64) {
@@ -526,7 +899,11 @@ pub fn draftVocab(ctx: *anyopaque) ?*const api.DraftVocabCounters {
 
 fn deinitFn(ptr: *anyopaque) void {
     const st: *State = @ptrCast(@alignCast(ptr));
-    st.lanes.deinit(); // rank 1 hears done
+    // the tier after the prompt cache's store (cuda.zig frees it first). The followers heard done at Loaded.finish when
+    // the orderly close ran, so nothing here may talk to them: tierStop sends no frame that matters and enters no
+    // collective; without finish (a start that failed), lanes.deinit's done still comes after the tier's last frame
+    tierStop(st);
+    st.lanes.deinit(); // the followers hear done, unless finish told them
     if (st.vision) |v| v.close();
     st.m.close();
     st.gpa.destroy(st);
@@ -695,6 +1072,7 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "--streams") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "--graph-cap") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_REPLAY_FLOOR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_IDX_RB") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_PF_SPLIT") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_WOA_W8") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_QUANT_ONCE") != null);

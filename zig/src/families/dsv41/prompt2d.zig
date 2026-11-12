@@ -51,6 +51,9 @@ pub fn connectSeconds() u32 {
 pub const Fan = struct {
     links: [3]?Link = .{ null, null, null },
     ports: ?Ports = null, // rank 0's, from listenAt until join has taken every follower
+    /// The ranks' weight digests are given back to every follower once rank 0 has them all and every settings check passed
+    /// (TF_DS_SSD_EVERY_RANK: a rank's store is named from all four weight files). Every rank alike.
+    share_digests: bool = false,
 
     pub fn open(io: std.Io, ip: [4]u8, port: u16, rank: u32, world: u32) !Fan {
         return openAt(io, ip, null, port, rank, world);
@@ -130,7 +133,11 @@ pub const Fan = struct {
     /// it, checks and answers (follow). `heard` starts over with this rank's own digest at its rank. "" when every rank can
     /// follow, else the first follower's words (in `why`).
     fn exchange(f: *const Fan, rank: u32, mine: ?Settings, digest: Digest, why: []u8, heard: *Heard) ![]const u8 {
+        heard.* = .{};
+        if (rank < heard.weights.len) heard.weights[rank] = digest;
         return if (rank == 0) f.lead(mine, why, heard) else f.follow(rank, mine, digest, why, heard);
+    }
+
     /// Rank 0: `mine`, when given, down every link; then every follower's answer: its weight digest (the follower on link g - 1,
     /// rank g, into heard.weights[g]) and its words. "" when each one can follow, else the first one's words (in `why`).
     /// heard.lead = `mine`.
@@ -143,12 +150,26 @@ pub const Fan = struct {
         }
         for (f.links) |l| if (l) |x| try x.send(frame[0..n]);
         if (mine == null) return "";
+        heard.lead = mine;
         var first: []const u8 = "";
-        var rest: [1024]u8 = undefined;
-        for (f.links) |l| if (l) |x| {
-            const got = try x.recv(if (first.len == 0) why else &rest);
-            if (first.len == 0 and got.len > 0) first = got;
+        var answer: [answer_max]u8 = undefined;
+        for (f.links, 1..) |l, g| if (l) |x| {
+            const got = try x.recv(&answer);
+            if (got.len < @sizeOf(Digest)) return error.BadAnswer;
+            heard.weights[g] = got[0..@sizeOf(Digest)].*;
+            const text = got[@sizeOf(Digest)..];
+            if (first.len == 0 and text.len > 0) {
+                const k = @min(text.len, why.len);
+                @memcpy(why[0..k], text[0..k]);
+                first = why[0..k];
+            }
         };
+        // every rank's digest back to each follower (all agreed: a follower that did not is leaving), in rank order
+        if (f.share_digests and first.len == 0) {
+            var table: [4 * @sizeOf(Digest)]u8 = undefined;
+            for (heard.weights, 0..) |w, g| @memcpy(table[g * @sizeOf(Digest) ..][0..@sizeOf(Digest)], &w);
+            for (f.links) |l| if (l) |x| try x.send(&table);
+        }
         return first;
     }
 
@@ -162,19 +183,56 @@ pub const Fan = struct {
         if (got.len != @sizeOf(Settings)) return error.BadAnswer;
         const theirs = std.mem.bytesToValue(Settings, got);
         if (theirs.magic != Settings.tag) return error.BadAnswer;
+        heard.lead = theirs;
         const text = if (mine) |s| s.differ(theirs, rank, why) else "";
-        try l.send(text);
+        var answer: [answer_max]u8 = undefined;
+        @memcpy(answer[0..@sizeOf(Digest)], &digest);
+        const k = @min(text.len, answer.len - @sizeOf(Digest));
+        @memcpy(answer[@sizeOf(Digest)..][0..k], text[0..k]);
+        try l.send(answer[0 .. @sizeOf(Digest) + k]);
+        if (f.share_digests and text.len == 0) {
+            // rank 0 gives every rank's digest back once every rank agreed; this rank's own must be the one it heard
+            var table: [4 * @sizeOf(Digest)]u8 = undefined;
+            const t = try l.recv(&table);
+            if (t.len != table.len or !std.mem.eql(u8, t[rank * @sizeOf(Digest) ..][0..@sizeOf(Digest)], &digest)) return error.BadAnswer;
+            for (&heard.weights, 0..) |*w, g| w.* = t[g * @sizeOf(Digest) ..][0..@sizeOf(Digest)].*;
+        }
         return text;
     }
 
     const answer_max = @sizeOf(Digest) + 1024; // a follower's answer: its weight digest, then its words (settingsChecked's why)
 };
 
-/// What the ranks of a run must agree on, checked at the start (Fan.commChecked) from Model.open's options.
+/// A rank's weight digest: the SHA-256 of its weight file (TF_DS_RANK_CACHE_SHA); no_digest: none.
+pub const Digest = [32]u8;
+pub const no_digest: Digest = @splat(0);
+
 /// What the start-up exchange gives a rank (Fan.settingsChecked).
+pub const Heard = struct {
     /// rank 0's Settings (rank 0: its own); null when rank 0 sent none
+    lead: ?Settings = null,
     /// the ranks' weight digests by rank: rank 0 holds every rank's, a follower its own (no_digest: none sent, or
+    /// another rank's) unless Fan.share_digests gave it all four
+    weights: [4]Digest = @splat(no_digest),
+};
+
+/// TF_DS_RANK_CACHE_SHA's text as a digest: 64 lowercase hex digits, "sha256:" before them or not; anything else null.
+pub fn weightDigest(text: []const u8) ?Digest {
+    const prefix = "sha256:";
+    const hex = if (std.mem.startsWith(u8, text, prefix)) text[prefix.len..] else text;
+    if (hex.len != 2 * @sizeOf(Digest)) return null;
+    var out: Digest = undefined;
+    for (&out, 0..) |*b, i| b.* = (nibble(hex[2 * i]) orelse return null) << 4 | (nibble(hex[2 * i + 1]) orelse return null);
+    return out;
+}
+
+fn nibble(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        else => null,
     };
+}
 
 /// 13; 4 = 1-11 (fill_resume 10, rdma_idle 11); 5 = 1-12 (and snap_land 12, the SSD tier's landing); 6 = 1-13 (and
 /// head_whole 13, TF_DS_HEAD_CAND's whole head after a round's candidates fell back); 7 = 1-14 (and fill_pair 14, TF_DS_ROCI_STAGGER's two passes); 8 = 1-15 (and snap_sync 15, the SSD tier's stores on every rank); 9 = the same kinds, a Settings of the Rocinante-only layout (no
@@ -194,10 +252,8 @@ pub const Settings = extern struct {
     graph_cap: u32, // TF_DS_GRAPH_CAP (--graph-cap), with graphs: the same (every rank keeps and drops the same graphs)
     pool: u64, // rank 0's window (--context, or TF_DS_WINDOW; a follower's --pool): a follower's holds rank 0's
     replay_floor: u32, // TF_DS_REPLAY_FLOOR: the same
-    idx_split: u32 = 0, // TF_DS_IDX_SPLIT (prompt.split_from): the same (the keyed indexer layers all-gather inside)
-    neighbor_rdma: u32 = 0, // TF_DS_NEIGHBOR_RDMA: the same exchange path on every rank
-    reserved: u32 = 0,
-    pool: u64, // rank 0's --context (a follower's --pool): a follower's holds rank 0's
+    idx_rb: u32, // TF_DS_IDX_RB (tri_index.idx_rb, the indexer's prompt score rows a program): the same
+    land_slots: u32 = 0, // rank 0's TF_DS_SPILL_LAND_SLOTS (0: its SSD tier off): every follower takes it, never compared
     exch: u32 = 0, // the exchange switches asked for, bit i exch_names[i] (exchAsked): the same
     kern: u32 = 0, // the kernel switches asked for, bit i kern_names[i] (kernAsked): the same
     kern2: u32 = 0, // the kernel switches beyond kern's 32 bits, bit i kern2_names[i] (kern2Asked): the same
@@ -205,7 +261,7 @@ pub const Settings = extern struct {
     pass_rows: u32 = 2048, // TF_DS_PASS_ROWS (pass_rows_asked: a pass's rows at most, the chunk's allocation): the same
     pf_raster: u32 = 0, // TF_DS_PF_RASTER's group of row tiles (pf_raster_asked; 0: off): the same (this word was the layout's padding, always 0)
 
-    pub const tag: u32 = 0x31345344; // "DS41"
+    // "DS41" is another build's frame (its replay floor where this one carries graphs and the graph cap). A change of
     // the fields or of the follower's answer bumps the last letter, so a follower refuses a rank 0 of another layout.
     // A new exchange or kernel switch takes the next bit of exch or kern and keeps the letter: differ refuses every bit
     // that differs, one this build has no name for included
@@ -233,10 +289,8 @@ pub const Settings = extern struct {
             w.print("{s}rank {d} keeps {d} CUDA graphs at most and rank 0 {d} (0: all): start rank {d} with --graph-cap {d} (or TF_DS_GRAPH_CAP={d})", .{ sepIf(&w, sep), rank, mine.graph_cap, lead.graph_cap, rank, lead.graph_cap, lead.graph_cap }) catch {};
         if (mine.replay_floor != lead.replay_floor)
             w.print("{s}rank {d} has TF_DS_REPLAY_FLOOR={d} and rank 0 {d}: set the same on every rank", .{ sepIf(&w, sep), rank, mine.replay_floor, lead.replay_floor }) catch {};
-        if (mine.idx_split != lead.idx_split)
-            w.print("{s}rank {d} splits the keyed indexer rows from {d} columns and rank 0 from {d} (TF_DS_IDX_SPLIT, 0: unset): set the same on every rank", .{ sepIf(&w, sep), rank, mine.idx_split, lead.idx_split }) catch {};
-        if (mine.neighbor_rdma != lead.neighbor_rdma)
-            w.print("{s}rank {d} has TF_DS_NEIGHBOR_RDMA={d} and rank 0 {d}: set the same on every rank", .{ sepIf(&w, sep), rank, mine.neighbor_rdma, lead.neighbor_rdma }) catch {};
+        if (mine.idx_rb != lead.idx_rb)
+            w.print("{s}rank {d} has TF_DS_IDX_RB={d} and rank 0 {d}: set the same on every rank", .{ sepIf(&w, sep), rank, mine.idx_rb, lead.idx_rb }) catch {};
         if (mine.pass_rows != lead.pass_rows)
             w.print("{s}rank {d} has TF_DS_PASS_ROWS={d} and rank 0 {d}: set the same on every rank", .{ sepIf(&w, sep), rank, mine.pass_rows, lead.pass_rows }) catch {};
         if (mine.exch != lead.exch) bitsDiffer(&w, sep, &exch_names, "exchange", mine.exch, lead.exch, rank);
@@ -271,6 +325,12 @@ pub const Settings = extern struct {
     fn sepIf(w: *const std.Io.Writer, sep: []const u8) []const u8 {
         return if (w.end > 0) sep else "";
     }
+
+    fn setWord(x: u32) []const u8 {
+        return if (x != 0) "set" else "unset";
+    }
+};
+
 /// The exchange switches the start-up settings carry (Settings.exch): bit i is exch_names[i], set when asked for. Each
 /// is read once by Model.open, before the settings and its agreement.
 pub const exch_names = [_][]const u8{ "", "", "", "", "", "", "", "", "TF_DS_ROCI_P2_FIRST", "TF_DS_ROCI_ENGRAM_AHEAD", "", "TF_DS_ROCI_SENT_FIRST", "", "", "", "", "", "", "TF_DS_ROCI_COMBINE_DOOR", "", "", "TF_DS_ROCI_STAGGER", "TF_DS_ENGRAM_PARTNER", "TF_DS_RING_WC", "TF_DS_RING_INPLACE", "TF_DS_RING_WORD", "TF_DS_RING_WORD_SIGNAL", "TF_DS_RING_WAIT", "TF_DS_ROCI_STAGGER_LANES", "TF_DS_PACK_EPILOGUE", "", "" };
@@ -287,6 +347,7 @@ pub const exch_ring_word_atomic: u32 = 1 << 26; // the switch's signal is the at
 pub const exch_ring_wait: u32 = 1 << 27; // TF_DS_RING_WAIT: the rings' queue pairs wait in the card (no proxy threads)
 pub const exch_pack_epilogue: u32 = 1 << 29; // TF_DS_PACK_EPILOGUE: gate/up's twin writes the expert pack's codes (every rank alike)
 pub const exch_roci_stagger_lanes: u32 = 1 << 28; // TF_DS_ROCI_STAGGER_LANES=3 (unset or 2: clear): three passes in flight, a third lane on every rank
+/// The last bit of the word (the others in between are free): every rank keeps its own SSD store (TF_DS_SSD_EVERY_RANK).
 /// An exchange switch's text: "1" asks for it; unset or any other text does not.
 /// A switch that is on unless set otherwise (TF_DS_ROCI_WAIT, TF_DS_RING_WAIT): unset or "1" is on; any other text, "0" included, is off (a typo
 /// takes the fallback path, never the new one by accident).
@@ -312,6 +373,10 @@ pub var roci_engram_ahead_asked: bool = false;
 /// one launch with the row quarters an owner sum's first part sends first, and that launch rings the part's doorbell itself when those
 /// quarters are stored.
 pub var roci_sent_first_asked: bool = false;
+/// TF_DS_SSD_FAULT as Model.open parsed it, once: the gate drill's faults of the four stores, each on one named rank (spill_sync.Fault).
+/// Every rank reads the same text and acts only when it is the named one; it needs TF_DS_SSD_EVERY_RANK.
+pub var ssd_fault: @import("spill_sync.zig").Fault = .{};
+
 /// The second set of links' port is the first's plus this: rank 0 listens on it for each follower, as it does on the first.
 pub const host_links_port_offset: u16 = 32;
 
@@ -1851,6 +1916,34 @@ test "own_stage: the row partner's fp32 [2, q, w], the sums [2, q, w] and the ot
     try std.testing.expectEqual(@as(u64, 0x10000 + 2 * 512 * 2560 * 4 + 2 * 512 * 2560 * 2), st.oth);
 }
 
+test "a weight digest is 64 lowercase hex digits, with sha256: before them or not" {
+    const hex = "00ff10a500ff10a500ff10a500ff10a500ff10a500ff10a500ff10a500ff10a5";
+    var want: Digest = undefined;
+    for (&want, 0..) |*b, i| b.* = ([_]u8{ 0x00, 0xff, 0x10, 0xa5 })[i % 4];
+    try std.testing.expectEqual(@as(?Digest, want), weightDigest(hex));
+    try std.testing.expectEqual(@as(?Digest, want), weightDigest("sha256:" ++ hex));
+    const bad = [_][]const u8{
+        "",
+        "sha256:",
+        hex[1..], // 63 digits
+        hex ++ "0", // 65
+        "00ff10A5" ++ hex[8..], // upper case
+        "00ff10g5" ++ hex[8..], // not hex
+        "SHA256:" ++ hex,
+        "sha256: " ++ hex[1..],
+        " " ++ hex[1..],
+        "sha512:" ++ hex,
+    };
+    for (bad) |b| try std.testing.expectEqual(@as(?Digest, null), weightDigest(b));
+}
+
+/// The two ends of one link for a test: a UNIX socket pair (frames as over TCP; no port to take, no accept to wait in).
+fn testLinks() ![2]Link {
+    var pair: [2]std.c.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
+    return .{ .{ .fd = pair[0] }, .{ .fd = pair[1] } };
+}
+
 test "TF_DS_PASS_ROWS takes any whole number of resume units up to the engine's largest pass (unset: one); TF_DS_PASS_FROM any multiple of the unit, 0 included (unset: four)" {
     const top = prompt.max_pass_rows;
     try std.testing.expectEqual(@as(u32, 16384), top);
@@ -1869,6 +1962,7 @@ test "TF_DS_PASS_ROWS takes any whole number of resume units up to the engine's 
         try std.testing.expect(std.mem.indexOf(u8, w, "TF_DS_PASS_ROWS=") != null);
         try std.testing.expect(std.mem.indexOf(u8, w, "whole number of 2048-row resume units") != null);
         try std.testing.expect(std.mem.indexOf(u8, w, "16384") != null);
+    }
     // a smaller ceiling (a build for fewer rows) holds the same rule
     try std.testing.expectEqual(@as(?u32, 8192), passRowsSetting("8192", 2048, 8192));
     try std.testing.expectEqual(@as(?u32, null), passRowsSetting("10240", 2048, 8192));
@@ -1880,6 +1974,8 @@ test "TF_DS_PASS_ROWS takes any whole number of resume units up to the engine's 
     try std.testing.expectEqual(@as(?u32, 8192), passFromSetting("8192", 2048));
     try std.testing.expectEqual(@as(?u32, 16384), passFromSetting("16384", 2048));
     for ([_][]const u8{ "", "1", "3000", "9000", "-8192", "4096 ", "x" }) |t| try std.testing.expectEqual(@as(?u32, null), passFromSetting(t, 2048));
+}
+
 test "TF_DS_PASS_BESIDE: unset is the resume rows; any whole number of units up to the booted pass rows is a setting; anything else none" {
     try std.testing.expectEqual(@as(?u32, 2048), passBesideSetting(null, 2048, 2048));
     try std.testing.expectEqual(@as(?u32, 2048), passBesideSetting(null, 2048, 4096));
@@ -1894,6 +1990,7 @@ test "TF_DS_PASS_BESIDE: unset is the resume rows; any whole number of units up 
     try std.testing.expectEqual(@as(?u32, null), passBesideSetting("8192", 2048, 4096));
     for ([_][]const u8{ "", "0", "1024", "3000", "16384", "4096 ", "-4096", "x" }) |t| try std.testing.expectEqual(@as(?u32, null), passBesideSetting(t, 2048, 8192));
 }
+
 test "TF_DS_PASS_FILLING: the environment sets the switch and prints its start line when on" {
     const env = struct { // the process environment, as Model.open reads it
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
@@ -2042,27 +2139,176 @@ test "an answer too short for a weight digest is refused" {
 
 test "four ranks, digests not shared: rank 0 hears every follower's weight digest in link order, and the first follower's words" {
     const served: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 1 };
+    var floorless = served; // rank 2 runs without the floor, rank 3 with fewer streams: rank 0 says rank 2's words
+    floorless.replay_floor = 0;
+    var eight = served;
+    eight.streams = 8;
+    const Peer = struct {
+        why: [1024]u8 = undefined,
+        said: []const u8 = "",
+        heard: Heard = .{},
+        err: ?anyerror = null,
+        fn run(p: *@This(), end: Link, rank: u32, mine: Settings) void {
+            var f: Fan = .{};
+            f.links[0] = end;
+            defer f.close();
+            const digest: Digest = @splat(@intCast(0x10 * rank + rank)); // 0x11, 0x22, 0x33
             p.said = f.exchange(rank, mine, digest, &p.why, &p.heard) catch |e| {
+                p.err = e;
+                return;
+            };
+        }
+    };
+    var peers: [3]Peer = .{ .{}, .{}, .{} };
+    var threads: [3]std.Thread = undefined;
+    var started: usize = 0;
+    defer for (threads[0..started]) |t| t.join(); // after rank 0's ends are closed (the defer below runs first)
+    // link g - 1 is follower g's (Fan.openAt: rank 0 listens on port + g - 1 for it)
+    var f: Fan = .{};
+    defer f.close();
+    const settings = [3]Settings{ served, floorless, eight };
+    for (&peers, &threads, settings, 1..) |*p, *t, mine, g| {
+        const ends = try testLinks();
+        f.links[g - 1] = ends[0];
+        t.* = try std.Thread.spawn(.{}, Peer.run, .{ p, ends[1], @as(u32, @intCast(g)), mine });
+        started += 1;
+    }
+    var why: [1024]u8 = undefined;
+    var heard: Heard = .{};
     const said = f.exchange(0, served, @splat(0xd0), &why, &heard);
+    f.close(); // a follower still waiting on rank 0 ends (PeerDown) instead of holding the join
+    for (threads) |t| t.join();
+    started = 0;
+    try std.testing.expectEqualStrings("rank 2 has TF_DS_REPLAY_FLOOR=0 and rank 0 1: set the same on every rank", try said);
+    for (peers, 1..) |p, g| {
+        try std.testing.expect(p.err == null);
+        try std.testing.expectEqual(@as(?Settings, served), p.heard.lead);
+        try std.testing.expectEqual(g >= 2, p.said.len > 0);
+    }
+    try std.testing.expectEqualStrings("rank 3 holds 8 streams and rank 0 serves 16: start rank 3 with --streams 16 (or TF_DS_STREAMS=16)", peers[2].said);
+    const want = [4]Digest{ @splat(0xd0), @splat(0x11), @splat(0x22), @splat(0x33) };
+    try std.testing.expectEqual(want, heard.weights);
+    try std.testing.expectEqual(@as(?Settings, served), heard.lead);
+}
+
+test "with the digests shared, every follower ends the exchange holding all four ranks' weight digests, and none does when a follower's settings differ" {
     const served: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 1 };
+    var eight = served;
+    eight.streams = 8;
+    const Peer = struct {
+        why: [1024]u8 = undefined,
+        said: []const u8 = "",
+        heard: Heard = .{},
+        err: ?anyerror = null,
+        fn run(p: *@This(), end: Link, rank: u32, mine: Settings) void {
+            var f: Fan = .{ .share_digests = true };
+            f.links[0] = end;
+            defer f.close();
+            const digest: Digest = @splat(@intCast(0x10 * rank + rank));
             p.said = f.exchange(rank, mine, digest, &p.why, &p.heard) catch |e| {
+                p.err = e;
+                return;
+            };
+        }
+    };
+    for ([_]bool{ false, true }) |one_differs| {
+        var peers: [3]Peer = .{ .{}, .{}, .{} };
+        var threads: [3]std.Thread = undefined;
+        var started: usize = 0;
+        defer for (threads[0..started]) |t| t.join();
+        var f: Fan = .{ .share_digests = true };
+        defer f.close();
+        const settings = [3]Settings{ served, if (one_differs) eight else served, served };
+        for (&peers, &threads, settings, 1..) |*p, *t, mine, g| {
+            const ends = try testLinks();
+            f.links[g - 1] = ends[0];
+            t.* = try std.Thread.spawn(.{}, Peer.run, .{ p, ends[1], @as(u32, @intCast(g)), mine });
+            started += 1;
+        }
         var why: [1024]u8 = undefined;
-        const heard = f.lead(&id, cs.lead, &why);
-        t.join();
+        var heard: Heard = .{};
         const said = f.exchange(0, served, @splat(0xd0), &why, &heard);
         f.close();
-        try std.testing.expect(peer.err == null);
-        try std.testing.expectEqualSlices(u8, &id, &peer.id);
-        try std.testing.expectEqualStrings(peer.said, try heard);
-        try std.testing.expectEqual(cs.differs, peer.said.len > 0);
-        if (cs.differs) {
-            const setting = if (cs.follower.?.streams != cs.lead.?.streams) "--streams 8" else "TF_DS_NEIGHBOR_RDMA";
-            try std.testing.expect(std.mem.indexOf(u8, peer.said, setting) != null);
-    const served: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 1 };
-            _ = f.exchange(rank, served, @splat(@intCast(0x10 * rank + rank)), &p.why, &p.heard) catch |e| {
+        for (threads) |t| t.join();
+        started = 0;
+        const want = [4]Digest{ @splat(0xd0), @splat(0x11), @splat(0x22), @splat(0x33) };
+        try std.testing.expectEqual(want, heard.weights);
+        for (peers, 1..) |p, g| {
+            if (one_differs) {
+                // rank 0 says the first follower's words and gives nothing back: each follower keeps its own digest alone
+                try std.testing.expectEqual(g == 2, p.said.len > 0);
+                try std.testing.expectEqual(@as(Digest, @splat(@intCast(0x10 * g + g))), p.heard.weights[g]);
+                try std.testing.expectEqual(no_digest, p.heard.weights[0]);
+            } else {
+                try std.testing.expect(p.err == null);
+                try std.testing.expectEqual(want, p.heard.weights);
+            }
         }
+        _ = try said;
     }
+}
+
+test "four ranks with the digests shared: the store's name computed from each rank's own heard digests is the same on all four" {
+    const identity = @import("spill_identity.zig");
+    const served: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 1 };
+    const common: identity.Common = .{
+        .engine = "native-12f3f2c3b4bf",
+        .model_revision = "1017",
+        .config = @splat(1),
+        .ablation = "keys@abc123",
+        .engram_revision = "e1",
+        .engram_json = @splat(2),
+        .engram_switches = "packed=1",
+        .kit = "kit-7",
+        .token_map = "map-3",
+        .driver = 580178,
+        .capability = 121,
+        .math = "pair_sum=1",
+        .layout = @splat(3),
+        .namespace_version = 2,
+        .state_version = 2,
+    };
+    const Peer = struct {
+        why: [1024]u8 = undefined,
+        heard: Heard = .{},
+        err: ?anyerror = null,
+        fn run(p: *@This(), end: Link, rank: u32, share: bool) void {
+            var f: Fan = .{ .share_digests = share };
+            f.links[0] = end;
+            defer f.close();
+            _ = f.exchange(rank, served, @splat(@intCast(0x10 * rank + rank)), &p.why, &p.heard) catch |e| {
+                p.err = e;
+            };
+        }
+    };
+    var peers: [3]Peer = .{ .{}, .{}, .{} };
+    var threads: [3]std.Thread = undefined;
+    var started: usize = 0;
+    defer for (threads[0..started]) |t| t.join();
+    var f: Fan = .{ .share_digests = true };
+    defer f.close();
+    for (&peers, &threads, 1..) |*p, *t, g| {
+        const ends = try testLinks();
+        f.links[g - 1] = ends[0];
+        t.* = try std.Thread.spawn(.{}, Peer.run, .{ p, ends[1], @as(u32, @intCast(g)), true });
+        started += 1;
+    }
+    var why: [1024]u8 = undefined;
+    var heard: Heard = .{};
     _ = try f.exchange(0, served, @splat(0xd0), &why, &heard);
+    f.close();
+    for (threads) |t| t.join();
+    started = 0;
+    var missing: identity.Missing = .{};
+    const lead_name = try identity.name(common, &heard.weights, &missing);
+    for (peers) |p| {
+        try std.testing.expect(p.err == null);
+        // every follower names its store from what it heard, and gets rank 0's name
+        const mine = try identity.name(common, &p.heard.weights, &missing);
+        try std.testing.expectEqual(lead_name, mine);
+    }
+}
+
 test "a follower runs rank 0's TF_DS_CUDA_SCHED, or says what differs" {
     const lead: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 1, .sched = cuda.context.sched_blocking };
 }
@@ -2102,8 +2348,14 @@ test "a follower runs rank 0's TF_DS_PASS_ROWS, or says to set the same on every
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(Settings));
 }
 
+test "rank 0's landing slots travel to every follower and are never compared (a follower holds no tier settings)" {
     const lead: Settings = .{ .world = 4, .streams = 8, .round_rows = 16, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 20, .replay_floor = 0, .idx_rb = 1, .land_slots = 2 };
+    var mine = lead;
+    mine.land_slots = 0;
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("", mine.differ(lead, 1, &buf));
     try std.testing.expectEqual(@as(u32, 11), frame_protocol); // kind 16 (cfg) after kind 15 (snap_sync), the Rocinante-only Settings; 11: fill_pair carries the third pass's rows
+    var older = mine;
     older.protocol = 5; // a follower whose image lacks fill_pair
     try std.testing.expectEqualStrings("rank 2 decodes frame protocol 5 and rank 0 sends 11: run every rank from the same image", older.differ(lead, 2, &buf));
 }
@@ -2167,6 +2419,8 @@ test "adoptSettings keeps every device buffer of the second pass's Two as its ow
         }
     }
     try std.testing.expect(seen >= 6);
+}
+
 test "the exchange switches that remain: a named bit each in Settings.exch, asked as \"1\" only; the retired bits are reserved and a rank that sets one is named as one this build has no name for" {
     const kept = [_]struct { name: []const u8, bit: u32, var_ptr: *bool }{
         .{ .name = "TF_DS_ROCI_P2_FIRST", .bit = exch_roci_p2_first, .var_ptr = &roci_p2_first_asked },

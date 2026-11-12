@@ -1,6 +1,8 @@
 //! The prompt cache's tests: a fake family whose state is a running sum, so a resumed pass equals a fresh one exactly when it should.
 const std = @import("std");
 const pc = @import("prompt_cache.zig");
+const imprint = @import("prompt_imprint.zig");
+const rmTree = @import("prompt_imprint_test.zig").rmTree;
 const Snapshots = pc.Snapshots;
 const Saved = pc.Saved;
 const Store = pc.Store;
@@ -8,8 +10,12 @@ const Plan = pc.Plan;
 const Images = pc.Images;
 const Allocator = std.mem.Allocator;
 
-const Peer = @import("prompt_cache_fake.zig").Peer;
-pub const Fake = @import("prompt_cache_fake.zig").Fake;
+/// Rank 1's bytes: it applies a request's drops before that request's keeps; drops made during a pass wait for the next request.
+const Peer = struct {
+    held: u64 = 0,
+    pending: u64 = 0,
+    max: u64 = 0,
+    in_pass: bool = false,
 
     fn request(p: *Peer) void {
         p.held -= p.pending;
@@ -27,6 +33,117 @@ const Fake = struct {
     live: usize = 0,
     spare_bytes: u64 = 0,
     peer: ?*Peer = null, // speed-up mode's rank 1: it keeps the same states and drops them only when a request names them
+    refuse_at: ?u32 = null, // the family's own rule (`usable`): a state at this position does not restore
+
+    const State = struct { at: u32, sum: u64 };
+
+    fn snapshots(f: *Fake) Snapshots {
+        return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn } };
+    }
+    /// With the family's own usable rule: a state at `refuse_at` does not restore.
+    fn checked(f: *Fake) Snapshots {
+        return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn, .usable = usableFn } };
+    }
+    fn usableFn(ptr: *anyopaque, saved: Saved, _: u32) bool {
+        const st: *State = @ptrCast(@alignCast(saved));
+        return of(ptr).refuse_at != st.at;
+    }
+    /// With learned states on disk: a state's position and sum in one file.
+    fn learned(f: *Fake) Snapshots {
+        return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn, .write = writeFn, .read = readFn, .forget = forgetFn } };
+    }
+    fn forgetFn(_: *anyopaque, dir: [:0]const u8, key: u64) void {
+        var path: [512]u8 = undefined;
+        _ = std.c.unlink(file(&path, dir, key) catch return);
+    }
+    fn file(buf: []u8, dir: []const u8, key: u64) ![:0]const u8 {
+        return std.fmt.bufPrintSentinel(buf, "{s}/{x:0>16}.bin", .{ dir, key }, 0);
+    }
+    fn writeFn(_: *anyopaque, saved: Saved, dir: [:0]const u8, key: u64) anyerror!void {
+        var path: [512]u8 = undefined;
+        const fd = std.c.open(try file(&path, dir, key), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        if (fd < 0) return error.WriteFailed;
+        defer _ = std.c.close(fd);
+        try imprint.writeAll(fd, std.mem.asBytes(@as(*State, @ptrCast(@alignCast(saved)))));
+    }
+    fn readFn(ptr: *anyopaque, dir: [:0]const u8, key: u64, at: u32) anyerror!Saved {
+        const f = of(ptr);
+        var path: [512]u8 = undefined;
+        const fd = std.c.open(try file(&path, dir, key), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (fd < 0) return error.ReadFailed;
+        defer _ = std.c.close(fd);
+        const st = try f.gpa.create(State);
+        errdefer f.gpa.destroy(st);
+        if (!imprint.readAt(fd, std.mem.asBytes(st), 0) or st.at != at) return error.ReadFailed;
+        f.live += 1;
+        return st;
+    }
+    /// A pool-like family: a kept state holds 10 bytes under `bytes`, and a dropped one's storage stays spare.
+    fn pooled(f: *Fake) Snapshots {
+        return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = savePooledFn, .restore = restoreFn, .drop = dropSpareFn, .charged = chargedFn, .spare = spareFn, .trim = trimFn, .reuses = reusesFn } };
+    }
+    fn reusesFn(ptr: *anyopaque, at: u32) bool {
+        return of(ptr).spare_bytes >= 90 + at;
+    }
+    fn savePooledFn(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!Saved {
+        const st = try saveFn(ptr, owner, at);
+        const f = of(ptr);
+        if (f.spare_bytes >= 90 + at) f.spare_bytes -= 90 + at; // the spare storage took it
+        return st;
+    }
+    fn chargedFn(_: *anyopaque, saved: Saved) u64 {
+        const st: *State = @ptrCast(@alignCast(saved));
+        return 90 + st.at;
+    }
+    fn dropSpareFn(ptr: *anyopaque, saved: Saved) void {
+        const st: *State = @ptrCast(@alignCast(saved));
+        of(ptr).spare_bytes += 90 + st.at;
+        dropFn(ptr, saved);
+    }
+    fn spareFn(ptr: *anyopaque) u64 {
+        return of(ptr).spare_bytes;
+    }
+    fn trimFn(ptr: *anyopaque, room_: u64) void {
+        const f = of(ptr);
+        f.spare_bytes = @min(f.spare_bytes, room_);
+    }
+    fn of(ptr: *anyopaque) *Fake {
+        return @ptrCast(@alignCast(ptr));
+    }
+    fn bytesFn(_: *anyopaque, at: u32) u64 {
+        return 100 + at;
+    }
+    fn saveFn(ptr: *anyopaque, _: ?*anyopaque, at: u32) anyerror!Saved {
+        const f = of(ptr);
+        if (f.fail_save) return error.CopyFailed;
+        if (at != f.at) return error.NotAtMark;
+        const st = try f.gpa.create(State);
+        st.* = .{ .at = f.at, .sum = f.sum };
+        f.live += 1;
+        if (f.peer) |p| {
+            p.held += 100 + at;
+            p.max = @max(p.max, p.held);
+        }
+        return st;
+    }
+    fn restoreFn(ptr: *anyopaque, _: ?*anyopaque, saved: Saved) anyerror!void {
+        const f = of(ptr);
+        if (f.fail_restore) return error.CopyFailed;
+        const st: *State = @ptrCast(@alignCast(saved));
+        f.at, f.sum = .{ st.at, st.sum };
+    }
+    fn dropFn(ptr: *anyopaque, saved: Saved) void {
+        const f = of(ptr);
+        const st: *State = @ptrCast(@alignCast(saved));
+        if (f.peer) |p| { // dropped before the pass: named in this request; during it: in the next one
+            if (p.in_pass) p.pending += 100 + st.at else p.held -= 100 + st.at;
+        }
+        f.gpa.destroy(st);
+        f.live -= 1;
+    }
+
+    /// A prompt pass from `plan.from`, keeping at each mark; returns the sum a fresh pass would give.
+    fn pass(f: *Fake, s: *Store, prompt: []const u32, plan: Plan) u64 {
         return f.passKeyed(s, prompt, plan.from, plan.marks, .none);
     }
 
@@ -85,17 +202,17 @@ test "a growing conversation resumes each turn where the last one's history ende
     var s = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .min_prompt = 0 }, 1 << 20);
     defer s.deinit();
     const t1 = [_]u32{ 1, 2, 3, 4, 5, 9, 9 }; // history 5, then a two-token generation prompt
-    var p = try s.begin(a, &t1, 5, &.{}, &.{}, null, &.{});
+    var p = try s.begin(a, &t1, 5, &.{}, &.{}, null);
     try std.testing.expectEqual(@as(u32, 0), p.from);
     try std.testing.expectEqualSlices(u32, &.{5}, p.marks);
     try std.testing.expectEqual(fresh(&t1), f.pass(&s, &t1, p));
     const t2 = [_]u32{ 1, 2, 3, 4, 5, 9, 7, 7, 6, 6, 9, 9 }; // the reply and a tool result, history 10
-    p = try s.begin(a, &t2, 10, &.{}, &.{}, null, &.{});
+    p = try s.begin(a, &t2, 10, &.{}, &.{}, null);
     try std.testing.expectEqual(@as(u32, 5), p.from);
     try std.testing.expectEqualSlices(u32, &.{10}, p.marks);
     try std.testing.expectEqual(fresh(&t2), f.pass(&s, &t2, p));
     const edited = [_]u32{ 1, 2, 3, 8, 5, 9, 7, 7, 6, 6, 9, 9 }; // an earlier turn edited: nothing resumes past it
-    p = try s.begin(a, &edited, 10, &.{}, &.{}, null, &.{});
+    p = try s.begin(a, &edited, 10, &.{}, &.{}, null);
     try std.testing.expectEqual(@as(u32, 0), p.from);
     try std.testing.expectEqual(fresh(&edited), f.pass(&s, &edited, p));
     try std.testing.expectEqual(@as(u64, 1), s.counts.hits);
@@ -111,19 +228,19 @@ test "an entry keys its lookahead tokens: a prompt that differs right after the 
     var s = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .min_prompt = 0 }, 1 << 20);
     defer s.deinit();
     const t1 = [_]u32{ 1, 2, 3, 4, 5, 9 };
-    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null, &.{})); // keeps [1 2 3 4] + 5
-    try std.testing.expect(s.find(&.{ 1, 2, 3, 4, 6, 9 }, &.{}, &.{}) == null);
-    try std.testing.expectEqual(@as(u32, 4), s.find(&.{ 1, 2, 3, 4, 5, 6 }, &.{}, &.{}).?.at);
-    try std.testing.expect(s.find(&.{ 1, 2, 3, 4 }, &.{}, &.{}) == null); // the lookahead token must be in the prompt
+    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null)); // keeps [1 2 3 4] + 5
+    try std.testing.expect(s.find(&.{ 1, 2, 3, 4, 6, 9 }, &.{}) == null);
+    try std.testing.expectEqual(@as(u32, 4), s.find(&.{ 1, 2, 3, 4, 5, 6 }, &.{}).?.at);
+    try std.testing.expect(s.find(&.{ 1, 2, 3, 4 }, &.{}) == null); // the lookahead token must be in the prompt
 }
 
-test "planned families resume and keep only at the request's chunk starts" {
+test "a state within the window of a prompt's end is passed over for an earlier one, and stays for the conversation that kept it" {
     const gpa = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
     var f: Fake = .{ .gpa = gpa };
-    var s = Store.init(gpa, f.snapshots(), .{ .planned = true, .min_prompt = 0 }, 1 << 20);
+    var s = Store.init(gpa, f.snapshots(), .{ .window = 3, .min_prompt = 0 }, 1 << 20);
     defer s.deinit();
     const long = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
     _ = f.pass(&s, &long, .{ .marks = &.{ 4, 8 } });
@@ -136,64 +253,93 @@ test "planned families resume and keep only at the request's chunk starts" {
     try std.testing.expectEqual(@as(u32, 8), p.from);
 }
 
-test "a planned family's own grid gives the starts when a request names none, and a resumed pass equals a fresh one" {
-    const gpa = std.testing.allocator;
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var f: Fake = .{ .gpa = gpa };
-    var s = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .planned = true, .grid = 4, .min_prompt = 0 }, 1 << 20);
-    defer s.deinit();
-    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-    const p1 = try s.begin(a, &t1, 7, &.{}, &.{}, null, &.{});
-    try std.testing.expectEqualSlices(u32, &.{4}, p1.marks); // history 7 floored to the grid's 4
-    _ = f.pass(&s, &t1, p1);
-    const t2 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 14 };
-    try std.testing.expect(s.find(&t2, &.{6}, &.{}) == null); // a request's own starts win over the grid
-    const p2 = try s.begin(a, &t2, 9, &.{}, &.{}, null, &.{});
-    try std.testing.expectEqual(@as(u32, 4), p2.from);
-    try std.testing.expectEqualSlices(u32, &.{8}, p2.marks);
-    try std.testing.expectEqual(fresh(&t2), f.pass(&s, &t2, p2));
+test "the native eligibility rule: on the grid, at most len - window from the end, its lookahead inside the prompt" {
+    try std.testing.expect(!pc.Rules.eligible(.{ .grid = 8, .window = 4 }, 47, 64));
+    try std.testing.expect(pc.Rules.eligible(.{ .grid = 8, .window = 4 }, 48, 52));
+    try std.testing.expect(!pc.Rules.eligible(.{ .grid = 8, .window = 4 }, 48, 51));
+    try std.testing.expectEqual(@as(?u32, 48), pc.Rules.maxAt(.{ .grid = 8, .window = 4 }, 52));
+    try std.testing.expectEqual(@as(?u32, null), pc.Rules.maxAt(.{ .grid = 8, .window = 4 }, 9));
+    try std.testing.expectEqual(@as(?u32, 9), pc.Rules.maxAt(.{}, 10));
+    try std.testing.expectEqual(@as(u32, 16), pc.Rules.floorGrid(.{ .grid = 8 }, 21));
+    try std.testing.expectEqual(@as(u32, 21), pc.Rules.floorGrid(.{}, 21));
 }
 
-/// Prompt calls of a pass from `from`: `step` rows on from each cut, sooner at any of `cuts` (as qwen27_slots.prefill).
-fn calls(len: u32, from: u32, step: u32, cuts: []const []const u32) usize {
-    var n: usize = 0;
-    var at = from;
-    while (at < len) : (n += 1) {
-        var end = @min(len, at + step);
-        for (cuts) |list| for (list) |c| if (c > at and c < end) {
-            end = c;
-        };
-        at = end;
+test "with no grid and no family rule, find returns exactly the state the tail rule found (2,000 seeded cases)" {
+    const gpa = std.testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0x9011);
+    const r = prng.random();
+    var case: usize = 0;
+    while (case < 2000) : (case += 1) {
+        const window = r.uintAtMost(u32, 64);
+        const lookahead = r.uintAtMost(u32, 1);
+        var f: Fake = .{ .gpa = gpa };
+        var s = Store.init(gpa, f.snapshots(), .{ .window = window, .lookahead = lookahead, .min_prompt = 0 }, 1 << 24);
+        defer s.deinit();
+        var base: [3][200]u32 = undefined;
+        var lens: [3]usize = undefined;
+        for (&base, &lens, 0..) |*b, *len, c| { // three conversations: the second and third share a random prefix of the first
+            len.* = 2 + r.uintLessThan(usize, 199);
+            const shared = if (c == 0) 0 else r.uintAtMost(usize, @min(len.*, lens[0]));
+            for (b[0..len.*], 0..) |*t, i| t.* = if (i < shared) base[0][i] else r.uintAtMost(u32, 3);
+            var marks: [200]u32 = undefined;
+            var m: usize = 0;
+            var at: u32 = 1;
+            while (at <= len.*) : (at += 1) {
+                if (r.uintLessThan(u32, 8) == 0) {
+                    marks[m] = at;
+                    m += 1;
+                }
+            }
+            _ = f.pass(&s, b[0..len.*], .{ .marks = marks[0..m] });
+        }
+        var query: [270]u32 = undefined; // a random prefix of one conversation, then random tokens
+        const from = r.uintLessThan(usize, 3);
+        const k = r.uintAtMost(usize, lens[from]);
+        @memcpy(query[0..k], base[from][0..k]);
+        const extra = r.uintAtMost(usize, 70);
+        for (query[k .. k + extra]) |*t| t.* = r.uintAtMost(u32, 3);
+        const prompt = query[0 .. k + extra];
+        if (prompt.len == 0) continue;
+        var want: ?*pc.Entry = null; // find's predicate, written out
+        for (s.entries.items) |e| {
+            if (e.tokens.len > prompt.len or e.at >= prompt.len or @as(usize, e.at) + window > prompt.len or e.at == 0) continue;
+            if (want != null and e.at <= want.?.at) continue;
+            if (!std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens)) continue;
+            want = e;
+        }
+        try std.testing.expectEqual(want, s.find(prompt, &.{}));
     }
-    return n;
 }
 
-test "a short prompt: a planned family keeps its marks, an unplanned one only its history's mark, at a chunk end its pass cuts anyway" {
+test "a state the family's own rule refuses is passed over for a shorter one; without the rule it is found" {
+    const gpa = std.testing.allocator;
+    var f: Fake = .{ .gpa = gpa };
+    const long = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    var with = Store.init(gpa, f.checked(), .{ .min_prompt = 0 }, 1 << 20);
+    defer with.deinit();
+    _ = f.pass(&with, &long, .{ .marks = &.{ 4, 8 } });
+    var without = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 1 << 20);
+    defer without.deinit();
+    _ = f.pass(&without, &long, .{ .marks = &.{ 4, 8 } });
+    f.refuse_at = 8;
+    try std.testing.expectEqual(@as(u32, 4), with.find(&long, &.{}).?.at);
+    try std.testing.expectEqual(@as(u32, 8), without.find(&long, &.{}).?.at);
+}
+
+test "planned families resume and keep only at the request's chunk starts" {
     const gpa = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
     var f: Fake = .{ .gpa = gpa };
-    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
-    var planned = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .planned = true, .grid = 4 }, 1 << 20);
-    defer planned.deinit();
-    try std.testing.expectEqualSlices(u32, &.{4}, (try planned.begin(a, &t1, 7, &.{}, &.{}, null, &.{})).marks); // 12 tokens, under the default min_prompt
-    var serial = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .chunk = 3 }, 1 << 20);
-    defer serial.deinit();
-    const p = try serial.begin(a, &t1, 7, &.{2}, &.{}, null, &.{}); // the shared block at 2 waits for min_prompt
-    try std.testing.expectEqualSlices(u32, &.{6}, p.marks); // history 7 floored to the pass's cut at 6 (3, 6, 9, 12)
-    try std.testing.expectEqual(calls(12, 0, 3, &.{}), calls(12, 0, 3, &.{p.marks})); // no extra prompt call
-    try std.testing.expect(calls(12, 0, 3, &.{&.{7}}) > calls(12, 0, 3, &.{})); // the history's own position would add one
-    try std.testing.expectEqual(fresh(&t1), f.pass(&serial, &t1, p));
-    try std.testing.expectEqual(@as(u32, 6), serial.find(&.{ 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0 }, &.{}, &.{}).?.at); // the same history, a new tail
-    var taps = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .chunk = 1 }, 1 << 20); // a pass that keeps at any row (Flash Next's mark taps)
-    defer taps.deinit();
-    try std.testing.expectEqualSlices(u32, &.{7}, (try taps.begin(a, &t1, 7, &.{2}, &.{}, null, &.{})).marks);
-    var none = Store.init(gpa, f.snapshots(), .{ .lookahead = 1 }, 1 << 20); // naming no chunk rows: nothing, as before
-    defer none.deinit();
-    try std.testing.expectEqual(@as(usize, 0), (try none.begin(a, &t1, 7, &.{}, &.{}, null, &.{})).marks.len);
+    var s = Store.init(gpa, f.snapshots(), .{ .planned = true, .min_prompt = 0 }, 1 << 20);
+    defer s.deinit();
+    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const p = try s.begin(a, &t1, 7, &.{}, &.{ 4, 6 }, null);
+    try std.testing.expectEqualSlices(u32, &.{6}, p.marks); // history 7 floored to the start at 6
+    _ = f.pass(&s, &t1, p);
+    try std.testing.expect(s.find(&.{ 1, 2, 3, 4, 5, 6, 7, 9 }, &.{4}) == null); // 6 is not one of this prompt's starts
+    try std.testing.expectEqual(@as(u32, 6), s.find(&.{ 1, 2, 3, 4, 5, 6, 7, 9 }, &.{ 4, 6 }).?.at);
 }
 
 test "eviction frees a conversation's superseded state first, then the oldest; a state past the budget is refused" {
@@ -205,19 +351,19 @@ test "eviction frees a conversation's superseded state first, then the oldest; a
     var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 330); // fake bytes: 100 + at
     defer s.deinit();
     const other = [_]u32{ 5, 5, 5, 5 };
-    _ = f.pass(&s, &other, try s.begin(a, &other, 3, &.{}, &.{}, null, &.{})); // 103 bytes
+    _ = f.pass(&s, &other, try s.begin(a, &other, 3, &.{}, &.{}, null)); // 103 bytes
     const t1 = [_]u32{ 1, 2, 3, 4, 5, 6 };
-    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null, &.{})); // 104: 207 held
+    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null)); // 104: 207 held
     const t2 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
-    _ = f.pass(&s, &t2, try s.begin(a, &t2, 6, &.{}, &.{}, null, &.{})); // 106 more: 313
+    _ = f.pass(&s, &t2, try s.begin(a, &t2, 6, &.{}, &.{}, null)); // 106 more: 313
     try std.testing.expectEqual(@as(usize, 3), s.entries.items.len);
     const t3 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-    _ = f.pass(&s, &t3, try s.begin(a, &t3, 8, &.{}, &.{}, null, &.{})); // 108: t1's state (extended by later turns) goes first
+    _ = f.pass(&s, &t3, try s.begin(a, &t3, 8, &.{}, &.{}, null)); // 108: t1's state (extended by later turns) goes first
     try std.testing.expectEqual(@as(usize, 3), s.entries.items.len);
-    try std.testing.expect(s.find(&.{ 5, 5, 5, 5 }, &.{}, &.{}) != null);
-    try std.testing.expectEqual(@as(u32, 8), s.find(&t3, &.{}, &.{}).?.at);
+    try std.testing.expect(s.find(&.{ 5, 5, 5, 5 }, &.{}) != null);
+    try std.testing.expectEqual(@as(u32, 8), s.find(&t3, &.{}).?.at);
     const big: [300]u32 = @splat(7);
-    _ = f.pass(&s, &big, try s.begin(a, &big, 299, &.{}, &.{}, null, &.{})); // 399 > 330: refused, nothing evicted
+    _ = f.pass(&s, &big, try s.begin(a, &big, 299, &.{}, &.{}, null)); // 399 > 330: refused, nothing evicted
     try std.testing.expectEqual(@as(u64, 1), s.counts.refused);
     try std.testing.expectEqual(@as(usize, 3), s.entries.items.len);
     try std.testing.expect(s.held <= s.budget);
@@ -233,15 +379,15 @@ test "a failed copy keeps nothing and a failed restore prefills from the start" 
     var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 1 << 20);
     defer s.deinit();
     const t1 = [_]u32{ 1, 2, 3, 4, 5, 6 };
-    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null, &.{}));
+    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null));
     try std.testing.expectEqual(@as(usize, 0), s.entries.items.len);
     try std.testing.expectEqual(@as(u64, 1), s.counts.failed);
     f.fail_save = false;
-    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null, &.{}));
+    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null));
     try std.testing.expectEqual(@as(usize, 1), s.entries.items.len);
     f.fail_restore = true;
     const t2 = [_]u32{ 1, 2, 3, 4, 5, 6, 7 };
-    const p = try s.begin(a, &t2, 6, &.{}, &.{}, null, &.{});
+    const p = try s.begin(a, &t2, 6, &.{}, &.{}, null);
     try std.testing.expectEqual(@as(u32, 0), p.from);
     try std.testing.expectEqual(@as(usize, 0), s.entries.items.len); // the entry that failed is gone
     try std.testing.expectEqual(fresh(&t2), f.pass(&s, &t2, p));
@@ -261,74 +407,27 @@ test "marks: the stable prefix with the last prompt and shared blocks, past the 
     try std.testing.expectEqualSlices(u32, &.{10}, try s.marks(a, &prompt, 7, 10, &.{3}, &.{}, &prev));
     try std.testing.expectEqualSlices(u32, &.{}, try s.marks(a, &prompt, 0, 0, &.{}, &.{}, &.{})); // a raw prompt keeps nothing
     try std.testing.expectEqualSlices(u32, &.{10}, try s.marks(a, &prompt, 0, 10, &.{9}, &.{}, &.{})); // a block next to the history
-    try std.testing.expectEqualSlices(u32, &.{10}, try s.marks(a, &prompt, 9, 10, &.{}, &.{}, &.{})); // resumed next to the history: kept
-    s.rules.warm = .on; // replies prefilled in the background: the resumed state serves the next turn
-    try std.testing.expectEqualSlices(u32, &.{}, try s.marks(a, &prompt, 9, 10, &.{}, &.{}, &.{}));
-    try std.testing.expectEqualSlices(u32, &.{1}, try s.marks(a, &prompt, 0, 1, &.{}, &.{}, &.{})); // from the start the history's mark stays
-    // a warm pass (history the whole prompt) keeps where its state can be keyed, however near it resumed
-    try std.testing.expectEqualSlices(u32, &.{11}, try s.marks(a, &prompt, 10, 12, &.{}, &.{}, &.{}));
-    s.rules.warm = .waits; // those passes wait for a quiet engine and may never run: the history's mark stays
-    try std.testing.expectEqualSlices(u32, &.{10}, try s.marks(a, &prompt, 9, 10, &.{}, &.{}, &.{}));
-    try std.testing.expectEqualSlices(u32, &.{11}, try s.marks(a, &prompt, 10, 12, &.{}, &.{}, &.{}));
 }
 
-test "under min_prompt the history's mark floors to its pass's last cut from the resume point, so it adds no prompt call, and the next turn resumes there exactly" {
+test "prompts under min_prompt keep nothing (their extra prompt call would cost more than reuse saves), longer ones keep as before" {
     const gpa = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
     var f: Fake = .{ .gpa = gpa };
-    var s = Store.init(gpa, f.snapshots(), .{ .warm = .on, .min_prompt = 64, .min_gap = 8, .chunk = 4 }, 1 << 20); // the 27B's rules, scaled down
+    var s = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .min_prompt = 8 }, 1 << 20);
     defer s.deinit();
-    var t2: [34]u32 = undefined;
-    for (&t2, 1..) |*t, i| t.* = @intCast(i);
-    const t1 = t2[0..23]; // the first turn: history 18, the request's starts at 4 and 11 (a system block's cut)
-    const starts1 = [_]u32{ 4, 11 };
-    const p = try s.begin(a, t1, 18, &.{}, &starts1, null, &.{});
-    try std.testing.expectEqualSlices(u32, &.{15}, p.marks); // its cuts 4, 8, 11, 15, 19, 23: a step on from 11, not 16 on a grid from 0
-    try std.testing.expectEqual(calls(23, 0, 4, &.{&starts1}), calls(23, 0, 4, &.{ &starts1, p.marks }));
-    try std.testing.expect(calls(23, 0, 4, &.{ &starts1, &.{16} }) > calls(23, 0, 4, &.{&starts1}));
-    try std.testing.expectEqual(fresh(t1), f.pass(&s, t1, p));
-    const starts2 = [_]u32{ 4, 11, 25 }; // the next turn: history 30, the reply decoded in rows 19 to 27
-    const spans2 = [_][2]u32{.{ 19, 27 }};
-    const q = try s.begin(a, &t2, 30, &.{}, &starts2, null, &spans2);
-    try std.testing.expectEqual(@as(u32, 15), q.from);
-    try std.testing.expectEqualSlices(u32, &.{27}, q.marks); // from 15 its cuts are 19, 23, 25, 27, 31, 34: the span's end, not 29
-    try std.testing.expectEqual(calls(34, 15, 4, &.{ &starts2, &.{ 19, 27 } }), calls(34, 15, 4, &.{ &starts2, &.{ 19, 27 }, q.marks }));
-    try std.testing.expectEqual(fresh(&t2), f.pass(&s, &t2, q));
-    try std.testing.expectEqualSlices(u32, &.{29}, try s.marks(a, &t2, 17, 30, &.{}, &starts1, &.{})); // resumed at a reply's end: 21, 25, 29, not 27 from 11
-    try std.testing.expectEqual(calls(34, 17, 4, &.{&starts1}), calls(34, 17, 4, &.{ &starts1, &.{29} }));
-    try std.testing.expectEqualSlices(u32, &.{}, try s.marks(a, &t2, 0, 0, &.{}, &.{}, &.{})); // a raw prompt keeps nothing
-    try std.testing.expectEqualSlices(u32, &.{}, try s.marks(a, t2[0..30], 15, 30, &.{}, &starts2, &.{})); // a warm pass's end is its last cut: the host keeps it
-    var long: [70]u32 = undefined; // past min_prompt: the history exactly and the shared block, as before
-    for (&long, 0..) |*t, i| t.* = @intCast(200 + i);
-    try std.testing.expectEqualSlices(u32, &.{ 40, 66 }, (try s.begin(a, &long, 66, &.{40}, &.{}, null, &.{})).marks);
-}
-
-test "a short prompt's mark inside its shared block is the block's state: the reply's own keep evicts another state, and the next turn resumes it" {
-    const gpa = std.testing.allocator;
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var f: Fake = .{ .gpa = gpa };
-    var s = Store.init(gpa, f.snapshots(), .{ .warm = .on, .min_prompt = 64, .chunk = 4 }, 350); // fake bytes 100 + at: three states pass it
-    defer s.deinit();
-    var other: [13]u32 = undefined; // an older conversation's state, the least recently used
-    for (&other, 0..) |*t, i| t.* = @intCast(90 + i);
-    _ = f.pass(&s, &other, try s.begin(a, &other, 12, &.{}, &.{}, null, &.{}));
-    var ctx: [30]u32 = undefined; // a 20-token system block, the user's turn to 22, the generation prompt to 25, then the reply
-    for (&ctx, 1..) |*t, i| t.* = @intCast(i);
-    const starts = [_]u32{ 4, 8, 12, 16, 19 }; // the request's starts, the last one before the conversation's own text
-    const p = try s.begin(a, ctx[0..25], 22, &.{20}, &starts, null, &.{});
-    try std.testing.expectEqualSlices(u32, &.{19}, p.marks);
-    _ = f.pass(&s, ctx[0..25], p);
-    _ = f.pass(&s, &ctx, .{ .from = 25, .marks = &.{29} }); // the reply's end kept as the 27B keeps it: room is made first
-    try std.testing.expect(s.find(&other, &.{}, &.{}) == null);
-    var next = ctx; // the next turn drops the reply's reasoning: it shares only the history
-    for (next[22..]) |*t| t.* = 77;
-    const q = try s.begin(a, &next, 28, &.{20}, &starts, null, &.{});
-    try std.testing.expectEqual(@as(u32, 19), q.from);
-    try std.testing.expectEqual(fresh(&next), f.pass(&s, &next, q));
+    const short = [_]u32{ 1, 2, 3, 4, 5, 9, 9 }; // 7 tokens, history 5
+    const p = try s.begin(a, &short, 5, &.{}, &.{}, null);
+    try std.testing.expectEqualSlices(u32, &.{}, p.marks);
+    try std.testing.expectEqual(fresh(&short), f.pass(&s, &short, p));
+    try std.testing.expectEqual(@as(usize, 0), s.entries.items.len);
+    const long = [_]u32{ 1, 2, 3, 4, 5, 9, 7, 7, 9, 9 }; // 10 tokens: the next turn keeps its history, resuming nothing
+    const q = try s.begin(a, &long, 8, &.{}, &.{}, null);
+    try std.testing.expectEqual(@as(u32, 0), q.from);
+    try std.testing.expectEqualSlices(u32, &.{8}, q.marks);
+    try std.testing.expectEqual(fresh(&long), f.pass(&s, &long, q));
+    try std.testing.expectEqual(@as(u32, 8), s.find(&.{ 1, 2, 3, 4, 5, 9, 7, 7, 9, 9, 4 }, &.{}).?.at);
 }
 
 test "kept states charge their real storage, a save takes spare storage first, and spare stays inside the budget" {
@@ -340,18 +439,18 @@ test "kept states charge their real storage, a save takes spare storage first, a
     var s = Store.init(gpa, f.pooled(), .{ .min_prompt = 0 }, 330); // new storage 100 + at, a kept state 90 + at
     defer s.deinit();
     const t1 = [_]u32{ 1, 2, 3, 4, 5, 6 };
-    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null, &.{}));
+    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null));
     try std.testing.expectEqual(@as(u64, 94), s.held);
     f.spare_bytes = 120; // a buffer readied while idle
     try std.testing.expectEqual(@as(u64, 116), s.room());
     const other = [_]u32{ 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5 };
-    _ = f.pass(&s, &other, try s.begin(a, &other, 10, &.{}, &.{}, null, &.{})); // takes the readied buffer: nothing evicted
+    _ = f.pass(&s, &other, try s.begin(a, &other, 10, &.{}, &.{}, null)); // takes the readied buffer: nothing evicted
     try std.testing.expectEqual(@as(u64, 194), s.held);
     try std.testing.expectEqual(@as(u64, 20), s.spare());
     try std.testing.expectEqual(@as(u64, 0), s.counts.evicted);
     var t2: [102]u32 = undefined;
     for (&t2, 1..) |*t, i| t.* = @intCast(i);
-    _ = f.pass(&s, &t2, try s.begin(a, &t2, 101, &.{}, &.{}, null, &.{})); // resumes t1's; 201 new: the spare shrinks, then `other` goes
+    _ = f.pass(&s, &t2, try s.begin(a, &t2, 101, &.{}, &.{}, null)); // resumes t1's; 201 new: the spare shrinks, then `other` goes
     try std.testing.expectEqual(@as(u64, 1), s.counts.evicted);
     try std.testing.expectEqual(@as(u64, 94 + 191), s.held);
     try std.testing.expect(s.held + s.spare() <= s.budget);
@@ -369,22 +468,22 @@ test "a shared system cut outlives its own conversation's turns: a second conver
     var c1: [30]u32 = @splat(9);
     var c2: [30]u32 = @splat(8);
     for ([_][]u32{ &c1, &c2 }) |c| { // cold prompts first
-        _ = f.pass(&s, c, try s.begin(a, c, 29, &.{}, &.{}, null, &.{}));
+        _ = f.pass(&s, c, try s.begin(a, c, 29, &.{}, &.{}, null));
         try std.testing.expect(s.held <= s.budget);
     }
     var conv: [45]u32 = undefined;
     for (&conv, 1..) |*t, i| t.* = @intCast(i); // a 20-token system block, then the turns
     for ([_]u32{ 25, 35, 45 }, [_]u32{ 24, 34, 44 }) |len, history| {
-        _ = f.pass(&s, conv[0..len], try s.begin(a, conv[0..len], history, &.{20}, &.{}, null, &.{}));
+        _ = f.pass(&s, conv[0..len], try s.begin(a, conv[0..len], history, &.{20}, &.{}, null));
         try std.testing.expect(s.held <= s.budget);
     }
     var c3: [60]u32 = @splat(7);
-    _ = f.pass(&s, &c3, try s.begin(a, &c3, 59, &.{}, &.{}, null, &.{}));
+    _ = f.pass(&s, &c3, try s.begin(a, &c3, 59, &.{}, &.{}, null));
     try std.testing.expect(s.held <= s.budget);
     var other: [25]u32 = undefined;
     @memcpy(other[0..20], conv[0..20]);
     for (other[20..], 0..) |*t, i| t.* = @intCast(90 + i);
-    const plan = try s.begin(a, &other, 24, &.{20}, &.{}, null, &.{});
+    const plan = try s.begin(a, &other, 24, &.{20}, &.{}, null);
     try std.testing.expectEqual(@as(u32, 20), plan.from); // the cut survived the first conversation's turns
     try std.testing.expectEqual(fresh(&other), f.pass(&s, &other, plan));
     try std.testing.expect(s.held <= s.budget);
@@ -404,7 +503,7 @@ test "a pass makes room for every state it keeps before it starts, so a peer tol
     var len: u32 = 30;
     while (len <= 200) : (len += 17) { // a conversation's turns: each keeps its history and the stable prefix, two states a pass
         peer.request(); // the drops the last pass made reach the peer with this request
-        const plan = try s.begin(a, conv[0..len], len - 3, &.{20}, &.{}, null, &.{}); // its own evictions too, before the peer keeps anything
+        const plan = try s.begin(a, conv[0..len], len - 3, &.{20}, &.{}, null); // its own evictions too, before the peer keeps anything
         _ = f.pass(&s, conv[0..len], plan);
         try std.testing.expect(s.held <= s.budget);
     }
@@ -421,66 +520,87 @@ test "a state a peer cannot resume is forgotten: the next prompt misses instead 
     var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 1000);
     defer s.deinit();
     const t1 = [_]u32{ 1, 2, 3, 4, 5, 6 };
-    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null, &.{}));
+    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null));
     const t2 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
-    const plan = try s.begin(a, &t2, 6, &.{}, &.{}, null, &.{});
+    const plan = try s.begin(a, &t2, 6, &.{}, &.{}, null);
     try std.testing.expectEqual(@as(u32, 4), plan.from);
-    s.forget(&t2, plan.from, &.{}); // the peer's answer: it lacks that state
+    s.forget(&t2, plan.from); // the peer's answer: it lacks that state
     try std.testing.expectEqual(@as(u64, 1), s.counts.failed);
-    try std.testing.expectEqual(@as(?*pc.Entry, null), s.find(&t2, &.{}, &.{}));
+    try std.testing.expectEqual(@as(?*pc.Entry, null), s.find(&t2, &.{}));
     try std.testing.expectEqual(s.entries.items.len, f.live);
 }
 
-test "a kept state grows only into what the budget leaves, and evicts nothing to do it" {
+test "a learned harness state outlives its store: a fresh session on a new one resumes it from disk, equal to a fresh pass" {
     const gpa = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    var f: Fake = .{ .gpa = gpa };
-    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 330); // fake bytes: 100 + at
-    defer s.deinit();
-    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6 };
-    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null, &.{})); // 104
-    const t2 = [_]u32{ 9, 9, 9, 9, 9, 9 };
-    _ = f.pass(&s, &t2, try s.begin(a, &t2, 5, &.{}, &.{}, null, &.{})); // 105: 209 held, 121 left
-    const e1 = s.find(&t1, &.{}, &.{}).?;
-    try std.testing.expect(s.grow(e1.saved, 100)); // 309 held
-    try std.testing.expectEqual(@as(u64, 204), e1.bytes);
-    try std.testing.expectEqual(@as(u64, 309), s.held);
-    try std.testing.expect(!s.grow(e1.saved, 22)); // 331 would pass the budget: refused, and both states stay
-    try std.testing.expectEqual(@as(usize, 2), s.entries.items.len);
-    try std.testing.expect(s.grow(e1.saved, 21)); // exactly the budget
-    try std.testing.expectEqual(s.budget, s.held);
-    var stranger: u8 = 0;
-    try std.testing.expect(!s.grow(&stranger, 0)); // a state the store doesn't hold
+    var root_buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/tf-learn-test-{d}", .{std.c.getpid()});
+    const rules: pc.Rules = .{ .lookahead = 1, .min_prompt = 0, .min_gap = 1 };
+    const harness = [_]u32{ 7, 7, 7, 7, 7, 7 }; // shared by every session: a state at 5 reads it all (lookahead 1)
+    const key = imprint.Imprint.keyOf(&harness);
+    defer rmTree(root);
+    {
+        var im = try imprint.Imprint.open(gpa, root, 3, 1 << 30);
+        defer im.deinit();
+        {
+            var f: Fake = .{ .gpa = gpa };
+            var s = Store.init(gpa, f.learned(), rules, 1 << 20);
+            defer s.deinit();
+            s.imprint = &im;
+            const first = harness ++ [_]u32{ 1, 2, 9 };
+            try std.testing.expectEqual(fresh(&first), f.pass(&s, &first, try s.begin(a, &first, 8, &.{5}, &.{}, null)));
+            try std.testing.expect(im.has(key));
+        }
+        var again = try imprint.Imprint.open(gpa, root, 3, 1 << 30); // a new server reads the index back
+        defer again.deinit();
+        var f: Fake = .{ .gpa = gpa };
+        var s = Store.init(gpa, f.learned(), rules, 1 << 20);
+        defer s.deinit();
+        s.imprint = &again;
+        const second = harness ++ [_]u32{ 3, 4, 9 };
+        const p = try s.begin(a, &second, 8, &.{5}, &.{}, null);
+        try std.testing.expectEqual(@as(u32, 5), p.from);
+        try std.testing.expectEqual(fresh(&second), f.pass(&s, &second, p));
+    }
 }
 
-test "a dead state leaves lookup at once and storage at the next safe boundary" {
+test "past the learned-state cap the least recently used state is forgotten, and a file that no longer reads is too" {
     const gpa = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
+    var root_buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/tf-learn-cap-{d}", .{std.c.getpid()});
+    defer rmTree(root);
+    const rules: pc.Rules = .{ .lookahead = 1, .min_prompt = 0, .min_gap = 1 };
+    const one = [_]u32{ 7, 7, 7, 7, 7, 7 };
+    const two = [_]u32{ 8, 8, 8, 8, 8, 8 };
+    var im = try imprint.Imprint.open(gpa, root, 3, 150); // a state at 5 is 105 bytes: one fits
+    defer im.deinit();
     var f: Fake = .{ .gpa = gpa };
-    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 1000);
+    var s = Store.init(gpa, f.learned(), rules, 1 << 20);
     defer s.deinit();
-    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6 };
-    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null, &.{}));
-    const t2 = [_]u32{ 9, 9, 9, 9, 9, 9 };
-    _ = f.pass(&s, &t2, try s.begin(a, &t2, 5, &.{}, &.{}, null, &.{}));
-    const e1 = s.find(&t1, &.{}, &.{}).?;
-    const saved = e1.saved;
-    try std.testing.expectEqual(@as(usize, 2), s.entries.items.len);
-    s.expired(saved); // a backend callback never frees state or sends a peer command
-    try std.testing.expectEqual(@as(usize, 2), s.entries.items.len);
-    try std.testing.expectEqual(@as(?*pc.Entry, null), s.find(&t1, &.{}, &.{}));
-    try std.testing.expectEqual(@as(u64, 1), s.counts.evicted);
-    try std.testing.expectEqual(@as(usize, 2), f.live);
-    s.expired(saved); // repeated notification counts only once
-    s.collectExpired();
-    try std.testing.expectEqual(@as(usize, 1), f.live);
-    s.expired(saved); // an opaque saved value, never a read of the freed Entry
-    try std.testing.expectEqual(@as(usize, 1), s.entries.items.len);
-    try std.testing.expectEqual(@as(u64, 1), s.counts.evicted);
+    s.imprint = &im;
+    const p1 = one ++ [_]u32{ 1, 9 };
+    try std.testing.expectEqual(fresh(&p1), f.pass(&s, &p1, try s.begin(a, &p1, 7, &.{5}, &.{}, null)));
+    const p2 = two ++ [_]u32{ 1, 9 };
+    try std.testing.expectEqual(fresh(&p2), f.pass(&s, &p2, try s.begin(a, &p2, 7, &.{5}, &.{}, null)));
+    try std.testing.expect(im.has(imprint.Imprint.keyOf(&two)) and !im.has(imprint.Imprint.keyOf(&one)));
+    var path: [512]u8 = undefined;
+    try std.testing.expect(std.c.unlink(try Fake.file(&path, im.dir, imprint.Imprint.keyOf(&one))) != 0); // its file went too
+    _ = std.c.unlink(try Fake.file(&path, im.dir, imprint.Imprint.keyOf(&two))); // a file lost behind the store's back
+    var g: Fake = .{ .gpa = gpa };
+    var t = Store.init(gpa, g.learned(), rules, 1 << 20);
+    defer t.deinit();
+    t.imprint = &im;
+    const p3 = two ++ [_]u32{ 2, 9 };
+    const plan = try t.begin(a, &p3, 7, &.{5}, &.{}, null);
+    try std.testing.expectEqual(@as(u32, 0), plan.from); // the read failed: a fresh pass, and the state is forgotten
+    try std.testing.expect(!im.has(imprint.Imprint.keyOf(&two)));
+    try std.testing.expectEqual(fresh(&p3), g.pass(&t, &p3, plan));
+    try std.testing.expect(im.has(imprint.Imprint.keyOf(&two))); // learned again by that pass
 }
 
 test "a kept state keys the prompt's images: another picture at the same tokens resumes nothing" {
@@ -520,58 +640,92 @@ test "a kept state keys the prompt's images: another picture at the same tokens 
     try std.testing.expectEqual(@as(u32, 5), (try s.lookupKeyed(a, &prompt, 5, &.{}, &.{}, later.images())).entry.?.at);
     try std.testing.expectEqual(@as(u32, 5), (try s.lookupKeyed(a, &prompt, 5, &.{}, &.{}, other.images())).entry.?.at);
 }
+
+test "every tier counter has its /metrics help, and every help names a counter (v3's landing, probe and store counters too)" {
+    const T = pc.TierCounts;
+    inline for (@typeInfo(T).@"struct".field_names) |name| try std.testing.expect(@field(T.help, name).len > 0);
+    inline for (@typeInfo(@TypeOf(T.help)).@"struct".field_names) |name| try std.testing.expect(@hasField(T, name));
+    inline for (.{ "direct_refused", "recover_deferred", "orphans_removed", "builds_pruned", "missing_errors", "landings", "landings_skipped", "landings_failed", "landing_pieces", "landing_bytes", "probe_runs", "probe_failed" }) |name|
+        try std.testing.expect(@hasField(T, name));
+    inline for (@typeInfo(@TypeOf(T.help)).@"struct".field_names) |name| try std.testing.expect(std.mem.indexOf(u8, @field(T.help, name), "--spill") == null); // settings are environment names
 }
 
-test "a state that lost its rows: an earlier one resumes, and the lost one leaves the store" {
-    const gpa = std.testing.allocator;
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var f: Fake = .{ .gpa = gpa };
-    var s = Store.init(gpa, f.checked(), .{ .min_prompt = 0 }, 1 << 20);
-    defer s.deinit();
-    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6 };
-    _ = f.pass(&s, &t1, try s.begin(a, &t1, 2, &.{}, &.{}, null, &.{})); // keeps 2
-    const t2 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
-    _ = f.pass(&s, &t2, try s.begin(a, &t2, 5, &.{}, &.{}, null, &.{})); // keeps 5
-    try std.testing.expectEqual(@as(usize, 2), f.live);
-    f.dead_at = 5; // another stream wrote over its rows
-    const t3 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-    const p = try s.begin(a, &t3, 2, &.{}, &.{}, null, &.{});
-    try std.testing.expectEqual(@as(u32, 2), p.from);
-    try std.testing.expectEqual(fresh(&t3), f.pass(&s, &t3, p));
-    try std.testing.expectEqual(@as(u64, 1), s.counts.evicted);
-    try std.testing.expectEqual(@as(u64, 0), s.counts.failed);
-    try std.testing.expectEqual(@as(usize, 1), s.entries.items.len); // its restore's release reclaimed the lost one
-    try std.testing.expectEqual(@as(usize, 1), f.live);
-    try std.testing.expectEqual(@as(u32, 2), s.find(&t2, &.{}, &.{}).?.at);
+// -- the token arrays a kept state holds on the host, charged to the budget (charge_tokens) --------------------------
+
+fn ids(comptime n: usize, base: u32) [n]u32 {
+    var out: [n]u32 = undefined;
+    for (&out, 0..) |*x, i| x.* = base + @as(u32, @intCast(i));
+    return out;
 }
 
-test "cache_salt: a state kept under one salt resumes only for that salt, and none only for none" {
-    const salted = @import("cache_salt.zig").key;
+test "token arrays: a keep at 16 of a 40-token prompt holds its state and both arrays (340 bytes); off, its state (116)" {
     const gpa = std.testing.allocator;
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
+    for ([_]bool{ true, false }) |charge| {
+        var f: Fake = .{ .gpa = gpa };
+        var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 1 << 20);
+        defer s.deinit();
+        s.charge_tokens = charge;
+        const p = ids(40, 1);
+        _ = f.pass(&s, &p, .{ .marks = &.{16} });
+        try std.testing.expectEqual(@as(u64, if (charge) 116 + 16 * 4 + 40 * 4 else 116), s.held);
+        try std.testing.expectEqual(@as(u64, if (charge) 16 * 4 + 40 * 4 else 0), s.token_held);
+    }
+}
+
+test "token arrays: a second keep the arrays push past the budget evicts the first; off, both stay" {
+    const gpa = std.testing.allocator;
+    for ([_]bool{ true, false }) |charge| {
+        var f: Fake = .{ .gpa = gpa };
+        var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 500);
+        defer s.deinit();
+        s.charge_tokens = charge;
+        _ = f.pass(&s, &ids(40, 1), .{ .marks = &.{16} });
+        _ = f.pass(&s, &ids(40, 1000), .{ .marks = &.{16} });
+        try std.testing.expectEqual(@as(usize, if (charge) 1 else 2), s.entries.items.len);
+        try std.testing.expect(s.held <= s.budget);
+        if (charge) try std.testing.expectEqual(@as(u32, 1000), s.entries.items[0].tokens[0]); // the newer one stays
+    }
+}
+
+test "token arrays: a mark whose state and arrays pass the budget is refused and counted; off, it is kept" {
+    const gpa = std.testing.allocator;
+    for ([_]bool{ true, false }) |charge| {
+        var f: Fake = .{ .gpa = gpa };
+        var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 300);
+        defer s.deinit();
+        s.charge_tokens = charge;
+        _ = f.pass(&s, &ids(40, 1), .{ .marks = &.{16} });
+        try std.testing.expectEqual(@as(usize, if (charge) 0 else 1), s.entries.items.len);
+        try std.testing.expectEqual(@as(u64, if (charge) 1 else 0), s.counts.refused);
+    }
+}
+
+test "token arrays: a resume by a longer prompt charges its longer last prompt, evicting another state, never itself" {
+    const gpa = std.testing.allocator;
     var f: Fake = .{ .gpa = gpa };
-    var s = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .min_prompt = 0 }, 1 << 20);
+    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 1000);
     defer s.deinit();
-    const t1 = [_]u32{ 1, 2, 3, 4, 5, 9 };
-    const t2 = [_]u32{ 1, 2, 3, 4, 5, 6 };
-    // kept under salt "a" and with no salt
-    const a1 = try salted(a, "a", &t1);
-    _ = f.pass(&s, a1, try s.begin(a, a1, 4, &.{}, &.{}, null, &.{}));
-    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null, &.{}));
-    // the same salt: a hit; another salt: a miss; no salt: the unsalted state
-    try std.testing.expectEqual(@as(u32, 4), s.find(try salted(a, "a", &t2), &.{}, &.{}).?.at);
-    try std.testing.expect(s.find(try salted(a, "b", &t2), &.{}, &.{}) == null);
-    const plain = s.find(&t2, &.{}, &.{}).?;
-    try std.testing.expectEqualSlices(u32, t1[0..5], plain.tokens);
-    // a salted prompt never resumes the unsalted state, an unsalted prompt never the salted one
-    var only: Store = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .min_prompt = 0 }, 1 << 20);
-    defer only.deinit();
-    _ = f.pass(&only, &t1, try only.begin(a, &t1, 4, &.{}, &.{}, null, &.{}));
-    try std.testing.expect(only.find(try salted(a, "a", &t2), &.{}, &.{}) == null);
-    const plan = try only.begin(a, try salted(a, "a", &t2), 4, &.{}, &.{}, null, &.{});
-    try std.testing.expectEqual(@as(u32, 0), plan.from);
+    s.charge_tokens = true;
+    const first = ids(40, 1);
+    _ = f.pass(&s, &first, .{ .marks = &.{16} }); // 340
+    _ = f.pass(&s, &ids(40, 500), .{ .marks = &.{16} }); // 340 more: 680
+    var long: [120]u32 = undefined; // the first conversation goes on: 120 tokens resume its state at 16
+    @memcpy(long[0..40], &first);
+    for (long[40..], 40..) |*x, i| x.* = @intCast(9000 + i);
+    const before = s.held;
+    // the pass restored the state itself, then tells the store it resumed
+    const e = s.find(&long, &.{}) orelse return error.NotFound;
+    try std.testing.expectEqual(@as(u32, 16), e.at);
+    s.resumed(e, &long, true);
+    // a last prompt of 120 tokens: 320 bytes more; 1000 - 680 = 320 fits exactly, nothing evicted
+    try std.testing.expectEqual(before + 4 * (120 - 40), s.held);
+    try std.testing.expect(s.held <= s.budget);
+    // a still longer resume: the other state goes for it, never the resumed one
+    var longer: [180]u32 = undefined;
+    @memcpy(longer[0..120], &long);
+    for (longer[120..], 120..) |*x, i| x.* = @intCast(9000 + i);
+    s.resumed(s.find(&longer, &.{}).?, &longer, true);
+    try std.testing.expectEqual(@as(usize, 1), s.entries.items.len);
+    try std.testing.expectEqual(@as(u32, 1), s.entries.items[0].tokens[0]);
+    try std.testing.expect(s.held <= s.budget);
 }

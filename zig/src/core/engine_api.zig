@@ -69,6 +69,9 @@ pub const Request = struct {
     prompt: []const u32,
     /// A lane-vision family's images in order, each span inside the prompt (its positions hold the image token).
     lane_images: []const LaneImage = &.{},
+    /// With `cache_key` (below): each lane image's identity for the durable tier (its span and the full SHA-256 its cache ids
+    /// derive from, prompt_cache.pictureId), in prompt order; empty: none known (the tier then keeps and finds nothing with them).
+    cache_media: []const prompt_cache.Media = &.{},
     max_tokens: u32,
     sampling: ?Sampling = null,
     /// Tokens that end the reply as ``stop`` (the token is delivered); empty when the request ignores EOS.
@@ -331,6 +334,8 @@ pub const Info = struct {
     greedy_only: bool = false,
     /// Whether a request's caches fit beside the running streams' now (null: a free lane does); else it waits in order.
     admit: ?Admit = null,
+    /// The prompt cache's disk tier as the engine was opened with it (null: the backend has no tier to bind).
+    spill: ?SpillInfo = null,
 };
 
 pub const Admit = struct {
@@ -348,6 +353,38 @@ pub const PromptCachePlan = struct {
     cap_bytes: ?u64 = null,
     room_bytes: ?u64 = null,
     margin_bytes: ?u64 = null,
+};
+
+/// The disk tier's settings as an engine took them, with what the family derives from them (Info.spill).
+pub const SpillInfo = struct {
+    settings: Spill,
+    /// The pinned staging the state layout needs at these smalls and restores (null: not known), with its formula.
+    staging_min_bytes: ?u64 = null,
+    staging_formula: []const u8 = "",
+};
+
+/// The disk tier's state (Status.spill): opening while the store's open runs, on, or off with its cause (a bad
+/// setting, the open's error or timeout, a failed probe, TF_DS_SPILL_OFF_REASON). The reason is copied into the
+/// struct, so a status read on another thread never points into the engine's memory.
+pub const SpillState = struct {
+    state: State = .opening,
+    reason_len: u8 = 0,
+    reason_buf: [120]u8 = undefined,
+
+    pub const State = enum { opening, on, off };
+
+    /// Off for `why` (cut to 120 bytes).
+    pub fn offFor(why: []const u8) SpillState {
+        var s: SpillState = .{ .state = .off };
+        const n = @min(why.len, s.reason_buf.len);
+        @memcpy(s.reason_buf[0..n], why[0..n]);
+        s.reason_len = @intCast(n);
+        return s;
+    }
+
+    pub fn reason(s: *const SpillState) []const u8 {
+        return if (s.state == .off) s.reason_buf[0..s.reason_len] else "";
+    }
 };
 
 /// A checkpoint family an engine reads: its config ``model_type`` and weight formats, as gate entries name them.
@@ -407,6 +444,238 @@ pub const Open = struct {
     policy: []const u8 = "",
     /// --vision: load the checkpoint's image tower (null: text only; an engine without one refuses).
     vision: ?VisionOpen = null,
+    /// The prompt cache's disk tier and parked-request scheduling, read from the environment (`Spill.fromEnv`).
+    spill: Spill = .{},
+};
+
+/// The process environment, for `Spill.fromEnv`.
+pub const ProcessEnv = struct {
+    pub fn get(_: ProcessEnv, name: [:0]const u8) ?[]const u8 {
+        const v = std.c.getenv(name) orelse return null;
+        return std.mem.span(v);
+    }
+};
+
+/// One call's time distribution (prompt_cache.Timing: log2 buckets, count, sum, max).
+pub const Timing = prompt_cache.Timing;
+
+/// The prompt cache's durable tier and its scheduling, read once from the environment by `fromEnv` on rank 0 (the
+/// store's rank; followers hold no tier state). A value that does not parse or is out of range turns the tier off
+/// naming it (`off`), never clamped, and the engine starts either way. An empty value counts as unset.
+pub const Spill = struct {
+    /// The tier was asked for: TF_DS_SPILL_GIB other than 0 (or not a number), or TF_DS_SPILL_OFF_REASON set.
+    asked: bool = false,
+    /// Why the tier is off although asked: a bad setting ("NAME=value: rule") or TF_DS_SPILL_OFF_REASON; null: on.
+    off: ?[]const u8 = null,
+    /// TF_DS_SPILL_DIR: the store's directory (absolute).
+    dir: ?[]const u8 = null,
+    /// TF_DS_SPILL_GIB: what the store may hold (0, the default: off).
+    gib: f64 = 0,
+    /// TF_DS_SPILL_MIN_FREE_GIB: no write leaves less free on the store's file system.
+    min_free_gib: f64 = 50,
+    /// TF_DS_SPILL_QUOTA: one conversation's share of the cap (0: none).
+    quota: f64 = 0,
+    /// TF_DS_SPILL_MIN_TOKENS: shorter kept states are not written.
+    min_tokens: u32 = 8192,
+    /// TF_SPILL_TURNS: old turns kept on a conversation's active path before they go first (0: until room is needed).
+    turns: u32 = 4,
+    /// TF_SPILL_LOAD_MS: one service's budget for every restore together, then staged writes.
+    load_ms: u32 = 40,
+    /// TF_SPILL_LOAD_WAIT_MS: how long a request waits for its restore in all (deferred while the tier has no room,
+    /// then parked on it) before it is admitted without it.
+    load_wait_ms: u32 = 30_000,
+    /// TF_SPILL_DEFER_MS: how long a request whose restore the tier refused for capacity waits with no restore
+    /// finishing (reset when one ends) before it is admitted on what memory holds (0: at once).
+    defer_ms: u32 = 5_000,
+    /// TF_SPILL_FLUSH_MS: a clean stop's bound for draining writes.
+    flush_ms: u32 = 15_000,
+    /// TF_SPILL_PUMP_MS: staging's share of a service while streams decode (at most load_ms).
+    pump_ms: u32 = 2,
+    /// TF_SPILL_POLL_MS: the idle host's poll and the other loop granularities.
+    poll_ms: u32 = 2,
+    /// TF_SPILL_DEFER_RETRY_MS: how soon a deferred request asks again.
+    defer_retry_ms: u32 = 25,
+    /// TF_SPILL_DEFER_MIN: the shortest point worth deferring for, in tokens (0: the family's grid).
+    defer_min: u32 = 0,
+    /// TF_DS_SPILL_STAGING_MIB: pinned host staging for writes, reads and small states together (its minimum, from
+    /// the state layout, smalls and restores, is checked where the layout is known).
+    staging_mib: u32 = 128,
+    /// TF_DS_SPILL_SMALLS: small-state slots for queued writes.
+    smalls: u32 = 4,
+    /// TF_DS_SPILL_RESTORES: restores at once (also the store's reads at once).
+    restores: u32 = 2,
+    /// TF_DS_SPILL_READERS: reader threads.
+    readers: u32 = 4,
+    /// TF_DS_SPILL_BACKLOG_GIB: unpublished write bytes before a keep is refused.
+    backlog_gib: f64 = 16,
+    /// TF_DS_SPILL_KEEP_BUILDS: earlier builds' stores kept beside this one's.
+    keep_builds: u32 = 1,
+    /// TF_DS_SPILL_OPEN_MS: how long the start waits for the store's open before it serves without the tier.
+    open_ms: u32 = 300_000,
+    /// TF_DS_SPILL_IOPRIO: the tier threads' I/O priority (be/0..be/7, idle; none leaves it as it is).
+    ioprio: IoPrio = .{},
+    /// TF_DS_SPILL_LAND_SLOTS: landing buffers preallocated on every rank.
+    land_slots: u32 = 2,
+    /// TF_DS_SPILL_LAND_PIECE_MIB: one broadcast piece of a landing.
+    land_piece_mib: u32 = 32,
+    /// TF_DS_SPILL_PROBE_TOKENS: the start-up probe's prompt.
+    probe_tokens: u32 = 8192,
+    /// TF_DS_SPILL_PROBE_EVERY: a sampled re-check every N keeps (0: at start only).
+    probe_every: u32 = 0,
+    /// TF_DS_SPILL_PROBE_ROWS: the rows a probe samples in each plane besides its first and last.
+    probe_rows: u32 = 8,
+    /// TF_DS_IMAGE_CACHE: pictures kept and found (on unless "0", the server's reading).
+    image_cache: bool = true,
+
+    pub const IoPrio = struct {
+        class: enum { none, be, idle } = .be,
+        level: u3 = 7,
+    };
+
+    pub const Int = struct { name: [:0]const u8, field: []const u8, min: u32, max: u32, unit: []const u8 };
+    pub const Float = struct { name: [:0]const u8, field: []const u8, min: f64, max: f64, unit: []const u8 };
+
+    /// The whole-number settings with their ranges (a value outside turns the tier off).
+    pub const ints = [_]Int{
+        .{ .name = "TF_DS_SPILL_MIN_TOKENS", .field = "min_tokens", .min = 0, .max = 1 << 24, .unit = "tokens" },
+        .{ .name = "TF_SPILL_TURNS", .field = "turns", .min = 0, .max = 1 << 16, .unit = "turns" },
+        .{ .name = "TF_SPILL_LOAD_MS", .field = "load_ms", .min = 1, .max = 10_000, .unit = "milliseconds" },
+        .{ .name = "TF_SPILL_LOAD_WAIT_MS", .field = "load_wait_ms", .min = 1, .max = 3_600_000, .unit = "milliseconds" }, // not 0: every restore begun would be dropped unused
+        .{ .name = "TF_SPILL_DEFER_MS", .field = "defer_ms", .min = 0, .max = 3_600_000, .unit = "milliseconds" },
+        .{ .name = "TF_SPILL_FLUSH_MS", .field = "flush_ms", .min = 0, .max = 3_600_000, .unit = "milliseconds" },
+        .{ .name = "TF_SPILL_PUMP_MS", .field = "pump_ms", .min = 0, .max = 10_000, .unit = "milliseconds" },
+        .{ .name = "TF_SPILL_POLL_MS", .field = "poll_ms", .min = 1, .max = 1_000, .unit = "milliseconds" },
+        .{ .name = "TF_SPILL_DEFER_RETRY_MS", .field = "defer_retry_ms", .min = 1, .max = 60_000, .unit = "milliseconds" },
+        .{ .name = "TF_SPILL_DEFER_MIN", .field = "defer_min", .min = 0, .max = 1 << 24, .unit = "tokens" },
+        .{ .name = "TF_DS_SPILL_STAGING_MIB", .field = "staging_mib", .min = 1, .max = 65_536, .unit = "MiB" },
+        .{ .name = "TF_DS_SPILL_SMALLS", .field = "smalls", .min = 1, .max = 64, .unit = "slots" },
+        .{ .name = "TF_DS_SPILL_RESTORES", .field = "restores", .min = 1, .max = 16, .unit = "restores" }, // the tier's bound (spill_tier.max_restores)
+        .{ .name = "TF_DS_SPILL_READERS", .field = "readers", .min = 1, .max = 64, .unit = "threads" },
+        .{ .name = "TF_DS_SPILL_KEEP_BUILDS", .field = "keep_builds", .min = 0, .max = 16, .unit = "builds" },
+        .{ .name = "TF_DS_SPILL_OPEN_MS", .field = "open_ms", .min = 1, .max = 86_400_000, .unit = "milliseconds" },
+        .{ .name = "TF_DS_SPILL_LAND_SLOTS", .field = "land_slots", .min = 1, .max = 16, .unit = "slots" },
+        .{ .name = "TF_DS_SPILL_LAND_PIECE_MIB", .field = "land_piece_mib", .min = 1, .max = 1024, .unit = "MiB" },
+        .{ .name = "TF_DS_SPILL_PROBE_TOKENS", .field = "probe_tokens", .min = 1, .max = 1 << 24, .unit = "tokens" },
+        .{ .name = "TF_DS_SPILL_PROBE_EVERY", .field = "probe_every", .min = 0, .max = 1 << 30, .unit = "keeps" },
+        .{ .name = "TF_DS_SPILL_PROBE_ROWS", .field = "probe_rows", .min = 0, .max = 62, .unit = "rows a plane" },
+    };
+    /// The fractional settings with their ranges.
+    pub const floats = [_]Float{
+        .{ .name = "TF_DS_SPILL_MIN_FREE_GIB", .field = "min_free_gib", .min = 0, .max = 1 << 20, .unit = "GiB" },
+        .{ .name = "TF_DS_SPILL_QUOTA", .field = "quota", .min = 0, .max = 1, .unit = "of the cap" },
+        .{ .name = "TF_DS_SPILL_BACKLOG_GIB", .field = "backlog_gib", .min = 1.0 / 1024.0, .max = 1 << 20, .unit = "GiB" },
+    };
+    /// The most TF_DS_SPILL_GIB may be.
+    pub const max_gib: f64 = 1 << 20;
+    /// Every name `fromEnv` reads (capabilities lists them).
+    pub const env_names = blk: {
+        var names: []const []const u8 = &.{ "TF_DS_SPILL_GIB", "TF_DS_SPILL_DIR", "TF_DS_SPILL_IOPRIO", "TF_DS_SPILL_OFF_REASON", "TF_DS_IMAGE_CACHE" };
+        for (ints) |n| names = names ++ &[_][]const u8{n.name};
+        for (floats) |n| names = names ++ &[_][]const u8{n.name};
+        break :blk names[0..names.len].*;
+    };
+
+    /// The tier is asked for, nothing turned it off, and it has a directory and a cap.
+    pub fn enabled(s: Spill) bool {
+        return s.asked and s.off == null and s.dir != null and s.gib > 0;
+    }
+
+    /// What the store's file system must have room for: this build's store, the kept builds', and the floor.
+    pub fn roomGib(s: Spill) f64 {
+        return @as(f64, @floatFromInt(1 + s.keep_builds)) * s.gib + s.min_free_gib;
+    }
+
+    /// The settings from `env` (anything with `get(name) ?[]const u8`, the process environment in the server). A bad
+    /// value's reason is written into `buf` (at least 200 bytes, living as long as the result).
+    pub fn fromEnv(env: anytype, buf: []u8) Spill {
+        var s: Spill = .{};
+        if (value(env, "TF_DS_SPILL_OFF_REASON")) |why| return .{ .asked = true, .off = why };
+        const gib_text = value(env, "TF_DS_SPILL_GIB") orelse return s;
+        const gib = std.fmt.parseFloat(f64, gib_text) catch null;
+        if (gib) |g| if (g == 0) return s;
+        s.asked = true;
+        s.gib = gib orelse return s.bad(buf, "TF_DS_SPILL_GIB", gib_text, "GiB, more than 0 up to 1048576");
+        if (!std.math.isFinite(s.gib) or s.gib < 0 or s.gib > max_gib) return s.bad(buf, "TF_DS_SPILL_GIB", gib_text, "GiB, more than 0 up to 1048576");
+        const dir = value(env, "TF_DS_SPILL_DIR") orelse {
+            s.off = std.fmt.bufPrint(buf, "TF_DS_SPILL_DIR: not set (TF_DS_SPILL_GIB={s} asks for the tier)", .{clip(gib_text)}) catch "TF_DS_SPILL_DIR: not set";
+            return s;
+        };
+        if (dir[0] != '/') return s.bad(buf, "TF_DS_SPILL_DIR", dir, "an absolute path");
+        s.dir = dir;
+        inline for (ints) |n| if (value(env, n.name)) |t| {
+            const v = std.fmt.parseInt(u32, t, 10) catch null;
+            if (v == null or v.? < n.min or v.? > n.max) return s.bad(buf, n.name, t, std.fmt.comptimePrint("{s}, a whole number from {d} to {d}", .{ n.unit, n.min, n.max }));
+            @field(s, n.field) = v.?;
+        };
+        inline for (floats) |n| if (value(env, n.name)) |t| {
+            const v = std.fmt.parseFloat(f64, t) catch null;
+            if (v == null or !std.math.isFinite(v.?) or v.? < n.min or v.? > n.max) return s.bad(buf, n.name, t, std.fmt.comptimePrint("{s}, from {d} to {d}", .{ n.unit, n.min, n.max }));
+            @field(s, n.field) = v.?;
+        };
+        if (value(env, "TF_DS_SPILL_IOPRIO")) |t| s.ioprio = ioPrio(t) orelse return s.bad(buf, "TF_DS_SPILL_IOPRIO", t, "be/0 to be/7, idle or none");
+        // untrimmed, as the server's picture keys read it (prompt_cache.imageCacheOn: the one reading)
+        s.image_cache = @import("prompt_cache.zig").imageCacheOn(env.get("TF_DS_IMAGE_CACHE"));
+        if (s.pump_ms > s.load_ms) {
+            s.off = std.fmt.bufPrint(buf, "TF_SPILL_PUMP_MS={d}: more than TF_SPILL_LOAD_MS={d} (staging's share of a service cannot pass the service)", .{ s.pump_ms, s.load_ms }) catch "TF_SPILL_PUMP_MS: more than TF_SPILL_LOAD_MS";
+            return s;
+        }
+        return s;
+    }
+
+    /// The state to show: the engine's when it reported one, else off for a bad setting, else opening.
+    pub fn stateOf(s: Spill, now: ?SpillState) SpillState {
+        if (now) |n| return n;
+        if (s.off) |why| return SpillState.offFor(why);
+        return .{ .state = .opening };
+    }
+
+    /// The derived room with its formula, as /health and the start-up line show it.
+    pub fn roomFormula(s: Spill, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("(1 + keep_builds {d}) x gib {d} + min_free_gib {d} = {d} GiB", .{ s.keep_builds, s.gib, s.min_free_gib, s.roomGib() });
+    }
+
+    /// TF_DS_SPILL_IOPRIO's text.
+    pub fn ioprioText(s: Spill, buf: *[8]u8) []const u8 {
+        return switch (s.ioprio.class) {
+            .be => std.fmt.bufPrint(buf, "be/{d}", .{s.ioprio.level}) catch unreachable,
+            .idle => "idle",
+            .none => "none",
+        };
+    }
+
+    /// The start-up log line (and /health's settings): the state, every value, and the derived room with its formula.
+    pub fn describe(s: Spill, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (!s.asked) return w.writeAll("spill: not asked (TF_DS_SPILL_GIB unset or 0)");
+        if (s.off) |why| return w.print("spill: off: {s}", .{why});
+        try w.print("spill: on: dir={s} gib={d} min_free_gib={d} room=", .{ s.dir.?, s.gib, s.min_free_gib });
+        try s.roomFormula(w);
+        inline for (ints) |n| try w.print(" {s}={d}", .{ n.field, @field(s, n.field) });
+        inline for (floats) |n| if (comptime !std.mem.eql(u8, n.field, "min_free_gib")) try w.print(" {s}={d}", .{ n.field, @field(s, n.field) });
+        var io_buf: [8]u8 = undefined;
+        try w.print(" ioprio={s} image_cache={s}", .{ s.ioprioText(&io_buf), if (s.image_cache) "on" else "off" });
+    }
+
+    fn bad(s: Spill, buf: []u8, comptime name: []const u8, text: []const u8, comptime rule: []const u8) Spill {
+        var out = s;
+        out.off = std.fmt.bufPrint(buf, name ++ "={s}: " ++ rule, .{clip(text)}) catch name ++ ": a bad value (" ++ rule ++ ")";
+        return out;
+    }
+
+    /// A set value, trimmed of spaces; null when unset or empty.
+    fn value(env: anytype, comptime name: [:0]const u8) ?[]const u8 {
+        const t = std.mem.trim(u8, env.get(name) orelse return null, " ");
+        return if (t.len == 0) null else t;
+    }
+
+    fn clip(t: []const u8) []const u8 {
+        return t[0..@min(t.len, 64)];
+    }
+
+        if (std.mem.eql(u8, t, "idle")) return .{ .class = .idle, .level = 0 };
+        if (std.mem.eql(u8, t, "none")) return .{ .class = .none, .level = 0 };
+        if (!std.mem.startsWith(u8, t, "be/") or t.len != 4 or t[3] < '0' or t[3] > '7') return null;
+        return .{ .class = .be, .level = @intCast(t[3] - '0') };
+    }
 };
 
 /// A packed decision: a trunk (pictures expand at `at`), a branch a question, and each branch's labels (`counts`).
@@ -423,8 +692,11 @@ pub const Decision = struct {
     arena: ?std.mem.Allocator = null, // the request's, for what the engine hands back
 };
 
-/// An opened engine; ``close`` stops its thread and frees its backend.
-pub const Opened = struct { engine: Engine, close: *const fn (ctx: *anyopaque) void, ctx: *anyopaque };
+/// An opened engine; ``close`` stops its thread and frees its backend. ``quiesce``, when the engine has one, is the
+/// orderly close without the frees, for a server's stop before its connections end: every request ends (cancelled),
+/// the engine's own last work runs (a family's followers hear done), and connection threads' calls stay valid (submit
+/// refused as Closed; cancel, status and memory unchanged). ``close`` after it frees the rest without repeating it.
+pub const Opened = struct { engine: Engine, close: *const fn (ctx: *anyopaque) void, ctx: *anyopaque, quiesce: ?*const fn (ctx: *anyopaque) void = null };
 
 pub const Memory = struct { active: u64 = 0, cache: u64 = 0, peak: u64 = 0, pinned: u64 = 0, limit: ?u64 = null };
 
@@ -438,6 +710,101 @@ pub const Explain = struct {
 pub const MemorySource = struct {
     ctx: ?*anyopaque = null,
     read: *const fn (ctx: ?*anyopaque, reset_peak: bool) ?Memory,
+};
+
+/// The prompt cache's counters for /health and /metrics, read from HTTP threads as one copy (LaneHost publishes it on
+/// its engine thread). Null in Status unless a tier or grouping is on. Totals unless in `gauges`.
+pub const CacheStats = struct {
+    memory_hits: u64 = 0,
+    memory_misses: u64 = 0,
+    kept: u64 = 0,
+    evicted: u64 = 0,
+    refused: u64 = 0,
+    failed: u64 = 0,
+    entries: u64 = 0,
+    held_bytes: u64 = 0,
+    disk_lookups: u64 = 0,
+    disk_hits: u64 = 0,
+    disk_hits_committed: u64 = 0,
+    restores_begun: u64 = 0,
+    restores_shared: u64 = 0,
+    restores_failed: u64 = 0,
+    restores_cancelled: u64 = 0,
+    restores_dropped: u64 = 0,
+    restores_refused: u64 = 0,
+    restores_active: u64 = 0,
+    restoring_bytes: u64 = 0,
+    restore_blocks_done: u64 = 0,
+    restore_blocks_total: u64 = 0,
+    restored_tokens: u64 = 0,
+    restore_waits: u64 = 0,
+    restore_wait_timeouts: u64 = 0,
+    restore_wait_ns: u64 = 0,
+    restore_wait_max_ns: u64 = 0,
+    restores_deferred: u64 = 0,
+    restores_deferred_expired: u64 = 0,
+    writes_enqueued: u64 = 0,
+    shared_promoted: u64 = 0,
+    flushes: u64 = 0,
+    flush_timeouts: u64 = 0,
+    flush_unpublished: u64 = 0,
+    parked: u64 = 0,
+    chats_continued: u64 = 0,
+    chats_continued_prefill_tokens: u64 = 0,
+    cached_tokens: u64 = 0,
+    computed_tokens: u64 = 0,
+    service_refused: u64 = 0,
+    token_bytes: u64 = 0,
+    /// The tier's own counters, each rank's (null: no tier).
+    spill: ?prompt_cache.RankCounts = null,
+    /// The tier's call timings (the lane host's store calls and the tier's own work).
+    times: prompt_cache.TierTimes = .{},
+
+    pub const gauges = [_][]const u8{ "entries", "held_bytes", "restores_active", "restoring_bytes", "restore_blocks_done", "restore_blocks_total", "parked", "token_bytes" };
+
+    /// Each field's /metrics help (a missing one fails the build).
+    pub const help = .{
+        .memory_hits = "Prompt passes that resumed a kept state in memory.",
+        .memory_misses = "Prompt lookups that found no usable kept state.",
+        .kept = "Prompt states kept in memory.",
+        .evicted = "Kept states evicted from memory for room.",
+        .refused = "Prompt states not kept: past the memory budget.",
+        .failed = "Kept states that failed to save or restore.",
+        .entries = "Prompt states kept in memory now.",
+        .held_bytes = "Bytes the kept states hold now.",
+        .disk_lookups = "Lookups that asked the disk tier.",
+        .disk_hits = "Lookups whose durable point was longer than the best usable memory state.",
+        .disk_hits_committed = "Disk restores every rank installed, adopted as kept states.",
+        .restores_begun = "Disk restore jobs started.",
+        .restores_shared = "Requests that joined a disk restore already in flight.",
+        .restores_failed = "Disk restores aborted on every rank (missing, damaged, guarded).",
+        .restores_cancelled = "Disk restores stopped: no request waited for them any more, or shutdown.",
+        .restores_dropped = "Installed disk restores not adopted: no room, or memory already had them.",
+        .restores_refused = "Disk restores not begun: the memory budget could not hold their destination, or the tier was at its capacity (once a request).",
+        .restores_active = "Disk restore jobs in flight.",
+        .restoring_bytes = "Memory the disk restores in flight reserved, charged to the prompt cache's budget.",
+        .restore_blocks_done = "Blocks the restores in flight have copied so far.",
+        .restore_blocks_total = "Blocks the restores in flight copy in all.",
+        .restored_tokens = "Prompt tokens restored from disk.",
+        .restore_waits = "Requests parked on a disk restore.",
+        .restore_wait_timeouts = "Requests admitted without their disk restore after TF_SPILL_LOAD_WAIT_MS.",
+        .restore_wait_ns = "Nanoseconds requests waited for disk restores (from their first wait, a deferral included).",
+        .restore_wait_max_ns = "The longest wait for a disk restore, in nanoseconds.",
+        .restores_deferred = "Requests whose disk restore was refused for capacity (restores or read slots in flight) and retried shortly instead of prefilling.",
+        .restores_deferred_expired = "Of them, requests admitted on what memory holds without the restore starting: TF_SPILL_DEFER_MS with no restore ending, or TF_SPILL_LOAD_WAIT_MS in all.",
+        .writes_enqueued = "Kept states enqueued for the disk tier at their keep.",
+        .shared_promoted = "Disk points promoted to shared prefixes.",
+        .flushes = "Clean-shutdown flushes of the disk tier.",
+        .flush_timeouts = "Flushes that reached their deadline with points unpublished.",
+        .flush_unpublished = "Points left unpublished at a flush deadline.",
+        .parked = "Requests parked on a disk restore now (reading it, or deferred to ask again).",
+        .chats_continued = "Streams that continued a conversation without resuming from its own turn state.",
+        .chats_continued_prefill_tokens = "Prompt tokens those streams prefilled.",
+        .cached_tokens = "Prompt tokens passes resumed from kept states.",
+        .computed_tokens = "Prompt tokens passes computed.",
+        .service_refused = "Parked-work services asked for inside a round, a prompt chunk or a CUDA graph capture, skipped.",
+        .token_bytes = "Bytes of the kept states' host token arrays (their ids, last prompts, lineage) the memory budget counts (with the SSD tier on).",
+    };
 };
 
 pub const Status = struct {
@@ -469,6 +836,10 @@ pub const Status = struct {
     fill_unknown: bool = false,
     /// Changes whenever the filling set does: a reader pairs its drain samples with one fill.
     fill_run: u64 = 0,
+    /// The prompt cache's counters, when its tier or grouping is on.
+    cache: ?CacheStats = null,
+    /// The disk tier's state, when it was asked for (outside `cache`: a tier that is off still shows).
+    spill: ?SpillState = null,
 };
 
 pub const SubmitError = error{ Closed, Busy, InvalidSpans, Stale }; // Stale: a learner's put-back has not reached the device
@@ -687,7 +1058,8 @@ test {
     _ = @import("lane_host_share.zig");
     _ = @import("lane_host_share_test.zig");
     _ = @import("prompt_cache.zig");
-    _ = @import("prompt_radix.zig");
+    _ = @import("prompt_cache_media_test.zig");
+    _ = @import("spill_settings_test.zig");
     _ = @import("prompt_imprint.zig");
     _ = @import("keepalive.zig");
     _ = @import("originals_test.zig");

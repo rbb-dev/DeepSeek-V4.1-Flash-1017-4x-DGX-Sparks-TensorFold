@@ -5,38 +5,56 @@ const api = @import("engine_api");
 const lanes = @import("lanes");
 const nemotron = @import("nemotron");
 const dsv41 = @import("dsv41");
-const lfm2 = @import("lfm2.zig");
-const glm = @import("glm_cuda");
 const Allocator = std.mem.Allocator;
 const budget = @import("cuda_memory.zig");
-const lane_backend = @import("cuda_bound.zig");
-const snaps = @import("cuda_snaps.zig");
-const nemotron_slide = @import("nemotron_slide.zig");
-const cuda_disk = @import("cuda_disk.zig");
-const vision_offer = @import("cuda_vision_offer.zig");
+const Pool = budget.Pool;
 
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
-const registry = .{ nemotron.native, nemotron.omni, glm.native, dsv41.native };
-
-/// --record opens here (engines.zig refuses it for a backend without this).
-pub const records = true;
+const registry = .{ nemotron.native, dsv41.native };
 
 pub const backends: []const []const u8 = &.{"cuda"};
 pub const families: []const api.Family = blk: {
-    var out: [registry.len + 1]api.Family = undefined;
+    var out: [registry.len]api.Family = undefined;
     for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats };
-    out[registry.len] = lfm2.family;
     const final = out;
     break :blk &final;
 };
 
 const gib: f64 = 1 << 30;
 
-const cuda_device = @import("cuda_device.zig");
-pub const chip = cuda_device.chip;
-pub const deviceName = cuda_device.deviceName;
-const getenv = cuda_device.getenv;
-const setting = cuda_device.setting;
+/// The chip class gate entries name ("nvidia-sm121" for a GB10) of the device TF_CUDA_DEVICE picks; null without one.
+pub fn chip(a: Allocator) ?[]const u8 {
+    const ordinal = envNumber(getenv("TF_CUDA_DEVICE")) catch return null;
+    var driver = cuda.Driver.open() catch return null;
+    defer driver.close();
+    if (ordinal orelse 0 >= driver.deviceCount() catch return null) return null;
+    return chipClass(a, driver.capability(@intCast(ordinal orelse 0)) catch return null);
+}
+
+fn chipClass(a: Allocator, capability: u32) ?[]const u8 {
+    return std.fmt.allocPrint(a, "nvidia-sm{d}", .{capability}) catch null;
+}
+
+fn getenv(name: [:0]const u8) ?[]const u8 {
+    return std.mem.span(std.c.getenv(name) orelse return null);
+}
+
+/// A variable's whole number: null when unset or empty, an error for anything else that is not one.
+fn envNumber(text: ?[]const u8) error{Invalid}!?u32 {
+    const t = std.mem.trim(u8, text orelse return null, " ");
+    if (t.len == 0) return null;
+    return std.fmt.parseInt(u32, t, 10) catch error.Invalid;
+}
+
+/// The flag's value, else the variable's, else `default`; `problem` names a variable that is not a whole number.
+fn setting(a: Allocator, flag: ?u32, name: [:0]const u8, default: u32, problem: *[]const u8) !?u32 {
+    if (flag) |v| return v;
+    const v = envNumber(getenv(name)) catch {
+        problem.* = try std.fmt.allocPrint(a, "{s}={s}: a whole number", .{ name, getenv(name).? });
+        return null;
+    };
+    return v orelse default;
+}
 
 /// The model's window (config.json's max_position_embeddings, text_config's first), 0 when it names none.
 fn modelContext(a: Allocator, io: std.Io, dir: []const u8) i64 {
@@ -58,11 +76,41 @@ fn contextWindow(requested: ?i64, native: i64, default: i64) error{ Negative, No
     return r;
 }
 
+/// The kernel set: TENSORFOLD_CUDA_KERNELS, else share/tensorfold/cuda/sm<capability> beside the binary.
+fn kernelDir(a: Allocator, io: std.Io, capability: u32) ![]const u8 {
+    if (getenv("TENSORFOLD_CUDA_KERNELS")) |dir| return a.dupe(u8, dir);
+    const exe = try std.process.executableDirPathAlloc(io, a);
+    return std.fs.path.join(a, &.{ exe, "..", "share", "tensorfold", "cuda", try std.fmt.allocPrint(a, "sm{d}", .{capability}) });
+}
+
+/// The bytes of the checkpoint's safetensors files: what its weights need on the device, near enough to refuse early.
+fn weightBytes(io: std.Io, dir: []const u8) u64 {
+    var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return 0;
+    defer d.close(io);
+    var total: u64 = 0;
+    var it = d.iterate();
+    while (it.next(io) catch null) |e| {
+        if (!std.mem.endsWith(u8, e.name, ".safetensors")) continue;
+        const st = d.statFile(io, e.name, .{}) catch continue;
+        total += st.size;
+    }
+    return total;
+}
+
+/// A /proc file's text, streamed: procfs reports size 0, and a positional read (readFileAlloc) stops there.
+fn procText(a: Allocator, io: std.Io, path: []const u8) ?[]u8 {
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var r = file.readerStreaming(io, &buf);
+    return r.interface.allocRemaining(a, .limited(1 << 20)) catch null;
+}
+
 /// The pool now, read on the thread whose context is current; `problem` names a bad variable.
-fn pool(a: Allocator, io: std.Io, ctx: *const cuda.Context, problem: *[]const u8) !?budget.Pool {
+fn pool(a: Allocator, io: std.Io, ctx: *const cuda.Context, problem: *[]const u8) !?Pool {
     const unified = (try ctx.attribute(.integrated)) != 0;
     const card = try ctx.memInfo();
-    const text = if (unified) budget.procText(a, io, "/proc/meminfo") else null;
+    const text = if (unified) procText(a, io, "/proc/meminfo") else null;
     const available = budget.counts(unified, .{ .total = card.total, .available = card.free }, text) catch {
         problem.* = "cannot read or parse /proc/meminfo's MemTotal and MemAvailable; refusing CUDA unified-memory admission";
         return null;
@@ -70,7 +118,7 @@ fn pool(a: Allocator, io: std.Io, ctx: *const cuda.Context, problem: *[]const u8
     const free = available.available;
     const total = available.total;
     const reserve = budget.reserveBytes(getenv("TENSORFOLD_MEMORY_RESERVE_GIB"), total, unified) catch {
-        problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_MEMORY_RESERVE_GIB={s}: a number of GiB from {d} to the memory's size", .{ getenv("TENSORFOLD_MEMORY_RESERVE_GIB").?, budget.floor(unified).least });
+        problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_MEMORY_RESERVE_GIB={s}: a number of GiB from 2 to the memory's size", .{getenv("TENSORFOLD_MEMORY_RESERVE_GIB").?});
         return null;
     };
     const limit = budget.limitBytes(getenv("TENSORFOLD_CUDA_MEMORY_LIMIT_GB")) catch {
@@ -82,11 +130,11 @@ fn pool(a: Allocator, io: std.Io, ctx: *const cuda.Context, problem: *[]const u8
 
 fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
     const u = cuda.usage(reset_peak);
-    return .{ .active = u.device, .cache = 0, .peak = u.peak, .pinned = u.host };
+    return .{ .active = u.device, .cache = 0, .peak = u.peak };
 }
 
 /// A lone driver returns false at completion or true when yield hands it to the lane core.
-const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool, resumed: bool) anyerror!bool;
+const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
 
 /// The context a lane thread needs current: the lane host steps rounds on its own thread, CUDA binds per thread.
 threadlocal var bound: ?*const cuda.Context = null;
@@ -107,32 +155,42 @@ const Host = struct {
     host: api.LaneHost,
     startup: []u8 = &.{},
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
-    store: ?*api.prompt_cache.Store = null, // kept Nemotron states; null when the budget is 0
-    learn: ?api.Learner = null, // the family's Sliding Weights learner (--slide), called with the context current
-    slide: ?*anyopaque = null, // that learner's adapter, freed by slide_free before the family
-    slide_free: ?*const fn (Allocator, *anyopaque) void = null,
-    dir: []u8 = &.{}, // the model folder the learner writes its lessons into
-    recording: ?*record.Recording = null, // --record: the recorder in front of the family's backend
-    snap_vt: api.prompt_cache.Snapshots.VTable = undefined, // a family's own kept states (Loaded.snaps), `store` copies through it
+    cache: ?api.prompt_cache.Store = null, // kept prompt states, when the family keeps them
+    snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
     graph_fallbacks: ?*const std.atomic.Value(u64) = null, // the family's failed graph captures, when it counts them
     head_rounds: ?*const [6]std.atomic.Value(u64) = null, // the family's decode rounds by the head's path, when counted
     draft_vocab: ?*const api.DraftVocabCounters = null, // the family's drafter on a pruned vocabulary, when it runs one
+    finish: ?*const fn (*anyopaque) void = null, // the family's orderly close (dsv41: its followers hear done), once
+    finished: bool = false,
+    quiet: ?*const fn (*anyopaque) bool = null, // the family's check for the tier's service fence (dsv41: no graph capture)
+    spill: ?api.Spill = null, // the tier's settings, when the family's tier was asked for: the lane host's configure
+    spill_start: ?api.SpillState = null, // the family's tier at its start (off: the reason status shows)
+
+    /// api.Opened.quiesce: every request ended and the engine thread joined (its last work done), then the family's
+    /// finish; nothing freed, so the server's connection threads may still call the engine until close.
+    fn quiesce(p: *anyopaque) void {
+        const h: *Host = @ptrCast(@alignCast(p));
+        h.host.quiesce();
+        h.finishOnce();
+    }
+
+    /// The family's finish, at most once (quiesce's, else close's), with the context current on the calling thread.
+    fn finishOnce(h: *Host) void {
+        if (h.finished) return;
+        h.finished = true;
+        const f = h.finish orelse return;
+        if (h.gpu) |g| g.ctx.makeCurrent() catch {};
+        f(h.family);
+    }
 
     fn close(p: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(p));
         h.host.stop();
+        h.finishOnce(); // after quiesce: nothing; else the family's finish before its kept states and its release
         h.core.deinit();
         h.cfg.deinit(h.gpa);
-        if (h.recording) |r| r.free(h.gpa);
         if (h.gpu) |g| g.ctx.makeCurrent() catch {};
-        if (h.store) |s| {
-            const rows = s.disk;
-            s.deinit();
-            h.gpa.destroy(s);
-            if (rows) |r| r.deinit(); // after the store: its entries leave the write queue as they go
-        }
-        if (h.slide) |s| h.slide_free.?(h.gpa, s);
-        h.gpa.free(h.dir);
+        if (h.cache) |*store| store.deinit(); // the family's kept states go before the family
         h.release(h.family);
         if (h.gpu) |g| {
             g.ctx.deinit();
@@ -143,7 +201,13 @@ const Host = struct {
         h.gpa.destroy(h);
     }
 
-    pub fn bind(p: *anyopaque) *Host {
+    /// The tier's service fence asks (the lane host's engine thread): the family's quiet, with the context bound.
+    fn quietCheck(p: *anyopaque) bool {
+        const x = bind(p);
+        return x.quiet.?(x.family);
+    }
+
+    fn bind(p: *anyopaque) *Host {
         const h: *Host = @ptrCast(@alignCast(p));
         if (h.gpu) |g| if (bound != &g.ctx) {
             g.ctx.makeCurrent() catch |e| std.log.err("cuCtxSetCurrent on the lane thread: {s}", .{@errorName(e)});
@@ -162,45 +226,28 @@ const Host = struct {
         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
         h.host.explain = explain;
-        h.host.cache = h.store;
-        h.host.warm_quiet = if (info.warm_turns) nemotron.native.warm_quiet else 0;
-        if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true, .logprobs = h.inner.vtable.first_row != null, .structures = h.inner.vtable.first_masked != null, .min_budget = nemotron.native.lone_min_budget, .resumes = true };
-        if (h.learn != null) h.host.learner = h.learner();
+        if (h.cache) |*store| h.host.cache = store;
+        if (h.quiet != null) h.host.quiet = .{ .ctx = h, .check = quietCheck };
+        // the tier asked for: its settings configure the host (after the store and its tier: configure reads them), the
+        // family's own off reason from its start (the open, the probe, an identity) shown as the settings' would be
+        if (h.spill) |given| {
+            var sp = given;
+            if (h.spill_start) |*start| if (start.state == .off and sp.off == null) {
+                sp.off = start.reason();
+            };
+            h.host.configure(sp);
+        }
+        if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
         h.host.graph_fallbacks = h.graph_fallbacks;
         h.host.head_rounds = h.head_rounds;
         h.host.draft_vocab = h.draft_vocab;
         try h.host.start();
     }
 
-    /// The family's learner, each call made with the context current on the lane thread.
-    fn learner(h: *Host) api.Learner {
-        return .{
-            .ctx = h,
-            .begin = struct {
-                fn f(p: *anyopaque, request: *const api.LearnRequest, sink: api.LearnSink) anyerror!void {
-                    const l = bind(p).learn.?;
-                    return l.begin(l.ctx, request, sink);
-                }
-            }.f,
-            .step = struct {
-                fn f(p: *anyopaque) api.Learner.Step {
-                    const l = bind(p).learn.?;
-                    return l.step(l.ctx);
-                }
-            }.f,
-            .abort = struct {
-                fn f(p: *anyopaque) void {
-                    const l = bind(p).learn.?;
-                    l.abort(l.ctx);
-                }
-            }.f,
-        };
-    }
-
     /// The family's lone driver with the context current on the lane thread.
     fn loneRun(p: *anyopaque, s: *lanes.Stream, hooks: api.LoneHooks) anyerror!bool {
         const x = bind(p);
-        return x.lone.?(x.family, s, hooks.ctx, hooks.committed, hooks.yield, hooks.resumed);
+        return x.lone.?(x.family, s, hooks.ctx, hooks.committed, hooks.yield);
     }
 
     /// The family's backend, each call made with the context current on the calling thread.
@@ -308,35 +355,14 @@ const Host = struct {
     }
 };
 
-const refusals = @import("cuda_refusal.zig");
-const record = @import("cuda_record.zig");
-
-/// The engine for `o.dir`, or null with `problem` set when `refusal` names a flag or no CUDA family reads it.
+/// The engine for `o.dir`, or null with `problem` set when no CUDA family reads the checkpoint.
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
-    if (refusals.backend(o)) |why| {
-        problem.* = why;
-        return null;
-    }
     inline for (registry) |F| {
         if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
-    }
-    if (std.mem.eql(u8, o.model_type, lfm2.family.model_type)) {
-        if (refusals.lfm2(o)) |why| {
-            problem.* = why;
-            return null;
-        }
-        return lfm2.open(a, gpa, io, o, problem);
     }
     problem.* = try std.fmt.allocPrint(a, "the native CUDA engine has no backend for {s} checkpoints yet", .{o.model_type});
     return null;
 }
-
-/// The admit's refusals: no stream fits, or --parallel asks for more than the budget holds.
-const no_stream = "the CUDA memory budget fits no stream: one at a {d}-token window takes {d:.2} GiB, " ++
-    "and {d:.2} GiB is left after the model's {d:.2} GiB and the {d:.1} GiB reserve{s}; " ++
-    "lower --context, or free device memory";
-const too_many = "--parallel {d} needs {d:.2} GiB for its streams at a {d}-token window, " ++
-    "and the CUDA memory budget leaves {d:.2} GiB{s}: serve --parallel {d}, or lower --context";
 
 fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
     // a family whose window depends on its own settings (DeepSeek-V4.1: the YaRN factor of its RoPE tables) reports it
@@ -349,25 +375,11 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         };
         return null;
     };
-    if (o.slide) {
-        if (!@hasDecl(F, "slide")) {
-            problem.* = try std.fmt.allocPrint(a, "--slide: {s} checkpoints do not learn on CUDA yet", .{o.model_type});
-            return null;
-        }
-        if (try nemotron_slide.refusal(F, a, io, o.dir, "`cp -RL` (a copy that follows links)")) |why| {
-            problem.* = why;
-            return null;
-        }
-    }
     const device = try setting(a, o.device, "TF_CUDA_DEVICE", 0, problem) orelse return null;
     const segments = try setting(a, o.segments, "TF_CUDA_SEGMENTS", 1, problem) orelse return null;
     if (segments < 1 or segments > F.max_segments) {
         const named = if (o.segments != null) "--segments " else "TF_CUDA_SEGMENTS=";
         problem.* = try std.fmt.allocPrint(a, "{s}{d}: whole prompt chunks a call, 1 to {d}", .{ named, segments, F.max_segments });
-        return null;
-    }
-    if (o.slide and segments > 1) {
-        problem.* = "--slide runs a prompt one chunk at a time, its change's scratch shared by every layer: serve it without --segments or TF_CUDA_SEGMENTS";
         return null;
     }
     const g = try gpa.create(Gpu);
@@ -392,174 +404,67 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const capability = try g.ctx.capability();
     var name_buf: [256]u8 = undefined;
     const name = g.ctx.name(&name_buf) catch "GPU";
-    if (o.slide and capability != 121) {
-        problem.* = try std.fmt.allocPrint(a, "--slide learns on a GB10 (sm_121) so far, and this {s} is sm_{d}: serve it without --slide", .{ name, capability });
+    const kernels = try kernelDir(a, io, capability);
+    std.Io.Dir.cwd().access(io, try std.fs.path.join(a, &.{ kernels, "aot.json" }), .{}) catch {
+        problem.* = try std.fmt.allocPrint(a, "no CUDA kernel set for sm_{d} at {s}: set TENSORFOLD_CUDA_KERNELS to a folder from aot_pack.py", .{ capability, kernels });
         return null;
-    }
-    const kernels: ?[]const u8 = switch (try cuda.aot.pick(a, io, getenv("TENSORFOLD_CUDA_KERNELS"), capability)) {
-        .native => null,
-        .captured => |dir| dir,
-        .missing => |dir| {
-            problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_CUDA_KERNELS={s} holds no aot.json: give a captured set's folder, or native for our own kernels", .{dir});
-            return null;
-        },
     };
     const before = try pool(a, io, &g.ctx, problem) orelse return null;
-    // a family split over hosts holds only its rank's share (GLM-5.3-Flash's TP); one split over GPUs gives its own
-    const whole = budget.weightBytes(io, o.dir);
-    const weights = if (@hasDecl(F, "weightShare")) F.weightShare(a, io, o.dir, whole) else if (@hasDecl(F, "weightBytes")) F.weightBytes(io, o.dir) else whole;
+    // a family that splits the checkpoint over several GPUs reports its own share
+    const weights = if (@hasDecl(F, "weightBytes")) F.weightBytes(io, o.dir) else weightBytes(io, o.dir);
     const held0 = cuda.usage(false).device;
-    // a family over hosts reads every rank's room after its load, by this budget, and admits by the smallest
-    const Probe = struct {
-        a: Allocator,
-        io: std.Io,
-        ctx: *const cuda.Context,
-        held: u64,
-        problem: *[]const u8,
-        fn read(p: *anyopaque) ?u64 {
-            const self: *@This() = @ptrCast(@alignCast(p));
-            const now = (pool(self.a, self.io, self.ctx, self.problem) catch return null) orelse return null;
-            return now.room(cuda.usage(false).device - self.held);
-        }
-    };
-    var probe: Probe = .{ .a = a, .io = io, .ctx = &g.ctx, .held = held0, .problem = problem };
-    var opts: F.Options = .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments, .slide = o.slide };
-    if (o.vision) |vo| {
-        if (!@hasField(F.Options, "vision")) {
-            problem.* = "--vision: this CUDA family reads no images; serve it without --vision";
-            return null;
-        }
-        const own: ?u32 = comptime if (@hasDecl(F, "default_image_tokens")) F.default_image_tokens else null;
-        opts.vision = .{ .image_tokens = if (vo.image_tokens_set) vo.image_tokens else own orelse vo.image_tokens, .max_images = vo.max_images };
-    }
-    if (o.precision) |p| {
-        if (!@hasField(F.Options, "precision")) {
-            problem.* = "--precision: this CUDA family reads no NVFP4 checkpoint; serve it without --precision";
-            return null;
-        }
-        opts.precision = std.meta.stringToEnum(@typeInfo(@TypeOf(opts.precision)).optional.child, @tagName(p)).?;
-    }
-    if (@hasField(F.Options, "room")) opts.room = .{ .ctx = &probe, .read = Probe.read };
     if (weights > before.room(held0)) {
         problem.* = try std.fmt.allocPrint(a, "the checkpoint's {d:.1} GiB of weights do not fit the {d:.1} GiB the CUDA memory budget grants ({d:.1} GiB free less a {d:.1} GiB reserve{s}); free device memory or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB", .{ toGib(weights), toGib(before.room(held0)), toGib(before.free), toGib(before.reserve), if (before.limit != null) ", under TENSORFOLD_CUDA_MEMORY_LIMIT_GB" else "" });
         return null;
     }
-    const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, opts) catch |e| {
-        cuda.tp_watch.fail(@errorName(e)); // a family over hosts: its other ranks stop with this error
-        if (@hasDecl(F, "explains_open")) if (F.explain(null, e)) |text| {
-            problem.* = text;
-            return null;
-        };
-        switch (@as(anyerror, e)) { // every family's open: GLM's error set has no ModeloptNeedsSm90
-            error.ModeloptNeedsSm90 => {
-                problem.* = try std.fmt.allocPrint(
-                    a,
-                    "{s} is sm_{d}: {s} (the 4-bit checkpoints run on it)",
-                    .{ name, capability, nemotron.kernels.modeloptRefusal(capability).? },
-                );
-                return null;
-            },
-            else => {
-                problem.* = try std.fmt.allocPrint(
-                    a,
-                    "the native CUDA engine cannot load {s} with {s} glue kernels ({s})",
-                    .{ o.dir, kernels orelse "its own", @errorName(e) },
-                );
-                return null;
-            },
-        }
-    };
-    defer if (!opened) loaded.deinit(loaded.ctx);
-    const taps = record.taps(loaded); // --record is refused before the host is made, so a refusal holds nothing
-    if (o.record) |dir| if (try record.refusal(a, io, o.model_type, dir, taps)) |why| {
-        problem.* = why;
+    const cache_want: u64 = @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib); // the prompt cache's budget
+    var fo: F.Options = .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments };
+    if (@hasField(F.Options, "spill")) fo.spill = familySpill(o.spill, cache_want); // a family that binds a tier
+    const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, fo) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} with kernels {s} ({s})", .{ o.dir, kernels, @errorName(e) });
         return null;
     };
+    defer if (!opened) loaded.deinit(loaded.ctx);
     const model = cuda.usage(false).device - held0;
     const after = try pool(a, io, &g.ctx, problem) orelse return null;
-    var room = after.room(model) -| loaded.learn_bytes;
-    var low: []const u8 = ""; // names the rank whose room bounds the streams, when it is not this one
-    if (@hasField(@TypeOf(loaded), "peer_room")) if (loaded.peer_room) |pr| if (pr.bytes < room) {
-        room = pr.bytes;
-        low = try std.fmt.allocPrint(a, " on rank {d}, the smallest room of the ranks", .{pr.rank});
-    };
-    const free = loaded.free_streams;
-    const streams = budget.admit(room, loaded.stream_bytes, free, o.lanes, o.lanes_fixed) catch |e| {
+    const room = after.room(model);
+    const streams = budget.admit(room, loaded.stream_bytes, if (@hasField(@TypeOf(loaded), "free_streams")) loaded.free_streams else 0, o.lanes, o.lanes_fixed) catch |e| {
         problem.* = switch (e) {
-            error.NoStream => try std.fmt.allocPrint(a, no_stream, .{
-                window,
-                toGib(loaded.stream_bytes),
-                toGib(room),
-                toGib(model),
-                toGib(after.reserve),
-                low,
-            }),
-            error.TooMany => try std.fmt.allocPrint(a, too_many, .{
-                o.lanes,
-                toGib(loaded.stream_bytes * (o.lanes -| free)),
-                window,
-                toGib(room),
-                low,
-                free + room / loaded.stream_bytes,
-            }),
+            error.NoStream => try std.fmt.allocPrint(a, "the CUDA memory budget fits no stream: one at a {d}-token window takes {d:.2} GiB, and {d:.2} GiB is left after the model's {d:.2} GiB and the {d:.1} GiB reserve; lower --context, or free device memory", .{ window, toGib(loaded.stream_bytes), toGib(room), toGib(model), toGib(after.reserve) }),
+            error.TooMany => try std.fmt.allocPrint(a, "--parallel {d} needs {d:.2} GiB for its streams at a {d}-token window, and the CUDA memory budget leaves {d:.2} GiB: serve --parallel {d}, or lower --context", .{ o.lanes, toGib(loaded.stream_bytes * o.lanes), window, toGib(room), room / loaded.stream_bytes }),
         };
         return null;
     };
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = loaded.backend, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = loaded.lone };
-    const held = loaded.stream_bytes * (streams -| free);
-    // a family keeping its own states (Loaded.snaps) takes --prompt-cache-gib, 0.5 GiB unless given, as before 1.0.12
-    const own_snaps = if (@hasField(@TypeOf(loaded), "snaps")) loaded.snaps != null else false;
-    const cache = if (@hasDecl(F, "snap_save")) budget.cacheBytes(o.prompt_cache_gib, room, held) else if (own_snaps) @as(u64, @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib)) else 0;
-    h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB{s}; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in passes of up to {d} rows{s}{s}; {s}", .{
-        capability,                                                                                                        device,                                                                                                       name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (loaded.learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(loaded.learn_bytes)}) else "", streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
-        if (cache > 0) try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(cache)}) else ", no prompt cache", if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
+    h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in {d}-row chunks{s}", .{
+        capability, device, name, if (after.unified) ", memory shared with the host" else "", toGib(model), streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
     });
     errdefer gpa.free(h.startup);
     if (@hasDecl(F, "graphFallbacks")) h.graph_fallbacks = F.graphFallbacks(loaded.ctx);
     if (@hasDecl(F, "headRounds")) h.head_rounds = F.headRounds(loaded.ctx);
     if (@hasDecl(F, "draftVocab")) h.draft_vocab = F.draftVocab(loaded.ctx);
+    if (@hasField(@TypeOf(loaded), "finish")) h.finish = loaded.finish;
+    // a family that keeps prompt states (its snapshots) gets the prompt cache: states at its chunk ends
+    if (@hasField(@TypeOf(loaded), "snaps")) if (loaded.snaps) |sn| {
+        const want = cache_want;
+        if (want > 0) {
+            h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop };
+            h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{ .window = if (@hasField(@TypeOf(sn), "tail")) sn.tail else 0 }, want);
+            if (@hasField(@TypeOf(loaded), "tier")) if (loaded.tier) |t| bindTier(&h.cache.?, &h.snap_vt, t, loaded.grid, loaded.replay, if (@hasField(@TypeOf(sn), "usable")) sn.usable else null, io);
         }
-    }
-    // a family that keeps prompt states its own way (Loaded.snaps) gets a store over them, as before 1.0.12
-    if (h.store == null and cache > 0) if (@hasField(@TypeOf(loaded), "snaps")) if (loaded.snaps) |sn| {
-        h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop, .resumes = if (@hasField(@TypeOf(sn), "resumes")) sn.resumes else null, .live = if (@hasField(@TypeOf(sn), "live")) sn.live else null };
-        const store = try gpa.create(api.prompt_cache.Store);
-        store.* = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{}, cache);
-        h.store = store;
     };
-    errdefer if (h.store) |store| {
-        store.deinit();
-        gpa.destroy(store);
+    // the SSD tier's settings and state for /health and /metrics (the family's, when it was asked for); the lane host
+    // gets them, the family's start state and its fence check at serve
+    const spill_info: ?api.SpillInfo = if (@hasField(@TypeOf(loaded), "spill_info")) loaded.spill_info else null;
+    if (spill_info) |si| if (si.settings.asked) {
+        h.spill = si.settings;
+        h.spill_start = if (@hasField(@TypeOf(loaded), "spill_state")) loaded.spill_state else null;
     };
-    if (@hasDecl(F, "slide")) if (loaded.learns != null) {
-        const Slide = nemotron_slide.Adapter(F.slide);
-        h.dir = try gpa.dupe(u8, o.dir);
-        const s = try gpa.create(Slide);
-        s.* = Slide.init(gpa, io, F.learnModel(loaded.ctx, h.dir));
-        h.slide = s;
-        h.slide_free = struct {
-            fn f(al: Allocator, p: *anyopaque) void {
-                const x: *Slide = @ptrCast(@alignCast(p));
-                x.deinit();
-                al.destroy(x);
-            }
-        }.f;
-        h.learn = s.hook();
-    };
-    errdefer if (h.slide) |s| {
-        h.slide_free.?(gpa, s);
-        gpa.free(h.dir);
-    };
-    if (o.record) |dir| {
-        const r = try record.open(gpa, io, dir, taps, loaded.backend);
-        h.recording = r;
-        h.inner = r.recorded.backend();
-        h.lone = null; // every token through the lane rounds, where the recorder sees it
-        std.log.info("recording each stream's rows under {s}/{s}", .{ dir, r.recorder.name });
-    }
-    errdefer if (h.recording) |r| r.free(gpa);
+    // what /health and the start-up line show: the family's own off reason from its start too (h holds the text)
+    const shown_spill = startInfo(spill_info, if (h.spill_start) |*st| st else null);
+    if (@hasField(@TypeOf(loaded), "quiet")) h.quiet = loaded.quiet;
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
     const vision: ?api.LaneVision = if (@hasField(@TypeOf(loaded), "lane_vision")) loaded.lane_vision else null;
     // the family's resume grid: a prompt step's rows between two rounds at the default cadence (the scheduling facts)
@@ -572,7 +477,38 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const fill: api.fill_order.Policy = if (@hasField(@TypeOf(loaded), "fill")) loaded.fill else .{};
     try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(usable), .prompt_cache = h.cache != null, .startup = h.startup, .efforts = familyEfforts(F), .lane_vision = vision, .structures = loaded.backend.vtable.first_masked != null, .spill = shown_spill, .resume_rows = resume_rows, .beside_rows = beside_rows, .rounds_beside = rounds_beside, .fill = fill }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
-    return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+    return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h, .quiesce = Host.quiesce };
+}
+
+/// Binds the SSD tier to the prompt cache: the family's resume grid (its prompt chunk) and replay window, its usable
+/// rule (stale and loading states passed over), the tier with this process's seed for conversations and lineages, and
+/// the token arrays charged to the budget (only with a tier).
+fn bindTier(store: *api.prompt_cache.Store, vt: *api.prompt_cache.Snapshots.VTable, tier: api.prompt_cache.Tier, grid: u32, replay: u32, usable: ?*const fn (*anyopaque, *anyopaque, u32) bool, io: std.Io) void {
+    vt.usable = usable;
+    store.rules.grid = grid;
+    store.rules.window = replay;
+    store.charge_tokens = true;
+    var seed: u32 = undefined;
+    io.random(std.mem.asBytes(&seed));
+    store.setTier(tier, seed | 1);
+}
+
+/// The tier's settings the family opens with: as given, but off from the start, named, with no prompt cache
+/// (--prompt-cache-gib 0: nothing to keep or restore), so the family opens no store, staging, landing or probe.
+fn familySpill(sp: api.Spill, cache_bytes: u64) api.Spill {
+    var out = sp;
+    if (out.asked and out.off == null and cache_bytes == 0) out.off = "the prompt cache is off (--prompt-cache-gib 0): the SSD tier has nothing to keep or restore";
+    return out;
+}
+
+/// /health's and the start-up line's tier, with the family's own off reason from its start (the open, the probe, an
+/// identity) when the settings had none: neither says "on" while it is off. `start` (the Host's) outlives the server.
+fn startInfo(si: ?api.SpillInfo, start: ?*const api.SpillState) ?api.SpillInfo {
+    var out = si orelse return null;
+    if (start) |st| if (st.state == .off and out.settings.off == null) {
+        out.settings.off = st.reason();
+    };
+    return out;
 }
 
 /// A family's reasoning efforts as numbers its chat template takes (F.efforts: name and value), else none.
@@ -590,26 +526,32 @@ fn toGib(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / gib;
 }
 
-test {
-    _ = budget; // cuda_memory.zig's own tests, which no other test binary reaches
-    _ = refusals;
-    _ = lane_backend;
-    _ = snaps;
-    _ = cuda_device; // the device and variable tests
+test "this host's /proc/meminfo reads whole and parses (Linux)" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const text = procText(a, std.testing.io, "/proc/meminfo") orelse return error.Unreadable;
+    defer a.free(text);
+    try std.testing.expect(budget.meminfo(text) != null);
 }
 
-test "the lane core sees a family's prefill_step through the lane backend, so a served prompt can step" {
-    var target: lanes.fake.Fake = .{ .gpa = std.testing.allocator, .prefill_chunks = 3 };
-    defer target.deinit();
-    var h: Host = undefined;
-    h.inner = target.stepped();
-    try std.testing.expect(h.backend().vtable.prefill_step != null);
+test "chip classes name the compute capability as gate entries do" {
+    const a = std.testing.allocator;
+    const name = chipClass(a, 121).?;
+    defer a.free(name);
+    try std.testing.expectEqualStrings("nvidia-sm121", name);
 }
 
-test "every registered family and d1's decision engine are listed for capabilities" {
-    try std.testing.expectEqual(@as(usize, registry.len + 1), families.len);
+test "every registered family is listed for capabilities" {
+    try std.testing.expectEqual(@as(usize, registry.len), families.len);
     try std.testing.expectEqualStrings("nemotron_h", families[0].model_type);
-    try std.testing.expectEqualStrings("lfm2_vl", families[registry.len].model_type);
+}
+
+test "variables: unset or empty means the default, anything but a whole number is refused" {
+    try std.testing.expectEqual(@as(?u32, null), try envNumber(null));
+    try std.testing.expectEqual(@as(?u32, null), try envNumber(""));
+    try std.testing.expectEqual(@as(?u32, 3), try envNumber(" 3"));
+    try std.testing.expectError(error.Invalid, envNumber("one"));
+    try std.testing.expectError(error.Invalid, envNumber("-1"));
 }
 
 test "context windows: the family default inside the model's, 0 for the model's, never past it" {
@@ -620,6 +562,107 @@ test "context windows: the family default inside the model's, 0 for the model's,
     try std.testing.expectError(error.PastNative, contextWindow(300000, 262144, 16384));
     try std.testing.expectError(error.Negative, contextWindow(-5, 262144, 16384));
     try std.testing.expectError(error.NoNative, contextWindow(0, 0, 16384));
+}
+
+/// A family for the orderly-close tests: counts its finish and release calls, and keeps a Fake target's prompt passes.
+const CloseFamily = struct {
+    mutex: std.Io.Mutex = .init,
+    finished: u32 = 0,
+    released: u32 = 0,
+    chunks: usize = 0, // prompt chunks begun
+    after_finish: usize = 0, // chunks begun after finish ran (its followers would wait for frames that never come)
+
+    fn finish(p: *anyopaque) void {
+        const f: *CloseFamily = @ptrCast(@alignCast(p));
+        f.mutex.lockUncancelable(std.testing.io);
+        defer f.mutex.unlock(std.testing.io);
+        f.finished += 1;
+    }
+
+    fn release(p: *anyopaque) void {
+        const f: *CloseFamily = @ptrCast(@alignCast(p));
+        f.released += 1;
+    }
+
+    /// A prompt chunk of the target: 10 ms each.
+    fn chunk(p: *anyopaque, _: *lanes.Stream, _: usize) void {
+        const f: *CloseFamily = @ptrCast(@alignCast(p));
+        f.mutex.lockUncancelable(std.testing.io);
+        f.chunks += 1;
+        if (f.finished > 0) f.after_finish += 1;
+        f.mutex.unlock(std.testing.io);
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+
+    fn state(f: *CloseFamily) struct { u32, usize, usize } {
+        f.mutex.lockUncancelable(std.testing.io);
+        defer f.mutex.unlock(std.testing.io);
+        return .{ f.finished, f.chunks, f.after_finish };
+    }
+
+    /// A Host over `target` with no device, served with one lane, as openWith leaves it.
+    fn host(f: *CloseFamily, gpa: Allocator, target: *lanes.fake.Fake) !*Host {
+        const h = try gpa.create(Host);
+        errdefer gpa.destroy(h);
+        h.* = .{ .gpa = gpa, .gpu = null, .family = f, .release = release, .finish = finish, .inner = target.backend(), .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined };
+        try h.serve(std.testing.io, .{ .exact_width = 8, .mtp = true, .speculate = true, .drafts = 7, .hidden_rows = true }, 8, .{ .lanes = 1 }, null);
+        return h;
+    }
+};
+
+/// A request's sink for the orderly-close tests.
+const CloseBox = struct {
+    mutex: std.Io.Mutex = .init,
+    tokens: usize = 0,
+    done: ?api.Reason = null,
+    fn event(ctx: *anyopaque, _: api.Id, ev: *const api.Event) void {
+        const b: *@This() = @ptrCast(@alignCast(ctx));
+        b.mutex.lockUncancelable(std.testing.io);
+        defer b.mutex.unlock(std.testing.io);
+        switch (ev.*) {
+            .tokens => |t| b.tokens += t.len,
+            .finished => |f| b.done = f.reason,
+            else => {},
+        }
+    }
+    fn state(b: *@This()) struct { ?api.Reason, usize } {
+        b.mutex.lockUncancelable(std.testing.io);
+        defer b.mutex.unlock(std.testing.io);
+        return .{ b.done, b.tokens };
+    }
+};
+
+test "the orderly close ends the requests and runs the family's finish once; close does not run it again" {
+    const gpa = std.testing.allocator;
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var fam: CloseFamily = .{};
+    const h = try fam.host(gpa, &target);
+    var closed = false;
+    defer if (!closed) Host.close(h);
+    const e = h.host.engine();
+    const prompt = [_]u32{ 2, 7, 1, 8 };
+    var box: CloseBox = .{};
+    try e.submit(1, &.{ .prompt = &prompt, .max_tokens = 1 << 30 }, .{ .ctx = &box, .event = CloseBox.event });
+    while (box.state()[1] == 0) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    Host.quiesce(h);
+    try std.testing.expectEqual(@as(?api.Reason, .failed), box.state()[0]); // cut by the stop: the client sends it again
+    try std.testing.expectEqual(@as(u32, 1), fam.state()[0]);
+    try std.testing.expectEqual(@as(u32, 0), fam.released);
+    var late: CloseBox = .{};
+    try std.testing.expectError(error.Closed, e.submit(2, &.{ .prompt = &prompt, .max_tokens = 8 }, .{ .ctx = &late, .event = CloseBox.event }));
+    Host.quiesce(h); // a second one does nothing
+    try std.testing.expectEqual(@as(u32, 1), fam.state()[0]);
+    closed = true;
+    Host.close(h);
+    try std.testing.expectEqual(@as(u32, 1), fam.state()[0]);
+    try std.testing.expectEqual(@as(u32, 1), fam.released);
+}
+
+test "the DeepSeek family hands the host its orderly close (the field openWith reads)" {
+    // openWith takes it by @hasField: a rename on either side would leave the followers without done at a stop
+    try std.testing.expect(@hasField(dsv41.native.Loaded, "finish"));
+    try std.testing.expect(@FieldType(dsv41.native.Loaded, "finish") == @FieldType(Host, "finish"));
 }
 
 test "the DeepSeek family hands the host its decode rounds by the head's path (the declaration openWith reads)" {
@@ -654,6 +697,41 @@ test "serve: the family's decode rounds by the head's path reach status; a famil
         h.host.engine().status(&st, &.{});
         try std.testing.expectEqual(if (counted) @as(?[6]u64, .{ 1, 2, 3, 4, 5, 6 }) else null, st.head_rounds);
     }
+}
+
+test "a close without the orderly close still runs the family's finish, once, before its release" {
+    const gpa = std.testing.allocator;
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var fam: CloseFamily = .{};
+    const h = try fam.host(gpa, &target);
+    Host.close(h);
+    try std.testing.expectEqual(@as(u32, 1), fam.state()[0]);
+    try std.testing.expectEqual(@as(u32, 1), fam.released);
+}
+
+test "a stop in a 1M-token prompt pass: the pass ends at its next chunk, then the family's finish, well inside the close's bound" {
+    const gpa = std.testing.allocator;
+    var fam: CloseFamily = .{};
+    // 512 chunks of 2048 tokens (a 1M-token prompt), 10 ms each here: 5 s whole
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 512, .prefill_hook = CloseFamily.chunk, .prefill_hook_ctx = &fam };
+    defer target.deinit();
+    const h = try fam.host(gpa, &target);
+    defer Host.close(h);
+    const e = h.host.engine();
+    const prompt = [_]u32{ 2, 7, 1, 8 };
+    var box: CloseBox = .{};
+    try e.submit(1, &.{ .prompt = &prompt, .max_tokens = 64 }, .{ .ctx = &box, .event = CloseBox.event });
+    while (fam.state()[1] < 3) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    const began = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
+    Host.quiesce(h);
+    const took_ms = @divTrunc(std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - began, std.time.ns_per_ms);
+    const seen = fam.state();
+    try std.testing.expectEqual(@as(?api.Reason, .failed), box.state()[0]); // its pass cut by the stop
+    try std.testing.expectEqual(@as(u32, 1), seen[0]);
+    try std.testing.expect(seen[1] < 16); // the pass stopped at a chunk end, not after its 512
+    try std.testing.expectEqual(@as(usize, 0), seen[2]); // finish (dsv41: done to the followers) after the pass ended
+    try std.testing.expect(took_ms < 1000); // TENSORFOLD_CLOSE_MS is 20,000 by default
 }
 
 test "a cancel during a long prompt stops it, and the next request's reply is unchanged (#291)" {
@@ -748,4 +826,169 @@ test "the CUDA context wrapper forwards bounded prefill and keeps its capability
     defer be.release(&s);
     try std.testing.expect(!try be.vtable.prefill_step.?(be.ptr, &s));
     try std.testing.expect(try be.vtable.prefill_step.?(be.ptr, &s));
+}
+
+test "bindTier: the tier on the prompt cache with the family's grid, replay window and usable rule; a store without one is the RAM cache alone" {
+    const gpa = std.testing.allocator;
+    const pc = api.prompt_cache;
+    const Snap = struct {
+        fn bytes(_: *anyopaque, _: u32) u64 {
+            return 1;
+        }
+        fn save(_: *anyopaque, _: ?*anyopaque, _: u32) anyerror!pc.Saved {
+            return error.Unused;
+        }
+        fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {}
+        fn drop(_: *anyopaque, _: pc.Saved) void {}
+        fn usable(_: *anyopaque, _: *anyopaque, _: u32) bool {
+            return true;
+        }
+    };
+    const Stub = struct { // a tier that answers nothing: only its presence matters here
+        fn lookup(_: *anyopaque, _: *const pc.Want) ?pc.Point {
+            return null;
+        }
+        fn begin(_: *anyopaque, _: *const pc.Point) anyerror!u64 {
+            return error.Unused;
+        }
+        fn poll(_: *anyopaque, _: u64, _: u64) pc.Poll {
+            return .{ .pending = .{} };
+        }
+        fn cancel(_: *anyopaque, _: u64) void {}
+        fn keep(_: *anyopaque, _: *const pc.Kept) ?u64 {
+            return null;
+        }
+        fn forget(_: *anyopaque, _: u64) void {}
+        fn flush(_: *anyopaque, _: u64) u64 {
+            return 0;
+        }
+        fn counts(_: *anyopaque, _: []pc.TierCounts) usize {
+            return 0;
+        }
+        const vt: pc.Tier.VTable = .{ .lookup = lookup, .begin = begin, .poll = poll, .cancel = cancel, .keep = keep, .forget = forget, .flush = flush, .counts = counts };
+    };
+    var family: u8 = 0;
+    var tier_state: u8 = 0;
+    var vt: pc.Snapshots.VTable = .{ .bytes = Snap.bytes, .save = Snap.save, .restore = Snap.restore, .drop = Snap.drop };
+    // without a tier (TF_DS_SPILL_GIB=0): the window from the family's tail, no grid, no usable rule, no tier, no charge
+    var plain = pc.Store.init(gpa, .{ .ptr = &family, .vtable = &vt }, .{ .window = 128 }, 1 << 20);
+    defer plain.deinit();
+    try std.testing.expectEqual(@as(u32, 128), plain.rules.window);
+    try std.testing.expectEqual(@as(u32, 0), plain.rules.grid);
+    try std.testing.expect(vt.usable == null and plain.tier == null and !plain.groups and !plain.charge_tokens);
+    // with one: exactly those change (the replay window is the family's, whatever the store started with)
+    var store = pc.Store.init(gpa, .{ .ptr = &family, .vtable = &vt }, .{ .window = 0 }, 1 << 20);
+    defer store.deinit();
+    bindTier(&store, &vt, .{ .ptr = &tier_state, .vtable = &Stub.vt }, 2048, 128, Snap.usable, std.testing.io);
+    try std.testing.expectEqual(@as(u32, 2048), store.rules.grid);
+    try std.testing.expectEqual(@as(u32, 128), store.rules.window);
+    try std.testing.expect(vt.usable == Snap.usable);
+    try std.testing.expect(store.tier != null and store.tier.?.ptr == @as(*anyopaque, &tier_state));
+    try std.testing.expect(store.charge_tokens);
+    // conversations and lineages numbered from this process's seed (odd: never 0), in the high half
+    try std.testing.expect(store.groups);
+    try std.testing.expect(store.next_group != 0 and store.next_group & 0xffff_ffff == 0 and (store.next_group >> 32) & 1 == 1);
+    try std.testing.expectEqual(store.next_group, store.next_lineage);
+}
+
+test "serve: the family's quiet hook and the tier's settings reach the lane host, its start's off reason reaches status; a family without them leaves the host unchanged" {
+    const gpa = std.testing.allocator;
+    const Fam = struct {
+        quiet_calls: u32 = 0,
+        fn release(_: *anyopaque) void {}
+        fn quiet(p: *anyopaque) bool {
+            const t: *lanes.fake.Fake = @ptrCast(@alignCast(p));
+            _ = t;
+            calls += 1;
+            return true;
+        }
+        var calls: u32 = 0;
+    };
+    var buf: [256]u8 = undefined;
+    const Env = struct {
+        pairs: []const [2][]const u8,
+        pub fn get(e: @This(), name: [:0]const u8) ?[]const u8 {
+            for (e.pairs) |q| if (std.mem.eql(u8, q[0], name)) return q[1];
+            return null;
+        }
+    };
+    for ([_]bool{ false, true }) |with_tier| {
+        var target: lanes.fake.Fake = .{ .gpa = gpa };
+        defer target.deinit();
+        const h = try gpa.create(Host);
+        defer gpa.destroy(h);
+        h.* = .{ .gpa = gpa, .gpu = null, .family = &target, .release = Fam.release, .inner = target.backend(), .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined };
+        if (with_tier) {
+            h.quiet = Fam.quiet;
+            h.spill = api.Spill.fromEnv(Env{ .pairs = &.{ .{ "TF_DS_SPILL_GIB", "256" }, .{ "TF_DS_SPILL_DIR", "/spill" }, .{ "TF_SPILL_LOAD_MS", "7" } } }, &buf);
+            h.spill_start = api.SpillState.offFor("the store did not open within TF_DS_SPILL_OPEN_MS=300000");
+        }
+        try h.serve(std.testing.io, .{ .exact_width = 8 }, 8, .{ .lanes = 2 }, null);
+        defer {
+            h.host.stop();
+            h.core.deinit();
+            h.cfg.deinit(gpa);
+        }
+        var st: api.Status = .{};
+        h.host.engine().status(&st, &.{});
+        if (!with_tier) {
+            // SPILL_GIB=0 (or another family): no fence hook, no tier settings, nothing under cache or spill
+            try std.testing.expect(h.host.quiet == null and h.host.tele == null and !h.host.spill_asked);
+            try std.testing.expect(st.cache == null and st.spill == null);
+            continue;
+        }
+        try std.testing.expect(h.host.spill_asked);
+        try std.testing.expectEqual(@as(u64, 7 * std.time.ns_per_ms), h.host.tier.service_ns); // TF_SPILL_LOAD_MS as given
+        try std.testing.expectEqual(api.SpillState.State.off, st.spill.?.state);
+        try std.testing.expectEqualStrings("the store did not open within TF_DS_SPILL_OPEN_MS=300000", st.spill.?.reason());
+        // the fence's quiet check reaches the family's, with the host bound
+        const q = h.host.quiet.?;
+        const before = Fam.calls;
+        try std.testing.expect(q.check(q.ctx));
+        try std.testing.expectEqual(before + 1, Fam.calls);
+    }
+}
+
+test "the tier with no prompt cache is off from the start, named, and the family opens nothing" {
+    var buf: [256]u8 = undefined;
+    const Env = struct {
+        pairs: []const [2][]const u8,
+        pub fn get(e: @This(), name: [:0]const u8) ?[]const u8 {
+            for (e.pairs) |q| if (std.mem.eql(u8, q[0], name)) return q[1];
+            return null;
+        }
+    };
+    const sp = api.Spill.fromEnv(Env{ .pairs = &.{ .{ "TF_DS_SPILL_GIB", "256" }, .{ "TF_DS_SPILL_DIR", "/spill" } } }, &buf);
+    const none = familySpill(sp, 0); // --prompt-cache-gib 0
+    try std.testing.expect(none.asked and none.off != null);
+    try std.testing.expect(std.mem.indexOf(u8, none.off.?, "--prompt-cache-gib 0") != null);
+    const some = familySpill(sp, 1 << 30); // a prompt cache: the settings as given
+    try std.testing.expect(some.off == null);
+    const bad = api.Spill.fromEnv(Env{ .pairs = &.{.{ "TF_DS_SPILL_GIB", "x" }} }, &buf);
+    try std.testing.expectEqualStrings(bad.off.?, familySpill(bad, 0).off.?); // a bad setting keeps its own reason
+    const unasked = familySpill(.{}, 0); // not asked: nothing changes
+    try std.testing.expect(!unasked.asked and unasked.off == null);
+}
+
+test "the start-up line and /health carry the family's own off reason from its start" {
+    var buf: [256]u8 = undefined;
+    const Env = struct {
+        pairs: []const [2][]const u8,
+        pub fn get(e: @This(), name: [:0]const u8) ?[]const u8 {
+            for (e.pairs) |q| if (std.mem.eql(u8, q[0], name)) return q[1];
+            return null;
+        }
+    };
+    const sp = api.Spill.fromEnv(Env{ .pairs = &.{ .{ "TF_DS_SPILL_GIB", "256" }, .{ "TF_DS_SPILL_DIR", "/spill" } } }, &buf);
+    const si: api.SpillInfo = .{ .settings = sp };
+    const off = api.SpillState.offFor("the start probe: rank 2's bytes differ from rank 0's");
+    const shown = startInfo(si, &off).?;
+    try std.testing.expectEqualStrings("the start probe: rank 2's bytes differ from rank 0's", shown.settings.off.?);
+    var line: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&line);
+    try shown.settings.describe(&w);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "spill: on") == null); // never "on" while it is off
+    const on_state: api.SpillState = .{ .state = .on };
+    try std.testing.expect(startInfo(si, &on_state).?.settings.off == null); // on: the settings as they were
+    try std.testing.expect(startInfo(null, &off) == null); // not asked: none
 }

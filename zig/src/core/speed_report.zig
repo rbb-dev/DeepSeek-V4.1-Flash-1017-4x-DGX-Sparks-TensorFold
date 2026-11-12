@@ -23,6 +23,8 @@ fn notedKind(env: []const u8, kind: u8) ?[]const u8 {
                     put(r, d.what, d.env, true, false, d.cost, "{s}={s}, {s}; {s}", .{ d.env, v, how, ins })
                 else
                     put(r, d.what, d.env, true, false, d.cost, "{s}={s}, {s}", .{ d.env, v, how });
+        put(r, "Prompt cache in memory", "--prompt-cache-gib", false, false, "returning conversations recompute their whole prompt", "its size is 0 (set --prompt-cache-gib, the fork's scripts use PROMPT_CACHE_GIB)", .{});
+            put(r, "SSD prompt cache", "TF_DS_SPILL_GIB", false, false, ssd_cost, "no size/directory given (the fork's scripts set it from free disk; set SPILL_GIB / SPILL_DIR, or TF_DS_SPILL_GIB and TF_DS_SPILL_DIR)", .{});
 test "the report: TF_DS_MERGE_D is listed as wanted and not running, with the kit's reason, when the loaded kit lacks the twins" {
     const keep_applied = pinApplied(false);
     defer unpin(keep_applied);
@@ -130,3 +132,5 @@ test "the report: TF_DS_MERGE_D is ON at every width (1, 2, 3), ON with the widt
     build(&r, .{}, mergeLookup("3"));
     try std.testing.expect(find(&r, "TF_DS_MERGE_D").?.on);
 }
+
+    try std.testing.expect(!pc.on and !pc.asked); // a size of 0 is a warning, not a choice

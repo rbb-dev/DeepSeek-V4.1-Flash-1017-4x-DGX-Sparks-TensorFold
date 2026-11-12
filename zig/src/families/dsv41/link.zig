@@ -89,7 +89,14 @@ pub const Link = struct {
         }
     }
 
-    /// One frame: its length (u32, little-endian), then its bytes.
+    /// Whether a frame has started to arrive within `us` microseconds (rounded up to a millisecond): the caller does other work
+    /// while it waits and reads the frame with recv when this says true. A closed peer reads as ready (recv then fails).
+    pub fn wait(l: Link, us: u32) bool {
+        var p = [1]c.pollfd{.{ .fd = l.fd, .events = c.POLL.IN, .revents = 0 }};
+        const ms: c_int = @intCast((us + 999) / 1000);
+        return c.poll(&p, 1, ms) != 0;
+    }
+
     pub fn send(l: Link, bytes: []const u8) !void {
         const held = where.enter(.link_send, 0, 0);
         defer where.leave(held);
@@ -120,6 +127,35 @@ pub const Link = struct {
             std.atomic.spinLoopHint();
         }
         if (got < len.len) try l.readAll(len[got..]);
+        const n = std.mem.readInt(u32, &len, .little);
+        if (n > buf.len) return error.FrameTooLong;
+        try l.readAll(buf[0..n]);
+        return buf[0..n];
+    }
+
+    /// recvSpin that gives up when nothing has begun to arrive within `spin_ns`: null then, the link untouched. A frame that has
+    /// begun is read whole.
+    pub fn recvSpinOrNone(l: Link, buf: []u8, spin_ns: u64) !?[]u8 {
+        var len: [4]u8 = undefined;
+        var got: usize = 0;
+        const t0 = monotonicNs();
+        var polls: u32 = 0;
+        while (got < len.len) {
+            const n = c.recv(l.fd, @as([*]u8, &len) + got, len.len - got, c.MSG.DONTWAIT);
+            if (n > 0) {
+                got += @intCast(n);
+                continue;
+            }
+            if (n == 0) return error.PeerDown;
+            switch (c.errno(n)) {
+                .AGAIN => {},
+                .INTR => continue,
+                else => return error.PeerDown,
+            }
+            polls +%= 1;
+            if (got == 0 and polls % 64 == 0 and monotonicNs() -% t0 > spin_ns) return null;
+            std.atomic.spinLoopHint();
+        }
         const n = std.mem.readInt(u32, &len, .little);
         if (n > buf.len) return error.FrameTooLong;
         try l.readAll(buf[0..n]);

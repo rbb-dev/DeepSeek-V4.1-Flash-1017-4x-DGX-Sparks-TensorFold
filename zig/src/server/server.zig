@@ -132,6 +132,9 @@ pub const Server = struct {
     next_id: std.atomic.Value(u64) = .init(1),
     /// Connections open now; a stop waits for them before freeing what they read.
     open_connections: std.atomic.Value(u32) = .init(0),
+    /// The stop's pipe: endIdle writes a byte, and every connection waiting idle for its next request polls the read
+    /// end beside its socket (-1: no pipe, so those waits last their idle_ms).
+    stop_pipe: [2]std.posix.fd_t = .{ -1, -1 },
     /// The idle keepalive on the engine's queue, armed by --keep-warm; null when off or not Metal.
     keepalive: ?*api.keepalive.Keepalive = null,
     preparing: std.atomic.Value(i64) = .init(0),
@@ -158,6 +161,10 @@ pub const Server = struct {
         srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa) };
         errdefer srv.deinit(); // a later step's failure stops the keepalive before the caller closes the engine
         if (config.cortheon) srv.cortheon = try cortheon.State.init(gpa, io, "TensorFold-Cortheon (+https://github.com/ashhart/TensorFold)", config.cortheon_search_key);
+        srv.stop_pipe = stopPipe() catch |e| blk: {
+            log.line("no stop pipe ({s}): at a stop, idle keep-alive connections wait out their idle timeout", .{@errorName(e)});
+            break :blk .{ -1, -1 };
+        };
         if (config.keep_warm_s > 0) if (engine.keepaliveTarget()) |target| {
             srv.keepalive = api.keepalive.Keepalive.start(gpa, io, target, @as(i64, config.keep_warm_s) * std.time.ns_per_s) catch |e| blk: {
                 log.line("idle keepalive off: {s}", .{@errorName(e)});
@@ -203,6 +210,9 @@ pub const Server = struct {
     pub fn deinit(srv: *Server) void {
         if (srv.keepalive) |k| k.stop(); // before the engine's queue goes away
         if (srv.grammars) |g| g.close();
+        for (srv.stop_pipe) |fd| if (fd >= 0) {
+            _ = std.posix.system.close(fd);
+        };
         srv.metrics.deinit();
         srv.arena.deinit();
         srv.store.deinit();
@@ -210,6 +220,14 @@ pub const Server = struct {
         srv.teacher.deinit();
         if (srv.cortheon) |c| c.deinit();
         srv.gpa.destroy(srv);
+    }
+
+    /// The stop: every connection waiting idle for its next request ends now, not after its idle timeout; one
+    /// reading or answering a request ends at its next wait. The byte stays unread, so every later wait sees it.
+    pub fn endIdle(srv: *Server) void {
+        if (srv.stop_pipe[1] < 0) return;
+        const byte = [_]u8{1};
+        _ = std.posix.system.write(srv.stop_pipe[1], &byte, byte.len);
     }
 
     /// The effort the template hears: the request's name, or this server's default.
@@ -389,7 +407,8 @@ pub const Server = struct {
         if (srv.metrics.statsLine(srv.io, now, @as(i96, srv.config.stats_every_s) * std.time.ns_per_s, &buf)) |text| log.line("{s}", .{text});
     }
 
-    /// Accepts connections until ``stop`` is set, each on its own thread.
+    /// Accepts connections until ``stop`` is set, each on its own thread, counted open before that thread runs (a stop
+    /// that finds none open frees what a thread not yet started would read).
     pub fn serve(srv: *Server, listener: listener_mod.Listener, stop: *const std.atomic.Value(bool)) void {
         while (listener.accept(stop)) |c| {
             // counted before its thread runs, so a zero count once this loop ends means no connection is left
@@ -403,6 +422,7 @@ pub const Server = struct {
         }
     }
 
+    /// One accepted connection's requests, on its own thread (already counted open by serve).
     fn connection(srv: *Server, accepted: listener_mod.Listener.Accepted) void {
         defer _ = srv.open_connections.fetchSub(1, .acq_rel);
         defer _ = std.posix.system.close(accepted.fd);
@@ -411,6 +431,7 @@ pub const Server = struct {
         var conn = http_conn.Conn.init(srv.gpa, accepted.fd, peer) catch return;
         defer conn.deinit();
         conn.timeouts = srv.config.timeouts;
+        if (srv.stop_pipe[0] >= 0) conn.wake = srv.stop_pipe[0];
         conn.auth_enabled = srv.keys != null and srv.keys.?.enabled();
         if (conn.auth_enabled) conn.hook = .{ .ctx = srv, .call = countReply };
         var arena: std.heap.ArenaAllocator = .init(srv.gpa);
@@ -464,6 +485,15 @@ pub const Server = struct {
         return false;
     }
 };
+
+/// The stop's pipe, both ends close-on-exec (a child process, video.zig's python3, inherits neither).
+fn stopPipe() error{PipeFailed}![2]std.posix.fd_t {
+    const posix = std.posix;
+    var fds: [2]posix.fd_t = undefined;
+    if (posix.errno(posix.system.pipe(&fds)) != .SUCCESS) return error.PipeFailed;
+    for (fds) |fd| _ = posix.system.fcntl(fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
+    return fds;
+}
 
 /// A header that appears exactly once; none or several read as absent (as the key match reads them).
 fn single(conn: *const http_conn.Conn, name: []const u8) ?[]const u8 {

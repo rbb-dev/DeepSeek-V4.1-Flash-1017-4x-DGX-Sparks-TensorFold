@@ -31,7 +31,9 @@ const ProcessEnv = struct {
 
 const weights = @import("weights.zig");
 const prompt = @import("prompt.zig");
+const land = @import("land.zig");
 const prompt2d = @import("prompt2d.zig");
+const spill_sync = @import("spill_sync.zig");
 const round = @import("round.zig");
 const sampling = @import("sampling.zig");
 const head_cand = @import("head_cand.zig");
@@ -119,6 +121,7 @@ pub const Options = struct {
     rdma_kernels: ?[]const u8 = null, // world 4: the rings' kernels' image (rdma_gather.cu's fatbin; null: the embedded one)
     graphs: bool = false, // the rounds' stretches as CUDA graphs (round.Graphs)
     graph_cap: usize = 0, // the captured stretches kept at most, least recently replayed out first (TF_DS_GRAPH_CAP; 0: all)
+    land_slots: u32 = 0, // rank 0: its SSD tier's landing buffers on every rank (TF_DS_SPILL_LAND_SLOTS; 0: the tier off)
     side: bool = false, // the mixes' side work on a stream of its own (round.Round.useSide)
     prefetch: bool = false, // the paced L2 prefetch (round.Round.usePrefetch)
     engram_aio: bool = false, // a round's Engram reads by Linux AIO on O_DIRECT (else the reader pool)
@@ -1379,6 +1382,8 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         .graph_cap = @intCast(@min(o.graph_cap, std.math.maxInt(u32))),
         .pool = o.pool,
         .replay_floor = @intFromBool(prompt.replay_floor),
+        .idx_rb = @intCast(@min(tri_index.idx_rb, std.math.maxInt(u32))),
+        .land_slots = o.land_slots,
         .exch = prompt2d.exchAsked(),
         .kern = prompt2d.kernAsked(),
         .kern2 = prompt2d.kern2Asked(),
@@ -1386,6 +1391,17 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         .pf_raster = prompt2d.pf_raster_asked,
         .pass_rows = prompt2d.pass_rows_asked,
         .pass_from = prompt2d.pass_from_asked,
+    };
+}
+
+/// This rank's weight digest from TF_DS_RANK_CACHE_SHA (the SHA-256 of its weight file): none when it is unset, empty
+/// or not a digest (said on stderr). The start goes on either way; without one the SSD tier is off, named.
+pub fn rankDigest() prompt2d.Digest {
+    const v = std.mem.span(std.c.getenv("TF_DS_RANK_CACHE_SHA") orelse return prompt2d.no_digest);
+    if (v.len == 0) return prompt2d.no_digest;
+    return prompt2d.weightDigest(v) orelse {
+        std.log.warn("TF_DS_RANK_CACHE_SHA is not a SHA-256 (64 lowercase hex digits, \"sha256:\" before them or not): this rank sends no weight digest", .{});
+        return prompt2d.no_digest;
     };
 }
 
@@ -1775,7 +1791,11 @@ pub const Model = struct {
     host_pos_c: []i64 = &.{},
     pair_bytes: usize = 0,
     rdma_rings: ?ring2d.Rings = null,
+    // the start-up exchange (prompt2d.Fan.commChecked): rank 0's Settings (rank 0: its own), and the ranks' weight
     // digests by rank (rank 0 holds every rank's, a follower its own; prompt2d.no_digest: none)
+    lead: prompt2d.Settings = undefined,
+    weights: [4]prompt2d.Digest = @splat(prompt2d.no_digest),
+
     /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port)
     /// and sets up every buffer. Needs `ctx` current on this thread.
     pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, o: Options) !*Model {
@@ -1826,6 +1846,17 @@ pub const Model = struct {
             prompt2d.roci_stagger3_asked = prompt2d.roci_stagger_lanes == 3; // every rank alike (Settings)
         }
         prompt2d.engram_partner_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ENGRAM_PARTNER")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        {
+            const text: ?[]const u8 = if (std.c.getenv("TF_DS_SSD_FAULT")) |v| std.mem.span(v) else null;
+            prompt2d.ssd_fault = spill_sync.Fault.parse(text, o.world) catch {
+                std.log.err("TF_DS_SSD_FAULT is write:R, corrupt:R or write:R,corrupt:S with each rank below {d}, not \"{s}\"", .{ o.world, text.? });
+                return error.BadSsdFault;
+            };
+            if (prompt2d.ssd_fault.any()) {
+                var fb: [48]u8 = undefined;
+                std.log.info("TF_DS_SSD_FAULT={s}: the four stores' drill: rank {d} carries out {s}{s}", .{ prompt2d.ssd_fault.text(&fb), o.rank, if (prompt2d.ssd_fault.armed(o.rank).write) "the write fault " else "", if (prompt2d.ssd_fault.armed(o.rank).corrupt) "the corrupt fault" else if (!prompt2d.ssd_fault.armed(o.rank).write) "none (another rank's)" else "" });
+            }
+        }
         prompt2d.pf_split_asked = readPfSplit(); // every rank alike (Settings)
         prompt2d.pf_raster_asked = try readPfRaster(); // every rank alike (Settings)
         prompt2d.woa_w8_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_WOA_W8")) |v| std.mem.span(v) else null); // every rank alike (Settings)
@@ -2122,9 +2153,21 @@ pub const Model = struct {
 
         try m.fan.join(io, o.master, o.port, o.rank, o.world, prompt2d.connectSeconds());
         try m.vfan.join(io, o.master, o.port + prompt2d.host_links_port_offset, o.rank, o.world, prompt2d.connectSeconds());
+        // every rank's streams, pool, round rows, rails, drafter, graphs and math switches checked against rank 0's first;
+        // each follower's answer carries its weight digest (TF_DS_RANK_CACHE_SHA) to rank 0
+        const mine = startSettings(o);
+        var heard: prompt2d.Heard = .{};
         m.comm = try m.fan.settingsChecked(o.rank, o.world, mine, rankDigest(), &heard);
         errdefer m.comm.deinit();
         m.comm.host = .{ .star = .{ .links = &m.vfan.links, .rank = o.rank, .world = o.world, .busy = &m.star_busy } };
+        m.lead = heard.lead orelse mine;
+        m.weights = heard.weights;
+        errdefer if (m.ring) |r| r.destroy(gpa);
+        errdefer if (m.rdma_mod) |*x| x.unload();
+
+        // kernels: the recorded Triton set, the served extension cubins, the torch-op images
+        m.set = try cuda.aot.Set.load(gpa, io, d, ctx.device, o.aot_dir orelse try std.fs.path.join(a, &.{ o.kit_dir, "aot" }));
+        errdefer m.set.deinit();
         // the kit's extra set (aot-extra/), which only the call sites of TF_DS_DRAFT_4WAY's stages, TF_DS_ATTN_U's prompt
         // attention, TF_DS_IDX_U's and TF_DS_IDX_V's prompt index scores and TF_DS_ATTN_U_DECODE's round attention search;
         // then every rank's drafter compared
@@ -2908,11 +2951,193 @@ pub const Model = struct {
         try d.check(d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, m.stream.handle), "cuMemcpyDtoDAsync");
     }
 
+    // -- spill v2's checkpoint state (port of wojo's GLM 0110, PR #124: spill_state.zig) ------------------------------
+    // A kept point's state on this rank as the spill tier stores it: the descriptor derived from the loaded weights and
+    // the live allocation, and the planes' addresses and copies for spill.Packer. Nothing here runs unless the tier
+    // calls it from the lanes, so with the tier off the served path never reaches it.
+
+    pub const spill = @import("spill_state.zig");
+
+    comptime {
+        std.debug.assert(draft.max_streams <= spill.max_slots);
+    }
+
+    /// This rank's state planes as spill.Packer reads and writes them: their device addresses (the whole pool's
+    /// compressed planes, a slot's rings and raw stores) and copies in the model's stream's order.
+    pub const SpillDev = struct {
+        m: *Model,
+
+        pub const Event = cuda.Event;
+
+        /// Row 0 of a block plane over the whole pool (the extent at base b starts b / ratio rows in, as view() puts it).
+        pub fn blockPlane(dv: SpillDev, p: spill.Plane) u64 {
+            const cs = &dv.m.caches;
+            return switch (p.kind) {
+                .comp_codes => cs.comp_codes[p.layer],
+                .comp_scales => cs.comp_scales[p.layer],
+                .idx_codes => cs.idx_codes[p.layer],
+                .idx_scales => cs.idx_scales[p.layer],
+                .ring, .raw_kv, .raw_score => 0,
+            };
+        }
+
+        /// Slot `slot`'s rows of a small plane (snapCopy's addresses).
+        pub fn slotPlane(dv: SpillDev, p: spill.Plane, slot: usize) u64 {
+            const m = dv.m;
+            const base: u64 = switch (p.kind) {
+                .ring => m.rings[p.layer],
+                .raw_kv => m.caches.raw_kv[p.layer],
+                .raw_score => m.caches.raw_score[p.layer],
+                .comp_codes, .comp_scales, .idx_codes, .idx_scales => 0,
+            };
+            return if (base == 0) 0 else base + slot * p.slotBytes();
+        }
+
+        pub fn capacity(dv: SpillDev) usize {
+            return dv.m.caches.cap;
+        }
+
+        pub fn slots(dv: SpillDev) usize {
+            return dv.m.streams;
+        }
+
         // (every copy of the tier's reads or writes the caches on the model's stream: behind a pair's second pass first)
+        pub fn d2h(dv: SpillDev, dst: []u8, src: u64) !void {
             try dv.m.pairJoin();
+            const d = dv.m.ctx.d;
+            try d.check(d.api.cuMemcpyDtoHAsync_v2(dst.ptr, src, dst.len, dv.m.stream.handle), "cuMemcpyDtoHAsync");
+        }
+
+        pub fn h2d(dv: SpillDev, dst: u64, src: []const u8) !void {
             try dv.m.pairJoin();
+            const d = dv.m.ctx.d;
+        }
+
+        pub fn fill(dv: SpillDev, dst: u64, value: u8, bytes: usize) !void {
             try dv.m.pairJoin();
+            const d = dv.m.ctx.d;
+            try d.check(d.api.cuMemsetD8Async(dst, value, bytes, dv.m.stream.handle), "cuMemsetD8Async");
+        }
+
+        pub fn record(dv: SpillDev, ev: cuda.Event) !void {
             try dv.m.pairJoin();
+            try ev.record(dv.m.stream);
+        }
+
+        /// Whether the copies before `ev` completed (spill_tier polls it; a device error reads as done, and the next
+        /// copy on the stream reports it).
+        pub fn done(_: SpillDev, ev: cuda.Event) bool {
+            return ev.done() catch true;
+        }
+
+        /// The copies before `ev` completed (a cancel, a drop, a shutdown: bounded by what was enqueued).
+        pub fn wait(_: SpillDev, ev: cuda.Event) void {
+            ev.synchronize() catch {};
+        }
+    };
+
+    /// The spill state descriptor of this rank, derived from the loaded layers (Caches.init's reading of them) and
+    /// checked against the live allocation: snapCopy's bytes, a ring per layer, every plane present. Replicated: every
+    /// rank holds the whole pool (no KV split), so rank 0's store holds every rank's bytes.
+    pub fn spillLayout(m: *const Model) !spill.StateLayout {
+        const layers = m.eng.w.layers;
+        if (layers.len > spill.max_layers) return error.SpillLayoutMismatch;
+        var shapes: [spill.max_layers]spill.LayerShape = undefined;
+        for (layers, shapes[0..layers.len]) |lay, *s| {
+            const kv = lay.comp_wkv != null;
+            s.* = .{ .ratio = if (kv) lay.ratio else 0, .kv = kv, .idx = kv and lay.idx_wk != null, .raw = kv and lay.ratio > 1 };
+        }
+        const l = try spill.StateLayout.init(shapes[0..layers.len], spill.Geometry.of(m.eng.c, chunk_rows, prompt.ring_extra, prompt.raw_rows), .replicated);
+        if (l.small_bytes != m.snapBytes() or m.rings.len != layers.len) return error.SpillLayoutMismatch;
+        const dv: SpillDev = .{ .m = @constCast(m) };
+        for (l.blockPlanes()) |p| if (dv.blockPlane(p) == 0) return error.SpillLayoutMismatch;
+        for (l.smallPlanes()) |p| {
+            if (dv.slotPlane(p, 0) == 0) return error.SpillLayoutMismatch;
+            if (p.kind == .ring and p.slotBytes() != m.eng.ringBytes()) return error.SpillLayoutMismatch;
+        }
+        return l;
+    }
+
+    /// The pool's extent and slot generations (one counter a chunk of positions), sized once at setup.
+    pub fn spillGenerations(m: *const Model, gpa: std.mem.Allocator) !spill.Generations {
+        return spill.Generations.init(gpa, m.caches.cap, chunk_rows);
+    }
+
+    /// A packer over this rank's planes, `l` from spillLayout and `g` from spillGenerations (both the caller's, alive
+    /// while it is used). Its calls enqueue on the model's stream and record the caller's event: no allocation, no wait.
+    pub fn spillPacker(m: *Model, l: *const spill.StateLayout, g: *spill.Generations) spill.Packer(SpillDev) {
+        return .{ .dev = .{ .m = m }, .layout = l, .gens = g, .rank = m.rank };
+    }
+
+    /// The Engram read-ahead joined and its rows dropped, so the next chunk reads its own rows from its prompt's ids.
+    /// Baseline hazard (also without spill): fillChunk takes a joined read-ahead whose (ahead_start, ahead_n) match its
+    /// chunk, and a pass that ends between chunks (cancel, error) leaves one standing; a later prompt resuming a kept
+    /// point at that position (in memory or restored) would consume rows hashed from the other prompt's ids. The fix
+    /// is one call at the start of every pass, in fillBegin after its joinAhead (outside this block: routed to the
+    /// coordinator); a restore calls this right before the resumed pass.
+    pub fn resetEngramAhead(m: *Model) void {
+        m.joinAhead();
+        if (m.eh) |*eh| {
+            eh.ahead_ready = .{ false, false };
+            eh.ahead_n = 0;
+            eh.ahead_err = null;
+        }
+    }
+
+    /// After a restored prompt's fill: the drafter's rings were rebuilt by its replay through the prompt's end
+    /// (spill.checkReplayRebuilds' rule, here as the pool records it), so the first draft reads no unwritten row.
+    pub fn spillCheckResumed(m: *const Model, slot: usize, len: usize) !void {
+        if (slot >= m.streams) return error.BadSlot;
+        if (m.dpool) |*p| if (p.absorbed[slot] != len) return error.DraftNotRebuilt;
+    }
+
+    /// A compressed plane as copyExtent copies it: its address, row bytes (copyExtent's own widths from the config)
+    /// and ratio.
+    pub const SpillRefPlane = struct { plane: u64, row: usize, ratio: usize };
+
+    /// copyExtent's planes as the landing and the probe walk them (land.Plane: the same fields).
+    pub fn landPlanes(m: *const Model, out: *[4 * spill.max_layers]land.Plane) ![]land.Plane {
+        var refs: [4 * spill.max_layers]SpillRefPlane = undefined;
+        const r = try m.spillRefPlanes(&refs);
+        for (r, out[0..r.len]) |x, *o| o.* = .{ .plane = x.plane, .row = x.row, .ratio = x.ratio };
+        return out[0..r.len];
+    }
+
+    /// copyExtent's planes in its order (every kv layer: codes, scales, then the index keys' codes and scales), read
+    /// from the loaded layers and the config, not from the spill layout. The landing and the probe walk them.
+    pub fn spillRefPlanes(m: *const Model, out: *[4 * spill.max_layers]SpillRefPlane) ![]SpillRefPlane {
+        const c = m.eng.c;
+        const cs = &m.caches;
+        var k: usize = 0;
+        for (m.eng.w.layers, 0..) |lay, i| {
+            if (lay.comp_wkv == null) continue;
+            if (k + 4 > out.len) return error.SpillLayoutMismatch;
+            const r: usize = lay.ratio;
+            out[k] = .{ .plane = cs.comp_codes[i], .row = c.head_dim / 2, .ratio = r };
+            out[k + 1] = .{ .plane = cs.comp_scales[i], .row = c.head_dim / 16, .ratio = r };
+            k += 2;
+            if (lay.idx_wk != null) {
+                out[k] = .{ .plane = cs.idx_codes[i], .row = c.index_head_dim / 2, .ratio = r };
+                out[k + 1] = .{ .plane = cs.idx_scales[i], .row = c.index_head_dim / 32, .ratio = r };
+                k += 2;
+            }
+        }
+        return out[0..k];
+    }
+
+    /// Each layer's gate_bias_vl (f32 [experts], the checkpoint's extra file) on the device: Gate.forward's bias at
+    /// image-span positions.
+    fn loadVisionBias(m: *Model, path: []const u8) !void {
+        const core = @import("core");
+        var f = try core.safetensors.File.open(m.gpa, m.io, path);
+        defer f.close(m.io);
+        var nb: [64]u8 = undefined;
+        for (m.w.layers, 0..) |*lay, i| {
+            const t = f.get(try std.fmt.bufPrint(&nb, "layers.{d}.ffn.gate.bias_vl", .{i})) orelse return error.MissingVisionBias;
+            if (!t.is(.f32, &.{m.cfg.experts})) return error.BadVisionBias;
+            const dst = try m.arena.take(t.bytes.len);
+            const tmp = try m.gpa.dupe(u8, t.bytes); // (a copy out of the file mapping first: see vit.zig)
+            defer m.gpa.free(tmp);
         try m.pairJoin(); // (a pair's second pass may still read the image rows this replaces)
         if (rows.len > 0) {
             if (m.img_buf == null or m.img_buf.?.len < rows.len) {

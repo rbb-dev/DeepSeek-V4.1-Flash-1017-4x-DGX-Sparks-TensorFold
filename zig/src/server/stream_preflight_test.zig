@@ -402,6 +402,51 @@ test "whitespace with tools disabled is unchanged" {
 test "prose before a call retains its leading whitespace" {
     try exerciseSpace("\n\nLook up.\n" ++ space_call, "\n\nLook up.\n", true, true, 1);
 }
+
+test "/health shows the prompt cache's counters where the engine reports them, and nothing new where it does not" {
+    const CacheEngine = struct {
+        cache: ?api.CacheStats,
+        fn engine(e: *@This()) api.Engine {
+            return .{ .ctx = e, .vtable = &.{ .info = info, .submit = HiEngine.submit, .cancel = HiEngine.cancel, .status = status, .memory = HiEngine.memory } };
+        }
+        fn info(_: *anyopaque) api.Info {
+            return .{ .context_window = 4096, .prompt_cache = true };
+        }
+        fn status(ctx: *anyopaque, out: *api.Status, _: []u32) void {
+            const e: *@This() = @ptrCast(@alignCast(ctx));
+            out.* = .{ .cache = e.cache };
+        }
+    };
+    var ranks: api.prompt_cache.RankCounts = .{ .n = 1 };
+    ranks.ranks[0].points = 5;
+    for ([_]?api.CacheStats{ .{ .chats_continued = 1, .disk_hits_committed = 3, .spill = ranks }, null }) |cache| {
+        var text: TestText = .{};
+        var backend: CacheEngine = .{ .cache = cache };
+        var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
+            .served_name = "test-model",
+            .model_ids = &.{"test-model"},
+            .enable_thinking = false,
+            .use_drafts = false,
+        }, null);
+        defer srv.deinit();
+        srv.noteRequest(120, 96, 3, 0, 0, &.{}, 2, .{}, 0, null, null, null);
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const health = try @import("status_routes.zig").healthValue(srv, arena.allocator(), false);
+        try std.testing.expectEqualStrings("96", health.get("cached_tokens_total").?.int);
+        try std.testing.expect(health.get("spill") == null); // the tier not asked for: no key
+        if (cache != null) {
+            try std.testing.expectEqualStrings("1", health.get("chats_continued").?.int);
+            const pc = health.get("prompt_cache").?.object;
+            try std.testing.expectEqualStrings("3", pc.get("disk_hits_committed").?.int);
+            try std.testing.expectEqualStrings("5", pc.get("spill").?.array[0].object.get("points").?.int);
+        } else {
+            try std.testing.expect(health.get("prompt_cache") == null);
+            try std.testing.expect(health.get("chats_continued") == null);
+        }
+    }
+}
+
 /// A two-call reply on `route`, whole and streamed: the stream sends no text that the whole reply does not show.
 fn expectToolStreamLikeWhole(route: Route, comptime fields: []const u8) !void {
     var backend: CallEngine = .{};

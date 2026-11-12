@@ -19,18 +19,24 @@ pub fn capabilities(a: Allocator) cli.Engines {
     return .{ .version = @import("build_options").version, .chip = if (native.families.len > 0) native.chip(a) else null, .backends = native.backends, .families = native.families };
 }
 
+/// The disk tier's reason text when a setting turns it off (the engine keeps the parsed settings for its life).
+var spill_reason: [256]u8 = undefined;
+
 /// What the open /health names: this release, the built-in backend and the GPU a serve with ``args`` opens.
 pub fn identity(a: Allocator, args: cli.Args) build_identity.Identity {
     return build_identity.of(native, a, @import("build_options").version, args.device);
 }
 
-/// The engine for the checkpoint in ``dir``, or null with ``problem`` set.
+/// The engine for the checkpoint in ``dir``, or null with ``problem`` set. The disk tier's settings come from the
+/// environment; a bad one turns the tier off, named on /health, and never refuses the open.
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, dir: []const u8, model_type: []const u8, args: cli.Args, problem: *[]const u8) !?Opened {
     if (args.record != null and !@hasDecl(native, "records")) {
         problem.* = "--record writes rows from the CUDA engine only so far: serve without --record";
         return null;
     }
-    return native.open(a, gpa, io, try cli.request(a, dir, model_type, args), problem);
+    var req = try cli.request(a, dir, model_type, args);
+    req.spill = api.Spill.fromEnv(api.ProcessEnv{}, &spill_reason);
+    return native.open(a, gpa, io, req, problem);
 }
 
 /// A tensor-parallel rank above 0 runs rank 0's steps until it stops; false with ``problem`` set when it cannot.
