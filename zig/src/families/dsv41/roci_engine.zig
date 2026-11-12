@@ -77,6 +77,12 @@ pub const Roci = struct {
     g: u8,
     layout: roci.Layout,
     arena: HostMem,
+    /// The second lane of a rank borrows the first lane's allocation (its second half): only the first frees it.
+    owns_arena: bool = true,
+    /// This lane (0, 1 or 2 for the prompt lanes of a rank, 3 the host lane) and the device addresses [lo, hi) of the whole allocation the
+    /// prompt lanes' arenas lie in.
+    lane: u8 = 0,
+    span: [2]u64 = .{ 0, 0 },
     ctl_mem: HostMem,
     verbs: fabric.verbs.Verbs,
     /// libmlx5, loaded when the queue pairs wait in the card (TF_DS_ROCI_WAIT=1).
@@ -86,11 +92,31 @@ pub const Roci = struct {
     passes: u64 = 0,
     prev: roci.Counters = .{},
 
+    /// open for the lanes of a rank: `lanes` 2 or 3 allocates the lanes' arenas as one block (so mx.Kernels' one range tests them all) and
+    /// lane 0 takes the first part; with `first` (the lane 0 Roci) `lanes` is this lane's place in the group (2: lane 1, 3: lane 2) and it opens
+    /// on that part of the block, with its own control block, queue pairs and proxies, and pairs the transports (a failure on one stops
+    /// the others: the caller links three with Transport.ring3). The last lane is closed first, lane 0 last.
     pub fn openLane(gpa: std.mem.Allocator, d: *const cuda.Driver, rank: u32, node: u8, world: u32, order: [4]u32, fan: *const prompt2d.Fan, devices: [roci.rails][]const u8, gid: u8, lanes: u8, first: ?*Roci, layout_set: roci.LayoutSet) !*Roci {
         const pages: Pages = .mmap; // (locked anonymous pages registered with cuMemHostRegister: the arena the transport's kernels run at device speed on)
         if (world != roci.world) return error.NotFourRanks;
+        if (lanes < 1 or lanes > 3) return error.BadLanes;
         const r = try gpa.create(Roci);
         errdefer gpa.destroy(r);
+        const total: usize = @intCast(r.layout.total);
+            r.lane = 3;
+            // the second or third lane: the first lane's block, the part of its place (`lanes` is 2 or 3 here)
+            if (lanes < 2 or f.lane != 0 or f.span[1] - f.span[0] < lanes * total) return error.NoSecondArena;
+            r.lane = lanes - 1;
+            r.owns_arena = false;
+            r.arena_mem = f.arena_mem;
+            r.arena = .{ .bytes = @alignCast(f.arena_mem.mem.bytes[r.lane * total ..][0..total]), .dev = f.arena_mem.mem.dev + r.lane * total };
+            r.span = f.span;
+        } else {
+            r.arena_mem = try Arena.alloc(d, total * lanes, pages);
+            r.arena = .{ .bytes = r.arena_mem.mem.bytes[0..total], .dev = r.arena_mem.mem.dev };
+            r.span = .{ r.arena_mem.mem.dev, r.arena_mem.mem.dev + total * lanes };
+        }
+        errdefer if (r.owns_arena) r.arena_mem.free(d);
         r.ctl_mem = try HostMem.alloc(d, @sizeOf(roci.Control), host_portable | host_mapped);
         errdefer _ = d.api.cuMemFreeHost(r.ctl_mem.bytes.ptr);
         const ctl: *roci.Control = @ptrCast(r.ctl_mem.bytes.ptr);
@@ -150,11 +176,13 @@ pub const Roci = struct {
         const set: roci.Settings = .{ .nap = nap.wanted() and !in_card, .codes = true, .gathers = true, .park = layout_set == .host, .idle_park_us = envU32("TF_DS_ROCI_IDLE_PARK_US", 0), .housekeep_every = @max(1, envU32("TF_DS_ROCI_HOUSEKEEP", 16)), .backstop_us = backstopUs(envU32("TF_DS_ROCI_BACKSTOP_US", 100)), .wait_qp = in_card };
         r.t = try roci.Transport.init(gpa, r.g, o, ctl, r.ctl_mem.dev, r.nic.nic(), set);
         errdefer r.t.deinit();
+        if (first) |f| roci.Transport.pair(f.t, r.t);
         var buf: [768]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
         const rails_text = try std.fmt.allocPrint(gpa, "{s},{s}", .{ devices[0], devices[1] });
         defer gpa.free(rails_text);
         roci.startLine(&w, r.g, rails_text, gid, set, signal) catch {};
+        std.log.info("{s}lane {d} of {d}: registration and exchange {d} ms, nap {}, arena {s}", .{ w.buffered(), r.lane, if (first) |f| @as(u8, @intCast((f.span[1] - f.span[0]) / total)) else lanes, (nowNs() - t0) / std.time.ns_per_ms, set.nap, "locked anonymous pages registered with cuMemHostRegister" });
         return r;
     }
 
@@ -164,6 +192,7 @@ pub const Roci = struct {
         if (r.mlx) |*m| m.close();
         r.verbs.close();
         _ = r.d.api.cuMemFreeHost(r.ctl_mem.bytes.ptr);
+        if (r.owns_arena) r.arena_mem.free(r.d);
         r.gpa.destroy(r);
     }
 
@@ -174,6 +203,7 @@ pub const Roci = struct {
 
     /// The device addresses [lo, hi) of the arena: a GEMM whose y lies in it stores whole lines (mx.Kernels.useStaged).
     pub fn range(r: *const Roci) [2]u64 {
+        return r.span;
     }
 
     /// The plan a chunk of `cap` rows takes (roci.Transport.shape_caps), else it has none.
@@ -201,6 +231,7 @@ pub const Roci = struct {
         r.prev = now;
         var buf: [768]u8 = undefined;
         var label: [32]u8 = undefined;
+        const l = std.fmt.bufPrint(&label, "lane {d} line {d}", .{ r.lane, r.passes }) catch "line";
         var w = std.Io.Writer.fixed(&buf);
         w.print("ROCI {s}: events {d} doorbells {d} stream_writes {d} wait_groups {d} data_writes {d} words {d} posts {d} bytes_out {d} wakes {d} backstop_wakes {d} post_ns_max {d} watchdog_max_age_ms {d} abort {d}", .{ l, d.events, d.doorbells, d.stream_writes, d.wait_groups, d.data_writes, d.words, d.posts, d.bytes_out, d.wakes, d.backstop_wakes, d.post_ns_max, d.watchdog_max_age_ms, @atomicLoad(u64, &r.t.ctl.abort.v, .monotonic) }) catch return;
         std.log.info("{s}", .{w.buffered()});
@@ -253,6 +284,15 @@ pub fn waitMode(text: ?[]const u8, signal: roci.Signal, mlx_ok: bool) WaitMode {
 }
 
 /// `TF_DS_ROCI_CPUS_B=a,b`: the second lane's two proxy cores (default 1,2: small cores that neither the decode rings' proxies nor the
+/// threads use).
+fn cpusFromEnvB() ?[roci.rails]u16 {
+    const v = std.c.getenv("TF_DS_ROCI_CPUS_B") orelse return .{ 1, 2 };
+    var it = std.mem.splitScalar(u8, std.mem.span(v), ',');
+    var out: [roci.rails]u16 = undefined;
+    for (&out) |*c| c.* = std.fmt.parseInt(u16, it.next() orelse return null, 10) catch return null;
+    return out;
+}
+
 /// `TF_DS_ROCI_CPUS=a,b`: the two rails' proxy cores; unset, the scheduler's choice.
 fn cpusFromEnv() ?[roci.rails]u16 {
     const v = std.c.getenv("TF_DS_ROCI_CPUS") orelse return null;

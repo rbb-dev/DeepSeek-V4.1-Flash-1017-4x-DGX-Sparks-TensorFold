@@ -109,3 +109,67 @@ pub const Blas = struct {
         try b.check(b.api.cublasSgemm_v2(b.handle, .t, .n, @intCast(rows), 1, @intCast(k), &one, x, @intCast(k), v, @intCast(k), &zero, out, @intCast(rows)));
     }
 };
+
+test "two handles on two streams give a pass's bytes: the same GEMMs on the second handle (own workspace, own stream), run beside the first's, equal one handle's" {
+    var driver = cuda.Driver.open() catch return error.SkipZigTest;
+    defer driver.close();
+    var cx = cuda.Context.init(&driver, 0) catch return error.SkipZigTest;
+    defer cx.deinit();
+    const gpa = std.testing.allocator;
+    var s0 = try cuda.Stream.init(&driver, true);
+    defer s0.deinit();
+    var s1 = try cuda.Stream.init(&driver, true);
+    defer s1.deinit();
+    var ws0 = try cuda.DeviceBuffer.alloc(&driver, Blas.workspace_bytes);
+    defer ws0.free();
+    var ws1 = try cuda.DeviceBuffer.alloc(&driver, Blas.workspace_bytes);
+    defer ws1.free();
+    var b0 = Blas.open(s0, ws0.ptr) catch return error.SkipZigTest;
+    defer b0.close();
+    var b1 = try Blas.open(s1, ws1.ptr);
+    defer b1.close();
+    // shapes of a pass: bf16 linears (rows 4,096) and the fp32 matmul of the router
+    const shapes = [_][3]usize{ .{ 4096, 1280, 2048 }, .{ 4096, 512, 1024 }, .{ 4096, 2048, 256 } };
+    var prng = std.Random.DefaultPrng.init(0x2b7);
+    const rng = prng.random();
+    for (shapes) |sh| {
+        const rows = sh[0];
+        const k = sh[1];
+        const n = sh[2];
+        const xb = try gpa.alloc(u16, rows * k);
+        defer gpa.free(xb);
+        const wb = try gpa.alloc(u16, n * k);
+        defer gpa.free(wb);
+        // small bf16 values (exponent 0x3c..0x40) so no input is a NaN or an infinity
+        for (xb) |*v| v.* = (@as(u16, rng.int(u8) & 0x80) << 8) | (@as(u16, 0x3c + rng.uintLessThan(u8, 5)) << 7) | rng.int(u7);
+        for (wb) |*v| v.* = (@as(u16, rng.int(u8) & 0x80) << 8) | (@as(u16, 0x3c + rng.uintLessThan(u8, 5)) << 7) | rng.int(u7);
+        var x = try cuda.DeviceBuffer.alloc(&driver, xb.len * 2);
+        defer x.free();
+        var w = try cuda.DeviceBuffer.alloc(&driver, wb.len * 2);
+        defer w.free();
+        var o: [3]cuda.DeviceBuffer = undefined;
+        for (&o) |*b| b.* = try cuda.DeviceBuffer.alloc(&driver, rows * n * 2);
+        defer for (&o) |*b| b.free();
+        // the first handle alone, then both at once on their streams
+        try b0.linearBf16(x.ptr, w.ptr, o[0].ptr, rows, k, n);
+        try s0.synchronize();
+        try b0.linearBf16(x.ptr, w.ptr, o[1].ptr, rows, k, n);
+        try b1.linearBf16(x.ptr, w.ptr, o[2].ptr, rows, k, n);
+        try s0.synchronize();
+        try s1.synchronize();
+        const got = try gpa.alloc(u8, rows * n * 2 * 3);
+        defer gpa.free(got);
+        for (o, 0..) |b, i| try driver.check(driver.api.cuMemcpyDtoH_v2(got[i * rows * n * 2 ..].ptr, b.ptr, rows * n * 2), "dtoh");
+        const len = rows * n * 2;
+        try std.testing.expectEqualSlices(u8, got[0..len], got[len .. 2 * len]);
+        try std.testing.expectEqualSlices(u8, got[0..len], got[2 * len .. 3 * len]);
+        // the control: one weight changed differs (the comparison is live)
+        const one: u16 = 0x3f80;
+        try b1.linearBf16(x.ptr, w.ptr, o[2].ptr, rows, k, n);
+        try s1.synchronize();
+        const again = try gpa.alloc(u8, len);
+        defer gpa.free(again);
+        try driver.check(driver.api.cuMemcpyDtoH_v2(again.ptr, o[2].ptr, len), "dtoh");
+        try std.testing.expect(!std.mem.eql(u8, again, got[0..len]));
+    }
+}

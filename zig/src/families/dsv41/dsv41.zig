@@ -123,7 +123,9 @@ test {
     refAll(rocinante_cd);
     refAll(ring_wait);
     refAll(roci_engine);
+    _ = @import("roci_pair.zig");
     _ = @import("pair_spans.zig");
+    _ = @import("pass_meter.zig");
     _ = @import("rocinante_test.zig");
     _ = @import("rocinante_cd_test.zig");
     refAll(replay_runner);

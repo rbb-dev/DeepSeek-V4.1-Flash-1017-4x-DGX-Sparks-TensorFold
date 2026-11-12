@@ -21,6 +21,16 @@ pub const line: usize = 64;
 pub const page: usize = 4096;
 /// The scheduling ring's entries: the host runs at least a pass ahead of the proxies, and a pass sends 168 times.
 pub const sched_len: usize = 8192;
+/// The arena is laid out for chunks of this many rows; a chunk uses lengths and offsets inside it. 4,096 unless the booted pass
+/// rows are more (setCap, once at the start, before any layout is read: every rank alike, TF_DS_PASS_ROWS is compared).
+pub var max_cap: usize = 4096;
+
+/// The pass rows the arena's layout and the plans' shapes follow (Model.open, once): the pass rows booted, never below 4,096 (the
+/// layout of a 2,048-row pass is the baseline).
+pub fn setCap(pass_rows: usize) void {
+    max_cap = @max(4096, pass_rows);
+    Transport.shape_caps = .{ max_cap, 2048 };
+}
 
 // -- the arena -------------------------------------------------------------------------------------------------------
 
@@ -487,6 +497,9 @@ pub const Transport = struct {
     fail_class: std.atomic.Value(u8) = .init(0),
     fail_peer: std.atomic.Value(u8) = .init(0),
     threads: [rails]?std.Thread = @splat(null),
+    /// The other lane's transport when two passes of a prompt are in flight (each its own arena, control block, queue pairs and
+    /// proxies): a failure on either stops both, and the host's check reads both.
+    sibling: ?*Transport = null,
     /// Settings.wait_qp: the janitor, the words the engine thread has written into the send queues (the generation of each (rail, class)),
     /// whether it is inside a reservation (a failure waits for it to be out before the NIC takes the queues away) and which thread it is, and
     /// how far the janitor has walked the scheduling ring.
@@ -496,6 +509,8 @@ pub const Transport = struct {
     poster_tid: std.atomic.Value(u32) = .init(0),
     cursor: std.atomic.Value(u64) = .init(0),
 
+    /// The rows of the two fixed plans: a whole pass's (max_cap) and a resume unit's. Follows setCap.
+    pub var shape_caps = [2]usize{ 4096, 2048 };
 
     pub fn init(gpa: std.mem.Allocator, g: u8, order: Order, ctl: *Control, ctl_dev: u64, nic: Nic, set: Settings) !*Transport {
         if (set.wait_qp and nic.prepost_fn == null) return error.NicCannotWait;
@@ -517,6 +532,7 @@ pub const Transport = struct {
 
     pub fn deinit(t: *Transport) void {
         t.stop.store(true, .release);
+        t.unlink();
         for (&t.threads) |*th| if (th.*) |x| {
             th.* = null;
         };
@@ -681,6 +697,35 @@ pub const Transport = struct {
     /// Whether the transport has failed (the host reads it at every enqueue and at its own synchronisation points).
     pub fn check(t: *Transport) !void {
         if (t.failed.load(.acquire) != 0 or @atomicLoad(u64, &t.ctl.abort.v, .acquire) != 0) return error.RociFailed;
+        if (t.sibling) |s| if (s.failed.load(.acquire) != 0 or @atomicLoad(u64, &s.ctl.abort.v, .acquire) != 0) return error.RociFailed;
+    }
+
+    /// Makes `a` and `b` the two lanes of one prompt: each fails the other.
+    pub fn pair(a: *Transport, b: *Transport) void {
+        a.sibling = b;
+        b.sibling = a;
+    }
+
+    /// Makes `a`, `b` and `c` the three lanes of one prompt (TF_DS_ROCI_STAGGER_LANES=3): a ring a -> b -> c -> a, so a failure on any
+    /// one reaches the other two through `fail`'s sibling call (each returns at its first line once it has failed).
+    pub fn ring3(a: *Transport, b: *Transport, c: *Transport) void {
+        a.sibling = b;
+        b.sibling = c;
+        c.sibling = a;
+    }
+
+    /// Takes this transport out of its sibling ring before it goes: the one that points at it points past it (null when none is left), so no
+    /// lane keeps a pointer to a closed one.
+    pub fn unlink(t: *Transport) void {
+        const next = t.sibling orelse return;
+        var p = next;
+        var hops: usize = 0;
+        while (p.sibling != null and p.sibling.? != t) : (hops += 1) {
+            if (hops > 4) break; // (a ring has at most three lanes)
+            p = p.sibling.?;
+        }
+        if (p.sibling != null and p.sibling.? == t) p.sibling = if (next == p) null else next;
+        t.sibling = null;
     }
 
     pub fn failure(t: *const Transport) ?struct { reason: FailReason, class: Class, peer: u8 } {
@@ -704,6 +749,8 @@ pub const Transport = struct {
         @atomicStore(u64, &t.ctl.doorbell.v, abort_value, .release);
         // (the card-waiting mode stores it big-endian; the queue pairs are gone by now, so the native word just above releases nothing)
         if (t.set.wait_qp) @atomicStore(u64, &t.ctl.doorbell.v, t.go(abort_value), .release);
+        // the other lane's streams may wait on words its peers will not send once this rank stops: stop it too (it fails
+        // once; its own sibling call returns at the first line)
     }
 
     /// awaitProxiesOut for the card-waiting mode: waits (short sleeps, at most `proxy_out_ms`) for the engine thread to be out of its

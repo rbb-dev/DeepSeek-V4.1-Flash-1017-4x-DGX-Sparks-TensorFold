@@ -154,6 +154,17 @@ fn clashes(used: []const [2]usize, lo: usize, hi: usize) bool {
 /// Whether one of the prompt cache's marks has its resume point at `at` (each kept at the resume point at or before it).
 fn markEnds(marks: []const u32, at: usize) bool {
     for (marks) |w| if (w / model.resume_rows * model.resume_rows == at) return true;
+/// The rows of the third pass of a group (TF_DS_ROCI_STAGGER_LANES=3) behind a pair whose second pass starts at `mid` and has `n2` rows, by
+/// the pass rule (passRowsAt), or null where there is none: fewer than three lanes open, a stream decoding or the host owing rounds (the rounds
+/// owed after a pair are counted for two passes), no prompt rows left behind the pair, or a stop at the pair's end (the prompt cache keeps a
+/// state or a hook runs there, so the pair is the group). The pass's own eligibility (whole, encoder-only, the worker holding it) is the model's.
+pub fn thirdPassRows(open_lanes: usize, decoding: bool, rounds: u32, mid: usize, n2: usize, len: usize, cap: usize, tail: bool, marks: []const u32, last_end: usize, replay: usize) ?usize {
+    if (open_lanes < 3 or decoding or rounds != 0 or mid + n2 >= len) return null;
+    const mid2 = mid + n2;
+    if (mid2 <= replay and (mid2 == last_end or markEnds(marks, mid2))) return null;
+    return passRowsAt(mid2, len, cap, tail, marks, last_end, replay);
+}
+
     return false;
 }
 
@@ -856,6 +867,11 @@ pub const Lanes = struct {
         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
         if (position != s.prompt_len) return error.PositionMismatch;
         return l.first;
+        if (s.progress) |p| {
+            p.begin(start);
+            // the rows count once the device has run them, not once the host has issued them (a pair returns ~0.9 s early)
+            if (m.meterArm(slot)) |g| p.gated(g.cell, g.gen);
+        }
         self.fills[slot] = .{
             .start = start,
             .replay = replay,
@@ -906,10 +922,47 @@ pub const Lanes = struct {
         const f = &self.fills[lane.slot].?;
         const seq = &self.seqs[lane.slot];
         const len = s.prompt_len;
+        // TF_DS_ROCI_STAGGER: this pass and the next one as a pair (rank 0's rule; the followers run the frame). The pair does not end
+        // its first pass where the prompt cache keeps a state or a hook runs, so every such stop is a stop of a pair.
+        var n2: usize = 0;
+        var n3: usize = 0; // the third pass of a group (TF_DS_ROCI_STAGGER_LANES=3), else 0
+        // A whole pass is one the host's facts leave at the booted rows (stream.wholePass: at pass rows of 2,048 a cut pass has the same rows).
+            const mid = f.start + n;
+            const n_b = passRowsAt(mid, len, cap, prompt2d.pass_tail_asked, s.reuse.marks, f.last_end, f.replay);
+            const stop_between = mid <= f.replay and (mid == f.last_end or markEnds(s.reuse.marks, mid));
+            if (!stop_between and m.pairEligible(seq.items[0 .. mid + n_b], f.start, n, mid, n_b, f.replay, cap)) n2 = n_b;
+            // TF_DS_ROCI_STAGGER_LANES=3: a third whole pass behind the pair, where nothing decodes (the host's rounds owed after a pair are counted for two
+            // passes: beside generating users the pair stays a pair); the group falls back to the pair where the prompt, a stop or the rule leaves no third pass
+            if (n2 != 0) {
+                if (thirdPassRows(m.pair_lanes, decoding_now, rounds_now, mid, n2, len, cap, prompt2d.pass_tail_asked, s.reuse.marks, f.last_end, f.replay)) |n_c| {
+                    if (m.groupEligible(seq.items[0 .. mid + n2 + n_c], f.start, &.{ n, n2, n_c }, f.replay, cap)) n3 = n_c;
+                }
+            }
+        }
+        if (n2 != 0) {
+            if (try self.begin(.fill_pair)) {
+                try self.wire.int(gpa, u64, f.start);
+                try self.wire.int(gpa, u32, @intCast(n));
+                try self.wire.int(gpa, u32, @intCast(n2));
+                try self.wire.int(gpa, u32, @intCast(n3));
+                try self.wire.int(gpa, u64, f.replay);
+                try self.flush();
+            }
+        } else if (try self.begin(.fill_chunk)) {
             try self.wire.int(gpa, u64, f.start);
             try self.wire.int(gpa, u32, @intCast(n));
             try self.wire.int(gpa, u64, f.replay);
             try self.flush();
+        }
+        if (self.spill) |t| t.bump(lane.base + f.start, lane.base + f.start + n + n2 + n3);
+        const head = if (n2 != 0) blk: {
+            try m.fillGroup(seq.items[0 .. f.start + n + n2 + n3], f.start, if (n3 != 0) &.{ n, n2, n3 } else &.{ n, n2 }, f.replay);
+            break :blk false;
+        } else try m.fillChunk(seq.items[0 .. f.start + n], f.start, n, f.replay);
+        f.start += n + n2 + n3;
+        if (s.progress) |p| {
+            if (n3 != 0) try m.meterGroup(lane.slot, &.{ f.start - n3 - n2, f.start - n3, f.start }) else if (n2 != 0) try m.meterPair(lane.slot, f.start - n2, f.start) else try m.meterChunk(lane.slot, f.start);
+            p.reach(f.start);
         }
         if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and
             (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
@@ -1116,6 +1169,7 @@ pub const Lanes = struct {
         // a pass runs block rows a stream through the decode window's linears (prompt.grouped: 128 rows at most), so
         // more streams than 128 / block (25 at the 5-row block) draft in passes of that many, each its own wire message
         const per = @max(1, pass_rows / block);
+        // a pass runs block rows a stream through the decode window's linears (prompt.grouped: 128 rows at most), so more
         var g0: usize = 0;
         while (g0 < n) : (g0 += per) {
             const g1 = @min(n, g0 + per);
@@ -1330,6 +1384,7 @@ fn landBcast(_: *anyopaque, _: []const land.Span) anyerror!void {
     return error.NoLanding; // (every rank restores from its own store: no span is broadcast)
 fn usesRdma(kind: Kind) bool {
     return switch (kind) {
+        .fill_begin, .fill_chunk, .fill_pair, .verify, .pass, .head_whole => true,
         else => false,
     };
 }
@@ -1429,6 +1484,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             9 => .done,
             10 => .fill_resume,
             11 => .rdma_idle,
+            14 => .fill_pair,
             else => return error.BadFrame,
         };
         if (usesRdma(kind) and rdma_idle) {
@@ -1470,26 +1526,15 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 if (m.fill_seq.len == 0) m.fill_seq = seqs[slot].items; // a piece after a round: the read-ahead again
                 _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| try refused(m, err);
             },
-            .verify => {
-                const nw = try r.int(u32);
-                if (nw == 0 or nw > max_streams) return error.BadFrame;
-                var wins: [max_streams]Win = undefined;
-                for (0..nw) |k| {
-                    const s: usize = try r.int(u32);
-                    const base: usize = @intCast(try r.int(u64));
-                    const end: usize = @intCast(try r.int(u64));
-                    const start: usize = @intCast(try r.int(u64));
-                    const absorb = try r.int(u8) != 0;
-                    try r.ids(gpa, &win_ids[k]);
-                    wins[k] = .{ .slot = s, .base = base, .end = end, .start = start, .absorb = absorb, .ids = win_ids[k].items };
-                }
-                const rows = try built.build(gpa, &seqs, wins[0..nw]);
-                m.verify(rows, built.absorb[0..nw]) catch |err| try refused(m, err);
-                if (m.prof) {
-                    follow_prof.rounds += 1;
-                    follow_prof.enqueue += m.t_enqueue;
-                    follow_prof.forward += m.t_forward;
-                }
+            .fill_pair => {
+                const start: usize = @intCast(try r.int(u64));
+                const n_a: usize = try r.int(u32);
+                const n_b: usize = try r.int(u32);
+                const n_c: usize = try r.int(u32); // the third pass's rows (0: a pair)
+                const replay: usize = @intCast(try r.int(u64));
+                if (start + n_a + n_b + n_c > seqs[slot].items.len) return error.BadChunk;
+                if (m.fill_seq.len == 0) m.fill_seq = seqs[slot].items;
+                m.fillGroup(seqs[slot].items[0 .. start + n_a + n_b + n_c], start, if (n_c != 0) &.{ n_a, n_b, n_c } else &.{ n_a, n_b }, replay) catch |err| try refusedExchange(m, err);
             },
             .pass => {
                 const n = try r.int(u32);
@@ -1851,7 +1896,86 @@ test "a prefix two conversations share: the second one resuming it in place woul
     try std.testing.expect(ln.keptOver(shared.base + shared.at, shared.base + 55296, &shared)); // the second one moves
     try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
 }
+        &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 },
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, // 9: the same kinds, the Rocinante-only Settings
+        &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }, // 11: the same kinds, fill_pair carries the third pass's rows
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (self.spill) |t| t.bump(lane.base + f.start, lane.base + f.start + n + n2 + n3);\n        self.instr.chunk(m.now() / std.time.ns_per_us, n);") != null);
+    for ([_][]const u8{ "m.fillChunk(seqs[slot]", "m.fillGroup(seqs[slot]" }) |call| {
+
+// The pair rules (R1-R7 of the frame-order panel, tip 7ce258cdb), one host test each. The rules are why a pair beside
+// generating users is safe: frames cannot differ between ranks, and nothing waits on a frame that is not yet there.
+
+test "R1: a pair is ONE frame with both sizes in it, and the follower reads the same fields in the same order" {
+    const src = @embedFile("lanes.zig");
+    const code = src;
+    const step = std.mem.indexOf(u8, code, "fn prefillStep(") orelse return error.TestUnexpectedResult;
+    const send = code[std.mem.indexOfPos(u8, code, step, "if (n2 != 0) {").?..std.mem.indexOfPos(u8, code, step, "} else if (try self.begin(.fill_chunk))").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, send, "self.begin(.fill_pair)"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, send, ".fill_chunk"));
+    const sent = [_][]const u8{ "u64, f.start", "u32, @intCast(n))", "u32, @intCast(n2))", "u32, @intCast(n3))", "u64, f.replay" };
+    var at: usize = 0;
+    for (sent) |w| at = (std.mem.indexOfPos(u8, send, at, w) orelse return error.TestUnexpectedResult) + w.len;
+    const h = code[std.mem.indexOf(u8, code, ".fill_pair => {").?..std.mem.indexOf(u8, code, ".verify, .head_whole, .pass => {").?]; // the follower's handler ends where the round frames start (D2: FollowCtx.roundFrame)
+    at = 0;
+    for ([_][]const u8{ "r.int(u64)", "r.int(u32)", "r.int(u32)", "r.int(u32)", "r.int(u64)" }) |w| at = (std.mem.indexOfPos(u8, h, at, w) orelse return error.TestUnexpectedResult) + w.len;
+    // one primitive, one handler: the follower runs the pair (or the group of three: the frame's third size, 0 for a pair) in a single fillGroup call
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, h, "m.fillGroup("));
+}
+
+test "TF_DS_ROCI_STAGGER_LANES=3: the third pass forms only with three lanes open, nothing decoding and nothing owed, rows left behind the pair, and no stop at the pair's end; a pair is never cut short by it" {
+    const no_marks = [_]u32{};
+    // a 100K prompt, 4,096-row passes: the pair at 0 and 4096, the third at 8192 takes a whole pass
+    try std.testing.expectEqual(@as(?usize, 4096), thirdPassRows(3, false, 0, 4096, 4096, 100_000, 4096, false, &no_marks, 0, 100_000));
+    try std.testing.expectEqual(@as(?usize, 4096), thirdPassRows(3, false, 0, 4096, 4096, 100_000, 4096, true, &no_marks, 0, 100_000));
+    // two lanes (the default): never
+    try std.testing.expectEqual(@as(?usize, null), thirdPassRows(2, false, 0, 4096, 4096, 100_000, 4096, false, &no_marks, 0, 100_000));
+    // a stream decoding, or the host owing rounds: the pair stays a pair
+    try std.testing.expectEqual(@as(?usize, null), thirdPassRows(3, true, 0, 4096, 4096, 100_000, 4096, false, &no_marks, 0, 100_000));
+    try std.testing.expectEqual(@as(?usize, null), thirdPassRows(3, false, 3, 4096, 4096, 100_000, 4096, false, &no_marks, 0, 100_000));
+    // the pair ends the prompt: no rows left for a third
+    try std.testing.expectEqual(@as(?usize, null), thirdPassRows(3, false, 0, 4096, 4096, 8192, 4096, false, &no_marks, 0, 8192));
+    // a stop at the pair's end (the keep point of the prompt cache, or a mark inside the replay): the pair is the group
+    try std.testing.expectEqual(@as(?usize, null), thirdPassRows(3, false, 0, 4096, 4096, 100_000, 4096, false, &no_marks, 8192, 100_000));
+    try std.testing.expectEqual(@as(?usize, null), thirdPassRows(3, false, 0, 4096, 4096, 100_000, 4096, false, &.{8192}, 0, 100_000));
+    // the same stop beyond the replay is no stop
+    try std.testing.expectEqual(@as(?usize, 4096), thirdPassRows(3, false, 0, 4096, 4096, 100_000, 4096, false, &no_marks, 8192, 8000));
+    // a short remainder is the pass rule's (the model refuses a pass that is not whole)
+    try std.testing.expectEqual(@as(?usize, 1000), thirdPassRows(3, false, 0, 4096, 4096, 8192 + 1000, 4096, false, &no_marks, 0, 9192) orelse return error.TestUnexpectedResult);
+    // the source: the third pass is asked only behind a pair, the frame carries it, and the pair's step stays a pair's for the host's rounds
+    const src = @embedFile("lanes.zig");
+    const step = std.mem.indexOf(u8, src, "fn prefillStep(") orelse return error.TestUnexpectedResult;
+    const second = std.mem.indexOfPos(u8, src, step, "if (!stop_between and m.pairEligible(").?;
+    const third = std.mem.indexOfPos(u8, src, step, "if (thirdPassRows(m.pair_lanes, decoding_now, rounds_now, mid, n2, len, cap").?;
+    const frame = std.mem.indexOfPos(u8, src, step, "try self.begin(.fill_pair)").?;
+    try std.testing.expect(second < third and third < frame);
+    try std.testing.expect(std.mem.indexOfPos(u8, src, step, "if (m.groupEligible(seq.items[0 .. mid + n2 + n_c], f.start, &.{ n, n2, n_c }, f.replay, cap)) n3 = n_c;") != null);
+    try std.testing.expect(std.mem.indexOfPos(u8, src, step, "t.bump(lane.base + f.start, lane.base + f.start + n + n2 + n3)") != null);
+    try std.testing.expect(std.mem.indexOfPos(u8, src, step, "f.start += n + n2 + n3;") != null);
+}
+
+test "R2: no follower handler waits for a later frame: the frame loop reads one whole frame and runs it" {
+    const src = @embedFile("lanes.zig");
+    const code = src;
+    // a follower that peeks at the link for the next frame's kind inside a pass is a deadlock
+    // (the failure line's socket probe, headProbe, peeks and sleeps on nothing: it is outside the loop)
+    const at = std.mem.indexOf(u8, code, "pub fn follow(gpa").?;
+    const loop = code[at..std.mem.indexOfPos(u8, code, at, "\n}\n").?];
+    try std.testing.expect(std.mem.indexOf(u8, loop, "peek" ++ "Kind") == null);
+}
+
+test "R4: the Engram worker is joined, or on its own reader, before a round follows a pair: rank 0 joins after the pair's issue, a follower's round frames join unless keep-ahead" {
+    try std.testing.expect(leavesAhead(.fill_pair, false) and leavesAhead(.fill_chunk, false));
+    for ([_]Kind{ .verify, .pass, .head_whole }) |k| {
+        try std.testing.expect(!leavesAhead(k, false));
+        try std.testing.expect(leavesAhead(k, true));
+    }
+    const src = @embedFile("lanes.zig");
+    const code = src;
+    const step = std.mem.indexOf(u8, code, "fn prefillStep(") orelse return error.TestUnexpectedResult;
+    const issued = std.mem.indexOfPos(u8, code, step, "} else try m.fillChunk(").?;
+    const join = std.mem.indexOfPos(u8, code, step, "if (yieldOn() and !m.keep_ahead) if (s.between)").?;
+    try std.testing.expect(issued < join);
+}
 
 test "draft chances are the prefix survivals chooseK sums" {
     var out: [3]f64 = undefined;

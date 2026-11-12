@@ -204,6 +204,8 @@ const Mode = struct {
     broken: ?u8 = null,
     /// Fill the gaps between a chain's bytes and its word with this pause.
     gap_ns: u64 = 0,
+    /// Control: this net's chains and words land in another net's nodes (two lanes wired into one).
+    cross_to: ?*Net = null,
     /// Control (with word_first): every chain's bytes held back, the words not, until the test opens the gate (Net.openGate),
     /// so a consumer that trusts the word looks before any byte has landed, whatever else the machine is doing.
     hold_data: bool = false,
@@ -317,6 +319,7 @@ const Net = struct {
         if (me.net.failed_nic[me.me].load(.acquire) != 0) return error.QpError;
         if (m.broken == me.me) return error.PostFailed;
         if (m.silent == me.me) return;
+        const dst = if (m.cross_to) |c| &c.nodes[peer] else &me.net.nodes[peer];
         if (m.late_rail == rail) sleep(m.late_ns);
         const w = &dst.ctl.recv[@backingInt(class)][me.me][rail].v;
         if (m.hold_rail == rail) {
@@ -446,6 +449,9 @@ const Run = struct {
     gens: u64,
     order: roci.Order,
     only_a: bool = false,
+    /// Added to every generation's pattern tag: two lanes' bytes differ, so bytes that cross lanes are seen.
+    gen_base: u64 = 0,
+    timeout_ns: u64 = 10 * std.time.ns_per_s,
     bad: [roci.world]u64 = @splat(0),
     err: [roci.world]?anyerror = @splat(null),
 };
@@ -458,6 +464,9 @@ fn rankMain(run: *Run, g: usize) void {
 
 fn rankBody(run: *Run, g: usize) !void {
     const nd = &run.net.nodes[g];
+    const s: FakeStream = .{ .only_rail_a = run.only_a, .timeout_ns = run.timeout_ns };
+    for (0..run.gens) |gen_| {
+        const gen = gen_ + run.gen_base;
         for (run.classes) |class| {
             const cap: usize = if (gen % 2 == 0) 4096 else 2048;
             const shape: u8 = if (gen % 2 == 0) 0 else 1;
@@ -473,7 +482,12 @@ fn rankBody(run: *Run, g: usize) !void {
 }
 
 fn runProgram(net: *Net, classes: []const C, gens: u64, order: roci.Order, only_a: bool) !Run {
+    return runProgramOn(net, classes, gens, order, only_a, 0, 10 * std.time.ns_per_s);
+}
+
+fn runProgramOn(net: *Net, classes: []const C, gens: u64, order: roci.Order, only_a: bool, gen_base: u64, timeout_ns: u64) !Run {
     var bar: Barrier = .{};
+    var run: Run = .{ .net = net, .bar = &bar, .classes = classes, .gens = gens, .order = order, .only_a = only_a, .gen_base = gen_base, .timeout_ns = timeout_ns };
     var th: [roci.world]std.Thread = undefined;
     for (&th, 0..) |*t, g| t.* = try std.Thread.spawn(.{}, rankMain, .{ &run, g });
     for (th) |t| t.join();
@@ -727,6 +741,8 @@ const GpuNode = struct {
     t: *roci.Transport = undefined,
     peer: *GpuNode = undefined,
     me: u8 = 0,
+    /// The proxy's posts wait while this is set (a peer that is late: the other lane must not wait on it).
+    hold: std.atomic.Value(bool) = .init(false),
 };
 
 fn hostAlloc(d: *const cuda.Driver, len: usize, flags: c_uint) !struct { p: [*]align(64) u8, dev: u64 } {
@@ -740,6 +756,7 @@ fn hostAlloc(d: *const cuda.Driver, len: usize, flags: c_uint) !struct { p: [*]a
 fn gpuPost(ctx: *anyopaque, rail: u8, peer: u8, class: C, chain: *const roci.Chain, word: u64) roci.PostError!void {
     const me: *GpuNode = @ptrCast(@alignCast(ctx));
     _ = peer;
+    while (me.hold.load(.acquire)) sleep(100_000);
     for (chain.slice()) |p| @memcpy(me.peer.arena[p.dst..][0..p.len], me.arena[p.src..][0..p.len]);
     @atomicStore(u64, &me.peer.ctl.recv[@backingInt(class)][me.me][rail].v, word, .release);
 }
@@ -889,6 +906,443 @@ test "a pass of 84 owner events: each rail's proxy prints its line and times eve
         }
     }
 }
+// -- two lanes: the second pass of a prompt in flight (TF_DS_ROCI_STAGGER) -------------------------------------------
+
+/// Two nets of four nodes, node g of each the two lanes of one rank: each fails the other.
+fn openLanes(m0: Mode, m1: Mode, set: roci.Settings, order: roci.Order) ![2]*Net {
+    const a = try Net.open(m0, set, order);
+    errdefer a.close();
+    const b = try Net.open(m1, set, order);
+    for (&a.nodes, &b.nodes) |*x, *y| roci.Transport.pair(x.t, y.t);
+    return .{ a, b };
+}
+
+const LaneJob = struct {
+    net: *Net,
+    classes: []const C,
+    gens: u64,
+    order: roci.Order,
+    gen_base: u64,
+    timeout_ns: u64 = 10 * std.time.ns_per_s,
+    run: ?Run = null,
+    err: ?anyerror = null,
+};
+
+fn laneMain(j: *LaneJob) void {
+    j.run = runProgramOn(j.net, j.classes, j.gens, j.order, false, j.gen_base, j.timeout_ns) catch |e| {
+        j.err = e;
+        return;
+    };
+}
+
+test "two lanes in flight at once: each lane's bytes land in its own arena and its own words, every generation, both orders" {
+    for ([_]roci.Order{ roci.identity, perm }) |order| {
+        const nets = try openLanes(.{}, .{}, .{ .nap = false, .gathers = true, .codes = true }, order);
+        defer nets[0].close();
+        defer nets[1].close();
+        try nets[0].start();
+        try nets[1].start();
+        const classes = [_]C{ .own1, .own2, .wob, .pack, .gm, .gf, .gb };
+        var jobs = [2]LaneJob{
+            .{ .net = nets[0], .classes = &classes, .gens = 4, .order = order, .gen_base = 0 },
+            .{ .net = nets[1], .classes = &classes, .gens = 4, .order = order, .gen_base = 500 },
+        };
+        var th: [2]std.Thread = undefined;
+        for (&th, &jobs) |*t, *j| t.* = try std.Thread.spawn(.{}, laneMain, .{j});
+        for (th) |t| t.join();
+        for (jobs) |j| {
+            try std.testing.expectEqual(@as(?anyerror, null), j.err);
+            for (j.run.?.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+            for (j.run.?.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+        }
+        // each lane counted its own events: the lanes share no counter
+        for (nets) |n| for (&n.nodes) |*nd| {
+            try std.testing.expectEqual(@as(u64, classes.len * 4), nd.t.counters().events);
+            try std.testing.expectEqual(@as(?@TypeOf(nd.t.failure().?), null), nd.t.failure());
+        };
+    }
+}
+
+test "control: lane 1's chains and words wired into lane 0's nodes never reach lane 1's waiters (the isolation check can fail)" {
+    const a = try Net.open(.{}, .{ .nap = false }, roci.identity);
+    defer a.close();
+    const b = try Net.open(.{ .cross_to = a }, .{ .nap = false }, roci.identity);
+    defer b.close();
+    try b.start();
+    const classes = [_]C{ .own1, .wob };
+    const run = try runProgramOn(b, &classes, 2, roci.identity, false, 500, 300 * std.time.ns_per_ms);
+    // every rank's wait for lane 1's words timed out: they went to the other lane
+    for (run.err) |e| try std.testing.expectEqual(@as(?anyerror, error.WaitTimeout), e);
+    // and they landed in lane 0's words: the wiring was live
+    var seen: u64 = 0;
+    for (&a.nodes) |*nd| {
+        for (&nd.ctl.recv) |*c| for (c) |*sw| for (sw) |*w| {
+            seen += w.v;
+        };
+    }
+    try std.testing.expect(seen != 0);
+}
+
+test "lane 1 runs past the 8,192-entry ring while lane 0 idles, then lane 0 runs: neither lane's ticket count, words or bytes depend on the other" {
+    const nets = try openLanes(.{}, .{}, .{ .nap = false }, roci.identity);
+    defer nets[0].close();
+    defer nets[1].close();
+    try nets[0].start();
+    try nets[1].start();
+    const ns = try gpa.alloc(usize, 9000);
+    defer gpa.free(ns);
+    @memset(ns, 1);
+    const classes = [_]C{.own2};
+    const run1 = try runAny(nets[1], &classes, ns, roci.identity);
+    for (run1.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+    for (run1.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+    for (&nets[0].nodes) |*nd| try std.testing.expectEqual(@as(u64, 0), nd.t.counters().events);
+    const run0 = try runProgramOn(nets[0], &.{ .own1, .gm }, 2, roci.identity, false, 0, 10 * std.time.ns_per_s);
+    for (run0.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+    for (run0.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+    for (&nets[1].nodes) |*nd| try std.testing.expectEqual(@as(u64, 9000), nd.t.counters().events);
+}
+
+test "a failure on lane 0 stops lane 1 of the same rank: abort values in its words, its next send and wait refuse, other ranks' lanes are untouched" {
+    const nets = try openLanes(.{ .broken = 0 }, .{}, .{ .nap = false }, roci.identity);
+    defer nets[0].close();
+    defer nets[1].close();
+    try nets[0].start();
+    try nets[1].start();
+    const s: FakeStream = .{};
+    try nets[0].nodes[0].t.send(s, .wob, 0);
+    var tries: u32 = 0;
+    while (nets[1].nodes[0].t.failure() == null and tries < 2000) : (tries += 1) sleep(1_000_000);
+    const f0 = nets[0].nodes[0].t.failure().?;
+    try std.testing.expectEqual(roci.FailReason.post, f0.reason);
+    const f1 = nets[1].nodes[0].t.failure().?;
+    try std.testing.expectEqual(roci.FailReason.peer, f1.reason);
+    try std.testing.expectError(error.RociFailed, nets[1].nodes[0].t.check());
+    try std.testing.expectError(error.RociFailed, nets[1].nodes[0].t.send(s, .own1, 0));
+    try std.testing.expectError(error.RociFailed, nets[1].nodes[0].t.wait(s, .own1));
+    for (&nets[1].nodes[0].ctl.recv) |*c| for (c) |*sw| for (sw) |*w| try std.testing.expectEqual(roci.abort_value, w.v);
+    for (nets) |n| for (n.nodes[1..]) |*nd| try std.testing.expectEqual(@as(?@TypeOf(nd.t.failure().?), null), nd.t.failure());
+}
+
+test "control: without the pairing a failure on lane 0 leaves lane 1 serving" {
+    const nets = [2]*Net{ try Net.open(.{ .broken = 0 }, .{ .nap = false }, roci.identity), try Net.open(.{}, .{ .nap = false }, roci.identity) };
+    defer nets[0].close();
+    defer nets[1].close();
+    try nets[0].start();
+    try nets[1].start();
+    try nets[0].nodes[0].t.send(FakeStream{}, .wob, 0);
+    var tries: u32 = 0;
+    while (nets[0].nodes[0].t.failure() == null and tries < 2000) : (tries += 1) sleep(1_000_000);
+    try std.testing.expect(nets[0].nodes[0].t.failure() != null);
+    sleep(20_000_000);
+    try std.testing.expectEqual(@as(?@TypeOf(nets[1].nodes[0].t.failure().?), null), nets[1].nodes[0].t.failure());
+    try nets[1].nodes[0].t.check();
+}
+
+// -- three lanes: TF_DS_ROCI_STAGGER_LANES=3 -----------------------------------------------------------------------------
+
+/// Three nets of four nodes, node g of each the three lanes of one rank: a ring, each fails the next, and so all.
+fn openLanes3(m: [3]Mode, set: roci.Settings, order: roci.Order) ![3]*Net {
+    const a = try Net.open(m[0], set, order);
+    errdefer a.close();
+    const b = try Net.open(m[1], set, order);
+    errdefer b.close();
+    const c = try Net.open(m[2], set, order);
+    for (&a.nodes, &b.nodes, &c.nodes) |*x, *y, *z| roci.Transport.ring3(x.t, y.t, z.t);
+    return .{ a, b, c };
+}
+
+test "three lanes in flight at once: each lane's bytes land in its own arena and its own words, every generation, both orders" {
+    for ([_]roci.Order{ roci.identity, perm }) |order| {
+        const nets = try openLanes3(.{ .{}, .{}, .{} }, .{ .nap = false, .gathers = true, .codes = true }, order);
+        defer nets[0].close();
+        defer nets[1].close();
+        defer nets[2].close();
+        for (nets) |n| try n.start();
+        const classes = [_]C{ .own1, .own2, .wob, .pack, .gm, .gf, .gb };
+        var jobs = [3]LaneJob{
+            .{ .net = nets[0], .classes = &classes, .gens = 4, .order = order, .gen_base = 0 },
+            .{ .net = nets[1], .classes = &classes, .gens = 4, .order = order, .gen_base = 500 },
+            .{ .net = nets[2], .classes = &classes, .gens = 4, .order = order, .gen_base = 900 },
+        };
+        var th: [3]std.Thread = undefined;
+        for (&th, &jobs) |*t, *j| t.* = try std.Thread.spawn(.{}, laneMain, .{j});
+        for (th) |t| t.join();
+        for (jobs) |j| {
+            try std.testing.expectEqual(@as(?anyerror, null), j.err);
+            for (j.run.?.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+            for (j.run.?.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+        }
+        for (nets) |n| for (&n.nodes) |*nd| {
+            try std.testing.expectEqual(@as(u64, classes.len * 4), nd.t.counters().events);
+            try std.testing.expectEqual(@as(?@TypeOf(nd.t.failure().?), null), nd.t.failure());
+        };
+    }
+}
+
+test "a failure on any one of three lanes stops the other two of the same rank, the ring in both directions; other ranks' lanes are untouched" {
+    for ([_]usize{ 0, 1, 2 }) |broken_lane| {
+        var modes = [3]Mode{ .{}, .{}, .{} };
+        modes[broken_lane] = .{ .broken = 0 };
+        const nets = try openLanes3(modes, .{ .nap = false }, roci.identity);
+        defer nets[0].close();
+        defer nets[1].close();
+        defer nets[2].close();
+        for (nets) |n| try n.start();
+        const s: FakeStream = .{};
+        try nets[broken_lane].nodes[0].t.send(s, .wob, 0);
+        for (nets, 0..) |n, i| {
+            var tries: u32 = 0;
+            while (n.nodes[0].t.failure() == null and tries < 3000) : (tries += 1) sleep(1_000_000);
+            const f = n.nodes[0].t.failure() orelse return error.LaneNotStopped;
+            try std.testing.expectEqual(if (i == broken_lane) roci.FailReason.post else roci.FailReason.peer, f.reason);
+            while (n.nodes[0].t.failing.load(.acquire) != 0) sleep(100_000);
+            try std.testing.expectError(error.RociFailed, n.nodes[0].t.check());
+        }
+        for (nets) |n| for (n.nodes[1..]) |*nd| try std.testing.expectEqual(@as(?@TypeOf(nd.t.failure().?), null), nd.t.failure());
+    }
+}
+
+test "control: a ring of two links (pair) leaves a third lane serving after a failure on lane 0" {
+    const a = try Net.open(.{ .broken = 0 }, .{ .nap = false }, roci.identity);
+    defer a.close();
+    const b = try Net.open(.{}, .{ .nap = false }, roci.identity);
+    defer b.close();
+    const c = try Net.open(.{}, .{ .nap = false }, roci.identity);
+    defer c.close();
+    for (&a.nodes, &b.nodes) |*x, *y| roci.Transport.pair(x.t, y.t);
+    for ([_]*Net{ a, b, c }) |n| try n.start();
+    try a.nodes[0].t.send(FakeStream{}, .wob, 0);
+    var tries: u32 = 0;
+    while (b.nodes[0].t.failure() == null and tries < 3000) : (tries += 1) sleep(1_000_000);
+    try std.testing.expect(b.nodes[0].t.failure() != null);
+    sleep(20_000_000);
+    try std.testing.expectEqual(@as(?@TypeOf(c.nodes[0].t.failure().?), null), c.nodes[0].t.failure());
+}
+
+test "a lane leaves the ring before it closes: the lane that pointed at it points past it, nothing keeps a pointer to a closed lane" {
+    var a: roci.Transport = undefined;
+    var b: roci.Transport = undefined;
+    var c: roci.Transport = undefined;
+    roci.Transport.ring3(&a, &b, &c);
+    c.unlink(); // (lanes close last to first)
+    try std.testing.expectEqual(@as(?*roci.Transport, &b), a.sibling);
+    try std.testing.expectEqual(@as(?*roci.Transport, &a), b.sibling);
+    try std.testing.expectEqual(@as(?*roci.Transport, null), c.sibling);
+    b.unlink();
+    try std.testing.expectEqual(@as(?*roci.Transport, null), a.sibling);
+    try std.testing.expectEqual(@as(?*roci.Transport, null), b.sibling);
+    a.unlink(); // (a lane with no sibling goes quietly)
+    // any order of closing leaves no dangling pointer
+    for ([_][3]usize{ .{ 0, 1, 2 }, .{ 0, 2, 1 }, .{ 1, 0, 2 }, .{ 1, 2, 0 }, .{ 2, 0, 1 }, .{ 2, 1, 0 } }) |order| {
+        var ts: [3]roci.Transport = undefined;
+        roci.Transport.ring3(&ts[0], &ts[1], &ts[2]);
+        var gone = [_]bool{ false, false, false };
+        for (order) |i| {
+            ts[i].unlink();
+            gone[i] = true;
+            for (&ts, 0..) |*t, j| if (!gone[j]) if (t.sibling) |sb| {
+                for (&ts, 0..) |*q, k| if (sb == q) try std.testing.expect(!gone[k]);
+            };
+        }
+    }
+}
+
+// -- two lanes on a real driver: the streams of a pair (skipped without one) ----------------------------------------------
+
+/// Two nodes of one lane: their arenas, control blocks and transports (the lane's own).
+const GpuLane = struct {
+    nodes: [2]GpuNode = undefined,
+
+    fn open(d: *const cuda.Driver, arena_len: usize) !GpuLane {
+        var l: GpuLane = .{};
+        for (&l.nodes, 0..) |*n, i| {
+            const a = try hostAlloc(d, arena_len, 0x01 | 0x02 | 0x04);
+            const c = try hostAlloc(d, @sizeOf(roci.Control), 0x01 | 0x02);
+            n.* = .{ .arena = a.p[0..arena_len], .arena_dev = a.dev, .ctl = @ptrCast(c.p), .ctl_dev = c.dev, .me = @intCast(i) };
+            n.ctl.* = .{};
+        }
+        return l;
+    }
+
+    fn start(l: *GpuLane) !void {
+        for (&l.nodes, 0..) |*n, i| {
+            n.peer = &l.nodes[1 - i];
+            n.t = try roci.Transport.init(gpa, @intCast(i), roci.identity, n.ctl, n.ctl_dev, .{ .ctx = n, .post_fn = gpuPost, .fail_fn = gpuFail, .reap_fn = gpuReap }, .{ .nap = false });
+            try n.t.start(null);
+        }
+    }
+
+    fn close(l: *GpuLane, d: *const cuda.Driver) void {
+        for (&l.nodes) |*n| n.t.deinit();
+        for (&l.nodes) |*n| {
+            _ = d.api.cuMemFreeHost(n.arena.ptr);
+            _ = d.api.cuMemFreeHost(@ptrCast(n.ctl));
+        }
+    }
+};
+
+/// The word each psum block holds: lane, node, block and generation.
+fn laneWord(lane: u32, node: u32, block: u32, gen: u32) u32 {
+    return (lane << 30) | (node << 28) | (block << 20) | gen;
+}
+
+fn laneWrite(d: *const cuda.Driver, nd: *GpuNode, s: cuda.Stream, lane: u32, gen: u32) !void {
+    const l = roci.layout();
+    const blk: usize = 1024 * 2560 * 4;
+    for (0..4) |b| try d.check(d.api.cuMemsetD32Async(nd.arena_dev + l.at(.psum) + b * blk, laneWord(lane, nd.me, @intCast(b), gen), blk / 4, s.handle), "memset");
+}
+
+/// Differing words of node `nd`'s stage regions against what its peer wrote: lane `from`'s words.
+fn laneStageBad(nd: *GpuNode, from: u32, gen: u32) u64 {
+    const l = roci.layout();
+    const blk: usize = 1024 * 2560 * 4;
+    const peer: u32 = 1 - nd.me;
+    const w = [2]u32{ laneWord(from, peer, nd.me, gen), laneWord(from, peer, nd.me ^ 2, gen) };
+    var bad: u64 = 0;
+    for (0..2) |k| {
+        const got = std.mem.bytesAsSlice(u32, nd.arena[l.at(.stage) + k * blk ..][0..blk]);
+        for (got) |x| bad += @intFromBool(x != w[k]);
+    }
+    return bad;
+}
+
+fn streamDone(s: cuda.Stream, ms: u64) bool {
+    var waited: u64 = 0;
+    while (waited < ms) : (waited += 1) {
+        if (s.d.api.cuStreamQuery(s.handle) == 0) return true;
+        sleep(1_000_000);
+    }
+    return false;
+}
+
+test "two lanes on one GPU: each lane's stream writes its arena, rings its own doorbell and waits its own words; every byte lands in its lane; the lanes' streams do not wait on each other" {
+    var driver = cuda.Driver.open() catch return error.SkipZigTest;
+    defer driver.close();
+    var cx = cuda.Context.init(&driver, 0) catch return error.SkipZigTest;
+    defer cx.deinit();
+    var lanes: [2]GpuLane = undefined;
+    lanes[0] = try GpuLane.open(&driver, 64 << 20);
+    lanes[1] = try GpuLane.open(&driver, 64 << 20);
+    try lanes[0].start();
+    try lanes[1].start();
+    defer for (&lanes) |*l| l.close(&driver);
+    var st: [2][2]cuda.Stream = undefined; // [lane][node]
+    for (&st) |*row| {
+        for (row) |*x| x.* = try cuda.Stream.init(&driver, true);
+    }
+    defer for (&st) |*row| {
+        for (row) |*x| x.deinit();
+    };
+    // generations in flight on both lanes at once: lane 1's sends are queued before lane 0's waits
+    for (1..5) |gen| {
+        for (0..2) |lane| for (0..2) |n| {
+            try laneWrite(&driver, &lanes[lane].nodes[n], st[lane][n], @intCast(lane), @intCast(gen));
+            try lanes[lane].nodes[n].t.send(st[lane][n], .own1, 0);
+        };
+        for (0..2) |lane| for (0..2) |n| try lanes[lane].nodes[n].t.wait(st[lane][n], .own1);
+        for (0..2) |lane| for (0..2) |n| try st[lane][n].synchronize();
+        for (0..2) |lane| for (0..2) |n| try std.testing.expectEqual(@as(u64, 0), laneStageBad(&lanes[lane].nodes[n], @intCast(lane), @intCast(gen)));
+    }
+    // each lane counted its own sends and waits
+    for (&lanes) |*ln| for (&ln.nodes) |*nd| {
+        try std.testing.expectEqual(@as(u64, 4), nd.t.counters().events);
+        try std.testing.expectEqual(@as(u64, 4), nd.t.counters().wait_groups);
+    };
+    // control: a consumer that waits lane 0's words reads lane 1's stage before lane 1's bytes are there (lane 1's peer is late)
+    lanes[1].nodes[1].hold.store(true, .release);
+    for (0..2) |n| {
+        try laneWrite(&driver, &lanes[1].nodes[n], st[1][n], 1, 9);
+        try lanes[1].nodes[n].t.send(st[1][n], .own1, 0);
+    }
+    for (0..2) |n| {
+        try laneWrite(&driver, &lanes[0].nodes[n], st[0][n], 0, 9);
+        try lanes[0].nodes[n].t.send(st[0][n], .own1, 0);
+    }
+    for (0..2) |n| try lanes[0].nodes[n].t.wait(st[0][n], .own1);
+    // liveness: lane 0's stream finishes while lane 1's node 0 waits on its late peer
+    try lanes[1].nodes[0].t.wait(st[1][0], .own1);
+    try std.testing.expect(streamDone(st[0][0], 3000));
+    try std.testing.expect(streamDone(st[0][1], 3000));
+    try std.testing.expect(!streamDone(st[1][0], 150)); // lane 1's wait is pending: the late peer has not posted
+    try std.testing.expect(laneStageBad(&lanes[1].nodes[0], 1, 9) != 0); // the wrong-lane control: lane 1's bytes are not there yet
+    lanes[1].nodes[1].hold.store(false, .release);
+    try lanes[1].nodes[1].t.wait(st[1][1], .own1);
+    try st[1][0].synchronize();
+    try st[1][1].synchronize();
+    try std.testing.expectEqual(@as(u64, 0), laneStageBad(&lanes[1].nodes[0], 1, 9));
+    try std.testing.expectEqual(@as(u64, 0), laneStageBad(&lanes[0].nodes[0], 0, 9));
+}
+
+test "control: lane 1's posts aimed at lane 0's arena leave lane 1's stage empty and overwrite lane 0's" {
+    var driver = cuda.Driver.open() catch return error.SkipZigTest;
+    defer driver.close();
+    var cx = cuda.Context.init(&driver, 0) catch return error.SkipZigTest;
+    defer cx.deinit();
+    var lanes: [2]GpuLane = undefined;
+    lanes[0] = try GpuLane.open(&driver, 64 << 20);
+    lanes[1] = try GpuLane.open(&driver, 64 << 20);
+    try lanes[0].start();
+    try lanes[1].start();
+    defer for (&lanes) |*l| l.close(&driver);
+    // the miswiring: lane 1's node 1 posts into lane 0's node 0 (arena and words)
+    lanes[1].nodes[1].peer = &lanes[0].nodes[0];
+    var st: [2]cuda.Stream = undefined;
+    for (&st) |*x| x.* = try cuda.Stream.init(&driver, true);
+    defer for (&st) |*x| x.deinit();
+    try laneWrite(&driver, &lanes[1].nodes[1], st[1], 1, 3);
+    try lanes[1].nodes[1].t.send(st[1], .own1, 0);
+    try st[1].synchronize();
+    var tries: u32 = 0;
+    while (lanes[0].nodes[0].ctl.recv[@backingInt(C.own1)][1][0].v == 0 and tries < 2000) : (tries += 1) sleep(1_000_000);
+    // lane 1's node 0 got nothing (its stage is zero: not the expected bytes) and lane 0's node 0 holds lane 1's bytes
+    try std.testing.expect(laneStageBad(&lanes[1].nodes[0], 1, 3) != 0);
+    try std.testing.expectEqual(@as(u64, 0), laneStageBad(&lanes[0].nodes[0], 1, 3));
+}
+
+test "the pair's cache gate: pass B's read of a layer's cache waits pass A's event; without the event it reads what A has not yet written" {
+    var driver = cuda.Driver.open() catch return error.SkipZigTest;
+    defer driver.close();
+    var cx = cuda.Context.init(&driver, 0) catch return error.SkipZigTest;
+    defer cx.deinit();
+    const flag = try hostAlloc(&driver, 4096, 0x01 | 0x02);
+    const flag_p: *u64 = @ptrCast(@alignCast(flag.p));
+    defer _ = driver.api.cuMemFreeHost(flag.p);
+    var cache = try cuda.DeviceBuffer.alloc(&driver, 4096);
+    defer cache.free();
+    var out = try cuda.DeviceBuffer.alloc(&driver, 8192);
+    defer out.free();
+    var sa = try cuda.Stream.init(&driver, true);
+    defer sa.deinit();
+    var sb = try cuda.Stream.init(&driver, true);
+    defer sb.deinit();
+    var ev = try cuda.Event.init(&driver, false);
+    defer ev.deinit();
+    try driver.check(driver.api.cuMemsetD32Async(cache.ptr, 0x11111111, 1024, sa.handle), "memset");
+    try sa.synchronize();
+    for ([_]bool{ true, false }) |gated| {
+        flag_p.* = 0;
+        const base: u64 = if (gated) 0 else 4096;
+        // A's attention writes the cache only when the host releases it (the layer is still running)
+        try sa.waitValues64(&.{flag.dev}, &.{1});
+        try driver.check(driver.api.cuMemsetD32Async(cache.ptr, if (gated) 0x22222222 else 0x33333333, 1024, sa.handle), "memset");
+        try ev.record(sa);
+        if (gated) try sb.wait(ev);
+        // B's attention reads the layer's cache
+        try driver.check(driver.api.cuMemcpyDtoDAsync_v2(out.ptr + base, cache.ptr, 4096, sb.handle), "copy");
+        sleep(100_000_000); // B has run as far as it may before A writes
+        @atomicStore(u64, flag_p, 1, .release);
+        try sa.synchronize();
+        try sb.synchronize();
+        var got: [1024]u32 = undefined;
+        try driver.check(driver.api.cuMemcpyDtoH_v2(&got, out.ptr + base, 4096), "dtoh");
+        const want: u32 = if (gated) 0x22222222 else 0x33333333;
+        var bad: u32 = 0;
+        for (got) |x| bad += @intFromBool(x != want);
+        // gated: B read A's write; ungated: B read the old bytes (the control is live)
+        if (gated) try std.testing.expectEqual(@as(u32, 0), bad) else try std.testing.expect(bad != 0);
+    }
+}
 
 // -- a decoder window's taps and head row (classes gt, hx) ----------------------------------------------------------------
 
@@ -1013,4 +1467,38 @@ test "four nodes: a decoder window's taps and head row land every byte at window
         for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
         for (&net.nodes) |*nd| try std.testing.expectEqual(@as(?@TypeOf(nd.t.failure().?), null), nd.t.failure());
     }
+}
+
+test "the arena and the plans follow the booted pass rows: 4,096 unless more (setCap), the plans of the whole pass and the resume unit" {
+    const keep = roci.max_cap;
+    const keep_caps = roci.Transport.shape_caps;
+    defer {
+        roci.max_cap = keep;
+        roci.Transport.shape_caps = keep_caps;
+    }
+    const roci_engine = @import("roci_engine.zig");
+    var totals: [3]u64 = undefined;
+    for ([_]usize{ 2048, 4096, 8192 }, 0..) |p, i| {
+        roci.setCap(p);
+        totals[i] = roci.layout().total;
+        // never below the baseline layout: a 2,048-row pass lays the arena out as before
+        try std.testing.expectEqual(@max(@as(usize, 4096), p), roci.max_cap);
+        try std.testing.expectEqual([2]usize{ @max(@as(usize, 4096), p), 2048 }, roci.Transport.shape_caps);
+        // the whole pass's plan and the resume unit's exist; any other cap has none; any-size plans reach the pass
+        _ = try roci_engine.Roci.shapeOf(p);
+        _ = try roci_engine.Roci.shapeOf(2048);
+        try std.testing.expectError(error.NoPlanForRows, roci_engine.Roci.shapeOf(roci.max_cap + 2048));
+        _ = try roci_engine.Roci.shapeFor(p - 100, p, true, 0);
+        try std.testing.expectError(error.NoPlanForRows, roci_engine.Roci.shapeFor(roci.max_cap + 1, p, true, 0));
+        // the events of the whole pass are built at its rows, every class, every node
+        for (0..roci.n_classes) |c| for (0..4) |g| {
+            const ev = roci.buildEvent(@fromBackingInt(@intCast(c)), p, g, roci.identity);
+            try std.testing.expect(ev.class == @as(roci.Class, @fromBackingInt(@intCast(c))));
+        };
+    }
+    try std.testing.expectEqual(totals[0], totals[1]); // 2,048 and 4,096 lay out alike
+    try std.testing.expect(totals[2] > totals[1] and totals[2] <= 2 * totals[1]); // 8,192 about twice
+    roci.setCap(4096);
+    try std.testing.expectEqual(keep_caps, roci.Transport.shape_caps);
+    try std.testing.expectEqual(totals[1], roci.layout().total);
 }

@@ -257,7 +257,7 @@ fn overlap(sp: Span, start: usize, n: usize) ?[2]usize {
 }
 
 pub const Chunk = struct {
-    cap: usize,
+    lane: u2 = 0, // the Rocinante lane this chunk's pass runs on (1: the second pass of a pair, 2: the third of a group of three)
     spans: []const Span = &.{}, // the prompt's image spans (absolute positions)
     img_rows: u64 = 0, // bf16 [span tokens, D]: their rows
     pick_vl: u64 = 0, // int32 [cap, slots]: the routing of span rows with the image bias, before it joins pick
@@ -1658,17 +1658,33 @@ pub const EngramHost = struct {
     // the prompt's read-ahead worker (engramWorker; model.zig runs it through a fill): chunk i's rows of Engram layer j
     // in wk_rows[i % 2][j], chunk i ready once wk_done[j] > i, its slot free again once wk_used[j] > i (the rows
     // uploaded), so the worker runs up to a chunk ahead of the layers: a chunk's table reads overlap the chunk before
+    wk_rows: [engram_rows.max_wk][2][]u16 = @splat(.{ &.{}, &.{} }),
+    wk_slots: usize = 2,
+    wk_hashes: [engram_rows.max_wk][]i64 = @splat(&.{}),
     wk_flat: []i64 = &.{},
     wk_w: []u8 = &.{},
     wk_s: []u8 = &.{},
     wk_done: [2]std.atomic.Value(usize) = .{ .init(0), .init(0) },
     wk_used: [2]std.atomic.Value(usize) = .{ .init(0), .init(0) },
+    // the engine thread's time in the pass (TF_DS_ROCI_PAIR_LOG's line): waiting for the worker's rows, and in the upload calls (a blocked copy is here)
+    inst_wait_ns: u64 = 0,
+    inst_apply_ns: u64 = 0,
+    // the worker's own time and reads (its thread adds, the engine thread's pair line reads the difference from `inst_snap`): steps, hashing,
+    // the rows' gather (the packed path's cache lookups and reads), decode on the host, rows asked, rows read (cache misses), bytes read
+    inst_steps: std.atomic.Value(u64) = .init(0),
+    inst_hash_ns: std.atomic.Value(u64) = .init(0),
+    inst_gather_ns: std.atomic.Value(u64) = .init(0),
+    inst_decode_ns: std.atomic.Value(u64) = .init(0),
+    inst_rows: std.atomic.Value(u64) = .init(0),
+    inst_miss: std.atomic.Value(u64) = .init(0),
+    inst_bytes: std.atomic.Value(u64) = .init(0),
     wk_stop: std.atomic.Value(bool) = .init(false),
     wk_failed: std.atomic.Value(bool) = .init(false),
     wk_err: ?anyerror = null,
     wk_thread: ?std.Thread = null,
     wk_seq: []const i32 = &.{}, // the prompt it reads (its whole ids)
     wk_start: usize = 0, // its first chunk's start
+    wk_group: usize = 0, // TF_DS_ROCI_WORKER_PAIR_MAJOR with two passes in flight: 4 chunks a group (WorkerOrder.group)
 
     pub fn init(gpa: std.mem.Allocator, c: *const Config, hasher: engram.Hasher, tables: *const engram_io.Tables, pool: *engram_io.Pool, rank: usize, world: usize, cap: usize) !EngramHost {
         const cols = hasher.cols();
@@ -1676,6 +1692,7 @@ pub const EngramHost = struct {
         const hi = (rank + 1) * cols / world;
         const k = hi - lo;
         const t = tables.layers.get(@intCast(c.engram_layers.slice()[0])) orelse return error.MissingEngramTable;
+        var wr: [engram_rows.max_wk][2][]u16 = @splat(.{ &.{}, &.{} });
         var max_w: usize = 0;
         var max_s: usize = 0;
         for (0..@min(2, c.engram_layers.slice().len)) |j| {
@@ -1696,6 +1713,11 @@ pub const EngramHost = struct {
         }
         return .{
             .wk_rows = wr,
+            .wk_slots = wk_slots,
+            .wk_hashes = blk: {
+                var h: [engram_rows.max_wk][]i64 = @splat(&.{});
+                break :blk h;
+            },
             .ahead_w = aw,
             .ahead_s = as,
             .ahead_rows = ar,
@@ -1785,6 +1807,8 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
         eh.hasher.hashes(seq, ch.start, n, eh.hashes[0 .. n * eh.hasher.layers * cols]);
         for (0..n) |r| {
             for (0..k) |j| eh.flat[r * k + j] = eh.hashes[(r * eh.hasher.layers + l) * cols + eh.lo + j];
+    group: usize = 0, // chunks a pass-major group takes from pass_from on, whatever the pass rule says (0: the rule): two passes in flight read both passes' layer 0, then both layer 1
+            const rows = if (self.group != 0 and at >= self.pass_from) self.group * self.chunk else if (self.pass_rows <= self.chunk) self.chunk else workerRuleRows(at, self.pass_from, self.pass_rows, self.chunk, self.filling_pass);
         }
         if (eh.paio) |aio| try aioGather(aio, t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]) else try eh.pool.gather(t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]);
         engram.decodeRows(eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s], eh.rows[0 .. m * t.row_w], m, t.row_w, t.row_s, 8); // the rows on 8 threads
@@ -1896,7 +1920,9 @@ pub fn engramWorker(eh: *EngramHost, c: *const Config, seq: []const i32, start: 
     const nl = @min(2, c.engram_layers.slice().len);
     const cols = eh.hasher.cols();
     const k = eh.hi - eh.lo;
+        .group = eh.wk_group,
         const n = @min(chunk, seq.len - at);
+        workerRows(eh, c, seq, at, n, j, cols, k, eh.wk_rows[step.chunk % eh.wk_slots][j], step.chunk % eh.wk_slots) catch |err| {
             eh.wk_err = err;
             eh.wk_failed.store(true, .release);
             return;
@@ -1906,11 +1932,33 @@ pub fn engramWorker(eh: *EngramHost, c: *const Config, seq: []const i32, start: 
 
     const li = c.engram_layers.slice()[j];
     const t = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
+    _ = eh.inst_steps.fetchAdd(1, .monotonic);
+    if (j == 0) {
+        const th = nowNs();
+        eh.hasher.hashes(seq, start, n, eh.wk_hashes[slot][0 .. n * eh.hasher.layers * cols]);
+        _ = eh.inst_hash_ns.fetchAdd(@intCast(nowNs() - th), .monotonic);
+    }
+    if (eh.pk) |pr| {
+        const tg = nowNs();
+        _ = eh.inst_gather_ns.fetchAdd(@intCast(nowNs() - tg), .monotonic);
+        const st = &pr.wk[slot][j];
+        _ = eh.inst_rows.fetchAdd(n * pr.slots(), .monotonic);
+        _ = eh.inst_miss.fetchAdd(st.misses, .monotonic);
+        _ = eh.inst_bytes.fetchAdd(st.misses * pr.rec, .monotonic);
+        return;
+    }
     for (0..n) |r| {
     }
     const m = n * k;
+    const tg = nowNs();
     if (eh.paio) |aio| try aioGather(aio, t, eh.wk_flat[0..m], eh.wk_w[0 .. m * t.row_w], eh.wk_s[0 .. m * t.row_s]) else try eh.pool.gather(t, eh.wk_flat[0..m], eh.wk_w[0 .. m * t.row_w], eh.wk_s[0 .. m * t.row_s]);
+    const td = nowNs();
     engram.decodeRows(eh.wk_w[0 .. m * t.row_w], eh.wk_s[0 .. m * t.row_s], out[0 .. m * t.row_w], m, t.row_w, t.row_s, 8);
+    _ = eh.inst_gather_ns.fetchAdd(@intCast(td - tg), .monotonic);
+    _ = eh.inst_decode_ns.fetchAdd(@intCast(nowNs() - td), .monotonic);
+    _ = eh.inst_rows.fetchAdd(m, .monotonic);
+    _ = eh.inst_miss.fetchAdd(m, .monotonic);
+    _ = eh.inst_bytes.fetchAdd(m * (t.row_w + t.row_s), .monotonic);
 }
 
     engramWorkerStop(eh);
@@ -1935,8 +1983,11 @@ pub fn engramWorkerStop(eh: *EngramHost) void {
 /// The worker's rows of Engram layer j for the chunk at `start` (waiting for them), for engramApply.
 pub fn engramWorkerRows(eh: *EngramHost, j: usize, start: usize, chunk: usize) ![]u16 {
     const ci = (start - eh.wk_start) / chunk;
+    const t_in = nowNs();
+    return eh.wk_rows[ci % eh.wk_slots][j];
 }
 
+    return &pr.wk[((start - eh.wk_start) / chunk) % eh.wk_slots][j];
             // WP4: the same row-sharded flush as attnMixes's pending branch (hcPost alone is _hc_mix_pf's "posted"
             // finisher without the RMSNorm finish; same G-buffer stride gotcha, same repack).
             try hcPostOwned(e, ch, .moe, r);
@@ -2145,6 +2196,128 @@ test "the boundary's in-place gathers put every rank's owned groups of the four 
     const whole = struct {
         fn byte(buf: u64, i: usize) u8 {
             return @truncate(buf / 3 + i * 17 + 1);
+/// The worker (greedy, blocked by its slot guard) against the host consuming a pair's units in the pair's issue order: A's layer-1
+/// Engram units, B's, A's layer-14, B's. Returns how many of the worker's steps were done when the host first consumed B's layer-14
+/// units, and whether the host ever waited on a step the worker could not take (a deadlock).
+fn pairWorkerRun(slots: usize, pairs: usize) struct { ok: bool, ahead_at_b14: usize } {
+    var order: WorkerOrder = .{ .start = 0, .chunks = pairs * 4, .chunk = 2048, .layers = 2, .pass_from = 0, .pass_rows = 4096 };
+    var done = [2]usize{ 0, 0 };
+    var used = [2]usize{ 0, 0 };
+    var steps: usize = 0;
+    var ahead: usize = 0;
+    var have_ahead = false;
+    var pending: ?WorkerStep = null;
+    const total = pairs * 8;
+    var host: usize = 0; // consumptions: 4 a pair (A j0, B j0, A j1, B j1), each 2 chunks
+    while (host < pairs * 4) {
+        // the worker takes every step its guard allows
+        while (steps < total) {
+            const st = pending orelse (order.next() orelse break);
+            if (st.chunk >= used[st.layer] + slots) {
+                pending = st;
+                break;
+            }
+            pending = null;
+            done[st.layer] = st.chunk + 1;
+            steps += 1;
+        }
+        const pair = host / 4;
+        const which = host % 4; // 0 A j0, 1 B j0, 2 A j1, 3 B j1
+        const j: usize = which / 2;
+        const first = pair * 4 + (which % 2) * 2;
+        if (done[j] < first + 2) return .{ .ok = false, .ahead_at_b14 = ahead };
+        used[j] = first + 2;
+        if (which == 3 and !have_ahead) {
+            ahead = steps;
+            have_ahead = true;
+        }
+        host += 1;
+    }
+    return .{ .ok = true, .ahead_at_b14 = ahead };
+}
+
+test "two passes in flight: the worker's four chunk slots serve a pair's four units in the issue order without a wait on a step it cannot take" {
+    const four = pairWorkerRun(4, 8);
+    try std.testing.expect(four.ok);
+    // the first pair's B layer-14 units are consumed when the worker is already into the next pair
+    try std.testing.expect(four.ahead_at_b14 >= 8);
+}
+
+test "control: two slots hold the worker back to the pair's own units (the guard is live)" {
+    const two = pairWorkerRun(2, 8);
+    const four = pairWorkerRun(4, 8);
+    try std.testing.expect(two.ahead_at_b14 < four.ahead_at_b14 or !two.ok);
+}
+
+test "TF_DS_ROCI_WORKER_PAIR_MAJOR: a group of four chunks reads layer 0 of all four, then layer 1 of all four, so the second pass's layer 0 comes after four steps, not six" {
+    // the baseline order for 4,096-row passes: pass A's layers, then pass B's
+    var today: WorkerOrder = .{ .start = 0, .chunks = 4, .chunk = 2048, .layers = 2, .pass_from = 0, .pass_rows = 4096 };
+    try expectWorkerOrder(&today, &.{
+        .{ .chunk = 0, .layer = 0 }, .{ .chunk = 1, .layer = 0 }, .{ .chunk = 0, .layer = 1 }, .{ .chunk = 1, .layer = 1 },
+        .{ .chunk = 2, .layer = 0 }, .{ .chunk = 3, .layer = 0 }, .{ .chunk = 2, .layer = 1 }, .{ .chunk = 3, .layer = 1 },
+    });
+    var major: WorkerOrder = .{ .start = 0, .chunks = 8, .chunk = 2048, .layers = 2, .pass_from = 0, .pass_rows = 4096, .group = 4 };
+    try expectWorkerOrder(&major, &.{
+        .{ .chunk = 0, .layer = 0 }, .{ .chunk = 1, .layer = 0 }, .{ .chunk = 2, .layer = 0 }, .{ .chunk = 3, .layer = 0 },
+        .{ .chunk = 0, .layer = 1 }, .{ .chunk = 1, .layer = 1 }, .{ .chunk = 2, .layer = 1 }, .{ .chunk = 3, .layer = 1 },
+        .{ .chunk = 4, .layer = 0 }, .{ .chunk = 5, .layer = 0 }, .{ .chunk = 6, .layer = 0 }, .{ .chunk = 7, .layer = 0 },
+        .{ .chunk = 4, .layer = 1 }, .{ .chunk = 5, .layer = 1 }, .{ .chunk = 6, .layer = 1 }, .{ .chunk = 7, .layer = 1 },
+    });
+    // the steps done when the host has its first pass's and its second pass's layer-0 rows
+    var o1: WorkerOrder = .{ .start = 0, .chunks = 8, .chunk = 2048, .layers = 2, .pass_from = 0, .pass_rows = 4096 };
+    var o2 = o1;
+    o2.group = 4;
+    var needs: [2]usize = .{ 0, 0 };
+    for ([_]*WorkerOrder{ &o1, &o2 }, 0..) |o, i| {
+        var n: usize = 0;
+        while (o.next()) |st| {
+            n += 1;
+            if (st.chunk == 3 and st.layer == 0) break;
+        }
+        needs[i] = n;
+    }
+    try std.testing.expectEqual(@as(usize, 6), needs[0]);
+    try std.testing.expectEqual(@as(usize, 4), needs[1]);
+    // a short last group takes what is left; below pass_from the rule's chunk-major order stays
+    var tail: WorkerOrder = .{ .start = 0, .chunks = 6, .chunk = 2048, .layers = 2, .pass_from = 0, .pass_rows = 4096, .group = 4 };
+    var seen: usize = 0;
+    while (tail.next()) |_| seen += 1;
+    try std.testing.expectEqual(@as(usize, 12), seen);
+    var below: WorkerOrder = .{ .start = 0, .chunks = 4, .chunk = 2048, .layers = 2, .pass_from = 8192, .pass_rows = 4096, .group = 4 };
+    try expectWorkerOrder(&below, &.{
+        .{ .chunk = 0, .layer = 0 }, .{ .chunk = 0, .layer = 1 }, .{ .chunk = 1, .layer = 0 }, .{ .chunk = 1, .layer = 1 },
+        .{ .chunk = 2, .layer = 0 }, .{ .chunk = 2, .layer = 1 }, .{ .chunk = 3, .layer = 0 }, .{ .chunk = 3, .layer = 1 },
+    });
+}
+
+test "TF_DS_ROCI_STAGGER_LANES=3: a group of three passes' 3u chunks, layer 0's then layer 1's, and any ring of a pass's units or more runs it against the uploads (no deadlock); the booted ring is three passes' units" {
+    for (1..engram_rows.max_units + 1) |u| {
+        var order: WorkerOrder = .{ .start = 0, .chunks = 6 * u, .chunk = 2048, .layers = 2, .pass_from = 0, .pass_rows = u * 2048, .group = 3 * u };
+        for (0..2) |group| for (0..2) |layer| for (0..3 * u) |k| {
+            const step = order.next() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(group * 3 * u + k, step.chunk);
+            try std.testing.expectEqual(layer, step.layer);
+        };
+        try std.testing.expect(order.next() == null);
+        const slots = engram_rows.workerSlotsN(u, 3);
+        try std.testing.expectEqual(@max(2, 3 * u), slots);
+        var why: [320]u8 = undefined;
+        if (slots <= engram_rows.max_wk) {
+            try std.testing.expect(ringRuns(u, 3, slots, 3));
+            try std.testing.expectEqual(@as(?[]const u8, null), engram_rows.slotsRefusal(&why, slots, u));
+        } else {
+            // the ring would be larger than the worker's largest: the start refuses it (units 6 to 8 at three lanes)
+            try std.testing.expect(engram_rows.slotsRefusal(&why, slots, u) != null);
+        }
+        // a ring under a pass's units never runs (the worker waits for a slot no upload frees), from the pass's units up to the largest it does
+        for (1..u) |sl| try std.testing.expect(!ringRuns(u, 3, sl, 3));
+        for (u..engram_rows.max_wk + 1) |sl| try std.testing.expect(ringRuns(u, 3, sl, 3));
+    }
+    try std.testing.expectEqual(@as(usize, 6), engram_rows.workerSlotsN(2, 3)); // 4,096-row passes: six chunk slots
+    try std.testing.expectEqual(engram_rows.workerSlots(2, true), engram_rows.workerSlotsN(2, 2));
+    try std.testing.expectEqual(engram_rows.workerSlots(2, false), engram_rows.workerSlotsN(2, 1));
+}
+
 
 /// Whether the kit's extra set has the two-block reader variant of every launch the owned path makes with TF_DS_ROCI at
 /// each row count of `rows` (a slab of a full pass): null when it has, else the reason. The launches are logged, not

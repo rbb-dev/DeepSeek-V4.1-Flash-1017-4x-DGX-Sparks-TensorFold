@@ -50,7 +50,10 @@ const comm_mod = @import("comm.zig");
 const link = @import("link.zig");
 const ring2d = @import("ring2d.zig");
 const roci_engine = @import("roci_engine.zig");
+const roci_pair = @import("roci_pair.zig");
 const pair_spans = @import("pair_spans.zig");
+const pass_meter = @import("pass_meter.zig");
+const pair_nap = @import("rdma_nap.zig");
 const rdma = @import("rdma.zig");
 const tri_index = @import("tri_index.zig");
 
@@ -294,24 +297,9 @@ const KitFinds = struct {
         return x.lookup(name, args, consts) != null;
     }
 
-        // the RoPE tables (the served build's bits: torch CPU pow and polar), every position a stream reaches
-        const half = c.rope_dim / 2;
-        const rope_rows = m.ctx_cap + round.max_rows + 1;
-        m.rope_buf = try cuda.DeviceBuffer.alloc(d, 4 * rope_rows * half * 4);
-        errdefer m.rope_buf.free();
-        {
-            const part = try gpa.alloc(u8, rope_rows * half * 4);
-            defer gpa.free(part);
-            for ([_][]const u8{ "rope-plain-cos.f32", "rope-plain-sin.f32", "rope-compressed-cos.f32", "rope-compressed-sin.f32" }, 0..) |name, j| {
-                var f = try std.Io.Dir.cwd().openFile(io, try std.fs.path.join(a, &.{ o.kit_dir, name }), .{});
-                defer f.close(io);
-                if (try f.readPositionalAll(io, part, 0) != part.len) return error.ShortRopeTable; // a table of fewer rows than a stream's context
-                try m.rope_buf.upload(j * part.len, part);
-            }
-        }
-        const tbl = rope_rows * half * 4;
-        const rope: prompt.Rope = .{ .cos = m.rope_buf.ptr, .sin = m.rope_buf.ptr + tbl };
-        const rope_c: prompt.Rope = .{ .cos = m.rope_buf.ptr + 2 * tbl, .sin = m.rope_buf.ptr + 3 * tbl };
+/// The Spark-class box's memory: a default of 4,096-row passes needs about 1.5 GiB more a node (measured) and, with the stagger, the
+/// guard below; a box with less than this much (CUDA's total) keeps 2,048-row passes. The default only: a setting is the operator's.
+const pass_rows_default_floor: usize = 96 << 30;
 
         m.arena = try prompt.Arena.init(d, o.arena_bytes);
         errdefer m.arena.deinit();
@@ -392,6 +380,9 @@ const KitFinds = struct {
         try m.synchronize();
         try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize"); // the setup's legacy-stream copies too
     if (!is_default or text == null or !std.mem.eql(u8, text.?, "4096")) return null;
+    if (total_bytes >= pass_rows_default_floor) return null;
+    return "this box's memory is under 96 GiB, too little for the larger pass's buffers";
+}
 
         // Engram on the host: the compressed token map, the multipliers, the tables and 64 readers
         if (o.engram_dir) |edir| {
@@ -416,6 +407,7 @@ const KitFinds = struct {
                 m.eh.?.paio = m.paio;
             }
         } else if (c.engram_layers.slice().len > 0) return error.NoEngramTables;
+    if (passRowsFallback(v, speed_defaults.defaulted("TF_DS_PASS_ROWS"), total_bytes)) |why| {
 
         // a vision checkpoint's image routing bias (without it a prompt with images is refused; text runs as ever)
         if (c.vision) {
@@ -740,11 +732,125 @@ pub fn startSettings(o: Options) prompt2d.Settings {
     };
 }
 
+const pair_guard_bytes: usize = 6 << 30;
+
+    return pairShortN(free, pass_rows, lane_arena, 2);
+}
+
+/// `pairShort` for `lanes` passes in flight (TF_DS_ROCI_STAGGER_LANES): every pass after the first takes the estimate.
+pub fn pairShortN(free: u64, pass_rows: usize, lane_arena: u64, lanes: usize) u64 {
+    const need = (lanes - 1) * pairEstimate(pass_rows, lane_arena) + pair_guard_bytes;
+/// What TF_DS_ROCI_STAGGER_LANES comes to at the start: the lanes asked for (`want`, 2 or 3), whether the operator set it, and whether
+/// every rank has the memory for them. A box under the floor refuses a lane count the operator set, by name; one that was only the
+/// default runs two lanes and warns. Two lanes are never judged here: the pair's own guard runs as it always did.
+pub const LanesChoice = struct { lanes: usize, warn: bool = false, refuse: bool = false };
+pub fn lanesChoice(want: usize, set: bool, fits_all: bool) LanesChoice {
+    if (want <= 2 or fits_all) return .{ .lanes = want };
+    if (set) return .{ .lanes = want, .refuse = true };
+    return .{ .lanes = 2, .warn = true };
+}
+
+fn pairShortText(buf: []u8, free: u64, pass_rows: usize, lane_arena: u64, v: PoolView, lanes: usize) ![]const u8 {
+    const what = if (lanes >= 3) "the second and third passes (TF_DS_ROCI_STAGGER_LANES=3)" else "the second pass";
+    return memoryRefusal(buf, what, true, pass_rows, (lanes - 1) * pairEstimate(pass_rows, lane_arena) + pair_guard_bytes, free, v);
         why = "needs the four-node 2D split with Rocinante";
+        switch (speed_defaults.verdict(why orelse "another rank cannot run it", speed_defaults.defaulted("TF_DS_ENGRAM_PARTNER"))) {
     const rc = try roci_engine.Roci.openLane(gpa, d, m.comm.rank, node, m.comm.world, m.two.?.rank_of, &m.fan, rails, Model.rdmaGid() orelse 3, 1, m.two.?.rc.?, .host);
+/// TF_DS_ROCI_STAGGER's start: two whole passes in flight need every exchange of a full pass on the transport (so no collective of
+/// another communicator runs beside a stream's memop waits), the Engram uploads from pinned memory (a pageable copy blocks the host thread
+/// that issues both passes), a second chunk, node of the split, lane, stream, cuBLAS handle and the per-layer cache events. Every rank's
+/// checks agree before anything is allocated; a rank that cannot run the route ends the start naming its reason.
+fn openPair(m: *Model, gpa: std.mem.Allocator, d: *const cuda.Driver, o: Options, sp: plan.Split, c: *const Config) !void {
+    var why: ?[]const u8 = null;
+    var free: usize = 0;
+    const two = if (m.two) |*t| t else null;
+    const connections: ?usize = if (std.c.getenv("CUDA_DEVICE_MAX_CONNECTIONS")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch null else null;
+    if (sp.pair == null or two == null) {
+        why = "needs the four-node 2D split";
+    } else if (c.format != .native) {
+        why = "needs the checkpoint's own FP8 / MXFP4 weights";
+    } else if (m.pass_rows % chunk_rows != 0 or m.pass_rows > pass_rows_max) {
+    } else if (m.pass_rows < 2 * chunk_rows) {
+    } else if (connections == null or connections.? < 16) {
+        why = "needs CUDA_DEVICE_MAX_CONNECTIONS=16 (the second pass's stream would share the first's queue, and a pending wait on it would block the other)";
+    } else if (!pinned) {
+        why = "needs TF_DS_ENGRAM_PINNED=1 (a pageable Engram upload blocks the host thread until the GPU reaches it, so the second pass could not be queued ahead)";
+    } else if (m.eh == null or !wk_on) {
+        why = "needs the Engram worker with its four chunk slots";
+    }
+    if (why == null and o.rdma_devices == null) why = "needs the rails' devices (TF_DS_RDMA_DEVICES)";
+    var lanes: usize = prompt2d.roci_stagger_lanes;
+    if (why == null) {
+        free = (try m.ctx.memInfo()).free;
+        if (lanes >= 3) {
+            // the third lane's bytes count: every rank votes on the memory for three, and a box under the floor either refuses (set) or keeps two (default)
+            const fits = pairShortN(free, m.pass_rows, lane_arena, 3) == 0;
+            const choice = lanesChoice(lanes, prompt2d.roci_stagger_lanes_set, try m.eng.agreeAll(fits));
+            if (choice.warn) std.log.warn("TF_DS_ROCI_STAGGER_LANES: rank {d}: three lanes need {d:.2} GiB free and a rank has less: two passes in flight", .{ m.comm.rank, @as(f64, @floatFromInt(2 * pairEstimate(m.pass_rows, lane_arena) + pair_guard_bytes)) / (1 << 30) });
+            if (choice.refuse and !fits) why = try pairShortText(&why_buf, free, m.pass_rows, lane_arena, poolView(m, c), 3) else if (choice.refuse) why = "TF_DS_ROCI_STAGGER_LANES=3: another rank has too little free memory for the third lane";
+            lanes = choice.lanes;
+        }
+        if (why == null and pairShort(free, m.pass_rows, lane_arena) != 0) why = try pairShortText(&why_buf, free, m.pass_rows, lane_arena, poolView(m, c), 2);
+    }
+    if (!try m.eng.agreeAll(why == null)) {
         const is_default = speed_defaults.defaulted("TF_DS_ROCI_STAGGER");
+        switch (speed_defaults.verdict(why orelse "another rank cannot run it", is_default)) {
+                if (why) |w| std.log.err("TF_DS_ROCI_STAGGER=1: off: {s}", .{w}) else std.log.err("TF_DS_ROCI_STAGGER=1: off: another rank cannot run it (its line names the reason)", .{});
+                return error.StaggerRefused;
+            },
+                std.log.warn("TF_DS_ROCI_STAGGER: off: {s}; without it: {s} (the engine runs one pass at a time; set TF_DS_ROCI_STAGGER=1 to make this a refusal, 0 to silence it)", .{ why orelse "another rank cannot run it (its line names the reason)", speed_defaults.costOf("TF_DS_ROCI_STAGGER") });
+                prompt2d.roci_stagger_asked = false;
+                return;
+            },
+        }
+    }
+    const used = m.arena.used;
     m.two_b = try prompt2d.Two.init(c, &m.w, &m.arena, sp, m.pass_rows);
+    m.two_b.?.adoptSettings(&m.two.?);
+    var devs_it = std.mem.splitScalar(u8, o.rdma_devices.?, ',');
+    const rails: [2][]const u8 = .{ devs_it.next() orelse return error.RociRails, devs_it.next() orelse return error.RociRails };
     m.two_b.?.rc = try roci_engine.Roci.openLane(gpa, d, m.comm.rank, @intCast(m.two.?.node()), m.comm.world, m.two.?.rank_of, &m.fan, rails, Model.rdmaGid() orelse 3, 2, m.two.?.rc.?, .prompt);
+    errdefer m.two_b.?.rc.?.close();
+    m.stream_b = if (m.pair_prio != .equal) blk: {
+        const range = try cuda.Stream.priorityRange(d);
+        break :blk try cuda.Stream.initPriority(d, roci_pair.prioritiesOf(m.pair_prio, range.least, range.greatest)[1]);
+    } else try cuda.Stream.init(d, true);
+    errdefer if (m.stream_b) |*x| x.deinit();
+    m.usePass(.b);
+    defer m.usePass(.a);
+    m.ch_b = try prompt.Chunk.init(&m.eng, &m.arena, m.pass_rows, m.ctx_cap);
+    m.ch_b.?.lane = 1;
+    m.blas_b = try cublas.Blas.open(m.stream_b.?, m.ch_b.?.blas_ws);
+    errdefer if (m.blas_b) |*b| b.close();
+    if (lanes >= 3) {
+        // the third lane: the same resources as the second's, the transport on the third part of the first lane's block, the three ring-linked
+        m.two_c = try prompt2d.Two.init(c, &m.w, &m.arena, sp, m.pass_rows);
+        m.two_c.?.adoptSettings(&m.two.?);
+        m.two_c.?.rc = try roci_engine.Roci.openLane(gpa, d, m.comm.rank, @intCast(m.two.?.node()), m.comm.world, m.two.?.rank_of, &m.fan, rails, Model.rdmaGid() orelse 3, 3, m.two.?.rc.?, .prompt);
+        errdefer m.two_c.?.rc.?.close();
+        rocinante_mod.Transport.ring3(m.two.?.rc.?.t, m.two_b.?.rc.?.t, m.two_c.?.rc.?.t);
+        m.stream_c = if (m.pair_prio != .equal) blk: {
+            const range = try cuda.Stream.priorityRange(d);
+            break :blk try cuda.Stream.initPriority(d, roci_pair.prioritiesOf(m.pair_prio, range.least, range.greatest)[1]);
+        } else try cuda.Stream.init(d, true);
+        errdefer if (m.stream_c) |*x| x.deinit();
+        m.usePass(.c);
+        m.ch_c = try prompt.Chunk.init(&m.eng, &m.arena, m.pass_rows, m.ctx_cap);
+        m.ch_c.?.lane = 2;
+        m.blas_c = try cublas.Blas.open(m.stream_c.?, m.ch_c.?.blas_ws);
+        errdefer if (m.blas_c) |*b| b.close();
+        m.ids64_c = try m.host.allocator().alloc(i64, m.pass_rows);
+        m.host_pos_c = try m.host.allocator().alloc(i64, m.pass_rows);
+        m.usePass(.b);
+    }
+    m.pair_lanes = lanes;
+    m.pair_ev = try roci_pair.Events.init(d, c.layers / 2, lanes);
+    errdefer if (m.pair_ev) |*e| e.deinit();
+    m.pair_join = try cuda.Event.init(d, true);
+    errdefer if (m.pair_join) |*e| e.deinit();
+    m.pair_t0 = try cuda.Event.init(d, true);
+    errdefer if (m.pair_t0) |*e| e.deinit();
+    m.pair_log = std.c.getenv("TF_DS_ROCI_PAIR_LOG") != null;
     if (m.pair_log) {
         // the span log's events: a pair of timing events per outstanding pair (pair_spans.cap of them), made here and only here
         m.span_t0 = try m.gpa.alloc(cuda.Event, pair_spans.cap);
@@ -754,6 +860,32 @@ pub fn startSettings(o: Options) prompt2d.Settings {
             m.span_join[i] = try cuda.Event.init(d, true);
         }
     }
+    m.pair_major = roci_pair.pairMajorOf(if (std.c.getenv("TF_DS_ROCI_WORKER_PAIR_MAJOR")) |v| std.mem.span(v) else null);
+    if (m.eh) |*eh| eh.wk_group = if (m.pair_major) roci_pair.groupChunksN(lanes, m.pass_rows, chunk_rows) else 0;
+    m.pair_gap = roci_pair.gapOf(if (std.c.getenv("TF_DS_ROCI_STAGGER_GAP")) |v| std.mem.span(v) else null);
+    m.ids64_b = try m.host.allocator().alloc(i64, m.pass_rows);
+    m.host_pos_b = try m.host.allocator().alloc(i64, m.pass_rows);
+    try m.stream_b.?.synchronize();
+    if (m.stream_c) |sc| try sc.synchronize();
+    m.pair_bytes = m.arena.used - used;
+    m.pair = true;
+    const after = m.ctx.memInfo() catch cuda.Context.MemInfo{ .free = free, .total = 0 };
+    const lay = @import("rocinante.zig").layout();
+    std.log.info("TF_DS_ROCI_STAGGER=1: rank {d}: {d} whole passes of {d} rows in flight (TF_DS_ROCI_STAGGER_LANES), the later's layer L after the earlier's layer L caches, issue gap {d} layers (TF_DS_ROCI_STAGGER_GAP), stream priorities A {d} and B {d} (TF_DS_ROCI_STAGGER_PRIO={d}; a lower number is more urgent), the Engram worker's order {s} (TF_DS_ROCI_WORKER_PAIR_MAJOR); the second pass's chunk and node take {d} bytes of the device arena, its transport's arena {d} bytes and control block {d} bytes; {d} bytes free before, {d} after; the Engram worker's ring holds {d} chunk slots of {d} rows, a pass takes {d}; the KV pool holds {d} positions ({d:.2} GiB on this Spark, POOL) and the floor kept free is {d:.1} GiB", .{ m.comm.rank, m.pair_lanes, m.pass_rows, m.pair_gap, m.stream.priority() catch -99, m.stream_b.?.priority() catch -99, @backingInt(m.pair_prio), if (m.pair_major) "pair-major (both passes' layer 0, then both layer 1)" else "pass-major (each pass's layers in turn)", m.pair_bytes, lay.total, @sizeOf(@import("rocinante.zig").Control), free, after.free, m.workerSlots(), chunk_rows, m.pass_rows / chunk_rows, m.pool_cap, @as(f64, @floatFromInt(poolView(m, c).bytes(m.pool_cap))) / (1 << 30), @as(f64, @floatFromInt(pair_guard_bytes)) / (1 << 30) });
+}
+
+/// One line of TF_DS_ROCI_PAIR_LOG: to the log, and appended to the file the variable names when its value is a path.
+fn pairLog(comptime fmt: []const u8, args: anytype) void {
+    std.log.info(fmt, args);
+    const v = std.c.getenv("TF_DS_ROCI_PAIR_LOG") orelse return;
+    if (v[0] != '/') return;
+    const line = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch return;
+    const fd = std.c.open(v, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return;
+    _ = std.c.write(fd, line.ptr, line.len);
+    _ = std.c.close(fd);
+}
+
     mxk: ?mx.Kernels = null, // Format.native: DeepSeek's own FP8 / MXFP4 checkpoint's kernels (mx.zig)
     rope_buf: cuda.DeviceBuffer,
     arena: prompt.Arena,
@@ -764,10 +896,42 @@ pub fn startSettings(o: Options) prompt2d.Settings {
     cand_vals: [round.max_rows * sampling.max_candidates]f32 = undefined,
     cand_ids: [round.max_rows * sampling.max_candidates]i64 = undefined,
     cand_flags: [round.max_rows]i32 = undefined,
+    // TF_DS_ROCI_STAGGER: the second lane of a pair of passes in flight: its node of the 2D split (own scratch, own transport), chunk,
+    // stream, cuBLAS handle, the per-layer cache events and its host id and position arrays.
+    pair: bool = false,
+    pair_open: std.atomic.Value(bool) = .init(false), // a pair's second pass may still run on stream_b (a group's last on stream_c): the first stream joins it before any other work
+    pair_last: usize = 2, // the passes of the group last queued (its last pass's events are what the next group's first waits on)
+    pair_lanes: usize = 2, // the passes in flight (TF_DS_ROCI_STAGGER_LANES: 2, or 3 with the third lane below)
+    two_b: ?prompt2d.Two = null,
+    ch_b: ?prompt.Chunk = null,
+    stream_b: ?cuda.Stream = null,
+    blas_b: ?cublas.Blas = null,
+    two_c: ?prompt2d.Two = null, // the third lane of a group of three (TF_DS_ROCI_STAGGER_LANES=3): the same resources as the second's
+    ch_c: ?prompt.Chunk = null,
+    stream_c: ?cuda.Stream = null,
+    blas_c: ?cublas.Blas = null,
+    pair_ev: ?roci_pair.Events = null,
+    pair_join: ?cuda.Event = null,
     span_ring: pair_spans.Ring = .{}, // TF_DS_ROCI_PAIR_LOG: the pairs whose span is not printed yet
     span_t0: []cuda.Event = &.{},
     span_join: []cuda.Event = &.{},
     span_slot: ?usize = null, // the slot of the pair being issued
+    pair_t0: ?cuda.Event = null, // timing events: the pair's first queued work on stream A, and its second pass's last (pair_join)
+    pair_log: bool = false, // TF_DS_ROCI_PAIR_LOG: one line a pair (a value starting with / also appends them to that file on rank 0)
+    pair_gap: usize = roci_pair.gap,
+    pair_prio: roci_pair.Prio = .equal, // TF_DS_ROCI_STAGGER_PRIO
+    pair_major: bool = false, // TF_DS_ROCI_WORKER_PAIR_MAJOR
+    fill_t0: u64 = 0, // the fill's admission (fillBegin), for the pair log's first line of a prompt
+    pair_in_fill: u64 = 0, // pairs run since fillBegin
+    pair_count: u64 = 0,
+    pair_prev_pending: bool = false, // the last pair's GPU span has not been printed
+    meter: pass_meter.Meter = .{}, // the rows the device has finished of each slot's prompt pass (the lane host's live prefill speed)
+    ids64_b: []i64 = &.{},
+    host_pos_b: []i64 = &.{},
+    ids64_c: []i64 = &.{},
+    host_pos_c: []i64 = &.{},
+    pair_bytes: usize = 0,
+    rdma_rings: ?ring2d.Rings = null,
     // digests by rank (rank 0 holds every rank's, a follower its own; prompt2d.no_digest: none)
     /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port)
     /// and sets up every buffer. Needs `ctx` current on this thread.
@@ -796,6 +960,21 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         // never captured RB above 2. Off (RB=1, today's behavior) unless set; validate on your own ring first.
         if (std.c.getenv("TF_DS_IDX_RB")) |v| tri_index.idx_rb = std.fmt.parseInt(usize, std.mem.span(v), 10) catch tri_index.idx_rb;
         if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
+        prompt2d.roci_stagger_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ROCI_STAGGER")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        {
+            const text: ?[]const u8 = if (std.c.getenv("TF_DS_ROCI_STAGGER_LANES")) |v| std.mem.span(v) else null;
+            prompt2d.roci_stagger_lanes = roci_pair.lanesOf(text) orelse {
+                std.log.err("TF_DS_ROCI_STAGGER_LANES is 2 or 3 (the passes in flight), not \"{s}\"", .{text.?});
+                return error.StaggerRefused;
+            };
+            prompt2d.roci_stagger_lanes_set = text != null;
+            if (prompt2d.roci_stagger_lanes == 3 and !prompt2d.roci_stagger_asked) {
+                std.log.err("TF_DS_ROCI_STAGGER_LANES=3 needs TF_DS_ROCI_STAGGER=1 (it is the stagger's third lane)", .{});
+                return error.StaggerRefused;
+            }
+            prompt2d.roci_stagger3_asked = prompt2d.roci_stagger_lanes == 3; // every rank alike (Settings)
+        }
+        rocinante_mod.setCap(prompt2d.pass_rows_asked); // (the transport's arenas and plans follow the pass rows, before any layout is read)
         const ring_word_text: ?[]const u8 = if (std.c.getenv("TF_DS_RING_WORD")) |v| std.mem.span(v) else null;
         prompt2d.ring_word_asked = prompt2d.switchDefaultOn(ring_word_text); // on unless set to something but 1; every rank alike (Settings)
         prompt2d.ring_word_explicit = ring_word_text != null;
@@ -839,10 +1018,47 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         if (std.c.getenv("TF_DS_L2_DN_MB")) |v| round.l2_dn_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dn_mb;
         if (std.c.getenv("TF_DS_L2_DEC_MB")) |v| round.l2_dec_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dec_mb;
         m.graph_fallbacks = .init(0);
+        m.pair = false;
+        m.pair_open = .init(false);
+        m.pair_lanes = 2;
+        m.pair_last = 2;
+        m.two_b = null;
+        m.ch_b = null;
+        m.stream_b = null;
+        m.blas_b = null;
+        m.two_c = null;
+        m.ch_c = null;
+        m.stream_c = null;
+        m.blas_c = null;
+        m.pair_ev = null;
+        m.pair_join = null;
+        m.pair_t0 = null;
         m.span_ring = .{};
         m.span_t0 = &.{};
         m.span_join = &.{};
         m.span_slot = null;
+        m.pair_log = false;
+        m.pair_gap = roci_pair.gap;
+        m.pair_prio = .equal;
+        m.pair_major = false;
+        m.fill_t0 = 0;
+        m.pair_in_fill = 0;
+        m.pair_count = 0;
+        m.pair_prev_pending = false;
+        m.meter = .{};
+        m.ids64_b = &.{};
+        m.host_pos_b = &.{};
+        m.ids64_c = &.{};
+        m.host_pos_c = &.{};
+        m.pair_bytes = 0;
+        m.rdma_rings = null;
+        // TF_DS_ROCI_STAGGER_PRIO: pass A's stream (this one, which every other piece of work also runs on) at the priority the mode gives it
+        m.pair_prio = roci_pair.prioOf(if (std.c.getenv("TF_DS_ROCI_STAGGER_PRIO")) |v| std.mem.span(v) else null);
+        m.stream = if (prompt2d.roci_stagger_asked and m.pair_prio != .equal) blk: {
+            const range = try cuda.Stream.priorityRange(d);
+            break :blk try cuda.Stream.initPriority(d, roci_pair.prioritiesOf(m.pair_prio, range.least, range.greatest)[0]);
+        } else try cuda.Stream.init(d, true);
+        errdefer m.stream.deinit();
         // rank 0's ports for its followers listen before its weights load: a follower that loads first connects and
         // waits in its port's backlog instead of retrying until rank 0 and the followers before it are in
         m.fan = try prompt2d.Fan.listenAt(o.master, o.listen, o.port, o.rank, o.world);
@@ -903,6 +1119,10 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         errdefer if (m.mxk) |*x| x.unload();
         // round over the host links)
         errdefer if (m.rdma_rings) |*x| x.close(gpa);
+        // the first lane's proxy threads (Roci.openLane, below) run from its start: a later failure stops them before the arena and the
+        // context go (at the function's scope: inside the `if` this would be dropped when the block ends well)
+        errdefer if (m.two) |*t| if (t.rc) |rc| rc.close();
+        if (sp.pair != null) {
             m.two = try prompt2d.Two.init(c, &m.w, &m.arena, sp, m.pass_rows);
             m.two.?.rank_of = prompt2d.rankOf(ord);
             try m.two.?.agreeTopology(d, &m.comm, m.stream);
@@ -926,6 +1146,7 @@ pub fn startSettings(o: Options) prompt2d.Settings {
                 const devs = o.rdma_devices.?;
                 var pit = std.mem.splitScalar(u8, devs, ',');
                 const rails: [2][]const u8 = .{ pit.next() orelse return error.RociRails, pit.next() orelse return error.RociRails };
+                m.two.?.rc = try roci_engine.Roci.openLane(gpa, d, m.comm.rank, @intCast(m.two.?.node()), m.comm.world, m.two.?.rank_of, &m.fan, rails, rdmaGid() orelse 3, if (prompt2d.roci_stagger_asked) @intCast(prompt2d.roci_stagger_lanes) else 1, null, .prompt);
                 // the producers that write the arena (the dense GEMMs) store whole lines there
                 if (m.mxk) |*x| try x.useStaged(m.two.?.rc.?.range()[0], m.two.?.rc.?.range()[1]);
             }
@@ -955,8 +1176,15 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         logPdlControls(m.comm.rank);
         std.log.info("transport: Rocinante carries every exchange between the Sparks; no NCCL is loaded or made (rank {d})", .{o.rank});
         if (m.mxk) |*x| m.eng.mx = x;
+        errdefer m.rd.dropPar();
+        errdefer m.rd.dropPrefetch();
+        errdefer m.rd.dropSide(&m.eng);
+        m.amax = try m.arena.take(round.max_rows * 4);
         m.cand = try m.arena.take(round.max_rows * (sampling.max_candidates * 12 + 4));
         m.eng.agree_flag = try m.arena.take(64); // G0.3: the graph captures' agreement bytes (agreeAll, agreeCapture)
+        errdefer if (m.dr) |*dr| dr.deinit();
+        errdefer if (m.pgraphs) |*g| g.deinit();
+        errdefer if (m.graphs) |*g| g.deinit();
         if (o.graphs) {
             m.graphs = round.Graphs.init(gpa, o.graph_cap);
             m.graphs.?.lazy.fallbacks = &m.graph_fallbacks;
@@ -966,18 +1194,54 @@ pub fn startSettings(o: Options) prompt2d.Settings {
                 m.dr.?.graphs = &m.pgraphs.?;
             }
         }
+        // (unwound in close()'s order: the pins, the packed rows, the rings, the pool, the tables)
+        errdefer if (m.tables) |*t| t.close();
+        errdefer if (m.epool) |p| p.deinit(gpa);
+        errdefer if (m.paio) |x| x.deinit();
+        errdefer if (m.aio) |x| x.deinit();
+        errdefer if (m.erows) |r| r.close();
+        errdefer if (m.eh) |*eh| prompt.engramUnpin(eh);
+        // Engram on the host: the compressed token map, the multipliers, the tables and 64 readers
+        if (o.engram_dir) |edir| {
+            const map_text = try std.Io.Dir.cwd().readFileAlloc(io, o.token_map orelse return error.NoTokenMap, a, .limited(1 << 26));
+            const map = try std.json.parseFromSliceLeaky([]i32, a, map_text, .{});
+            const EngramJson = struct { multipliers: [][]i64 };
+            const ej_text = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ o.kit_dir, "engram.json" }), a, .limited(1 << 26));
+            const ej = try std.json.parseFromSliceLeaky(EngramJson, a, ej_text, .{ .ignore_unknown_fields = true });
+            var mult: [engram.max_layers][engram.max_ngram]i64 = @splat(@splat(0));
+            for (ej.multipliers, 0..) |row, l| for (row, 0..) |v, k| {
+                mult[l][k] = v;
+            };
+            m.tables = try engram_io.Tables.open(gpa, io, edir);
+            m.epool = try engram_io.Pool.init(gpa, io, 64);
                 const owned = false; // (TF_DS_ENGRAM_OWNED is a retired name: the whole tables are on every node)
+                    .chunk_dev_b = if (prompt2d.roci_stagger_asked) try m.arena.take(m.pass_rows * sl * rec) else 0,
+                    .chunk_dev_c = if (prompt2d.roci_stagger_asked and prompt2d.roci_stagger_lanes >= 3) try m.arena.take(m.pass_rows * sl * rec) else 0,
         if (c.vision and c.format == .exl3) { // (Format.native: the checkpoint's own gate.bias_vl, loaded with the weights)
             const path = o.vision_bias orelse try std.fs.path.join(a, &.{ o.kit_dir, "vision", "gate_bias_vl.safetensors" });
             m.loadVisionBias(path) catch |err| if (o.vision_bias != null or err != error.FileNotFound) return err;
         }
 
+        return engram_rows.workerSlotsN(m.pass_rows / chunk_rows, if (prompt2d.roci_stagger_asked) prompt2d.roci_stagger_lanes else 1);
+    /// A pair's second pass: its lane before the first's (it borrows the first's arena), then its events, handle and stream.
+    fn closePair(m: *Model) void {
+        if (m.two_c) |*t| if (t.rc) |rc| rc.close(); // (the third lane before the second)
+        if (m.two_b) |*t| if (t.rc) |rc| rc.close();
+        if (m.pair_join) |*ev| ev.deinit();
+        if (m.pair_t0) |*ev| ev.deinit();
         for (m.span_t0) |*ev| ev.deinit();
         for (m.span_join) |*ev| ev.deinit();
         if (m.span_t0.len != 0) m.gpa.free(m.span_t0);
         if (m.span_join.len != 0) m.gpa.free(m.span_join);
         m.span_t0 = &.{};
         m.span_join = &.{};
+        if (m.pair_ev) |*ev| ev.deinit();
+        if (m.blas_c) |*b| b.close();
+        if (m.stream_c) |*x| x.deinit();
+        if (m.blas_b) |*b| b.close();
+        if (m.stream_b) |*x| x.deinit();
+    }
+
     /// The diagnostic logs (TF_DS_ROCI_XLOG, TF_DS_NACT_LOG) to their files: every 256th call and, forced, at close. Called after a round's work, with
     /// the stream synchronized here: never inside a round. Nothing runs when both logs are off.
     pub fn flushDiag(m: *Model, force: bool) void {
@@ -993,7 +1257,14 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         if (nact_buf) |b| nactWrite(m, b);
     }
 
+    pub fn close(m: *Model) void {
+        m.joinAhead();
+        m.stream.synchronize() catch {};
         m.flushDiag(true);
+        if (m.stream_b) |s| s.synchronize() catch {};
+        if (m.stream_c) |s| s.synchronize() catch {};
+        m.closePair(); // the second lane before the first: it borrows the first's arena
+        m.ilead_ev.free(LeadEvents{ .d = m.ctx.d });
         if (m.dr) |*dr| dr.deinit();
         if (m.timer) |t| {
             t.deinit();
@@ -1153,6 +1424,79 @@ pub fn startSettings(o: Options) prompt2d.Settings {
     /// Slot `slot`'s own state into `buf` (save: true) or back from it, in the stream's order (no wait): with the
     /// extent's compressed rows, the state a prompt pass stands in at a chunk end.
     pub fn snapCopy(m: *Model, slot: usize, buf: u64, save: bool) !void {
+        try m.pairJoin();
+        const rb = m.eng.ringBytes();
+        const pb = prompt.raw_rows * m.eng.c.head_dim * 4;
+        var at = buf;
+        for (m.rings) |r| {
+            try m.copyState(r + slot * rb, at, rb, save);
+            at += rb;
+        }
+        for (m.caches.raw_kv[0..m.eng.c.layers], m.caches.raw_score[0..m.eng.c.layers]) |k, sc| {
+            for ([_]u64{ k, sc }) |live| if (live != 0) {
+                try m.copyState(live + slot * pb, at, pb, save);
+                at += pb;
+            };
+        }
+    }
+
+    /// The compressed rows of positions [0, at) of the extent at `from` copied into the extent at `to` (a kept prompt
+    /// resumed in another extent while a live stream holds its own), in the stream's order: every kv-source layer's
+    /// codes and scales and its index keys, the rows view() places at those positions.
+    pub fn copyExtent(m: *Model, from: usize, to: usize, at: usize) !void {
+        try m.pairJoin(); // (the copy reads the cache planes a pair's second pass may still be writing)
+        const c = m.eng.c;
+        const cs = &m.caches;
+        for (m.eng.w.layers, 0..) |lay, i| {
+            if (lay.comp_wkv == null) continue;
+            const r: usize = lay.ratio;
+            if (from % r != 0 or to % r != 0 or at % r != 0) return error.BadView;
+            const n = at / r;
+            try m.copySpan(cs.comp_codes[i], from / r, to / r, n, c.head_dim / 2);
+            try m.copySpan(cs.comp_scales[i], from / r, to / r, n, c.head_dim / 16);
+            if (lay.idx_wk != null) {
+                try m.copySpan(cs.idx_codes[i], from / r, to / r, n, c.index_head_dim / 2);
+                try m.copySpan(cs.idx_scales[i], from / r, to / r, n, c.index_head_dim / 32);
+            }
+        }
+    }
+
+    fn copySpan(m: *Model, plane: u64, from: usize, to: usize, n: usize, row: usize) !void {
+        const d = m.ctx.d;
+        try d.check(d.api.cuMemcpyDtoDAsync_v2(plane + to * row, plane + from * row, n * row, m.stream.handle), "cuMemcpyDtoDAsync");
+    }
+
+    fn copyState(m: *Model, live: u64, kept: u64, bytes: usize, save: bool) !void {
+        const d = m.ctx.d;
+        const dst = if (save) kept else live;
+        const src = if (save) live else kept;
+        try d.check(d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, m.stream.handle), "cuMemcpyDtoDAsync");
+    }
+
+        // (every copy of the tier's reads or writes the caches on the model's stream: behind a pair's second pass first)
+            try dv.m.pairJoin();
+            try dv.m.pairJoin();
+            try dv.m.pairJoin();
+            try dv.m.pairJoin();
+        try m.pairJoin(); // (a pair's second pass may still read the image rows this replaces)
+        if (rows.len > 0) {
+            if (m.img_buf == null or m.img_buf.?.len < rows.len) {
+                if (m.img_buf) |*b| b.free();
+                m.img_buf = null;
+                m.img_buf = try cuda.DeviceBuffer.alloc(m.ctx.d, rows.len);
+            }
+            const d = m.ctx.d;
+                // the default: one WARN naming why and what it costs, the round joins the worker as before; set to 1 by the operator: the refusal
+                if (speed_defaults.verdict(why, speed_defaults.defaulted("TF_DS_ENGRAM_KEEP_AHEAD")) == .fallback) {
+                    std.log.warn("TF_DS_ENGRAM_KEEP_AHEAD: rank {d}: off: the Engram reads are not asynchronous (TF_DS_ENGRAM_AIO=0), so the round and the worker would share one reader pool; without it: {s} (set TF_DS_ENGRAM_KEEP_AHEAD=1 to make this a refusal, 0 to silence it)", .{ m.rank, speed_defaults.costOf("TF_DS_ENGRAM_KEEP_AHEAD") });
+                    return;
+                }
+        try m.pairJoin();
+        m.fill_t0 = m.now();
+        m.pair_in_fill = 0;
+            const t_apply = m.now();
+            eh.inst_apply_ns += m.now() - t_apply;
+        try m.pairJoin();
         const c = e.c;
         const ch = &m.ch;
         // an image position's id is negative in the sequence (its n-grams dead for Engram): its embedding's id is the
@@ -1166,7 +1510,7 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         if (pt) |t| try t.mark(e.s, .start);
         try prompt.begin(e, ch, m.ids64[0..n], start, m.host_pos);
         if (ch.spans.len > 0) try prompt.embedSpans(e, ch);
-        if (pt) |t| try t.mark(m.stream, .embed);
+        if (pt) |t| try t.mark(e.s, .embed);
         const taps = m.dr != null;
         var floor: usize = 0;
         var kv_done: ?usize = null;
@@ -1194,7 +1538,7 @@ pub fn startSettings(o: Options) prompt2d.Settings {
                     // encoder-only: no synchronize either (as at the chunk's end below), so the next chunk's host steps
                     // run while this one's last layers do; the profile alone waits
                     if (pt) |t| {
-                        try m.synchronize();
+                        try e.s.synchronize();
                         try t.finish();
                     }
                     return false;
@@ -1257,6 +1601,65 @@ pub fn startSettings(o: Options) prompt2d.Settings {
                     eh.ahead_ready = .{ false, false };
                     eh.ahead_err = null;
                     m.ahead = std.Thread.spawn(.{}, prompt.engramReadAheadAll, .{ eh, c, m.fill_seq[0 .. start + n + nn], start + n, nn }) catch null;
+        if (m.two_c) |*t| if (t.rc) |rc| try rc.t.check();
+    /// The stream, cuBLAS handle and node of the split of one pass of a pair: A is the model's, B the second lane's. Every launch and
+    /// exchange a layer makes reads `Engine.s`, `Engine.t.stream`, `Engine.blas` and `Engine.two` (whose transport is the lane), so
+    /// swapping them runs the same serial calls on the pass's own stream and lane.
+    fn usePass(m: *Model, p: roci_pair.PairPass) void {
+        m.eng.s = m.passStreamOf(p);
+        m.eng.t.stream = m.eng.s;
+        m.eng.blas = switch (p) {
+            .a => &m.blas,
+            .b => if (m.blas_b) |*b| b else &m.blas, // (the lane's handle is opened after its chunk, which is made on the lane's own stream)
+            .c => if (m.blas_c) |*b| b else &m.blas,
+        };
+        m.eng.two = switch (p) {
+            .a => if (m.two) |*t| t else null,
+            .b => if (m.two_b) |*t| t else null,
+            .c => if (m.two_c) |*t| t else null,
+        };
+    }
+
+    /// The stream of a pass of a group: A the model's, B and C the lanes' own.
+    fn passStreamOf(m: *const Model, p: roci_pair.PairPass) cuda.Stream {
+        return switch (p) {
+            .a => m.stream,
+            .b => m.stream_b.?,
+            .c => m.stream_c.?,
+        };
+    }
+
+    /// The chunk of a pass of a group.
+    fn passChunkOf(m: *Model, p: roci_pair.PairPass) *prompt.Chunk {
+        return switch (p) {
+            .a => &m.ch,
+            .b => &m.ch_b.?,
+            .c => &m.ch_c.?,
+        };
+    }
+
+    /// A new prompt pass on `slot`: the cell its progress is gated by and the generation it counts under (null: a slot beyond the table).
+    pub fn meterArm(m: *Model, slot: usize) ?pass_meter.Armed {
+        return m.meter.arm(slot);
+    }
+
+    /// The serial chunk just issued ends at `rows` of `slot`'s prompt: they count once the first stream has run it.
+    pub fn meterChunk(m: *Model, slot: usize, rows: usize) !void {
+        try m.meter.mark(m.stream, slot, rows);
+    }
+
+    /// The pair just issued: pass A ends at `rows_a`, pass B at `rows_b`; each counts once its own stream has run it.
+    pub fn meterPair(m: *Model, slot: usize, rows_a: usize, rows_b: usize) !void {
+        try m.meterGroup(slot, &.{ rows_a, rows_b });
+    }
+
+    /// The group just issued: pass k ends at `ends[k]`; each counts once its own stream has run it.
+    pub fn meterGroup(m: *Model, slot: usize, ends: []const usize) !void {
+        for (ends, 0..) |rows, k| try m.meter.mark(m.passStreamOf(@fromBackingInt(@intCast(k))), slot, rows);
+    }
+
+    /// The first stream waits for the pair's second pass to finish its work: before anything that is not the next pair (a serial pass,
+    /// a decode round, a snapshot) reads or writes what the pair did. Stream-ordered: the host does not wait.
     /// Prints, in issue order, every outstanding pair's GPU span whose events are done (TF_DS_ROCI_PAIR_LOG; rank 0 prints, every rank keeps the ring).
     fn sweepSpans(m: *Model) void {
         const Ctx = struct {
@@ -1274,40 +1677,228 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         _ = m.span_ring.sweep(Ctx{ .m = m });
     }
 
+    pub fn pairJoin(m: *Model) !void {
         if (m.pair_log) m.sweepSpans();
+        if (!m.pair_open.swap(false, .acq_rel)) return;
+        try m.stream.wait(m.pair_join.?);
+    }
+
+    /// Whether the passes [start_a, start_a + n_a) and [start_b, start_b + n_b) run as a pair: the route, whole 4,096-row encoder-only passes
+    /// back to back (the pass rule gave `pass_rows_now` rows), the Engram worker holding both, and the boundary on owned rows.
+    pub fn pairEligible(m: *Model, seq: []const i32, start_a: usize, n_a: usize, start_b: usize, n_b: usize, replay: usize, pass_rows_now: usize) bool {
+        _ = start_b;
+        return m.groupEligible(seq, start_a, &.{ n_a, n_b }, replay, pass_rows_now);
+    }
+
+    /// `pairEligible` for the passes of a group, back to back from `start_a` (`ns` their rows: two, or three with TF_DS_ROCI_STAGGER_LANES=3 and
+    /// the third lane open): the route, whole encoder-only passes of the booted rows, the Engram worker holding all of them.
+    pub fn groupEligible(m: *Model, seq: []const i32, start_a: usize, ns: []const usize, replay: usize, pass_rows_now: usize) bool {
+        if (!m.pair or ns.len < 2 or ns.len > m.pair_lanes) return false;
+        var end = start_a;
+        for (ns) |n| end += n;
+        const worker = m.eh == null or (wk_on and m.fill_seq.len >= end and m.fill_seq.ptr == seq.ptr);
+        if (!roci_pair.eligibleGroup(true, ns.len, m.pass_rows, pass_rows_now, start_a, ns, replay, worker)) return false;
+        if (seq.len < end) return false;
+        const t = if (m.two) |*x| x else return false;
         _ = t;
+        return (ns[0] % chunk_rows == 0) and ns[0] % m.comm.world == 0;
+    }
+
+    /// A pass's start, as the serial chunk's: its view, ids, positions and pre, and its image spans. A and B have their own host id and
+    /// position arrays, so the two starts do not overwrite each other.
+    fn preparePass(m: *Model, ch: *prompt.Chunk, seq: []const i32, start: usize, n: usize, replay: usize, p: roci_pair.PairPass) !void {
+        const e = &m.eng;
+        const c = e.c;
+        m.usePass(p);
+        try ch.view(n, chunk_rows);
+        ch.spans = m.ch.spans;
+        ch.img_rows = m.ch.img_rows;
+        const ids = switch (p) {
+            .a => m.ids64[0..n],
+            .b => m.ids64_b[0..n],
+            .c => m.ids64_c[0..n],
+        };
+        const pos = switch (p) {
+            .a => m.host_pos[0..n],
+            .b => m.host_pos_b[0..n],
+            .c => m.host_pos_c[0..n],
+        };
+        const image_id: i64 = if (c.image_token) |t| t else 0;
+        for (0..n) |j| ids[j] = if (seq[start + j] < 0) image_id else seq[start + j];
+        try prompt.begin(e, ch, ids, start, pos);
+        ch.encoder_only = prompt.encoderOnly(start, n, replay);
+        if (ch.spans.len > 0) try prompt.embedSpans(e, ch);
+    }
+
+    const PairState = struct { sh: prompt.Shared = .{}, engram_pre: ?usize = null };
+
+    /// One layer of one pass of a pair, the serial chunk's own calls in the same order (fillChunk's loop body, an encoder-only pass). With `cache_ev`
+    /// the pass records it after the layer's attention: that is where its compressed caches and window ring are written, the state the
+    /// next pass reads at the same layer.
+    fn passLayer(m: *Model, ch: *prompt.Chunk, seq: []const i32, start: usize, n: usize, li: usize, st: *PairState, taps: bool, p: roci_pair.PairPass, cache_ev: ?*cuda.Event) !void {
+        const e = &m.eng;
+        const c = e.c;
+        m.usePass(p);
+        var no_ahead: ?std.Thread = null;
+        if (m.two_b) |*t| _ = t;
+        const t = e.two.?;
+        if (t.engramAhead() and li + 1 < c.layers and e.w.layers[li + 1].engram_wkv != null and prompt.engramOnRoci(e, ch, li + 1)) {
+            try m.engramLayer(e, ch, seq, start, n, li + 1, true, &no_ahead, .pre);
+            st.engram_pre = li + 1;
+        }
+        if (e.w.layers[li].engram_wkv != null) {
+            const phase: EngramPhase = if (st.engram_pre == li) .finish else .all;
+            try m.engramLayer(e, ch, seq, start, n, li, true, &no_ahead, phase);
+        }
+        // a DSpark tap reads the streams after the layer's Engram (_forward_k's order)
+        if (taps) if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| try prompt.tap(e, ch, j, li);
+        try prompt.attnMixes(e, ch, li);
+        try prompt.attention(e, ch, &m.view, &st.sh, li, m.ring_view[li], 0, false);
+        // the pass's caches and ring of this layer are written: the other pass's layer may run
+        if (cache_ev) |ev| try ev.*.record(e.s);
+        try prompt.gather(e, ch, ch.pa, .attn, li);
+        try prompt.ffnMixes(e, ch, li);
+        try prompt.moe(e, ch, li);
+        try prompt.gather(e, ch, ch.pm, .moe, li + 1);
+        prompt.endLayer(ch);
+    }
+
+    /// A pass's boundary layer on owned rows (fillChunk's `boundaryRange` branch); the cache event follows it.
+    fn passBoundary(m: *Model, ch: *prompt.Chunk, li: usize, st: *PairState, p: roci_pair.PairPass, cache_ev: *cuda.Event) !void {
+        const e = &m.eng;
+        m.usePass(p);
+        const r = prompt.boundaryRange(e, ch, li) orelse return error.BadPair;
+        try prompt.boundaryUpdate(e, ch, &m.view, &st.sh, li, r);
+        try cache_ev.*.record(e.s);
+    }
+
+    /// TF_DS_ROCI_STAGGER: two whole encoder-only passes in flight, pass A on the model's chunk, stream and lane, B on the second's. B's
+    /// layer L waits A's cache event for L; a later pair's A waits the previous pair's B (nothing waits the host). The issue order is
+    /// `roci_pair.pairSchedule`: A's layer L, then B's layer L - gap, then B's remaining layers and the boundaries; every rank runs this
+    /// same list. The call never synchronizes: the host queues the whole pair, and the next one, ahead of the GPU.
+    pub fn fillPair(m: *Model, seq: []const i32, start_a: usize, n_a: usize, start_b: usize, n_b: usize, replay: usize) !void {
+        if (start_b != start_a + n_a) return error.BadPair;
+        return m.fillGroup(seq, start_a, &.{ n_a, n_b }, replay);
+    }
+
+    /// `fillPair` for a group of `ns.len` passes (two, or three with TF_DS_ROCI_STAGGER_LANES=3), back to back from `start_a`: pass k on
+    /// lane k, each pass's layer L after its predecessor's layer L caches (`roci_pair.groupSchedule`), the first after the previous group's last.
+    pub fn fillGroup(m: *Model, seq: []const i32, start_a: usize, rows: []const usize, replay: usize) !void {
+        const ns = rows;
+        if (!m.pair) return error.BadPair;
+        if (ns.len < 2 or ns.len > m.pair_lanes) return error.BadPair;
+        if (!roci_pair.eligibleGroup(true, ns.len, m.pass_rows, m.pass_rows, start_a, ns, replay, m.eh == null or wk_on)) return error.BadPair;
+        var starts: [roci_pair.max_lanes]usize = undefined;
+        var end = start_a;
+        for (ns, 0..) |n, k| {
+            starts[k] = end;
+            end += n;
+        }
+        if (seq.len < end) return error.BadChunk;
+        const e = &m.eng;
+        const c = e.c;
+        const half = c.layers / 2;
+        const first = !m.pair_open.load(.acquire);
+        const host_t0 = m.now();
+        const cpu_t0 = pair_nap.cpuNow();
         // every finished pair's GPU span (its first queued work to its second pass's last), in order
         if (m.pair_log) m.sweepSpans();
+        if (m.ahead) |th| {
+            m.ahead = null;
+        }
+        defer {
+            m.usePass(.a);
+            prompt.ptimer = null;
+        }
+        prompt.ptimer = null;
+        const taps = m.dr != null;
+        if (m.eh) |*eh| {
+            const same = eh.wk_thread != null and eh.wk_seq.ptr == m.fill_seq.ptr and eh.wk_seq.len == m.fill_seq.len and
+                start_a >= eh.wk_start and (start_a - eh.wk_start) % chunk_rows == 0 and
+            if (!same) try prompt.engramWorkerStart(eh, c, m.fill_seq, start_a, chunk_rows, prompt2d.pass_from_asked, m.pass_rows);
+        }
+        var chs: [roci_pair.max_lanes]*prompt.Chunk = undefined;
+        var sts: [roci_pair.max_lanes]PairState = .{ .{}, .{}, .{} };
+        for (ns, 0..) |n, k| {
+            const which: roci_pair.PairPass = @fromBackingInt(@intCast(k));
+            chs[k] = m.passChunkOf(which);
+            try m.preparePass(chs[k], seq, starts[k], n, replay, which);
+        }
+        try m.pair_t0.?.record(m.stream);
         m.span_slot = if (m.pair_log) m.span_ring.push(m.pair_count + 1) else null;
         if (m.span_slot) |sl| try m.span_t0[sl].record(m.stream);
+        if (m.pair_log and m.comm.rank == 0 and m.pair_in_fill == 0)
+            pairLog("ROCI pair {d} is the fill's first at {d}: admission to the first launch {d:.1} ms", .{ m.pair_count + 1, start_a, @as(f64, @floatFromInt(m.now() - m.fill_t0)) / 1e6 });
+        var buf: [roci_pair.maxSteps(roci_pair.max_half)]roci_pair.Step = undefined;
+        const steps = roci_pair.groupSchedule(ns.len, half, m.pair_gap, first, &buf);
+        for (steps) |step| switch (step) {
+            .wait => |w| {
+                // a pass waits its predecessor's events: A the previous group's last pass's, B A's, C B's
+                m.usePass(w.pass);
+                const pred = roci_pair.predecessor(@backingInt(w.pass), m.pair_last);
+                try m.eng.s.wait(m.pair_ev.?.at(pred, w.li).*);
+            },
+            .layer => |l| {
+                const k: usize = @backingInt(l.pass);
+                const s0 = starts[k];
+                const n0 = ns[k];
+                try m.issueLead(m.passStreamOf(l.pass));
+                try m.passLayer(chs[k], seq[0 .. s0 + n0], s0, n0, l.li, &sts[k], taps, l.pass, m.pair_ev.?.at(k, l.li));
+            },
+            .boundary => |q| {
+                const k: usize = @backingInt(q);
+                try m.passBoundary(chs[k], half, &sts[k], q, m.pair_ev.?.at(k, half));
+            },
+        };
+        // everything the group queued on the last stream (each pass's end is behind its predecessor's boundary event), for whoever is not the next group
+        const last: roci_pair.PairPass = @fromBackingInt(@intCast(ns.len - 1));
+        m.usePass(last);
+        try m.pair_join.?.record(m.passStreamOf(last));
         if (m.span_slot) |sl| try m.span_join[sl].record(m.passStreamOf(last));
         m.span_slot = null;
+        m.pair_last = ns.len;
+        m.pair_open.store(true, .release);
+        m.pair_count += 1;
+        m.pair_prev_pending = true;
+        m.pair_in_fill += 1;
+            const eh = &m.eh.?;
+            for (&d, cur, eh.inst_snap) |*x, y, z| x.* = y -% z;
+            eh.inst_snap = cur;
+            const ms = struct {
+                fn of(t_ns: u64) f64 {
+                    return @as(f64, @floatFromInt(t_ns)) / 1e6;
                 }
-                if (pt) |t| try t.mark(m.stream, .engram);
+            }.of;
+        }
+        if (m.eh) |*eh| {
+            eh.inst_wait_ns = 0;
+            eh.inst_apply_ns = 0;
+        }
+    }
+
+    /// The prompt's logits (its last row's, the ranks' columns in rank order) after a fill's last chunk.
+    pub fn promptLogits(m: *const Model) u64 {
+        return m.ch.head_g;
+    }
+
+        try m.pairJoin();
+        try m.pairJoin();
+                }
+                m.clk_rounds += 1;
             }
-            // a DSpark tap reads the streams after the layer's Engram (_forward_k's order)
-            if (taps) if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| try prompt.tap(e, ch, j);
-            try prompt.attnMixes(e, ch, li);
-            if (pt) |t| try t.mark(m.stream, .mix_attn);
-            try prompt.attention(e, ch, &m.view, &shared, li, m.ring_view[li], floor, kv_done != null and kv_done.? == li);
-            if (pt) |t| try t.mark(m.stream, .attn);
-            ch.ga_rs = try prompt.gather(e, ch, ch.pa, ch.ga);
-            if (pt) |t| try t.mark(m.stream, .gather_a);
-            try prompt.ffnMixes(e, ch, li);
-            if (pt) |t| try t.mark(m.stream, .mix_ffn);
-            try prompt.moe(e, ch, li);
-            if (pt) |t| try t.mark(m.stream, .moe);
-            ch.gm_rs = try prompt.gather(e, ch, ch.pm, ch.gm);
-            if (pt) |t| try t.mark(m.stream, .gather_m);
-            prompt.endLayer(ch);
         }
         try prompt.head(e, ch);
         if (pt) |t| try t.mark(m.stream, .head);
         if (m.dr) |*dr| {
-            // its taps (the tap layers side by side) into the slot's drafter rings
-            const dw = c.hidden;
-            for (0..c.dspark_taps.slice().len) |j| try e.ops.copyRows(e.s, prompt.tapRows(e, ch, j), dw * 2, dr.at + j * dw * 2, dr.taps_w * 2, dw * 2, ch.n);
-            try dr.absorb(e, ch, &m.dpool.?, m.fill_slot, dr.at, ch.n, ch.start);
+            const wins = rows.windows orelse return error.BadRound;
+            var items: [max_streams]draft.Item = undefined;
+            var n: usize = 0;
+            for (wins, absorb) |win, yes| {
+                if (!yes) continue;
+                items[n] = .{ .slot = @intCast(rows.slots.?[win.row]), .taps = m.rd.taps + win.row * dr.taps_w * 2, .n = win.n, .start = @intCast(rows.pos[win.row]) };
+                n += 1;
+            }
+            if (n > 0) try dr.absorbMany(e, &m.ch, &m.dpool.?, items[0..n]);
         }
         // no synchronize: the next chunk's host steps (its first Engram layer's hashing, table reads and decode, ~0.14 s
         // at 2,048 rows) run while this chunk's kernels do; readers of the results (the prompt's logits) synchronize.
@@ -1315,6 +1906,7 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         if (pt) |t| {
             try m.synchronize();
             try t.finish();
+        if (m.two_c) |*t| if (t.rc) |rc| rc.t.fail(why, .own1, gone);
     /// Track B: the round's first `count` candidates a row (sampling.topCandidates' set and order) on the host, from the
     /// device's logits: vals and ids [R, count], flags [R] (non-zero: that row must be read whole, roundLogits).
     }
@@ -1329,6 +1921,7 @@ pub fn startSettings(o: Options) prompt2d.Settings {
     /// The drafter's batched pass for N streams: each one's pending token at position q0 in its slot (its rings hold
     /// its positions below q0), `steps` drafts each (the drafter's drafts and confidences on the host).
     pub fn pass(m: *Model, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize) !void {
+        try m.pairJoin();
 
         }
         return true;
@@ -1347,123 +1940,124 @@ test "TF_DS_RING_WORD_SIGNAL: unset and atomic name the fetch-and-add (the guara
     try std.testing.expectEqual(rdma.Roci.off, Model.ringWordOf());
 }
 
-    }
 
-    /// fillChunk's pass of n > wave_rows rows with TF_DS_WAVES: wave A (rows [start, start + wave_rows), in ch2) and
-    /// wave B (the rest, in ch) layer by layer, A's work then B's on the stream, each wave's partial gathers (the
-    /// quarters of pa and pm) on cs over comm2 while the stream runs the other wave. A wave's kernels take the rows and
-    /// inputs a fillChunk of its rows would: the stream runs A's layer before B's (B's attention reads A's keys of
-    /// that layer) and B's before A's next, and a wave's consumers wait for its gathers. The head and the logits are
-    /// B's (ch's), as the second of two chunks would leave them.
-    fn fillPair(m: *Model, seq: []const i32, start: usize, n: usize, replay: usize) !bool {
-        if (n > 2 * wave_rows) return error.BadChunk;
-        const e = &m.eng;
-        const c = e.c;
-        const ws = [2]*prompt.Chunk{ &m.ch2, &m.ch };
-        const st = [2]usize{ start, start + wave_rows };
-        const nw = [2]usize{ wave_rows, n - wave_rows };
-        const image_id: i64 = if (c.image_token) |t| t else 0;
-        for (0..n) |j| m.ids64[j] = if (seq[start + j] < 0) image_id else seq[start + j];
-        var hp: [2][]i64 = undefined;
-        var shared: [2]prompt.Shared = .{ .{}, .{} };
-        var live = [2]bool{ true, true };
-        var posted = [2]bool{ false, false }; // a wave's gm gather on cs the stream has not waited for yet
-        // whatever happens, the stream waits for every gather on cs before the pass's buffers are used again
-        defer for (0..2) |w| if (posted[w]) m.stream.wait(m.wev[w][3]) catch {};
-        for (0..2) |w| {
-            hp[w] = m.host_pos[w * wave_rows ..];
-            try prompt.begin(e, ws[w], m.ids64[w * wave_rows ..][0..nw[w]], st[w], hp[w]);
-            if (ws[w].spans.len > 0) try prompt.embedSpans(e, ws[w]);
-        }
-        const taps = m.dr != null;
-        var floor: usize = 0;
-        var kv_done: ?usize = null;
-        // the Engram rows read ahead for the whole pass (fillChunk's), each wave applying its part of them
-        var ahead: ?std.Thread = m.ahead;
-        m.ahead = null;
-        defer if (ahead) |th| th.join();
-        if (m.eh) |*eh| {
-            if (ahead != null and (eh.ahead_start != start or eh.ahead_n != n)) {
-                ahead.?.join();
-                ahead = null;
-            }
-            const whole = eh.ahead_start == start and eh.ahead_n == n and eh.ahead_err == null and eh.ahead_ready[0] and (c.engram_layers.slice().len < 2 or eh.ahead_ready[1]);
-            if (ahead == null and !whole) {
-                eh.ahead_start = start;
-                eh.ahead_n = n;
-                eh.ahead_ready = .{ false, false };
-                eh.ahead_err = null;
-                ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, @as(usize, 0) }) catch null;
-            }
-        }
-        for (0..c.layers) |li| {
-            if (li == c.layers / 2) {
-                for (0..2) |w| {
-                    try m.waitGm(&posted, w);
-                    live[w] = try prompt.replayCut(e, ws[w], &m.view, &shared[w], li, replay, hp[w]);
-                }
-                if (!live[1]) return false; // encoder-only (wave A's rows too): fillChunk's, no synchronize
-                floor = replay;
-                kv_done = li;
-            }
-            if (e.w.layers[li].engram_wkv != null) {
-                const eh = if (m.eh) |*x| x else return error.NoEngramTables;
-                if (ahead) |th| {
-                    th.join();
-                    ahead = null;
-                }
-                if (eh.ahead_err) |err| return err;
-                const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)).?;
-                const ne = @min(2, c.engram_layers.slice().len);
-                // the next layer's read-ahead takes the hashes of this one's (the whole pass's): only after rows read
-                // ahead, never after the waves hashed their own rows here
-                const read_ahead = j < 2 and eh.ahead_ready[j] and eh.ahead_start == start and eh.ahead_n == n;
-                for (0..2) |w| if (live[w]) {
-                    try m.waitGm(&posted, w);
-                    try prompt.engramApply(e, ws[w], eh, li, seq[0 .. st[w] + nw[w]]);
-                };
-                if (j + 1 < ne) {
-                    if (!eh.ahead_ready[j + 1] and read_ahead)
-                        ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, j + 1 }) catch null;
-                } else if (m.fill_seq.len > start + n and m.fill_seq.ptr == seq.ptr) {
-                    const nn = @min(chunk_rows, m.fill_seq.len - start - n);
-                    eh.ahead_start = start + n;
-                    eh.ahead_n = nn;
-                    eh.ahead_ready = .{ false, false };
-                    eh.ahead_err = null;
-                    m.ahead = std.Thread.spawn(.{}, prompt.engramReadAheadAll, .{ eh, c, m.fill_seq[0 .. start + n + nn], start + n, nn }) catch null;
-                }
-            }
-            for (0..2) |w| if (live[w]) {
-                const ch = ws[w];
-                try m.waitGm(&posted, w);
-                if (taps) if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| try prompt.tap(e, ch, j);
-                try prompt.attnMixes(e, ch, li);
-                try prompt.attention(e, ch, &m.view, &shared[w], li, m.ring_view[li], floor, kv_done != null and kv_done.? == li);
-                try m.gatherOnCs(w, 0, ch.pa, ch.ga);
-            };
-            for (0..2) |w| if (live[w]) {
-                const ch = ws[w];
-                try m.stream.wait(m.wev[w][1]);
-                try prompt.ffnMixes(e, ch, li);
-                try prompt.moe(e, ch, li);
-                try m.gatherOnCs(w, 2, ch.pm, ch.gm);
-                posted[w] = true;
-                prompt.endLayer(ch);
-            };
-        }
-        for (0..2) |w| try m.waitGm(&posted, w);
-        try prompt.head(e, &m.ch);
-        if (m.dr) |*dr| {
-            const dw = c.hidden;
-            for (0..2) |w| if (live[w]) {
-                const ch = ws[w];
-                for (0..c.dspark_taps.slice().len) |j| try e.ops.copyRows(e.s, prompt.tapRows(e, ch, j), dw * 2, dr.at + j * dw * 2, dr.taps_w * 2, dw * 2, ch.n);
-                try dr.absorb(e, ch, &m.dpool.?, m.fill_slot, dr.at, ch.n, ch.start);
-            };
-        }
-        return true;
+test "TF_DS_ROCI_STAGGER: every write to state a later pass reads is issued before the cache event that gates it, and the tier's copies join the pair first" {
+    const model_src = @embedFile("model.zig");
+    const code = model_src[0 .. std.mem.indexOf(u8, model_src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    // the layer's event follows the whole attention call (the ring, the compressor's store, the index keys and the compressed groups are written inside it)
+    const layer = code[std.mem.indexOf(u8, code, "fn passLayer(").?..std.mem.indexOf(u8, code, "fn passBoundary(").?];
+    const att = std.mem.indexOf(u8, layer, "try prompt.attention(").?;
+    const rec = std.mem.indexOf(u8, layer, "ev.*.record(e.s)").?;
+    try std.testing.expect(att < rec);
+    // and no cache write after it in the layer: the calls after the event are the partials' gathers, the mixes and the experts
+    for ([_][]const u8{ "kvSourceAt", "fp4Store", "scatterRows", "boundaryUpdate" }) |w| try std.testing.expect(std.mem.indexOf(u8, layer[rec..], w) == null);
+    // the boundary's event follows its cache writes (the owned update and the gather that lands the other ranks' rows)
+    const bnd = code[std.mem.indexOf(u8, code, "fn passBoundary(").?..std.mem.indexOf(u8, code, "pub fn fillPair(").?];
+    try std.testing.expect(std.mem.indexOf(u8, bnd, "prompt.boundaryUpdate(").? < std.mem.indexOf(u8, bnd, "cache_ev.*.record(e.s)").?);
+    // the cache planes are written only by kvSourceAt (attention's compressor update, and the boundary's owned update)
+    const p = @embedFile("prompt.zig");
+    const pcode = p[0 .. std.mem.indexOf(u8, p, "\ntest \"") orelse return error.TestUnexpectedResult];
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, pcode, "tri_attn.fp4Store("));
+    const kv_at = pcode[std.mem.indexOf(u8, pcode, "pub fn kvSourceAt(").?..std.mem.indexOf(u8, pcode, "pub fn boundaryUpdate(").?];
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kv_at, "tri_attn.fp4Store("));
+    for ([_][]const u8{ "cs.raw_kv[li]", "cs.raw_score[li]" }) |w| {
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, pcode, w));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, kv_at, w));
     }
+    // every copy the spill tier makes on the model's stream joins the pair's second pass first
+    const dev = model_src[std.mem.indexOf(u8, model_src, "pub const SpillDev = struct").?..std.mem.indexOf(u8, model_src, "pub fn done(_: SpillDev").?];
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, dev, "try dv.m.pairJoin();"));
+}
+
+test "R6 and R7: lane 1, chunk B, node B and stream B are pass B's alone; a round, a verify and a pass use pass A's scratch" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    for ([_][]const u8{ "pub fn verifyHead(", "pub fn verify(", "pub fn pass(" }) |name| {
+        const at = std.mem.indexOf(u8, code, name) orelse return error.TestUnexpectedResult;
+        const end = std.mem.indexOfPos(u8, code, at, "\n    }\n") orelse return error.TestUnexpectedResult;
+        for ([_][]const u8{ "ch_b", "stream_b", "blas_b", "node_b" }) |w|
+            try std.testing.expect(std.mem.indexOf(u8, code[at..end], w) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, ".lane = 1;"));
+    try std.testing.expect(std.mem.indexOf(u8, code, "m.ch_b.?.lane = 1;") != null);
+}
+
+test "a pair's pass B: every entry that touches the model's stream starts with pairJoin, and the two that did not now do" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    for ([_][]const u8{ "pub fn snapCopy(", "pub fn copyExtent(", "pub fn setImages(", "pub fn fillBegin(", "pub fn fillChunk(", "pub fn verifyHead(", "pub fn verify(", "pub fn pass(" }) |name| {
+        const at = std.mem.indexOf(u8, code, name) orelse return error.TestUnexpectedResult;
+        const end = std.mem.indexOfPos(u8, code, at, "\n    }\n") orelse return error.TestUnexpectedResult;
+        const first = std.mem.indexOfPos(u8, code, at, "try m.pairJoin();") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(first < end);
+        // before any other call that is not a bare local: the join is within the function's first statements
+        try std.testing.expect(first - at < 600);
+    }
+}
+
+test "TF_DS_ROCI_PAIR_LOG: the pair line names the engine thread's CPU time, the worker's hash, gather and decode time, rows and bytes, and a fill's first pair names the admission to its first launch" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    for ([_][]const u8{ "engine thread CPU", "hash {d:.1} ms, gather {d:.1} ms, decode {d:.1} ms", "rows asked", "admission to the first launch", "m.fill_t0 = m.now();" }) |w|
+        try std.testing.expect(std.mem.indexOf(u8, code, w) != null);
+    // the worker adds its time where it spends it
+    const p = @embedFile("prompt.zig");
+    for ([_][]const u8{ "eh.inst_hash_ns.fetchAdd", "eh.inst_gather_ns.fetchAdd", "eh.inst_decode_ns.fetchAdd", "eh.inst_bytes.fetchAdd" }) |w|
+        try std.testing.expect(std.mem.count(u8, p, w) >= 1);
+}
+    const pair = code[std.mem.indexOf(u8, code, "pub fn fillGroup(").?..];
+    const g_at = std.mem.indexOf(u8, steps, "try m.issueLead(m.passStreamOf(l.pass));").?;
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, steps[0..std.mem.indexOf(u8, steps, "// everything the group queued").?], "issueLead("));
+    try std.testing.expect(std.mem.indexOf(u8, lcb, "if (m.two_c) |*t| if (t.rc) |rc| try rc.t.check();") != null);
+
+test "Model.open: a refusal or failure after partial setup unwinds what already runs (the transport lanes' proxy threads, the Engram readers, the round's side state, the pair), before the arena and the context go" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    const open = code[std.mem.indexOf(u8, code, "    pub fn open(gpa: std.mem.Allocator").?..std.mem.indexOf(u8, code, "    pub fn close(m: *Model) void {").?];
+    const at = struct {
+        fn f(s: []const u8, needle: []const u8) !usize {
+            return std.mem.indexOf(u8, s, needle) orelse error.TestUnexpectedResult;
+        }
+    }.f;
+    // 1. the first lane's proxy threads start inside Model.open (Roci.openLane); an errdefer at the function's scope (one inside the
+    // `if` would be dropped when the block ends well) stops them, registered after the arena's so that it runs before the arena is freed
+    // (a refused TF_DS_ROCI_STAGGER otherwise ended rank 0 with SIGSEGV, the lane's threads still running when the context went)
+    const arena = try at(open, "errdefer m.arena.deinit();");
+    const lane = try at(open, "errdefer if (m.two) |*t| if (t.rc) |rc| rc.close();");
+    const first_lane = try at(open, "m.two.?.rc = try roci_engine.Roci.openLane(");
+    try std.testing.expect(arena < lane and lane < first_lane);
+    // 2. the Engram host's tables, pool, rings, packed rows and pins: unwound in close()'s order, registered before the block that makes them
+    const tables_open = try at(open, "m.tables = try engram_io.Tables.open(");
+    const names = [_][]const u8{
+        "errdefer if (m.tables) |*t| t.close();",
+        "errdefer if (m.epool) |p| p.deinit(gpa);",
+        "errdefer if (m.paio) |x| x.deinit();",
+        "errdefer if (m.aio) |x| x.deinit();",
+        "errdefer if (m.erows) |r| r.close();",
+        "errdefer if (m.eh) |*eh| prompt.engramUnpin(eh);",
+    };
+    var last: usize = 0;
+    for (names) |n| {
+        const i = try at(open, n);
+        try std.testing.expect(i > last and i < tables_open);
+        last = i;
+    }
+    // 3. the round's side state and the drafter / graph caches
+    const round_init = try at(open, "m.rd = try round.Round.init(");
+    try std.testing.expect(round_init < try at(open, "errdefer m.rd.dropSide(&m.eng);"));
+    try std.testing.expect(round_init < try at(open, "errdefer m.rd.dropPrefetch();"));
+    try std.testing.expect(round_init < try at(open, "errdefer m.rd.dropPar();"));
+    try std.testing.expect((try at(open, "errdefer if (m.graphs) |*g| g.deinit();")) < try at(open, "if (o.graphs) {"));
+    try std.testing.expect((try at(open, "errdefer if (m.dr) |*dr| dr.deinit();")) < try at(open, "m.dr = try draft.Drafter.init("));
+    // 4. the pair's events are unwound inside openPair
+    const pf = code[(try at(code, "fn openPair("))..(try at(code, "/// The host's place for a transport's failure line."))];
+    try std.testing.expect(std.mem.indexOf(u8, pf, "errdefer if (m.pair_ev) |*e| e.deinit();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, "errdefer if (m.pair_join) |*e| e.deinit();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, "errdefer if (m.pair_t0) |*e| e.deinit();") != null);
+    // 5. close() uses the same pair teardown
+    const close = code[try at(code, "pub fn close(m: *Model) void {")..];
+    try std.testing.expect(std.mem.indexOf(u8, close, "m.closePair();") != null);
+}
 
     /// Wave w's partial `src` gathered into `dst` on cs (events k, k + 1: ready on the stream, gathered on cs).
     fn gatherOnCs(m: *Model, w: usize, k: usize, src: u64, dst: u64) !void {
@@ -1481,37 +2075,88 @@ test "TF_DS_RING_WORD_SIGNAL: unset and atomic name the fetch-and-add (the guara
         try m.stream.wait(m.wev[w][3]);
         posted[w] = false;
     }
+    try std.testing.expect(std.mem.indexOf(u8, code, "pairShort(free, m.pass_rows, lane_arena) != 0) why = try pairShortText(") != null);
 
-    /// The prompt's logits (its last row's, the ranks' columns in rank order) after a fill's last chunk.
-    pub fn promptLogits(m: *const Model) u64 {
-        return m.ch.head_g;
+test "TF_DS_ROCI_STAGGER_LANES: the guard counts every lane after the first, a box under the floor refuses a set count and keeps two for a default, and two lanes are judged as they always were" {
+    const keep_caps = rocinante_mod.Transport.shape_caps;
+    defer {
+        rocinante_mod.setCap(4096);
+        rocinante_mod.Transport.shape_caps = keep_caps;
     }
+    var p: usize = 2048;
+    while (p <= pass_rows_max) : (p += 2048) {
+        rocinante_mod.setCap(p);
+        const lane = rocinante_mod.layoutOf(.prompt).total;
+        const est = pairEstimate(p, lane);
+        // two lanes are the pair's guard
+        for ([_]u64{ 0, est, est + pair_guard_bytes, est + pair_guard_bytes - 1, 1 << 40 }) |free| try std.testing.expectEqual(pairShort(free, p, lane), pairShortN(free, p, lane, 2));
+        // three lanes: two estimates and the floor
+        try std.testing.expectEqual(2 * est + pair_guard_bytes, pairShortN(0, p, lane, 3));
+        try std.testing.expectEqual(@as(u64, 0), pairShortN(2 * est + pair_guard_bytes, p, lane, 3));
+        try std.testing.expectEqual(@as(u64, 1), pairShortN(2 * est + pair_guard_bytes - 1, p, lane, 3));
+        // a box that fits two and not three
+        try std.testing.expectEqual(@as(u64, 0), pairShortN(est + pair_guard_bytes, p, lane, 2));
+        try std.testing.expectEqual(est, pairShortN(est + pair_guard_bytes, p, lane, 3));
+    }
+    // the 4,096-row passes on a Spark with 12 GiB free: a pair fits, three lanes are short by the third pass's estimate and name it
+    rocinante_mod.setCap(4096);
+    const lane4096 = rocinante_mod.layoutOf(.prompt).total;
+    try std.testing.expectEqual(@as(u64, 0), pairShortN(12 << 30, 4096, lane4096, 2));
+    try std.testing.expect(pairShortN(12 << 30, 4096, lane4096, 3) > 0);
+    var buf: [1000]u8 = undefined;
+    const c: Config = undefined;
+    const v: PoolView = .{ .c = &c, .layers = &.{}, .slots = 16, .pool = 1 << 24, .floor = 1 << 20 };
+    _ = v;
+    // the decision, by what every rank says
+    try std.testing.expectEqual(LanesChoice{ .lanes = 2 }, lanesChoice(2, false, true));
+    try std.testing.expectEqual(LanesChoice{ .lanes = 2 }, lanesChoice(2, true, false)); // (two lanes: the pair's own guard decides)
+    try std.testing.expectEqual(LanesChoice{ .lanes = 3 }, lanesChoice(3, true, true));
+    try std.testing.expectEqual(LanesChoice{ .lanes = 3 }, lanesChoice(3, false, true));
+    try std.testing.expectEqual(LanesChoice{ .lanes = 3, .refuse = true }, lanesChoice(3, true, false)); // set: refused, by name
+    try std.testing.expectEqual(LanesChoice{ .lanes = 2, .warn = true }, lanesChoice(3, false, false)); // the default: two lanes and a warning
+    // the source: every rank's memory votes before the choice, the refusal names the setting and the third pass, the third lane opens only for three
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    const open = code[std.mem.indexOf(u8, code, "fn openPair(").?..std.mem.indexOf(u8, code, "/// How the issue lead's events are made and destroyed").?];
+    const vote = std.mem.indexOf(u8, open, "lanesChoice(lanes, prompt2d.roci_stagger_lanes_set, try m.eng.agreeAll(fits))").?;
+    const agree = std.mem.indexOf(u8, open, "if (!try m.eng.agreeAll(why == null))").?;
+    const lane_c = std.mem.indexOf(u8, open, "if (lanes >= 3) {\n        // the third lane").?;
+    try std.testing.expect(vote < agree and agree < lane_c);
+    try std.testing.expect(std.mem.indexOf(u8, open, "pairShortText(&why_buf, free, m.pass_rows, lane_arena, poolView(m, c), 3)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, open, "rocinante_mod.Transport.ring3(m.two.?.rc.?.t, m.two_b.?.rc.?.t, m.two_c.?.rc.?.t);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, open, "roci_pair.Events.init(d, c.layers / 2, lanes)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, open, "roci_pair.groupChunksN(lanes, m.pass_rows, chunk_rows)") != null);
+    // the setting is read once, before the settings are compared, and three lanes without the stagger end the start by name
+    const read = std.mem.indexOf(u8, code, "prompt2d.roci_stagger_lanes = roci_pair.lanesOf(text) orelse {").?;
+    const asked = std.mem.indexOf(u8, code, "prompt2d.roci_stagger_asked = prompt2d.switchAsked(").?;
+    try std.testing.expect(asked < read);
+    try std.testing.expect(std.mem.indexOf(u8, code, "TF_DS_ROCI_STAGGER_LANES=3 needs TF_DS_ROCI_STAGGER=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "TF_DS_ROCI_STAGGER_LANES is 2 or 3 (the passes in flight), not") != null);
+    _ = &buf;
+}
 
-    /// One round over every stream's window (rows.windows, each with its stream's slot and extent), then each window
-    /// whose stream drafts has its rows' taps absorbed into its slot's drafter rings at its positions (the served
-    /// eager absorb: rows past the ones the round keeps sit where the drafter never reads, and the next window
-    /// overwrites them). absorb[i]: window i's stream drafts.
-    pub fn verify(m: *Model, rows: round.Rows, absorb: []const bool) !void {
-        const e = &m.eng;
-        if (m.prof) try m.synchronize(); // (the GPU idle, so the issue time shows whether the host keeps it fed)
-        const t0 = m.now();
-        try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.pool_cap, null, if (m.graphs) |*g| g else null);
-        if (m.prof) {
-            m.t_enqueue = m.now() - t0;
-            try m.synchronize();
-            m.t_forward = m.now() - t0;
-            if (m.timer) |t| try t.finish();
-            if (m.rd.clk != 0) {
-                var h: [1 + 2 * round.Round.max_clocks]u64 = undefined;
-                const d = m.ctx.d;
-                try d.check(d.api.cuMemcpyDtoH_v2(&h, m.rd.clk, h.len * 8), "cuMemcpyDtoH");
-                const n = @min(h[0], round.Round.max_clocks);
-                for (1..n) |i| {
-                    const tag = h[2 + 2 * i] & 0xff;
-                    m.clk_ph[tag] += h[1 + 2 * i] -% h[1 + 2 * (i - 1)];
-                    m.clk_cnt[tag] += 1;
-                }
-                m.clk_rounds += 1;
+test "TF_DS_ROCI_STAGGER_LANES: a group of three is issued by groupSchedule, each pass waits its predecessor's events (the first the last group's last pass), and the join is the last pass's stream" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    const g = code[std.mem.indexOf(u8, code, "pub fn fillGroup(").?..];
+    try std.testing.expect(std.mem.indexOf(u8, g, "roci_pair.groupSchedule(ns.len, half, m.pair_gap, first, &buf)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g, "const pred = roci_pair.predecessor(@backingInt(w.pass), m.pair_last);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g, "m.pair_ev.?.at(k, l.li)") != null and std.mem.indexOf(u8, g, "m.pair_ev.?.at(k, half)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g, "try m.pair_join.?.record(m.passStreamOf(last));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g, "m.pair_last = ns.len;") != null);
+    // the first pass of a group asks nothing of events the host has not recorded: `first` is the pair_open flag read before anything is queued
+    try std.testing.expect(std.mem.indexOf(u8, g, "const first = !m.pair_open.load(.acquire);") != null);
+    // every lane is made, closed and reset where the second's are
+    try std.testing.expect(std.mem.indexOf(u8, code, "if (m.two_c) |*t| if (t.rc) |rc| rc.close(); // (the third lane before the second)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "if (m.stream_c) |s| s.synchronize() catch {};") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "        m.ch_c = null;\n        m.stream_c = null;\n        m.blas_c = null;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "        m.ids64_c = &.{};\n        m.host_pos_c = &.{};") != null);
+    // the group's ids and positions are the lane's own: no two passes write one array
+    try std.testing.expect(std.mem.indexOf(u8, code, ".c => m.ids64_c[0..n],") != null and std.mem.indexOf(u8, code, ".c => m.host_pos_c[0..n],") != null);
+    // the chunk's lane number is the Engram records' set
+    try std.testing.expect(std.mem.indexOf(u8, code, "m.ch_c.?.lane = 2;") != null);
+}
+
             }
         }
         const t1 = m.now();
@@ -1526,8 +2171,6 @@ test "TF_DS_RING_WORD_SIGNAL: unset and atomic name the fetch-and-add (the guara
             }
             if (n > 0) try dr.absorbMany(e, &m.ch, &m.dpool.?, items[0..n]);
         }
-        try m.synchronize();
-        if (m.prof) m.t_absorb = m.now() - t1;
     }
 
     /// The rounds' GPU clocks (a profile): the forward's start and each stretch's ends, for its gaps.
@@ -1552,11 +2195,45 @@ test "TF_DS_RING_WORD_SIGNAL: unset and atomic name the fetch-and-add (the guara
         pt.* = try round.PhaseTimer.init(m.gpa, m.ctx.d);
         m.ptimer = pt;
         m.rd.timer = t;
+    try std.testing.expect(std.mem.indexOf(u8, code, "return memoryRefusal(buf, what, true, pass_rows, (lanes - 1) * pairEstimate(pass_rows, lane_arena) + pair_guard_bytes, free, v);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "const what = if (lanes >= 3) \"the second and third passes (TF_DS_ROCI_STAGGER_LANES=3)\" else \"the second pass\";") != null);
     }
 
     /// The monotonic clock (ns).
     pub fn now(m: *const Model) u64 {
         return @intCast(std.Io.Timestamp.now(m.io, .awake).nanoseconds);
+    m.two_c = null;
+    m.partner_rc = null;
+    m.ring = null;
+    m.rdma_rings = null;
+    try m.checkTransport(); // (nothing configured: nothing failed)
+    // a decode ring that lost a peer: every wait on its rank is released by the abort word, and the round after it computes on
+    // whatever the buffers hold
+    var r: rdma.Ring = undefined;
+    r.failed = .init(true);
+    r.why = @splat(0);
+    @memcpy(r.why[0..4], "lost");
+    m.ring = &r;
+    try std.testing.expectError(error.RingFailed, m.checkTransport());
+    m.ring = null;
+    const rings: ring2d.Rings = .{ .g = 0, .r = 0, .p = 0, .all4 = &r, .col = &r, .pair = null };
+    m.rdma_rings = rings;
+    try std.testing.expectError(error.RingFailed, m.checkTransport());
+    // the call sites on rank 0
+    const lsrc = @embedFile("lanes.zig");
+    const vat = std.mem.indexOf(u8, lsrc, "    fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {").?;
+    const vbody = lsrc[vat .. vat + std.mem.indexOf(u8, lsrc[vat..], "\n    }\n").?];
+    const first = std.mem.indexOf(u8, vbody, "try m.checkTransport();").?;
+    try std.testing.expect(first < std.mem.indexOf(u8, vbody, "if (try self.begin(.verify)) {").?);
+    const second = std.mem.indexOfPos(u8, vbody, first + 1, "try m.checkTransport();").?;
+    try std.testing.expect(second > std.mem.indexOf(u8, vbody, "if (m.cand_first) try m.verifyHead(").? and second < std.mem.indexOf(u8, vbody, "const keyed = head == head_cand.key;").?);
+    // the drafter pass: asked once before the passes' frames go out (draftFn sends one frame a group of streams), and again after each pass
+    const pat = std.mem.indexOf(u8, lsrc, "    fn draftFn(ptr: *anyopaque").?;
+    const pbody = lsrc[pat .. pat + std.mem.indexOf(u8, lsrc[pat..], "\n    }\n").?];
+    try std.testing.expect(std.mem.indexOf(u8, pbody, "try m.checkTransport();").? < std.mem.indexOf(u8, pbody, "if (try self.begin(.pass)) {").?);
+    try std.testing.expect(std.mem.indexOfPos(u8, pbody, std.mem.indexOf(u8, pbody, "try m.pass(").?, "try m.checkTransport();") != null);
+}
+
 
 test "this rank's weight digest comes from TF_DS_RANK_CACHE_SHA; unset, empty or not a digest, none (and the start goes on)" {
     const env = struct {
@@ -1685,12 +2362,25 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
         const pool = &m.dpool.?;
         for (q0, slots) |q, s| pool.absorbed[@intCast(s)] = @intCast(q);
         try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
+    // the partner split: the refusal is the operator's branch, the warning and the cleared flag the default's, and no lane is opened before either
+    const warn = std.mem.indexOf(u8, body[v..], "std.log.warn(\"TF_DS_ENGRAM_PARTNER: off:").?;
     const kv = std.mem.indexOf(u8, kb, "speed_defaults.verdict(why, speed_defaults.defaulted(\"TF_DS_ENGRAM_KEEP_AHEAD\")) == .fallback").?;
+    const kwarn = std.mem.indexOf(u8, kb[kv..], "std.log.warn(\"TF_DS_ENGRAM_KEEP_AHEAD: rank").?;
     const kerr = std.mem.indexOf(u8, kb[kv..], "return error.KeepAheadSharesReader;").?;
+    // both are in the defaults table, so the speed report lists a fallback with its reason
+    const gib: usize = 1 << 30;
     try std.testing.expect(passRowsFallback("2048", true, 64 * gib) == null);
     try std.testing.expect(passRowsFallback(null, true, 64 * gib) == null);
 }
 
+    const warn = std.mem.indexOf(u8, body[v..], "std.log.warn(\"TF_DS_ROCI_STAGGER: off:").?;
+    try std.testing.expect(refuse < refused and refused < warn and warn < off); // the refusal is the operator's branch, the fallback the other
+    // the fallback names what it costs and runs before any allocation of the second pass
+    try std.testing.expect(std.mem.indexOf(u8, body[v..], "speed_defaults.costOf(\"TF_DS_ROCI_STAGGER\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "needs passes of two resume units (TF_DS_PASS_ROWS=4096)") != null);
+}
+
+test "the four-way drafter's mismatch between ranks still refuses, naming the cause and the way out" {
     try std.testing.expect(std.mem.indexOf(u8, src, "set TF_DS_DRAFT_MAIN_4WAY=0 on every Spark") != null);
 }
     }

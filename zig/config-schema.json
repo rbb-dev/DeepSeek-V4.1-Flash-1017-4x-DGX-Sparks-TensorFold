@@ -77,6 +77,29 @@
    "secret": false
   },
   {
+   "id": 931,
+   "name": "tf_ds_roci_stagger_lanes",
+   "env": "TF_DS_ROCI_STAGGER_LANES",
+   "group": "transport",
+   "tab": "Transport",
+   "kind": "int",
+   "unit": "passes",
+   "min": 2,
+   "max": 3,
+   "default": "2",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Passes in flight",
+   "doc": "How many consecutive whole prompt passes run at once when the stagger is on: 2 (the pair) or 3 (a third pass on a third Rocinante lane). Measured on the four Sparks (a cold ~147K-token prompt): no gain at 3 (6,433 tok/s against 6,491-6,507 at 2, inside the noise), compute time a pass +2.7 % (three streams co-running stretch every kernel; idle unchanged at 39.7 ms), and about 5.5 GiB less free memory a Spark: keep 2. Needs TF_DS_ROCI_STAGGER=1 and passes of at most 10,240 rows; a Spark under the memory floor refuses 3 by name. Replies unchanged.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:1896",
+   "secret": false
+  },
+  {
    "id": 981,
    "name": "tf_ds_roci_xlog",
    "env": "TF_DS_ROCI_XLOG",

@@ -13,6 +13,11 @@
 //!   - TF_DS_ROCI_COLLECT's copy (Ops.collect2): two blocks from device memory into write-combined host memory, the bytes equal, the time
 //!     of the launch printed; a changed source must differ.
 //!     written to the other three regions, copied out to their rows, against the in-place gather's layout, with the region in cudaMalloc, in
+//!   - TF_DS_ROCI_STAGGER's two lanes (roci_pair): two passes' exchanges in flight at once on two streams a node, each lane's bytes in its own
+//!     lane; a late peer on one lane holds that lane's wait and not the other's streams; the cache gate (pass B's read behind pass A's event is
+//!     A's write, without the event it is not).
+//!   - TF_DS_ROCI_STAGGER_LANES=3 (roci_triple): three passes' exchanges in flight at once on three lanes, each lane's bytes in its own lane; the cache
+//!     gate chain (pass C's read behind B's event behind A's event is A's write, with B's wait on A's left out it is not).
 //!   - The decoder half on owned rows (roci_dec_rows, roci_dec_mixes, roci_dec_kset): at every decoder window of d = 1 to 128 rows, each
 //!     launch class layers 20-39 make at a node's slab of the plan (slab_plan: q(d) = 16 or 32 rows a rank) against the window's one
 //!     launch, the baseline decoder half's: act_quant, wq_a / wkv / wq_b, the q RMSNorm, the router's logits and routing, hcPre; the posted
@@ -1028,6 +1033,268 @@ fn rociDecKset(r: *Run, rng_in: std.Random) !void {
 
 /// three that landed out to their rows: every array of every node must hold the bytes the in-place gather leaves, the groups around
                 r.report(try std.fmt.bufPrint(&line, "roci_boundary {s}: four nodes' cache arrays after the staged gather against the in-place gather's layout (rows around the chunk untouched)", .{nm}), bad, true);
+// -- TF_DS_ROCI_STAGGER ----------------------------------------------------------------------------------------------
+
+const PairNode = struct {
+    arena: []align(64) u8,
+    arena_dev: u64,
+    ctl: *dsv41.rocinante.Control,
+    ctl_dev: u64,
+    t: *dsv41.rocinante.Transport = undefined,
+    peer: *PairNode = undefined,
+    me: u8 = 0,
+    hold: std.atomic.Value(bool) = .init(false),
+};
+
+fn pairHostAlloc(d: *const cuda.Driver, len: usize, flags: c_uint) !struct { p: [*]align(64) u8, dev: u64 } {
+    var p: ?*anyopaque = null;
+    try d.check(d.api.cuMemHostAlloc(&p, len, flags), "cuMemHostAlloc");
+    var dev: u64 = 0;
+    try d.check(d.api.cuMemHostGetDevicePointer_v2(&dev, p, 0), "cuMemHostGetDevicePointer");
+    return .{ .p = @ptrCast(@alignCast(p.?)), .dev = dev };
+}
+
+fn pairNap(ns: u64) void {
+    const ts: std.c.timespec = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
+    _ = std.c.nanosleep(&ts, null);
+}
+
+fn pairPost(ctx: *anyopaque, rail: u8, peer: u8, class: dsv41.rocinante.Class, chain: *const dsv41.rocinante.Chain, word: u64) dsv41.rocinante.PostError!void {
+    const me: *PairNode = @ptrCast(@alignCast(ctx));
+    _ = peer;
+    while (me.hold.load(.acquire)) pairNap(100_000);
+    for (chain.slice()) |p| @memcpy(me.peer.arena[p.dst..][0..p.len], me.arena[p.src..][0..p.len]);
+    @atomicStore(u64, &me.peer.ctl.recv[@backingInt(class)][me.me][rail].v, word, .release);
+}
+fn pairFail(_: *anyopaque) void {}
+fn pairReap(_: *anyopaque, _: u8) dsv41.rocinante.PostError!void {}
+
+const PairLane = struct {
+    nodes: [2]PairNode = undefined,
+
+    fn open(l: *PairLane, d: *const cuda.Driver) !void {
+        for (&l.nodes, 0..) |*n, i| {
+            const a = try pairHostAlloc(d, 64 << 20, 0x01 | 0x02 | 0x04);
+            const c = try pairHostAlloc(d, @sizeOf(dsv41.rocinante.Control), 0x01 | 0x02);
+            n.* = .{ .arena = a.p[0 .. 64 << 20], .arena_dev = a.dev, .ctl = @ptrCast(c.p), .ctl_dev = c.dev, .me = @intCast(i) };
+            n.ctl.* = .{};
+        }
+        for (&l.nodes, 0..) |*n, i| {
+            n.peer = &l.nodes[1 - i];
+            n.t = try dsv41.rocinante.Transport.init(std.heap.page_allocator, @intCast(i), dsv41.rocinante.identity, n.ctl, n.ctl_dev, .{ .ctx = n, .post_fn = pairPost, .fail_fn = pairFail, .reap_fn = pairReap }, .{ .nap = false });
+            try n.t.start(null);
+        }
+    }
+
+    fn close(l: *PairLane, d: *const cuda.Driver) void {
+        for (&l.nodes) |*n| n.t.deinit();
+        for (&l.nodes) |*n| {
+            _ = d.api.cuMemFreeHost(n.arena.ptr);
+            _ = d.api.cuMemFreeHost(@ptrCast(n.ctl));
+        }
+    }
+};
+
+fn pairWord(lane: u32, node: u32, block: u32, gen: u32) u32 {
+    return (lane << 30) | (node << 28) | (block << 20) | gen;
+}
+
+fn pairWrite(d: *const cuda.Driver, nd: *PairNode, s: cuda.Stream, lane: u32, gen: u32) !void {
+    const l = dsv41.rocinante.layout();
+    const blk: usize = 1024 * 2560 * 4;
+    for (0..4) |b| try d.check(d.api.cuMemsetD32Async(nd.arena_dev + l.at(.psum) + b * blk, pairWord(lane, nd.me, @intCast(b), gen), blk / 4, s.handle), "memset");
+}
+
+/// Words of node `nd`'s stage regions that differ from the peer's lane `from` words.
+fn pairStageBad(nd: *PairNode, from: u32, gen: u32) usize {
+    const l = dsv41.rocinante.layout();
+    const blk: usize = 1024 * 2560 * 4;
+    const peer: u32 = 1 - nd.me;
+    const w = [2]u32{ pairWord(from, peer, nd.me, gen), pairWord(from, peer, nd.me ^ 2, gen) };
+    var bad: usize = 0;
+    for (0..2) |k| {
+        const got = std.mem.bytesAsSlice(u32, nd.arena[l.at(.stage) + k * blk ..][0..blk]);
+        for (got) |x| bad += @intFromBool(x != w[k]);
+    }
+    return bad;
+}
+
+fn pairStreamDone(d: *const cuda.Driver, s: cuda.Stream, ms: u64) bool {
+    var waited: u64 = 0;
+    while (waited < ms) : (waited += 1) {
+        if (d.api.cuStreamQuery(s.handle) == 0) return true;
+        pairNap(1_000_000);
+    }
+    return false;
+}
+
+/// Two passes of a pair on one rank's two lanes (each lane its own arena, control block, transport; two nodes a lane, one stream a node): both
+/// lanes' exchanges in flight at once land every byte in their own lane; a lane-1 peer that is late holds lane 1's wait while lane 0's
+/// streams finish; lane 1 miswired into lane 0's arena must differ; pass B's cache read behind the event sees A's write and, without the event,
+/// does not.
+fn rociPair(r: *Run, rng_in: std.Random) !void {
+    _ = rng_in;
+    const d = r.d;
+    var lanes: [2]PairLane = undefined;
+    try lanes[0].open(d);
+    try lanes[1].open(d);
+    defer for (&lanes) |*l| l.close(d);
+    var st: [2][2]cuda.Stream = undefined;
+    for (&st) |*row| {
+        for (row) |*x| x.* = try cuda.Stream.init(d, true);
+    }
+    defer for (&st) |*row| {
+        for (row) |*x| x.deinit();
+    };
+    var bad: usize = 0;
+    for (1..5) |gen| {
+        for (0..2) |lane| {
+            for (0..2) |n| {
+                try pairWrite(d, &lanes[lane].nodes[n], st[lane][n], @intCast(lane), @intCast(gen));
+                try lanes[lane].nodes[n].t.send(st[lane][n], .own1, 0);
+            }
+        }
+        for (0..2) |lane| {
+            for (0..2) |n| try lanes[lane].nodes[n].t.wait(st[lane][n], .own1);
+        }
+        for (0..2) |lane| {
+            for (0..2) |n| try st[lane][n].synchronize();
+        }
+        for (0..2) |lane| {
+            for (0..2) |n| bad += pairStageBad(&lanes[lane].nodes[n], @intCast(lane), @intCast(gen));
+        }
+    }
+    r.report("roci_pair: two lanes in flight at once, four generations: every word of each lane's stage regions is its own lane's", bad, true);
+    // lane 1's node 1 is late; lane 0's streams finish meanwhile and lane 1's node 0 still waits
+    lanes[1].nodes[1].hold.store(true, .release);
+    for (0..2) |n| {
+        try pairWrite(d, &lanes[1].nodes[n], st[1][n], 1, 9);
+        try lanes[1].nodes[n].t.send(st[1][n], .own1, 0);
+    }
+    for (0..2) |n| {
+        try pairWrite(d, &lanes[0].nodes[n], st[0][n], 0, 9);
+        try lanes[0].nodes[n].t.send(st[0][n], .own1, 0);
+        try lanes[0].nodes[n].t.wait(st[0][n], .own1);
+    }
+    try lanes[1].nodes[0].t.wait(st[1][0], .own1);
+    const live = pairStreamDone(d, st[0][0], 3000) and pairStreamDone(d, st[0][1], 3000);
+    const pending = !pairStreamDone(d, st[1][0], 150);
+    r.note("roci_pair: lane 0's streams finish while lane 1's wait for its late peer is pending (a pending wait on one stream holds the other)", live and pending);
+    r.report("roci_pair control: the wait for lane 1's words not yet released, lane 1's stage holds lane 1's bytes", pairStageBad(&lanes[1].nodes[0], 1, 9), false);
+    lanes[1].nodes[1].hold.store(false, .release);
+    try lanes[1].nodes[1].t.wait(st[1][1], .own1);
+    try st[1][0].synchronize();
+    try st[1][1].synchronize();
+    r.report("roci_pair: after the late peer posts, lane 1's stage holds its bytes", pairStageBad(&lanes[1].nodes[0], 1, 9) + pairStageBad(&lanes[0].nodes[0], 0, 9), true);
+    // the cache gate
+    const flag = try pairHostAlloc(d, 4096, 0x01 | 0x02);
+    defer _ = d.api.cuMemFreeHost(flag.p);
+    const flag_p: *u64 = @ptrCast(@alignCast(flag.p));
+    var cache = try cuda.DeviceBuffer.alloc(d, 4096);
+    defer cache.free();
+    var out = try cuda.DeviceBuffer.alloc(d, 8192);
+    defer out.free();
+    var ev = try cuda.Event.init(d, false);
+    defer ev.deinit();
+    var diff: [2]usize = .{ 0, 0 };
+    for ([_]bool{ true, false }, 0..) |gated, gi| {
+        flag_p.* = 0;
+        const base: u64 = if (gated) 0 else 4096;
+        const val: u32 = if (gated) 0x22222222 else 0x33333333;
+        try st[0][0].waitValues64(&.{flag.dev}, &.{1});
+        try d.check(d.api.cuMemsetD32Async(cache.ptr, val, 1024, st[0][0].handle), "memset");
+        try ev.record(st[0][0]);
+        if (gated) try st[1][0].wait(ev);
+        try d.check(d.api.cuMemcpyDtoDAsync_v2(out.ptr + base, cache.ptr, 4096, st[1][0].handle), "copy");
+        pairNap(100_000_000);
+        @atomicStore(u64, flag_p, 1, .release);
+        try st[0][0].synchronize();
+        try st[1][0].synchronize();
+        var got: [1024]u32 = undefined;
+        for (got) |x| diff[gi] += @intFromBool(x != val);
+    }
+    r.report("roci_pair: pass B's read of a layer's cache behind pass A's event is A's write", diff[0], true);
+    r.report("roci_pair control: the same read without the event", diff[1], false);
+}
+
+/// TF_DS_ROCI_STAGGER_LANES=3: three passes on one rank's three lanes (each its own arena, control block, transport; two nodes a lane, one stream a
+/// node): all three lanes' exchanges in flight at once land every byte in their own lane; and the cache gate chains, pass C's read of a layer's
+/// cache behind B's event behind A's event is A's write, and with B's wait left out is not.
+fn rociTriple(r: *Run, rng_in: std.Random) !void {
+    _ = rng_in;
+    const d = r.d;
+    var lanes: [3]PairLane = undefined;
+    for (&lanes) |*l| try l.open(d);
+    defer for (&lanes) |*l| l.close(d);
+    var st: [3][2]cuda.Stream = undefined;
+    for (&st) |*row| {
+        for (row) |*x| x.* = try cuda.Stream.init(d, true);
+    }
+    defer for (&st) |*row| {
+        for (row) |*x| x.deinit();
+    };
+    var bad: usize = 0;
+    for (1..5) |gen| {
+        for (0..3) |lane| {
+            for (0..2) |n| {
+                try pairWrite(d, &lanes[lane].nodes[n], st[lane][n], @intCast(lane), @intCast(gen));
+                try lanes[lane].nodes[n].t.send(st[lane][n], .own1, 0);
+            }
+        }
+        for (0..3) |lane| {
+            for (0..2) |n| try lanes[lane].nodes[n].t.wait(st[lane][n], .own1);
+        }
+        for (0..3) |lane| {
+            for (0..2) |n| try st[lane][n].synchronize();
+        }
+        for (0..3) |lane| {
+            for (0..2) |n| bad += pairStageBad(&lanes[lane].nodes[n], @intCast(lane), @intCast(gen));
+        }
+    }
+    r.report("roci_triple: three lanes in flight at once, four generations: every word of each lane's stage regions is its own lane's", bad, true);
+    // the cache gate chain A -> B -> C
+    const flag = try pairHostAlloc(d, 4096, 0x01 | 0x02);
+    defer _ = d.api.cuMemFreeHost(flag.p);
+    const flag_p: *u64 = @ptrCast(@alignCast(flag.p));
+    var cache = try cuda.DeviceBuffer.alloc(d, 4096);
+    defer cache.free();
+    var mid = try cuda.DeviceBuffer.alloc(d, 8192);
+    defer mid.free();
+    var out = try cuda.DeviceBuffer.alloc(d, 8192);
+    defer out.free();
+    var ev_a = try cuda.Event.init(d, false);
+    defer ev_a.deinit();
+    var ev_b = try cuda.Event.init(d, false);
+    defer ev_b.deinit();
+    var diff: [2]usize = .{ 0, 0 };
+    for ([_]bool{ true, false }, 0..) |gated, gi| {
+        flag_p.* = 0;
+        const base: u64 = if (gated) 0 else 4096;
+        const val: u32 = if (gated) 0x22222222 else 0x33333333;
+        // stale contents everywhere, so a read that runs early sees a value that is not `val`
+        try d.check(d.api.cuMemsetD32Async(cache.ptr, 0x11111111, 1024, st[0][0].handle), "memset");
+        try d.check(d.api.cuMemsetD32Async(mid.ptr + base, 0x11111111, 1024, st[0][0].handle), "memset");
+        try st[0][0].synchronize();
+        try st[0][0].waitValues64(&.{flag.dev}, &.{1});
+        try d.check(d.api.cuMemsetD32Async(cache.ptr, val, 1024, st[0][0].handle), "memset");
+        try ev_a.record(st[0][0]);
+        if (gated) try st[1][0].wait(ev_a);
+        try d.check(d.api.cuMemcpyDtoDAsync_v2(mid.ptr + base, cache.ptr, 4096, st[1][0].handle), "copy");
+        try ev_b.record(st[1][0]);
+        try st[2][0].wait(ev_b); // C always waits B: the chain breaks only where B skips A
+        try d.check(d.api.cuMemcpyDtoDAsync_v2(out.ptr + base, mid.ptr + base, 4096, st[2][0].handle), "copy");
+        pairNap(100_000_000);
+        @atomicStore(u64, flag_p, 1, .release);
+        try st[0][0].synchronize();
+        try st[1][0].synchronize();
+        try st[2][0].synchronize();
+        var got: [1024]u32 = undefined;
+        for (got) |x| diff[gi] += @intFromBool(x != val);
+    }
+    r.report("roci_triple: pass C's read of a layer's cache behind B's event behind A's event is A's write", diff[0], true);
+    r.report("roci_triple control: the same chain with B's wait on A's event left out", diff[1], false);
+}
+
     .{ "ring_word", ringWord, 9 },
     .{ "roci_readers", rociReaders, 1 + 7 * 3 + 3 },
     .{ "roci_stage", rociStage, 2 * 4 + 1 },
@@ -1038,3 +1305,5 @@ fn rociDecKset(r: *Run, rng_in: std.Random) !void {
     .{ "roci_dec_rows", rociDecRows, 3 * 8 },
     .{ "roci_dec_mixes", rociDecMixes, 4 + 4 + 3 + 3 },
     .{ "roci_dec_kset", rociDecKset, 3 },
+    .{ "roci_pair", rociPair, 6 },
+    .{ "roci_triple", rociTriple, 3 },

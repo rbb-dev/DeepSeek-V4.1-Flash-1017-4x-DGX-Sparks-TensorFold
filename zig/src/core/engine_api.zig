@@ -643,3 +643,36 @@ test {
     _ = @import("keepalive.zig");
     _ = @import("originals_test.zig");
 }
+
+test "a gated pass counts a pair's rows when the device has finished each pass, not when the host has issued them" {
+    var gate: std.atomic.Value(u64) = .init(0);
+    var p: lanes.stream.Progress = .{};
+    p.begin(0);
+    p.gated(&gate, 1);
+    gate.store(1 << 32, .release); // armed for this fill: nothing finished
+    // the host issued a whole pair (two 4,096-row passes) and returned: what prefillStep reports at once
+    p.reach(8192);
+    try std.testing.expectEqual(@as(u32, 0), p.computed());
+    const issued: PromptPass = .{ .computed = p.computed(), .total = 8192, .resumed = 0, .seconds = 0.6 };
+    try std.testing.expectEqual(@as(?f64, null), issued.rate()); // not 8,192 / 0.6 = 13.7 K tok/s
+    // pass A's last layer is done
+    gate.store((1 << 32) | 4096, .release);
+    try std.testing.expectEqual(@as(u32, 4096), p.computed());
+    const half: PromptPass = .{ .computed = p.computed(), .total = 8192, .resumed = 0, .seconds = 0.8 };
+    try std.testing.expectApproxEqAbs(@as(f64, 5120), half.rate().?, 1e-9);
+    // pass B's
+    gate.store((1 << 32) | 8192, .release);
+    try std.testing.expectEqual(@as(u32, 8192), p.computed());
+    const done: PromptPass = .{ .computed = p.computed(), .total = 8192, .resumed = 0, .seconds = 1.1 };
+    try std.testing.expectApproxEqAbs(@as(f64, 8192.0 / 1.1), done.rate().?, 1e-6);
+    // a callback of an earlier fill (another generation) neither lifts nor lowers it; the device's rows never pass the host's
+    gate.store((7 << 32) | 8192, .release);
+    try std.testing.expectEqual(@as(u32, 0), p.computed());
+    p.gated(&gate, 7);
+    p.reach(4096);
+    try std.testing.expectEqual(@as(u32, 4096), p.computed());
+    // a pass resumed from a kept state counts from its resume point; begin() takes the gate off (a host pass without one)
+    p.begin(2048);
+    p.reach(4096);
+    try std.testing.expectEqual(@as(u32, 2048), p.computed());
+}

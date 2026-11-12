@@ -185,6 +185,8 @@ pub const Fan = struct {
     };
 
 /// head_whole 13, TF_DS_HEAD_CAND's whole head after a round's candidates fell back); 7 = 1-14 (and fill_pair 14, TF_DS_ROCI_STAGGER's two passes); 8 = 1-15 (and snap_sync 15, the SSD tier's stores on every rank); 9 = the same kinds, a Settings of the Rocinante-only layout (no
+/// NCCL cores, retired exchange and kernel bits) and a start-up exchange without a library's id. 10 = 1-16 (and cfg 16, a live change of settings of class A to every rank: live_config.CfgFrame). 11 = the same kinds, a fill_pair frame that carries the third pass's rows (TF_DS_ROCI_STAGGER_LANES; 0: a pair). A new set of kinds takes the next
+pub const frame_protocol: u32 = 11;
 /// What the ranks of a run must agree on, checked at the start (Fan.settingsChecked) from Model.open's options.
 pub const Settings = extern struct {
     magic: u32 = tag,
@@ -236,9 +238,11 @@ pub const Settings = extern struct {
     fn sepIf(w: *const std.Io.Writer, sep: []const u8) []const u8 {
         return if (w.end > 0) sep else "";
     }
+pub const exch_roci_stagger: u32 = 1 << 21;
 pub const exch_ring_word: u32 = 1 << 25;
 pub const exch_ring_word_atomic: u32 = 1 << 26; // the switch's signal is the atomic fetch-and-add (unset: the inline word)
 pub const exch_ring_wait: u32 = 1 << 27; // TF_DS_RING_WAIT: the rings' queue pairs wait in the card (no proxy threads)
+pub const exch_roci_stagger_lanes: u32 = 1 << 28; // TF_DS_ROCI_STAGGER_LANES=3 (unset or 2: clear): three passes in flight, a third lane on every rank
 /// A switch that is on unless set otherwise (TF_DS_ROCI_WAIT, TF_DS_RING_WAIT): unset or "1" is on; any other text, "0" included, is off (a typo
 /// takes the fallback path, never the new one by accident).
 pub fn switchDefaultOn(text: ?[]const u8) bool {
@@ -250,6 +254,19 @@ pub fn switchDefaultOn(text: ?[]const u8) bool {
 /// TF_DS_ROCI_ENGRAM_AHEAD as Model.open read it (switchAsked), once (Settings.exch; Two.engramAhead): an
 /// TF_DS_ROCI_SENT_FIRST as Model.open read it (switchAsked), once (Settings.exch; Two.sentFirst): wo_b runs in
 /// TF_DS_ROCI_COMBINE_DOOR as Model.open read it (switchAsked), once (Settings.exch; Two.combineDoor): the MoE's
+/// TF_DS_ROCI_STAGGER as Model.open read it (switchAsked), once (Settings.exch; effective with every Rocinante switch and TF_DS_ENGRAM_PINNED): two
+/// consecutive whole passes of a prompt in flight, each on its own lane (a second Rocinante, chunk, stream and cuBLAS handle).
+pub var roci_stagger_asked: bool = false;
+
+/// TF_DS_ROCI_STAGGER_LANES as Model.open read it (roci_pair.lanesOf), once (Settings.exch; the ranks must agree: every rank opens the third
+/// lane or none): the passes in flight, 2 (unset: a pair as it always was) or 3 (`roci_stagger3_asked`, the Settings bit), and whether the
+/// operator set it (a box short of memory refuses a count that was set; one that was only the default keeps two lanes).
+pub var roci_stagger_lanes: usize = 2;
+pub var roci_stagger3_asked: bool = false;
+pub var roci_stagger_lanes_set: bool = false;
+
+    if (roci_stagger_asked) x |= exch_roci_stagger;
+    if (roci_stagger3_asked) x |= exch_roci_stagger_lanes;
     if (ring_word_asked) x |= exch_ring_word;
     if (ring_word_atomic_asked) x |= exch_ring_word_atomic;
     if (ring_wait_asked) x |= exch_ring_wait;
@@ -405,8 +422,16 @@ pub const Two = struct {
         return t;
     }
 
+    /// The second lane's node: every setting the start agreed (whatever the first node's agreements and checks decided), with its own
+    /// scratch from its own `init`. The decode rings and the transport are the first node's (the second lane gets its own transport after).
+    pub fn adoptSettings(t: *Two, from: *const Two) void {
         const own = .{ t.u_full, t.xd_full, t.peer, t.own, t.rest_dec, t.rest_chunk, t.rest_rows };
+        t.* = from.*;
         t.u_full, t.xd_full, t.peer, t.own, t.rest_dec, t.rest_chunk, t.rest_rows = own;
+        t.rings = null;
+        t.rc = null;
+    }
+
     fn restScratch(a: *prompt.Arena, ex: weights.Experts, rows: usize, slots: usize, chunk: bool) !exl3_experts2d.RestScratch {
         const sz = try exl3_experts2d.RestScratch.sizes(rows, slots, ex, chunk);
         var rs: exl3_experts2d.RestScratch = undefined;
@@ -1030,6 +1055,7 @@ test "a follower runs rank 0's indexer score rows, or says to set the same on ev
     comptime var sum: usize = 0;
     inline for (@typeInfo(Settings).@"struct".field_names) |name| sum += @sizeOf(@FieldType(Settings, name));
     try std.testing.expectEqual(sum, @sizeOf(Settings));
+    try std.testing.expectEqual(@as(u32, 11), frame_protocol);
 test "a follower runs rank 0's TF_DS_PASS_ROWS, or says to set the same on every rank; rank 0's TF_DS_PASS_FROM travels and is never compared" {
     const lead: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 1, .pass_rows = 4096, .pass_from = 8192 };
     var buf: [256]u8 = undefined;
@@ -1042,6 +1068,9 @@ test "a follower runs rank 0's TF_DS_PASS_ROWS, or says to set the same on every
     try std.testing.expectEqualStrings("rank 3 has TF_DS_PASS_ROWS=4096 and rank 0 2048: set the same on every rank", lead.differ(mine, 3, &buf));
     // every field whole 4- or 8-byte words: no padding travels
     const lead: Settings = .{ .world = 4, .streams = 8, .round_rows = 16, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 20, .replay_floor = 0, .idx_rb = 1, .land_slots = 2 };
+    try std.testing.expectEqual(@as(u32, 11), frame_protocol); // kind 16 (cfg) after kind 15 (snap_sync), the Rocinante-only Settings; 11: fill_pair carries the third pass's rows
+    older.protocol = 5; // a follower whose image lacks fill_pair
+    try std.testing.expectEqualStrings("rank 2 decodes frame protocol 5 and rank 0 sends 11: run every rank from the same image", older.differ(lead, 2, &buf));
 }
 test "the expert pack as codes needs the checkpoint's own weights, the parity rest blocks and whole 128-value blocks" {
     try std.testing.expectEqual(@as(?[]const u8, null), packCodesOff(true, 512, 128));
@@ -1076,6 +1105,22 @@ test "quartersDecode sends each block's own rows of src at its place in the whol
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, qbody, "error.RingRefused"));
     try std.testing.expect(std.mem.indexOf(u8, qbody, "t.parts") == null);
 }
+
+test "adoptSettings keeps every device buffer of the second pass's Two as its own" {
+    // A device pointer (or scratch set) added to `Two` that is missing from the keep list would be copied from the first pass and shared
+    // by two passes in flight.
+    const src = @embedFile("prompt2d.zig");
+    const head = "pub fn adoptSettings(";
+    const at = std.mem.indexOf(u8, src, head).?;
+    const body = src[at..std.mem.indexOfPos(u8, src, at, "t.rc = null;").?];
+    var seen: usize = 0;
+    const info = @typeInfo(Two).@"struct";
+    inline for (info.field_names, info.field_types) |name, ty| {
+        if (ty == u64 or ty == ?exl3_experts2d.RestScratch) {
+            seen += 1;
+            try std.testing.expect(std.mem.indexOf(u8, body, "t." ++ name) != null);
+        }
+    }
     try std.testing.expect(seen >= 6);
 test "the exchange switches that remain: a named bit each in Settings.exch, asked as \"1\" only; the retired bits are reserved and a rank that sets one is named as one this build has no name for" {
     const kept = [_]struct { name: []const u8, bit: u32, var_ptr: *bool }{
@@ -1084,6 +1129,7 @@ test "the exchange switches that remain: a named bit each in Settings.exch, aske
         .{ .name = "TF_DS_ROCI_SENT_FIRST", .bit = exch_roci_sent_first, .var_ptr = &roci_sent_first_asked },
         .{ .name = "TF_DS_ROCI_COMBINE_DOOR", .bit = exch_roci_combine_door, .var_ptr = &roci_combine_door_asked },
         .{ .name = "TF_DS_ROCI_STAGGER", .bit = exch_roci_stagger, .var_ptr = &roci_stagger_asked },
+        .{ .name = "TF_DS_ROCI_STAGGER_LANES", .bit = exch_roci_stagger_lanes, .var_ptr = &roci_stagger3_asked },
         .{ .name = "TF_DS_ENGRAM_PARTNER", .bit = exch_engram_partner, .var_ptr = &engram_partner_asked },
     };
     var buf: [1024]u8 = undefined;
@@ -1109,6 +1155,7 @@ test "the exchange switches that remain: a named bit each in Settings.exch, aske
     var odd = lead;
     odd.exch = 1 << 0; // the old TF_DS_OWNER_YX bit
     try std.testing.expect(std.mem.indexOf(u8, odd.differ(lead, 1, &buf), "switches this build has no name for") != null);
+    try std.testing.expectEqualStrings("rank 1 decodes frame protocol 9 and rank 0 sends 11: run every rank from the same image", odd.differ(lead, 1, &buf));
 
 test "a default-on switch (TF_DS_ROCI_WAIT, TF_DS_RING_WAIT): unset and 1 are on; 0, empty and any other text are off" {
     try std.testing.expect(switchDefaultOn(null));

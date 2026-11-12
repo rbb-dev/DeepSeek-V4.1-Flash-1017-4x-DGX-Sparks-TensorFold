@@ -16,6 +16,29 @@ pub const Stream = struct {
         return .{ .d = d, .handle = s };
     }
 
+    /// The context's stream priorities: `least` (the default, 0) and `greatest` (numerically lower: the most urgent).
+    pub const PriorityRange = struct { least: c_int, greatest: c_int };
+
+    pub fn priorityRange(d: *const Driver) Error!PriorityRange {
+        var least: c_int = 0;
+        var greatest: c_int = 0;
+        try d.check(d.api.cuCtxGetStreamPriorityRange(&least, &greatest), "cuCtxGetStreamPriorityRange");
+        return .{ .least = least, .greatest = greatest };
+    }
+
+    /// A non-blocking stream of the given priority (a value of priorityRange's ends; the driver clamps others).
+    pub fn initPriority(d: *const Driver, prio: c_int) Error!Stream {
+        var s: abi.Stream = null;
+        try d.check(d.api.cuStreamCreateWithPriority(&s, abi.stream_non_blocking, prio), "cuStreamCreateWithPriority");
+        return .{ .d = d, .handle = s };
+    }
+
+    pub fn priority(self: Stream) Error!c_int {
+        var p: c_int = 0;
+        try self.d.check(self.d.api.cuStreamGetPriority(self.handle, &p), "cuStreamGetPriority");
+        return p;
+    }
+
     pub fn deinit(self: *Stream) void {
         _ = self.d.api.cuStreamDestroy_v2(self.handle);
         self.* = undefined;

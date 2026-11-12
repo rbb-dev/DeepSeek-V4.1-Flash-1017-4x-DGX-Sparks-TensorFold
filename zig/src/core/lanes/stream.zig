@@ -98,6 +98,31 @@ pub const MarkHook = struct {
     at: *const fn (ptr: *anyopaque, s: *Stream, at: u32) void,
 };
 
+/// Whether the step at `start` is a whole pass of the booted `pass_rows` by the host's facts alone, and may be the first of a pair:
+/// Where `pass_rows` is the resume rows (TF_DS_PASS_ROWS=2048) a cut pass has the booted rows too, so the rows cannot tell a whole
+/// pass from a cut one; the facts do. For pass rows above the resume rows it is passRows(...) == pass_rows and !decoding (a test).
+    const x = f orelse return false;
+}
+
+/// A backend that issues work ahead of the device (the host returns while the kernels still run) gates the count: `gate`
+/// holds `generation << 32 | rows` the device has finished, and a reader counts no more than that.
+    gen: std.atomic.Value(u32) = .init(0),
+    gate: std.atomic.Value(?*const std.atomic.Value(u64)) = .init(null),
+    /// The pass starts at `rows` (restored from a kept state); none computed yet. Takes any gate off.
+        p.gate.store(null, .release);
+    /// From here the rows count only once `finished` (generation `gen`) says the device is done with them.
+    pub fn gated(p: *Progress, finished: *const std.atomic.Value(u64), gen: u32) void {
+        p.gen.store(gen, .release);
+        p.gate.store(finished, .release);
+    }
+
+        const issued = p.at.load(.acquire);
+        const from = p.from.load(.monotonic);
+        const g = p.gate.load(.acquire) orelse return .{ .from = from, .at = issued };
+        const v = g.load(.acquire);
+        // (another generation: a callback of an earlier fill, or the fill not armed yet: nothing finished)
+        const done: u32 = if (@as(u32, @truncate(v >> 32)) == p.gen.load(.acquire)) @truncate(v) else 0;
+        return .{ .from = from, .at = @min(issued, done) };
 /// Drafts the backend holds for the stream's next round; a tree keeps its tokens and parents on the host.
 pub const Held = struct {
     count: u32,
@@ -556,6 +581,21 @@ test "loop guard fires, closes thinking, and latches once" {
     try std.testing.expect(!s.finished and s.force.items.len == 0);
     _ = try s.commit(gpa, &.{8}, &.{});
     try std.testing.expect(!s.finished and s.loop_period.? == 1);
+}
+
+test "wholePass: the facts of a pass at the booted rows, from pass_from on, with nothing decoding; the rows alone cannot tell it from a cut pass" {
+    const quiet: Facts = .{ .decoding = false, .filling = false, .waiting = false, .step_rows = std.math.maxInt(u32) };
+    var f = quiet;
+    f.waiting = true;
+    f = quiet;
+    f.filling = true;
+    f = quiet;
+    f.decoding = true;
+    // the rule's cut at every pass size (2,048 included, where the rows are the same cut or whole): wholePass is the rule's whole
+    // pass with nothing decoding, for pass rows above the resume rows, over every combination of facts
+        const g: Facts = .{ .decoding = decoding, .filling = filling, .waiting = waiting, .step_rows = step_rows };
+        const rule_whole = passRows(g, start, 8192, p, 2048, fp) == p;
+    };
 }
 
 const reference = @import("novelty.zig").reference;
