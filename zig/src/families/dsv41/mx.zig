@@ -216,6 +216,9 @@ pub const Kernels = struct {
     dec_quant: cuda.Function, // act_quant for decode launches (a programmatic dependent launch)
     dec_l2pf: cuda.Function, // the active experts' down weights into L2 (beside the 2D exchange)
     dec_on: bool, // TF_DS_DECODE_DEC=0: the GEMV kernels instead (the reference path, measured slower)
+    // TF_DS_DEC_PDL=0: the decode tensor-core kernels (dense, gate / up, down) as ordinary launches, the same kernels (the
+    // decode plan's G0.2 control (a)); unset or any other value: programmatic dependent launches as served
+    dec_pdl: bool,
     counters: cuda.DeviceBuffer,
     combine: cuda.Function,
     bf16: cuda.Function,
@@ -249,6 +252,7 @@ pub const Kernels = struct {
             .dec_group = try m.function("tf_dsn_dec_group_kernel"),
             .dec_quant = try m.function("tf_dsn_dec_quant_kernel"),
             .dec_l2pf = try m.function("tf_dsn_dec_l2pf_kernel"),
+            .dec_pdl = if (std.c.getenv("TF_DS_DEC_PDL")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true,
             .counters = counters,
             .module = m,
             .act_quant = try m.function("tf_dsn_act_quant_kernel"),
@@ -464,6 +468,7 @@ fn decDenseLaunch(k: *const Kernels, s: cuda.Stream, kind: u2, as: []const DecAr
     const rg = decRg(m);
     var args: cuda.Args = .{};
     args.add(mm);
+    try cuda.launch.launch(k.dec[kind][rg], .{ .grid = .{ .x = @intCast(ctas), .y = 1, .z = @intCast(cs_all) }, .block = .{ .x = 32 * dec_warps }, .shared = decShared(dec_dense_cfg, @as(usize, 1) << @intCast(rg)), .pdl = pdl and k.dec_pdl }, s, &args);
 }
 
 fn decDense(k: *const Kernels, s: cuda.Stream, kind: u2, a: DecArgs, z: ?Z) !void {
@@ -1042,6 +1047,7 @@ pub fn gateUp(k: *const Kernels, s: cuda.Stream, d: *const cuda.Driver, ex: weig
             ga.add(b);
             const tpc = dec_warps / (2 * dec_gu_ks);
             const rg = decRg(r);
+            return cuda.launch.launch(k.dec[3][rg], .{ .grid = .{ .x = @intCast(cdiv(nx.tiles * 2, tpc)), .y = @intCast(ny), .z = 1 }, .block = .{ .x = 32 * dec_warps }, .shared = decShared(dec_gu_cfg, @as(usize, 1) << @intCast(rg)), .pdl = k.dec_pdl }, s, &ga);
         }
         ga.add(a);
         if (k.sab) return launch(k.gu_sab, s, .{ cdiv(nx.tiles * 32, 16), ny, 1 }, 256, &ga);

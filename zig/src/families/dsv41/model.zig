@@ -776,6 +776,7 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         errdefer if (m.par) |*x| x.unload();
         m.mxk = if (c.format == .native) try mx.Kernels.load(d, cuda.kernels.dsv41_native) else null;
         errdefer if (m.mxk) |*x| x.unload();
+        logPdlControls(m.comm.rank);
         if (m.mxk) |*x| m.eng.mx = x;
         if (c.vision and c.format == .exl3) { // (Format.native: the checkpoint's own gate.bias_vl, loaded with the weights)
             const path = o.vision_bias orelse try std.fs.path.join(a, &.{ o.kit_dir, "vision", "gate_bias_vl.safetensors" });
@@ -801,6 +802,34 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         m.lg.unload();
         m.pf.unload();
         m.set.deinit();
+    /// The decode plan's G0.2 controls (TF_DS_DEC_PDL, TF_DS_RDMA_PDL, TF_DS_TRITON_PDL_ATTR, TF_DS_PDL), one line on each
+    /// rank when any is off, so a run can show that every rank has the same ones.
+    fn logPdlControls(rank: usize) void {
+        const off = struct {
+            fn f(name: [*:0]const u8) bool {
+                return if (std.c.getenv(name)) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
+            }
+        }.f;
+        const native = off("TF_DS_DEC_PDL");
+        const ring = !rdmaPdl();
+        const tri_attr = off("TF_DS_TRITON_PDL_ATTR");
+        const all = off("TF_DS_PDL");
+        if (!(native or ring or tri_attr or all)) return;
+        const w = struct {
+            fn f(o: bool) []const u8 {
+                return if (o) "off" else "on";
+            }
+        }.f;
+        std.log.info("decode PDL controls on rank {d}: native decode kernels {s}, RDMA kernels {s}, Triton consumer launch attribute {s}, every launch attribute {s}", .{ rank, w(native or all), w(ring or all), w(tri_attr or all), w(all) });
+    }
+
+    /// TF_DS_RDMA_PDL=0 (or the Python build's TF_RDMA_PDL=0): the RDMA rings' kernels as ordinary launches with their
+    /// pdl argument 0 (no griddepcontrol in them): the decode plan's G0.2 control (b). Unset or any other value: as served.
+    pub fn rdmaPdl() bool {
+        for ([_][*:0]const u8{ "TF_DS_RDMA_PDL", "TF_RDMA_PDL" }) |name| if (std.c.getenv(name)) |v| return !std.mem.eql(u8, std.mem.span(v), "0");
+        return true;
+    }
+
     /// TF_DS_RDMA_GID: the RDMA rings' GID index on every device; unset, each device's first RoCE v2 IPv4 GID.
     pub fn rdmaGid() ?u8 {
         const v = std.c.getenv("TF_DS_RDMA_GID") orelse return null;
