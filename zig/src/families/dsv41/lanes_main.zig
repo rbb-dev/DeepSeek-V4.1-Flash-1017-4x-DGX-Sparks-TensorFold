@@ -239,7 +239,12 @@ pub fn main(init: std.process.Init) !u8 {
 
     var driver = try cuda.Driver.open();
     defer driver.close();
-    var ctx = try cuda.Context.init(&driver, 0);
+    // the server picks its device with TF_CUDA_DEVICE; a follower follows it rather than always taking 0
+    const device_ordinal: c_int = blk: {
+        const v = std.c.getenv("TF_CUDA_DEVICE") orelse break :blk 0;
+        break :blk std.fmt.parseInt(c_int, std.mem.span(v), 10) catch 0;
+    };
+    var ctx = try cuda.Context.init(&driver, device_ordinal);
     defer ctx.deinit();
     const t0 = std.Io.Timestamp.now(io, .awake);
     const m = try dsv41.model.Model.open(gpa, io, &ctx, o);
