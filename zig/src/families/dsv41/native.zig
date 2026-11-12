@@ -21,6 +21,10 @@
 //!                                               a rank that differs from rank 0 stops at the start, as one with
 //!                                               other graphs, graph cap, RDMA devices or drafter does
 //!   TF_RDMA_DEVICES                             the decode gathers over the RDMA ring on these devices (the rings are required)
+//!   TF_DS_RDMA_COLLECT_PEERS=1                  (with TF_RDMA_DEVICES at world 4) the rings' gather_into copy-out
+//!                                               reads every peer's slot at once: a row of blocks a peer, each waiting
+//!                                               for its own peer's flag (dsv41_rdma_collect_peers); the same bytes, so
+//!                                               each rank's own choice; one line says it is on, or why it is off
 //!   TF_DS_RING_WC=1                             (with TF_RDMA_DEVICES) the rings' send and landing data slots from
 //!                                               cudaHostAlloc(cudaHostAllocMapped | cudaHostAllocWriteCombined),
 //!                                               registered with ibv_reg_mr as in the baseline; the flags, sizes, sent words,
@@ -47,16 +51,19 @@
 //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
 //!   TF_DS_SERVED_K=all|solo                     a stream verifies at most the served lane's choice of drafts (its
 //!                                               round table and draft ms): at any streams, or one stream alone
-//!   TF_FILL_CHUNKS=N                            a prompt pass runs N chunks (of 2,048) at a time, the other streams'
-//!   TF_FILL_ROUNDS, TF_FILL_FIRST               rounds between (TF_FILL_ROUNDS of them, 4 unless set); its first
-//!                                               piece TF_FILL_FIRST chunks (unset: N), so a prompt that short runs
-//!                                               whole. One pass at a time. Unset or 0: each pass whole
-//!   TF_FILL_MANY=1                              with TF_FILL_CHUNKS: a request is admitted while a pass fills and
-//!                                               its pass runs between the other's pieces (fewest tokens left first)
-//!   TF_DS_SOLO_OVERHEAD=1                       a lone drafted stream's head windows cost the fixed draft allowance
-//!   TF_DS_NO_COPIES=1                           a drafted stream proposes no suffix-lookup copy windows
-//!   TF_DS_PASS_ROWS=N, TF_DS_PASS_FROM=P        a prompt pass's rows at most (a multiple of 2,048 up to the build's
-//!                                               pass rows), passes of 2,048 below position P (8192 unless set)
+//!   TF_DS_NO_COPIES=1                           decode windows take no copied continuation of the stream's own
+//!                                               context (the drafter's drafts alone; the replies' tokens as without);
+//!                                               rank 0's setting (it plans every window)
+//!   TF_DS_CAND_FIRST=1                          rank 0's round reads (the device's argmax, or a sampled round's first
+//!                                               candidates) run before the drafter's absorb on the stream, and the
+//!                                               host waits for them alone and draws while the absorb runs: the same
+//!                                               kernels on the same inputs, so the same replies; one line says so
+//!   TF_DS_COPY_MATCH=N                          a copied continuation needs N matching tokens, 4 .. 64 (unset: 8);
+//!                                               rank 0's setting
+//!   TF_DS_COPY_ROWS=W                           a lone stream's copied continuation spans up to W rows, 7 .. 17
+//!                                               (unset: the drafter's 6): from 8 drafts, doubling while every copied
+//!                                               token lands, on rungs of 8, 12 and 16 (the replies' tokens as
+//!                                               without); rank 0's setting
 //!   TF_DS_PF_SPLIT=A|B|C6|C7|1                  a prompt chunk's split FP8 GEMMs (wq_a, wkv, wq_b, wo_b, the
 //!                                               indexer's wq_b) on a restructured split loop: that tile
 //!                                               configuration wherever it divides the shape's split, or (1) the
@@ -108,6 +115,12 @@
 //!                                               without it 64 bytes, one stage's), the same arithmetic in the same
 //!                                               order (the replies' bits as without); with the checkpoint's own
 //!                                               weights and the tile kernels; every rank the same
+//!   TF_DS_DECODE_FUSE=1                         a decode round's routed sum (the slots' outputs summed in expert id
+//!                                               order) in the down kernel's launch instead of a launch of its own, and a
+//!                                               2D node's assembly of the experts' intermediate writing down's codes
+//!                                               (down's quant launch goes), the same arithmetic in the same order (the
+//!                                               replies' bits as without); with the checkpoint's own weights and the
+//!                                               decode kernels; every rank the same
 //!   TF_DS_DRAFT_MAIN_4WAY=1                     a 2D node's drafter main_proj on its quarter of the columns (rows of
 //!                                               the rank file's whole entry), an absorb's rows gathered by the
 //!                                               backbone's quarters; the drafts' bits as without; with the
@@ -118,6 +131,12 @@
 //!                                               with the checkpoint's own weights, the decode kernels and the kit's
 //!                                               extra set (aot-extra/: the stages' sparse attention at their heads);
 //!                                               decided before the weights load, every rank the same
+//!   TF_DS_HC_LATE_FORK=1                        a decode mix's side work (the stored streams' dots and the Sinkhorn,
+//!                                               on the mixes' side stream) launched after the main stream's next
+//!                                               launch, the router or the attention's input projections, so a captured
+//!                                               round holds that kernel as the finish's first successor; the same
+//!                                               kernels on the same inputs (the replies' bits as without); with the
+//!                                               checkpoint's own weights and the side stream; every rank the same
 //!   TF_DS_ATTN_EPILOGUE=1                      a prompt chunk's attention output takes the inverse RoPE and wo_a's
 //!                                               quant (its codes and scales, or wo_a's quant-dequant rows) in one
 //!                                               launch, wo_a then reading those bytes (the same arithmetic and the
@@ -328,6 +347,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const st = try gpa.create(State);
     errdefer gpa.destroy(st);
     st.gpa = gpa;
+    // the copy settings need nothing from the model: a bad one refuses the start before the weights load
+    const copies = !lanes_mod.noCopies(getenv("TF_DS_NO_COPIES"));
+    const copy_match = lanes_mod.copyMatch(getenv("TF_DS_COPY_MATCH")) orelse return error.BadCopyMatch;
+    const copy_rows = lanes_mod.copyRows(getenv("TF_DS_COPY_ROWS")) orelse return error.BadCopyRows;
     st.m = try model.Model.open(gpa, io, ctx, .{
         .model_dir = dir,
         .cache_dir = getenv("TF_DS_RANK_CACHE") orelse return error.NoRankCache,
@@ -360,14 +383,17 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer st.lanes.deinit();
     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
     if (getenv("TF_DS_SERVED_K")) |t| st.lanes.served_k = if (std.mem.eql(u8, t, "1") or std.mem.eql(u8, t, "all")) .all else if (std.mem.eql(u8, t, "solo")) .solo else .off;
-    if (getenv("TF_FILL_CHUNKS")) |t| st.lanes.fill_chunks = std.fmt.parseInt(usize, t, 10) catch return error.BadFill;
-    if (getenv("TF_FILL_FIRST")) |t| st.lanes.fill_first = std.fmt.parseInt(usize, t, 10) catch return error.BadFill;
-    st.lanes.fill_many = if (getenv("TF_FILL_MANY")) |v| !std.mem.eql(u8, v, "0") else false;
-    const fill_rounds: u32 = if (getenv("TF_FILL_ROUNDS")) |t| std.fmt.parseInt(u32, t, 10) catch return error.BadFill else 4;
-    st.lanes.solo_overhead = if (getenv("TF_DS_SOLO_OVERHEAD")) |v| !std.mem.eql(u8, v, "0") else false;
-    st.lanes.no_copies = if (getenv("TF_DS_NO_COPIES")) |v| !std.mem.eql(u8, v, "0") else false;
-    if (getenv("TF_DS_PASS_ROWS")) |t| st.lanes.pass_rows = try passRows(t);
-    if (getenv("TF_DS_PASS_FROM")) |t| st.lanes.pass_from = std.fmt.parseInt(usize, t, 10) catch return error.BadPassRows;
+    // copied continuations: rank 0 plans every window (a verify frame carries the window's rows, not its plan), so its
+    // own settings are the engine's
+    st.lanes.copies = copies;
+    st.lanes.copy_match = copy_match;
+    st.lanes.copy_rows = copy_rows;
+    if (!st.lanes.copies) std.log.info("TF_DS_NO_COPIES=1: decode windows take no copied continuation (the drafter's drafts alone)", .{});
+    if (st.lanes.copy_match != lanes_mod.copy_match_default) std.log.info("TF_DS_COPY_MATCH={d}: a copied continuation needs {d} matching tokens ({d} without the setting)", .{ st.lanes.copy_match, st.lanes.copy_match, lanes_mod.copy_match_default });
+    if (st.lanes.copy_rows != 0) {
+        var line: [192]u8 = undefined;
+        std.log.info("{s}", .{lanes_mod.copyRowsLine(&line, st.lanes.copy_rows) catch "TF_DS_COPY_ROWS"});
+    }
     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
     st.vision = null;
     if (st.m.cfg.vision) st.vision = try vision_mod.Vision.open(gpa, io, st.m, dir, getenv("TF_DS_KIT").?);
@@ -413,6 +439,7 @@ pub fn tierMath(two: ?*const prompt2d.Two, k: ?*const mx.Kernels) spill_start.Ma
         .pass_rows = prompt2d.pass_rows_asked,
         .pass_from = prompt2d.pass_from_asked,
         .pass_tail = prompt2d.pass_tail_asked,
+        .decode_fuse = if (k) |x| x.decode_fuse else false,
         .mma_sf = if (k) |x| x.sf == .chained else false,
         .mma_sf_exact = if (k) |x| x.sf == .exact else false,
         .gemm_w16 = if (k) |x| x.gemm_w16 else false,
@@ -477,6 +504,8 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NoKit => "set TF_DS_KIT to the kernel kit (cubins/, the RoPE tables, engram.json)",
         error.NoFreeSlot => "this engine serves TF_DS_STREAMS streams at once (default 4): --parallel at most that",
         error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 64",
+        error.BadCopyMatch => "TF_DS_COPY_MATCH: the matching tokens a copied continuation needs, 4 .. 64 (unset: 8)",
+        error.BadCopyRows => std.fmt.comptimePrint("TF_DS_COPY_ROWS: a lone stream's copied window's rows at most, {d} .. {d} (unset: {d})", .{ lanes_mod.window_rows + 1, lanes_mod.copy_rows_most, lanes_mod.window_rows }),
         error.BadGraphCap => "TF_DS_GRAPH_CAP: the captured CUDA graphs kept at most, a count (0: all)",
         error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 32",
         error.BadPassRows => "TF_DS_PASS_ROWS: a multiple of 2,048 from 2,048 to the build's pass rows; TF_DS_PASS_FROM: a position",
@@ -573,6 +602,7 @@ test "the tier's math carries TF_DS_PF_SPLIT in effect: the native kernels' sett
     k.topk_tiles = false;
     k.bf16_rows = false;
     k.run128 = false;
+    k.decode_fuse = false;
     k.sf = .off;
     for ([_]mx.PfSplit{ .off, .table, .a, .b, .c6, .c7 }, [_][]const u8{ "0", "1", "A", "B", "C6", "C7" }) |sw, text| {
         k.split = sw;
@@ -600,6 +630,10 @@ test "the tier's math carries TF_DS_PF_SPLIT in effect: the native kernels' sett
     try std.testing.expect(!tierMath(null, null).pf_run128 and !tierMath(null, &k).pf_run128);
     k.run128 = true;
     try std.testing.expect(tierMath(null, &k).pf_run128);
+    // TF_DS_DECODE_FUSE likewise
+    try std.testing.expect(!tierMath(null, null).decode_fuse and !tierMath(null, &k).decode_fuse);
+    k.decode_fuse = true;
+    try std.testing.expect(tierMath(null, &k).decode_fuse);
     // TF_DS_MMA_SF likewise: the arithmetic in effect after the agreement, off without the native kernels
     k.sf = .off;
     try std.testing.expect(!tierMath(null, null).mma_sf and !tierMath(null, &k).mma_sf);
@@ -617,6 +651,8 @@ test "the tier's math carries TF_DS_PF_SPLIT in effect: the native kernels' sett
 
 test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
+    try std.testing.expectEqualStrings("TF_DS_COPY_MATCH: the matching tokens a copied continuation needs, 4 .. 64 (unset: 8)", explain(null, error.BadCopyMatch).?);
+    try std.testing.expectEqualStrings("TF_DS_COPY_ROWS: a lone stream's copied window's rows at most, 7 .. 17 (unset: 6)", explain(null, error.BadCopyRows).?);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "--streams") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "--graph-cap") != null);
@@ -630,9 +666,11 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_IDX_PROJ_OWNED") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_BF16_ROWS") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_PF_RUN128") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_DECODE_FUSE") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_DRAFT_4WAY") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_DRAFT_MAIN_4WAY") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.DraftersDiffer).?, "TF_DS_DRAFT_MAIN_4WAY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_HC_LATE_FORK") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_ATTN_U") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_IDX_U") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_IDX_V") != null);

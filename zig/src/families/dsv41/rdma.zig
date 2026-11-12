@@ -88,6 +88,11 @@ const send_depth = 512;
 const cq_depth = 4096;
 const stage_threads = 512;
 const collect_threads = 256;
+comptime {
+    // rdma_gather.cu's COLLECT_THREADS pins the same 256: the host's unit4 = 4 * collect_threads and the kernel's
+    // c0 + k * COLLECT_THREADS must agree.
+    if (collect_threads != 256) @compileError("collect_threads must equal rdma_gather.cu's COLLECT_THREADS (256)");
+}
 const mtu_4096 = 5;
 const port_num = 1;
 const relay_wr: u64 = 1 << 63; // a relayed write's wr_id: its sequence with this bit
@@ -125,6 +130,7 @@ pub const Settings = struct {
     wait_explicit: bool = true, // TF_DS_RING_WAIT was set (to 1), not the default: only names the switch in a refusal (Model.open has already fallen back where the default cannot run)
     wait: bool = false, // TF_DS_RING_WAIT (needs roci == .word): Core Direct queue pairs wait in the card on the doorbell; no proxy thread
     cpu: ?u16 = null, // the proxy thread's CPU (TF_DS_RDMA_CPUS), else wherever the scheduler puts it
+    collect_peers: bool = false, // TF_DS_RDMA_COLLECT_PEERS: gather_into's copy-out by dsv41_rdma_collect_peers
 };
 
 /// What the other side's queue pairs toward this rank need (a device each), and where this rank's receive ring is.
@@ -147,6 +153,7 @@ pub const Kernels = struct {
     stage: cuda.Function,
     collect: cuda.Function,
     collect_into: cuda.Function,
+    collect_peers: ?cuda.Function = null,
     collect_roci: ?cuda.Function = null,
     collect_into_roci: ?cuda.Function = null,
     collect_peers_roci: ?cuda.Function = null,
@@ -187,6 +194,12 @@ pub const Kernels = struct {
     }
 };
 
+/// gather_into's destinations as the collecting kernels take them (rdma_gather.cu Dsts): rank p's slice, rows of row4[p]
+/// float4 packed in its ring slot, copied to rows stride4[p] float4 apart from ptr[p] (0: not copied out; row4 0: zero
+/// width, not copied out either).
+pub const Dsts = extern struct { ptr: [8]u64 = @splat(0), stride4: [8]i64 = @splat(0), row4: [8]c_int = @splat(0) };
+
+/// What a collecting kernel reads besides the destinations: the receive ring (its device address), the flags [slots]
 /// [world], the sequence word, the abort word and the probe (device addresses; probe 0: none), this rank and the
 /// world; with TF_DS_RING_WORD the generation words [peer][lane], the lanes toward each peer, the first expired
 /// wait's record and the wait's deadline instead of the flags.
@@ -211,6 +224,7 @@ pub const CollectRing = struct {
     own_stride4: u64 = 0,
     own_n4: u32 = 0,
 };
+
 /// Whether a gather's copy-out waits on the lanes' generation words: the ring's own signal (CollectRing.roci), which is off when
 /// connect refused the setting, so no kernel is handed words that do not exist.
 fn collectsOnWords(s: Settings, ring: CollectRing) bool {
@@ -325,6 +339,7 @@ pub fn xlogRenderPub(gpa: std.mem.Allocator, rank: u32, world: u32, ring: []cons
 /// wait is the lanes' words, bounded); else dsv41_rdma_collect_peers when `s.collect_peers` and the fatbin has it (on
 /// peersGrid's grid; no probe), else dsv41_rdma_collect_into on the baseline grid (the float4 copied out, `copy4`, a block
 /// for each collect_grain x 256 of them, up to collect_blocks). Every path copies the same bytes.
+pub fn launchCollect(k: Kernels, s: Settings, stream: cuda.Stream, d: Dsts, rows: u32, ring: CollectRing, copy4: u64) Error!void {
     if (collectsOnWords(s, ring)) {
         const w = ring;
         const pr = Kernels.pick(k.collect_peers_roci, k.collect_peers_roci_x);
@@ -377,13 +392,90 @@ pub fn xlogRenderPub(gpa: std.mem.Allocator, rank: u32, world: u32, ring: []cons
         const blocks = std.math.clamp((copy4 + per - 1) / per, 1, s.collect_blocks);
         return cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = s.pdl }, stream, &a);
     }
+    if (s.collect_peers) if (k.collect_peers) |f| {
+        // every peer's slot at once: a row of blocks a peer copied out
+        var row4s: [max_ranks]u32 = @splat(0);
+        for (0..ring.world) |p| row4s[p] = if (peerCopied(d, @intCast(p), ring.rank)) @intCast(d.row4[p]) else 0;
+        const g = peersGrid(rows, row4s[0..ring.world], ring.rank, s.collect_blocks);
+        var b: cuda.Args = .{};
+        b.add(d);
+        b.add(@as(c_int, @intCast(rows)));
+        b.add(ring.recv);
+        b.add(ring.flags);
+        b.add(ring.seq);
+        b.add(@as(c_int, @intCast(ring.rank)));
+        b.add(@as(c_int, @intCast(ring.world)));
+        b.add(@as(c_int, @intCast(s.slots)));
+        b.add(@as(u64, s.max_bytes));
+        b.add(ring.abort);
+        b.add(@as(c_int, @intFromBool(s.pdl)));
+        return cuda.launch.launch(f, .{ .grid = .{ .x = g.x, .y = g.y, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = s.pdl }, stream, &b);
+    };
+    var a: cuda.Args = .{};
+    a.add(d);
+    a.add(@as(c_int, @intCast(rows)));
+    a.add(ring.recv);
+    a.add(ring.flags);
+    a.add(ring.seq);
+    a.add(@as(c_int, @intCast(ring.rank)));
+    a.add(@as(c_int, @intCast(ring.world)));
+    a.add(@as(c_int, @intCast(s.slots)));
+    a.add(@as(u64, s.max_bytes));
+    a.add(ring.probe);
+    a.add(ring.abort);
+    a.add(@as(c_int, @intFromBool(s.pdl)));
+    const per = collect_threads * s.collect_grain;
+    const blocks = std.math.clamp((copy4 + per - 1) / per, 1, s.collect_blocks);
+    try cuda.launch.launch(k.collect_into, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = s.pdl }, stream, &a);
+}
+
+/// dsv41_rdma_collect_peers' grid: y a row of blocks for each peer copied out, x blocks a row.
+pub const PeersGrid = struct { x: u32, y: u32 };
+
+/// TF_DS_RDMA_COLLECT_PEERS' grid for a gather_into of `rows` rows: a row of blocks (y) for each peer copied out
+/// (row4[p] > 0 and p not `rank`), and as many blocks a row (x) as the widest of them has units (a row's 1,024 float4 a
+/// unit: the kernel's PEER_UNIT4), up to `collect_blocks` shared out among those peers, at least one each; a grid of one
+/// when no peer is copied out.
+pub fn peersGrid(rows: u32, row4: []const u32, rank: u32, collect_blocks: u32) PeersGrid {
+    const unit4: u32 = 4 * collect_threads;
+    var peers: u32 = 0;
+    var units: u32 = 0;
+    for (row4, 0..) |w, p| {
+        if (p == rank or w == 0) continue;
+        peers += 1;
+        units = @max(units, rows * ((w + unit4 - 1) / unit4));
+    }
+    if (peers == 0) return .{ .x = 1, .y = 1 };
+    return .{ .x = std.math.clamp(units, 1, @max(1, collect_blocks / peers)), .y = peers };
+}
+
+/// Whether the collecting kernels copy rank `p`'s slot out: a destination pointer and a nonzero row width, and not
+/// this rank's own slice. The host's grid (peersGrid) and dsv41_rdma_collect_peers' block row selection both use this
+/// rule; the kernel's condition in rdma_gather.cu must match it.
+pub fn peerCopied(d: Dsts, p: u32, rank: u32) bool {
+    return p != rank and d.ptr[p] != 0 and d.row4[p] != 0;
+}
+
+/// The peer dsv41_rdma_collect_peers' block row `y` copies: the y-th rank p in order with peerCopied(d, p, rank); null
+/// when the grid's rows are exhausted. Mirrors the kernel's `p` selection (rdma_gather.cu).
+pub fn peerAtRow(d: Dsts, world: u32, rank: u32, y: u32) ?u32 {
+    var left = y;
+    var p: u32 = 0;
+    while (p < world) : (p += 1) {
+        if (!peerCopied(d, p, rank)) continue;
+        if (left == 0) return p;
+        left -= 1;
+    }
+    return null;
+}
+
 /// cuMemHostRegister / cuMemHostUnregister, which the runtime's driver table does not hold.
-const HostReg = struct {
+pub const HostReg = struct {
     lib: std.DynLib,
     register: *const fn (?*anyopaque, usize, c_uint) callconv(.c) cuda.abi.Result,
     unregister: *const fn (?*anyopaque) callconv(.c) cuda.abi.Result,
 
-    fn open() Error!HostReg {
+    pub fn open() Error!HostReg {
         var lib = std.DynLib.open("libcuda.so.1") catch return error.NoHostRegister;
         errdefer lib.close();
         return .{
@@ -400,12 +492,13 @@ extern "c" fn mlock(addr: *const anyopaque, len: usize) c_int;
 /// cuMemHostRegister makes them mapped and portable. `allocHost` takes them from cudaHostAlloc instead: with `wc` it
 /// asks for write-combined pages, which a kernel writes and the NIC reads (the GPU reads them too; a CPU read of them
 /// is uncached and slow, so only the rings' data slots live here, never a flag, size, sent word or the doorbell).
+pub const Pinned = struct {
     mem: []align(std.heap.page_size_min) u8,
     dev: DevicePtr,
     host: bool = false, // cudaHostAlloc memory: free it with cuMemFreeHost, not munmap + cuMemHostUnregister
     d: ?*const cuda.Driver = null,
 
-    fn alloc(d: *const cuda.Driver, hr: *const HostReg, len: usize) Error!Pinned {
+    pub fn alloc(d: *const cuda.Driver, hr: *const HostReg, len: usize) Error!Pinned {
         const n = std.mem.alignForward(usize, len, 1 << 16);
         const mem = try std.posix.mmap(null, n, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
         errdefer std.posix.munmap(mem);
@@ -439,6 +532,7 @@ extern "c" fn mlock(addr: *const anyopaque, len: usize) c_int;
         return .{ .mem = mem, .dev = dev, .host = true, .d = d };
     }
 
+    pub fn free(p: *Pinned, hr: *const HostReg) void {
         if (p.host) {
             _ = p.d.?.api.cuMemFreeHost(p.mem.ptr);
             p.* = undefined;
@@ -1913,8 +2007,7 @@ pub const Ring = struct {
         if (dsts.len != r.world) return error.BadInfo;
         const n4 = rows * own_row4;
         if (@as(usize, n4) * 16 > r.s.max_bytes) return error.TooLarge;
-        const D = extern struct { ptr: [8]u64, stride4: [8]i64, row4: [8]c_int };
-        var dd: D = std.mem.zeroes(D);
+        var dd: Dsts = .{};
         var copy4: u64 = 0;
         for (dsts, 0..) |t, p| {
             if (t.ptr == 0) continue;
@@ -2259,6 +2352,62 @@ test "the info a peer reads is a plain extern struct (it crosses the link as byt
     try std.testing.expectEqual(@as(usize, 120), @offsetOf(Info, "recv"));
     try std.testing.expectEqual(@as(usize, 128), @offsetOf(Info, "gen"));
     try std.testing.expectEqual(@as(usize, 136), @offsetOf(Info, "gen_rkey"));
+}
+
+test "TF_DS_RDMA_COLLECT_PEERS' grid: a row of blocks a peer copied out, as many as the widest peer's units up to its share of the collecting blocks" {
+    // the modal all4 exchange: 2 rows of 640 float4 (10,240 bytes) from each of 3 peers, a block a row a peer
+    try std.testing.expectEqual(PeersGrid{ .x = 2, .y = 3 }, peersGrid(2, &.{ 640, 640, 640, 640 }, 1, 48));
+    // the head's quarters (8,096 / 8,064 float4 a row, 8 units each): 16 a peer, a third of the 48
+    try std.testing.expectEqual(PeersGrid{ .x = 16, .y = 3 }, peersGrid(2, &.{ 8096, 8064, 8096, 8064 }, 0, 48));
+    // 26 rows (16 streams) of 640: 26 units a peer, capped at 16
+    try std.testing.expectEqual(PeersGrid{ .x = 16, .y = 3 }, peersGrid(26, &.{ 640, 640, 640, 640 }, 2, 48));
+    // the column ring's one peer: its units up to all 48
+    try std.testing.expectEqual(PeersGrid{ .x = 2, .y = 1 }, peersGrid(2, &.{ 256, 256 }, 0, 48));
+    try std.testing.expectEqual(PeersGrid{ .x = 48, .y = 1 }, peersGrid(34, &.{ 8096, 8096 }, 1, 48));
+    // a null destination (row4 0) is not copied out, nor this rank's own slice
+    try std.testing.expectEqual(PeersGrid{ .x = 3, .y = 2 }, peersGrid(3, &.{ 640, 0, 640, 640 }, 3, 48));
+    // none copied out: a grid of one
+    try std.testing.expectEqual(PeersGrid{ .x = 1, .y = 1 }, peersGrid(2, &.{ 0, 640 }, 1, 48));
+    // a budget of one block still gives each peer one
+    try std.testing.expectEqual(PeersGrid{ .x = 1, .y = 3 }, peersGrid(2, &.{ 640, 640, 640, 640 }, 0, 1));
+    // a row of 1,025 float4: two units
+    try std.testing.expectEqual(PeersGrid{ .x = 2, .y = 1 }, peersGrid(1, &.{ 1025, 1025 }, 0, 48));
+}
+
+test "collect_peers' block rows skip a zero-width destination and keep every copied peer's row" {
+    // rank 1's destination has a pointer but row4 = 0: the host's grid excludes it. Ranks 2 and 3 are copied out;
+    // rank 0 is this rank. The kernel's y-th row must select 2 and 3, not 1 and 2.
+    const d: Dsts = .{
+        .ptr = .{ 0x1000, 0x2000, 0x3000, 0x4000, 0, 0, 0, 0 },
+        .row4 = .{ 64, 0, 64, 64, 0, 0, 0, 0 },
+        .stride4 = .{ 64, 64, 64, 64, 0, 0, 0, 0 },
+    };
+    try std.testing.expectEqual(PeersGrid{ .x = 2, .y = 2 }, peersGrid(2, &.{ 64, 0, 64, 64 }, 0, 48));
+    try std.testing.expect(!peerCopied(d, 0, 0)); // this rank's own slice
+    try std.testing.expect(!peerCopied(d, 1, 0)); // a pointer but row4 0: not copied out
+    try std.testing.expect(peerCopied(d, 2, 0));
+    try std.testing.expect(peerCopied(d, 3, 0));
+    try std.testing.expectEqual(@as(?u32, 2), peerAtRow(d, 4, 0, 0));
+    try std.testing.expectEqual(@as(?u32, 3), peerAtRow(d, 4, 0, 1));
+    try std.testing.expectEqual(@as(?u32, null), peerAtRow(d, 4, 0, 2));
+}
+
+test "TF_DS_RDMA_COLLECT_PEERS is off by default; gatherInto takes dsv41_rdma_collect_peers only when it is set and the fatbin has the kernel" {
+    const s: Settings = .{ .max_bytes = 64 };
+    try std.testing.expect(!s.collect_peers);
+    const src = @embedFile("rdma.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, ".collect_peers = m.function(\"dsv41_rdma_collect_peers\") catch null") != null);
+    const at = std.mem.indexOf(u8, src, "pub fn launchCollect(") orelse return error.TestUnexpectedResult;
+    const body = src[at .. at + (std.mem.indexOf(u8, src[at..], "\n}\n") orelse return error.TestUnexpectedResult)];
+    const peers = std.mem.indexOf(u8, body, "if (s.collect_peers) if (k.collect_peers) |f| {") orelse return error.TestUnexpectedResult;
+    const grid = std.mem.indexOf(u8, body, "const g = peersGrid(rows, row4s[0..ring.world], ring.rank, s.collect_blocks);") orelse return error.TestUnexpectedResult;
+    const today = std.mem.indexOf(u8, body, "try cuda.launch.launch(k.collect_into,") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(peers < grid and grid < today);
+    // gather_into stages, then launches its copy-out through launchCollect alone
+    const gi = std.mem.indexOf(u8, src, "pub fn gatherInto(") orelse return error.TestUnexpectedResult;
+    const gbody = src[gi .. gi + (std.mem.indexOf(u8, src[gi..], "\n    }\n") orelse return error.TestUnexpectedResult)];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gbody, "try launchCollect(r.k, r.s, stream, dd, rows, "));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, gbody, "cuda.launch.launch("));
 }
 
 test "lanes pair each subnet's devices in list order; a peer across the ring has none" {

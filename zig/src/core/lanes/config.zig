@@ -35,8 +35,20 @@ pub const Model = struct {
     draft_streams: bool = false, // the head drafts every stream of a shared round in one batch
     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
     lane_costs: []const Cost = &.{}, // a lone stream's window ms by rows, up to its widest tree (timed at load)
+    copies: bool = true, // windows may take a stream's copied continuations (windows.copyProposal)
+    enter_match: i64 = 8, // and the matching tokens a copy needs
+    copy_rows: u32 = 0, // a lone stream's copied window's rows at most, past the exact width (0: the exact width)
     lone_copies: bool = true, // a lone stream proposes copies (false: only streams in shared rounds do)
 };
+
+/// A wide copy's first width in drafts (Model.copy_rows set): a lone stream's copies start there and double to their
+/// most while every copied token lands.
+pub const wide_first: u32 = 8;
+
+/// A lone stream's first copy width past every window's (copy_rows set): wide_first drafts, at most `alone_max`.
+pub fn aloneFirst(alone_max: u32) u32 {
+    return @min(wide_first, alone_max);
+}
 
 pub const Config = struct {
     solo_head_overhead_ms: ?f64 = null, // fixed overhead for a lone head window; null keeps the live estimate
@@ -67,8 +79,13 @@ pub const Config = struct {
     shared_costs: Table,
     lane_costs: Table, // window ms by rows to 64 (lanes/plan_lanes.zig)
     mtp_step_ms: f64,
-    enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation)
+    copies: bool = true, // windows take copied continuations (false: never; Model.copies)
+    enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation; Model.enter_match)
     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation
+    // a lone stream's copy widths in drafts, first and most (Model.copy_rows past the exact width: wide_first and
+    // copy_rows - 1; else first_copy and max_copy, every window's)
+    alone_first: u32 = 0,
+    alone_max: u32 = 0,
     lone_copies: bool = true, // Model.lone_copies
     k: Constants = .{},
 
@@ -105,7 +122,11 @@ pub const Config = struct {
         }
         const depth_prior = try gpa.dupe(f64, prior);
         errdefer gpa.free(depth_prior);
+        const wide = m.copy_rows > width and max_copy >= 1;
+        const alone_max: u32 = if (wide) @min(m.copy_rows, max_rows) - 1 else max_copy;
         return .{
+            .alone_first = if (wide) aloneFirst(alone_max) else first_copy,
+            .alone_max = alone_max,
             .lone_copies = m.lone_copies,
             .family_width = width,
             .max_copy = max_copy,
@@ -127,6 +148,8 @@ pub const Config = struct {
             .shared_costs = try alloc.extendCosts(gpa, timed.items, batch_rows),
             .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
             .mtp_step_ms = m.mtp_step_ms,
+            .copies = m.copies,
+            .enter_match = m.enter_match,
             .k = .{ .depth_rate = if (m.depth_rate > 0) m.depth_rate else (Constants{}).depth_rate },
             .solo_head_overhead_ms = m.solo_head_overhead_ms,
             .copy_proposals = m.copy_proposals,
@@ -177,4 +200,35 @@ test "copy windows stay on unless a backend opts out" {
     var off = try Config.init(a, .{ .copy_proposals = false }, 8, 7);
     defer off.deinit(a);
     try std.testing.expect(!off.copy_proposals);
+}
+
+test "a lone stream's copy widths: every window's without copy_rows; wide_first up to copy_rows - 1 with it, the other widths kept" {
+    const gpa = std.testing.allocator;
+    const m: Model = .{ .exact_width = 6, .gpu_tokens = false, .mtp = true, .speculate = true, .drafts = 5, .hidden_rows = true };
+    var c0 = try Config.init(gpa, m, 48, 47);
+    defer c0.deinit(gpa);
+    try std.testing.expectEqual(c0.first_copy, c0.alone_first);
+    try std.testing.expectEqual(c0.max_copy, c0.alone_max);
+    for ([_][3]u32{ .{ 17, 8, 16 }, .{ 13, 8, 12 }, .{ 7, 6, 6 }, .{ 9, 8, 8 } }) |x| {
+        var wm = m;
+        wm.copy_rows = x[0];
+        var c = try Config.init(gpa, wm, 48, 47);
+        defer c.deinit(gpa);
+        try std.testing.expectEqual(x[1], c.alone_first);
+        try std.testing.expectEqual(x[2], c.alone_max);
+        // every other width as without it
+        try std.testing.expectEqual(c0.first_copy, c.first_copy);
+        try std.testing.expectEqual(c0.max_copy, c.max_copy);
+        try std.testing.expectEqual(c0.base_width, c.base_width);
+        try std.testing.expectEqual(c0.family_width, c.family_width);
+        try std.testing.expectEqual(c0.most_drafts, c.most_drafts);
+    }
+    // the rows the host allows bound it; copy_rows at or under the exact width is no wide copy
+    for ([_][3]u32{ .{ 17, 12, 11 }, .{ 6, 48, 5 }, .{ 4, 48, 5 } }) |x| {
+        var wm = m;
+        wm.copy_rows = x[0];
+        var c = try Config.init(gpa, wm, x[1], x[1] - 1);
+        defer c.deinit(gpa);
+        try std.testing.expectEqual(x[2], c.alone_max);
+    }
 }

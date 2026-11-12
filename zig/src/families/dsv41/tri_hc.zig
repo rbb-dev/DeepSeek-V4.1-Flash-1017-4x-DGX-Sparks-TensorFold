@@ -79,14 +79,50 @@ pub const Sink = struct { s: cuda.Stream, fork: cuda.Event };
 
 /// sink.wait_stream(current stream): a Tri on the side stream after the work queued so far; no PDL (no _pdl() there).
 fn sinkTri(t: Tri, sk: Sink) !Tri {
-    if (t.log == null) {
-        try sk.fork.record(t.stream);
-        try sk.s.wait(sk.fork);
-    }
+    try forkAt(t, sk);
+    return sideOf(t, sk);
+}
+
+/// The fork's point: the side work waits for the main stream's work queued so far.
+fn forkAt(t: Tri, sk: Sink) !void {
+    if (t.log) |l| return l.mark(.fork);
+    try sk.fork.record(t.stream);
+}
+
+/// A Tri on the side stream after the fork last recorded (sinkTri's second half).
+fn sideOf(t: Tri, sk: Sink) !Tri {
+    if (t.log) |l| try l.mark(.wait) else try sk.s.wait(sk.fork);
     var st = t;
     st.stream = sk.s;
     st.pdl = false;
     return st;
+}
+
+/// A mix's side work after its fork: the stored streams' dots (`dots`: _hc_mix_part of x) and the Sinkhorn
+/// (_hc_sinkhorn), on the side stream (launchSide).
+pub const SideWork = struct {
+    sink: Sink,
+    dots: bool,
+    x: u64,
+    post: u64,
+    comb: u64,
+    fn_w: u64,
+    part: u64,
+    base: u64,
+    scale: u64,
+    pre_out: u64,
+    eps: f32,
+    hc_eps: f32,
+    iters: usize,
+    rows: usize,
+    d: usize,
+};
+
+/// The side work's launches on the side stream, behind the fork recorded where hcPre2 records it.
+pub fn launchSide(t: Tri, w: SideWork) !void {
+    const st = try sideOf(t, w.sink);
+    if (w.dots) try mixPart(st, w.x, null, w.post, w.comb, w.fn_w, w.part, w.rows, w.d);
+    try sinkhorn(st, w.part, w.base, w.scale, w.pre_out, w.post, w.comb, w.eps, w.hc_eps, w.iters, w.rows, w.d);
 }
 
 /// t.run with `rows` appended as an i32 argument.
@@ -153,6 +189,18 @@ fn sinkhorn(t: Tri, part: u64, base: u64, scale: u64, pre_out: u64, post: u64, c
 
 /// hc_pre2: hc_pre's outputs for a decode window (the same bits), the last post fused in if `posted`; returns the src.
 pub fn hcPre2(t: Tri, h: u64, fn_w: u64, scale: u64, base: u64, pre_in: u64, norm_w: u64, eps: f32, hc_eps: f32, iters: usize, out: u64, pre_out: u64, post: u64, comb: u64, part: u64, posted: ?Posted, sink: ?Sink, rows: usize, d: usize) !u64 {
+    return pre2(t, h, fn_w, scale, base, pre_in, norm_w, eps, hc_eps, iters, out, pre_out, post, comb, part, posted, sink, rows, d, null);
+}
+
+/// hcPre2 whose side work starts after the main stream's next launch (TF_DS_HC_LATE_FORK): the same kernels, the
+/// same forks (the side work waits for the work queued up to where hcPre2 forks), but the side stream's launches come
+/// later, so the main stream's next kernel is captured first. On the dots path the side work goes into `late` for the
+/// caller's launchSide after that next launch; else the Sinkhorn is launched after the finish, here.
+pub fn hcPre2Late(t: Tri, h: u64, fn_w: u64, scale: u64, base: u64, pre_in: u64, norm_w: u64, eps: f32, hc_eps: f32, iters: usize, out: u64, pre_out: u64, post: u64, comb: u64, part: u64, posted: ?Posted, sink: Sink, rows: usize, d: usize, late: *?SideWork) !u64 {
+    return pre2(t, h, fn_w, scale, base, pre_in, norm_w, eps, hc_eps, iters, out, pre_out, post, comb, part, posted, sink, rows, d, late);
+}
+
+fn pre2(t: Tri, h: u64, fn_w: u64, scale: u64, base: u64, pre_in: u64, norm_w: u64, eps: f32, hc_eps: f32, iters: usize, out: u64, pre_out: u64, post: u64, comb: u64, part: u64, posted: ?Posted, sink: ?Sink, rows: usize, d: usize, late: ?*?SideWork) !u64 {
     if (posted) |ps| std.debug.assert(ps.h_out != h);
     if (sink != null and posted != null and hcDotsOn(d)) {
         // hc_dots: the post alone and the finish here, the mixes of the stored streams and the Sinkhorn on the side one
@@ -162,16 +210,25 @@ pub fn hcPre2(t: Tri, h: u64, fn_w: u64, scale: u64, base: u64, pre_in: u64, nor
             p("POST", "*fp32", post), p("COMB", "*fp32", comb),
         }, &.{ ci("WIDE", 4 * d), ci("D", d), ci("KB", 4 * d / hc_blocks), ci("WORLD", ps.world), t.pdlConst() });
         try finishSplit(t, ps.h_out, part, base, scale, pre_in, norm_w, out, pre_out, post, comb, eps, hc_eps, iters, true, rows, d);
-        const st = try sinkTri(t, sink.?);
-        try mixPart(st, ps.h_out, null, post, comb, fn_w, part, rows, d);
-        try sinkhorn(st, part, base, scale, pre_out, post, comb, eps, hc_eps, iters, rows, d);
+        const w: SideWork = .{ .sink = sink.?, .dots = true, .x = ps.h_out, .post = post, .comb = comb, .fn_w = fn_w, .part = part, .base = base, .scale = scale, .pre_out = pre_out, .eps = eps, .hc_eps = hc_eps, .iters = iters, .rows = rows, .d = d };
+        try forkAt(t, sink.?);
+        if (late) |l| l.* = w else try launchSide(t, w);
         return ps.h_out;
     }
     try mixPart(t, h, posted, post, comb, fn_w, part, rows, d);
     const src = if (posted) |ps| ps.h_out else h;
     if (d % 1024 == 0) {
         // the split finish (switch "hc_split" on in the served build); with `sink` its Sinkhorn half on the side stream
-        if (sink) |sk| try sinkhorn(try sinkTri(t, sk), part, base, scale, pre_out, post, comb, eps, hc_eps, iters, rows, d);
+        if (sink) |sk| {
+            if (late != null) {
+                // the fork after the mixes, as below, the Sinkhorn launched after the finish (the finish captured first)
+                try forkAt(t, sk);
+                try finishSplit(t, src, part, base, scale, pre_in, norm_w, out, pre_out, post, comb, eps, hc_eps, iters, true, rows, d);
+                try launchSide(t, .{ .sink = sk, .dots = false, .x = src, .post = post, .comb = comb, .fn_w = fn_w, .part = part, .base = base, .scale = scale, .pre_out = pre_out, .eps = eps, .hc_eps = hc_eps, .iters = iters, .rows = rows, .d = d });
+                return src;
+            }
+            try sinkhorn(try sinkTri(t, sk), part, base, scale, pre_out, post, comb, eps, hc_eps, iters, rows, d);
+        }
         try finishSplit(t, src, part, base, scale, pre_in, norm_w, out, pre_out, post, comb, eps, hc_eps, iters, sink != null, rows, d);
     } else {
         try t.run("_hc_finish_u", .{ u(rows), 1, 1 }, &finishArgs(src, part, base, scale, pre_in, norm_w, out, pre_out, post, comb, eps, hc_eps), &.{ ci("D", d), ci("NB", hc_blocks), ci("ITERS", iters), ci("BLOCK", 1024), t.pdlConst() });
@@ -445,6 +502,7 @@ fn expectLog(log: *tri.Log, names: []const []const u8, wires: []const Wire) !voi
     defer {
         log.deinit();
         log.items = .empty;
+        log.marks = .empty;
     }
     try std.testing.expectEqual(names.len, log.items.items.len);
     for (names, log.items.items) |n, k| try std.testing.expectEqualStrings(n, k.name);
@@ -471,6 +529,57 @@ test "expectLog reads a logged argument by its kind, a pointer or an integer" {
         .{ 0, "N", 7 },
         .{ 0, "F", @as(u64, @as(u32, @bitCast(@as(f32, 1.5)))) },
     });
+}
+
+/// Two logged launches the same: function, grid, arguments and constexprs.
+fn sameLaunch(a: tri.Log.Kept, b: tri.Log.Kept) bool {
+    if (!std.mem.eql(u8, a.name, b.name) or !std.mem.eql(u32, &a.grid, &b.grid) or a.args.len != b.args.len or a.consts.len != b.consts.len) return false;
+    for (a.args, b.args) |x, y| {
+        if (!std.mem.eql(u8, x.name, y.name) or !std.meta.eql(x.value, y.value)) return false;
+    }
+    for (a.consts, b.consts) |x, y| {
+        if (!std.mem.eql(u8, x.name, y.name) or !std.meta.eql(x.int, y.int) or !std.meta.eql(x.f32, y.f32)) return false;
+    }
+    return true;
+}
+
+test "TF_DS_HC_LATE_FORK: a mix's side work is launched after the main stream's next launch, the launches the baseline's" {
+    const a = std.testing.allocator;
+    const h = stand(1);
+    const part = stand(2);
+    const ps: Posted = .{ .gathered = stand(3), .world = 2, .h_out = stand(4) };
+    for ([_]?Posted{ ps, null }) |posted| {
+        var today: tri.Log = .{ .gpa = a };
+        defer today.deinit();
+        _ = try hcPre2(.{ .log = &today }, h, stand(5), stand(6), stand(7), stand(8), stand(9), 1e-20, 1e-6, 20, stand(10), stand(11), stand(12), stand(13), part, posted, side, 16, 5120);
+        var late: tri.Log = .{ .gpa = a };
+        defer late.deinit();
+        const t: Tri = .{ .log = &late };
+        var w: ?SideWork = null;
+        const src = try hcPre2Late(t, h, stand(5), stand(6), stand(7), stand(8), stand(9), 1e-20, 1e-6, 20, stand(10), stand(11), stand(12), stand(13), part, posted, side, 16, 5120, &w);
+        try std.testing.expectEqual(if (posted) |x| x.h_out else h, src);
+        // the main stream's next launch (the router), then the side work left for it
+        try t.run("router", .{ 1, 1, 1 }, &.{}, &.{});
+        if (w) |x| try launchSide(t, x);
+        const got = late.items.items;
+        const was = today.items.items;
+        try std.testing.expectEqual(was.len + 1, got.len);
+        // dots path: post, finish | router | dots, Sinkhorn (baseline: post, finish, dots, Sinkhorn); without the post: the
+        // dots, finish | Sinkhorn | router (baseline: the dots, the Sinkhorn on the side stream, then the finish)
+        const order: []const usize = if (posted != null) &.{ 0, 1, 99, 2, 3 } else &.{ 0, 2, 1, 99 };
+        for (order, got) |i, k| {
+            if (i == 99) {
+                try std.testing.expectEqualStrings("router", k.name);
+            } else try std.testing.expect(sameLaunch(was[i], k));
+        }
+        try std.testing.expectEqual(posted != null, w != null);
+        // the forks: recorded where the baseline are (after the finish; without the post after the dots), the side
+        // stream's wait (its first launch) after the main stream's next launch (or the finish)
+        const M = tri.Log.Mark;
+        const fork_at: usize = if (posted != null) 2 else 1;
+        try std.testing.expectEqualSlices(M, &.{ .{ .at = fork_at, .what = .fork }, .{ .at = fork_at, .what = .wait } }, today.marks.items);
+        try std.testing.expectEqualSlices(M, &.{ .{ .at = fork_at, .what = .fork }, .{ .at = fork_at + 1, .what = .wait } }, late.marks.items);
+    }
 }
 
 test "a posted mix reads the gathered planes at the stride it is given, the launch's own rows by default" {

@@ -195,6 +195,10 @@ pub const Round = struct {
     side: ?cuda.Stream = null,
     join: ?cuda.Event = null,
     side_out: bool = false,
+    // TF_DS_HC_LATE_FORK (useLateFork): a mix's side work launched after the main stream's next launch (flushSide), not
+    // at the mix; the side work a mix left to launch
+    late_fork: bool = false,
+    side_work: ?tri_hc.SideWork = null,
     // the paced L2 prefetch (usePrefetch): the next kernels' weights touched into L2 on a stream of its own
     pf: ?cuda.Stream = null,
     pf_fork: ?cuda.Event = null,
@@ -354,6 +358,8 @@ pub const Round = struct {
         rd.side = null;
         rd.join = null;
         rd.side_out = false;
+        rd.late_fork = false;
+        rd.side_work = null;
         rd.pf = null;
         rd.pf_fork = null;
         rd.pf_join = null;
@@ -375,6 +381,14 @@ pub const Round = struct {
         rd.join = try cuda.Event.init(e.d, false);
         rd.side = s;
         rd.sink.s = s;
+    }
+
+    /// TF_DS_HC_LATE_FORK: each mix's side work (on the side stream: useSide) launched after the main stream's next
+    /// launch, the router or the attention's input projections, so that kernel is captured as the finish's first
+    /// successor and the side work as its second (the forks where they are: the side work waits for the same main-stream
+    /// work). The same kernels on the same inputs, so the bytes are.
+    pub fn useLateFork(rd: *Round) void {
+        rd.late_fork = rd.side != null;
     }
 
     /// TF_DS_HEAD_CAND / TF_DS_HEAD_KEY: the parts of a round's head by candidates or by best (a node's at the most rows
@@ -504,6 +518,7 @@ pub const Round = struct {
     /// outstanding; a side stream still capturing (its capture sequence not ended with the main stream's) is logged.
     fn abortCapture(rd: *Round, e: *const Engine) void {
         rd.side_out = false;
+        rd.side_work = null;
         rd.pf_out = false;
         _ = e;
         for ([_]?cuda.Stream{ rd.side, rd.pf, rd.par }) |os| if (os) |st| {
@@ -512,8 +527,19 @@ pub const Round = struct {
         };
     }
 
+    /// TF_DS_HC_LATE_FORK: the side work the last mix left (its fork recorded there) launched now, behind the main
+    /// stream's next launch, and its join recorded behind it.
+    fn flushSide(rd: *Round, e: *const Engine) !void {
+        const w = rd.side_work orelse return;
+        rd.side_work = null;
+        try tri_hc.launchSide(e.t, w);
+        try rd.join.?.record(rd.side.?);
+        rd.side_out = true;
+    }
+
     /// The main stream waits for the side work forked so far.
     fn joinSide(rd: *Round, e: *const Engine) !void {
+        try rd.flushSide(e);
         if (!rd.side_out) return;
         try e.s.wait(rd.join.?);
         rd.side_out = false;
@@ -633,6 +659,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         const ldxs = [_]usize{ c.hidden, c.hidden, c.hidden, c.hidden };
         try prompt.groupedDecode(e, ch, R, ls[0..n], xs[0..n], ldxs[0..n], outs[0..n], lds[0..n], dts[0..n]);
     }
+    try rd.flushSide(e); // (TF_DS_HC_LATE_FORK: the mix's side work behind the input projections)
     try rd.mark(e, .a_in);
     // the indexer's top-k takes every entry it scans (short contexts): its selection needs no scores
     const has_idx = ratio != 0 and lay.idx_wq_b != null;
@@ -868,6 +895,7 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     if (e.mx) |k| {
         // Format.native: Gate.forward's fp32 logits (bf16 rows and weight), the routing, the experts
         try mx.bf16Gemm(k, e.s, rd.x, c.hidden, lay.gate_w, c.hidden, R, c.experts, c.hidden, rd.gl, c.experts, .f32, 1, false, 1, 0, 0, 0, ch.mxe.z);
+        try rd.flushSide(e); // (TF_DS_HC_LATE_FORK: the mix's side work behind the router)
         try tri_norm.route(e.t, rd.gl, 0, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - 1, rd.pick, rd.mw, R, c.experts, sl);
         try rd.mark(e, .m_rt);
         if (e.two) |tw| {
@@ -877,7 +905,13 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
             try rd.mark(e, .m_gu);
             if (k.dec_on and l2_skip & 8 == 0) try rd.prefetchDown(e, k, ex, ch.mxe, l2_dn_mb << 20);
             if (l2_next_early) try prefetchNext(e, rd, li);
+            // (TF_DS_DECODE_FUSE: the parity split's assembly writes down's codes too, and down takes them)
+            const coded = tw.ir != 0 and k.decode_fuse;
+            if (coded) {
+                try tw.assembleParityCodes(e, k, ex, ch.xsd.xd, rd.pick, R * ch.mxe.slots, ch.mxe);
+            } else if (tw.ir != 0) try tw.assembleParity(e, ex, ch.xsd.xd, rd.pick, R * ch.mxe.slots) else try tw.catRank(e, ch.xsd.xd, tw.xd_full, R * ch.mxe.slots, tw.gu, 2);
             try rd.mark(e, .m_x);
+            if (coded) try mx.downDecCodes(k, e.s, ex, ch.mxe, rd.pick, R, rd.pm, tw.dw[tw.p], false) else try mx.down(k, e.s, ex, ch.mxe, tw.xd_full, ex.down_k, rd.pick, R, rd.pm, tw.dw[tw.p], false, true);
         } else {
             try mx.gateUp(k, e.s, e.d, lay.experts, ch.mxe, rd.x, c.hidden, rd.pick, rd.mw, R, c.swiglu_limit, ch.xsd.xd, lay.experts.width, true);
             try mx.down(k, e.s, lay.experts, ch.mxe, ch.xsd.xd, lay.experts.width, rd.pick, R, rd.pm, c.hidden, false, true);
@@ -1346,9 +1380,20 @@ fn headCandidates(e: *const Engine, rd: *Round, R: usize, k: u8) !void {
 fn mix(e: *const Engine, rd: *Round, h: u64, spare: *u64, pending: *?u64, params: [3]u64, pre_in: u64, norm: u64, pre_out: u64, R: usize) !u64 {
     const c = e.c;
     try rd.joinSide(e);
-    defer if (rd.side) |s| if (rd.join.?.record(s)) {
+    // (a side work left for flushSide has no join yet: flushSide records it)
+    defer if (rd.side) |s| if (rd.side_work == null) if (rd.join.?.record(s)) {
         rd.side_out = true;
     } else |_| {};
+    if (rd.late_fork) {
+        // TF_DS_HC_LATE_FORK: the side work after the main stream's next launch
+        const ps: ?tri_hc.Posted = if (pending.*) |gp| .{ .gathered = gp, .world = e.world, .h_out = spare.* } else null;
+        const out = try tri_hc.hcPre2Late(e.t, h, params[0], params[1], params[2], pre_in, norm, c.eps, c.hc_eps, c.hc_iters, rd.x, pre_out, rd.post, rd.comb, rd.part, ps, rd.sink, R, c.hidden, &rd.side_work);
+        if (ps != null) {
+            pending.* = null;
+            spare.* = h;
+        }
+        return out;
+    }
     if (pending.*) |gp| {
         const out = try tri_hc.hcPre2(e.t, h, params[0], params[1], params[2], pre_in, norm, c.eps, c.hc_eps, c.hc_iters, rd.x, pre_out, rd.post, rd.comb, rd.part, .{ .gathered = gp, .world = e.world, .h_out = spare.* }, rd.sink, R, c.hidden);
         pending.* = null;
@@ -1464,6 +1509,52 @@ test "context buckets as graph.py makes them" {
 fn notPorted(src: std.builtin.SourceLocation) error{NotPortedYet} {
     std.debug.print("{{\"not_ported\": \"{s}:{d}\"}}\n", .{ src.file, src.line });
     return error.NotPortedYet;
+}
+
+test "TF_DS_HC_LATE_FORK: a mix leaves its side work, the router and the input projections launch it, a join launches what is left" {
+    const src = @embedFile("round.zig");
+    const S = struct {
+        fn body(text: []const u8, head: []const u8) []const u8 {
+            const at = std.mem.indexOf(u8, text, head).?;
+            return text[at .. at + std.mem.indexOf(u8, text[at..], "\n}\n").?];
+        }
+        fn method(text: []const u8, head: []const u8) []const u8 {
+            const at = std.mem.indexOf(u8, text, head).?;
+            return text[at .. at + std.mem.indexOf(u8, text[at..], "\n    }\n").?];
+        }
+        fn before(text: []const u8, first: []const u8, then: []const u8) !void {
+            const i = std.mem.indexOf(u8, text, first) orelse return error.TestUnexpectedResult;
+            const j = std.mem.indexOf(u8, text, then) orelse return error.TestUnexpectedResult;
+            try std.testing.expect(i < j);
+        }
+    };
+    // the mix: late, hcPre2Late into the round's side work, whose join waits for flushSide; else the baseline hcPre2
+    const mx_body = S.body(src, "fn mix(e: *const Engine, rd: *Round,");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, mx_body, "tri_hc.hcPre2Late("));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, mx_body, "tri_hc.hcPre2("));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, mx_body, "defer if (rd.side) |s| if (rd.side_work == null) if (rd.join.?.record(s)) {"));
+    // the FFN mix's next launch is the router: the side work right behind it
+    const moe_body = S.body(src, "fn moe(e: *const Engine, rd: *Round,");
+    try S.before(moe_body, "try mx.bf16Gemm(k, e.s, rd.x, c.hidden, lay.gate_w,", "try rd.flushSide(e);");
+    try S.before(moe_body, "try rd.flushSide(e);", "try tri_norm.route(");
+    // the attention mix's: the input projections (after a tap's copy in a tap layer)
+    const att_body = S.body(src, "fn attention(e: *const Engine, rd: *Round,");
+    try S.before(att_body, "try prompt.groupedDecode(e, ch, R, ls[0..n], xs[0..n], ldxs[0..n], outs[0..n], lds[0..n], dts[0..n]);", "try rd.flushSide(e);");
+    try S.before(att_body, "try rd.flushSide(e);", "try rd.mark(e, .a_in);");
+    // a join (each mix's first step, a stretch's end) launches a side work still left first; a failed capture drops it
+    try S.before(src, "    fn joinSide(rd: *Round, e: *const Engine) !void {\n        try rd.flushSide(e);", "        if (!rd.side_out) return;");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, S.method(src, "    fn abortCapture("), "rd.side_work = null;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, S.method(src, "    fn flushSide("), "try rd.join.?.record(rd.side.?);"));
+}
+
+test "TF_DS_DECODE_FUSE: a 2D round's parity assembly writes down's codes and down takes them; unset, assembleParity and down's own quant" {
+    const src = @embedFile("round.zig");
+    const at = std.mem.indexOf(u8, src, "fn moe(").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n}\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "const coded = tw.ir != 0 and k.decode_fuse;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "try tw.assembleParityCodes(e, k, ex, ch.xsd.xd, rd.pick, R * ch.mxe.slots, ch.mxe);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "if (coded) try mx.downDecCodes(k, e.s, ex, ch.mxe, rd.pick, R, rd.pm, tw.dw[tw.p], false) else try mx.down(k, e.s, ex, ch.mxe, tw.xd_full, ex.down_k, rd.pick, R, rd.pm, tw.dw[tw.p], false, true);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "} else if (tw.ir != 0) try tw.assembleParity(e, ex, ch.xsd.xd, rd.pick, R * ch.mxe.slots) else try tw.catRank(e, ch.xsd.xd, tw.xd_full, R * ch.mxe.slots, tw.gu, 2);"));
 }
 
 test "TF_DS_HEAD_CAND: the last stretch's head by the round's head_k, its graph keyed by it; head_k 0 runs the baseline head" {

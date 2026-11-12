@@ -3881,6 +3881,62 @@ __device__ __forceinline__ void dec_dn(const DnArgs& a) {
     }
 }
 
+// tf_dsn_combine's arguments for a down launch that sums the slots itself (TF_DS_DECODE_FUSE): y [R, N] fp32 (row
+// stride ldy) = (accumulate ? y : 0) + each row's picked entries' outputs (DnArgs out, ldo) in ascending expert id, pick
+// [R, S] (ids past E or negative: another node's); cnt [gridDim.x] int zeros, left zero.
+struct CombArgs {
+    const int* pick;
+    int R, S, E, accumulate;
+    float* y;
+    int64_t ldy;
+    int* cnt;
+};
+
+// tf_dsn_combine's sums of columns n_lo .. n_hi - 1 of every row, by one CTA (the same additions in the same order); out
+// written by other CTAs of the launch (read past L1). Apart from dec_dn_cb's loop (its registers are the loop's).
+__device__ __noinline__ void dec_dn_sum(const float* out, int64_t ldo, const CombArgs& c, int n_lo, int n_hi) {
+    const int wn = n_hi - n_lo;
+    for (int i = threadIdx.x; i < c.R * wn; i += blockDim.x) {
+        const int r = i / wn, n = n_lo + i % wn;
+            int order[16];
+            int k = 0;
+            for (int s = 0; s < c.S && s < 16; s++) {
+                const int e = c.pick[r * c.S + s];
+                if (e < 0 || e >= c.E) continue;
+                int j = k++;
+                while (j > 0 && c.pick[r * c.S + order[j - 1]] > e) {
+                    order[j] = order[j - 1];
+                    j--;
+                }
+                order[j] = s;
+            }
+            for (int j = 0; j < k; j++) v += __ldcg(out + size_t(r * c.S + order[j]) * ldo + n);
+        c.y[size_t(r) * c.ldy + n] = v;
+    }
+}
+
+// dec_dn with the routed sum (tf_dsn_combine) after it in the same launch: each CTA counts itself into its column
+// group once dec_dn has written its entries' outputs (a CTA past the active experts at once), and the group's last CTA
+// sums the group's columns of every row as tf_dsn_combine does, then clears the count.
+template <int RG>
+__device__ __forceinline__ void dec_dn_cb(const DnArgs& a, const CombArgs& c) {
+    __shared__ int last;
+    dec_dn<RG>(a);
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const int prev = atomicAdd(c.cnt + blockIdx.x, 1);
+        last = prev == int(gridDim.y) - 1;
+        if (last) c.cnt[blockIdx.x] = 0;
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    dec::pdl_wait();  // pick and y are earlier kernels' (a CTA past the active experts has not waited yet)
+    const int cols = (blockDim.x >> 5) / a.splits * 16, n_lo = int(blockIdx.x) * cols;
+    dec_dn_sum(a.out, a.ldo, c, n_lo, min(a.N, n_lo + cols));
+}
+
 // Up to four dense linears of one format and row count in one launch (the linears of one input: a launch and its
 // tail instead of each's): linear p takes the CTAs cta0[p] .. cta0[p + 1] - 1, each as its own launch would.
 struct DecMulti {
@@ -3920,6 +3976,11 @@ extern "C" __global__ void tf_dsn_bench_rows_kernel(const uint4* __restrict__ sr
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) dst[i] = src[i];
 }
 
+// dec_dn with the routed sum in the launch (TF_DS_DECODE_FUSE: dec_dn_cb); grid and dynamic shared memory dec_dn's
+        dec_dn_cb<RG>(a, c);                                                                                           \
+    }
+#undef TF_DSN_DEC_CB
+
 // act_quant (tf_dsn_act_quant's codes and scales, the same arithmetic) for decode launches: an ordinary launch that
 // lets the next kernel (a decode tensor-core kernel, launched as a programmatic dependent launch) start its weights'
 // prologue while this runs. (Itself not a dependent launch: a predecessor of another kind may let it start early yet
@@ -3936,6 +3997,39 @@ extern "C" __global__ void tf_dsn_dec_quant_kernel(const void* __restrict__ x, i
     const int m = int(warp / groups), g = int(warp % groups);
     const int k = g * kBlk + lane;
     const float v = bf16r(load_x(x, x_dtype, size_t(m) * ldx + k));
+    float amax = fabsf(v);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float sc = round_scale(fmaxf(amax, 1e-4f));
+    q[size_t(m) * ldq + k] = to_e4m3(v / sc);
+    if (lane == 0) s[size_t(m) * lds + g] = sc;
+}
+
+// tf_ds_assemble_rest's assembly of a 2D node's expert intermediate (out [P, 2 ig + ir] bf16: pair 0's main rows
+// [P, ig], pair 1's, then each slot's rest from the pair that computed it, owner[pick], at P x ig + row x ir of that
+// pair's pack) and tf_dsn_dec_quant's codes and scales of it, in one launch (TF_DS_DECODE_FUSE): a warp a (row, 32-value
+// group), each value read where assemble_rest copies it from, written where it writes it, and quantized with
+// tf_dsn_dec_quant's arithmetic. An ordinary launch that lets the decode down kernel after it start early, as
+// tf_dsn_dec_quant does. ig and ir multiples of 32.
+extern "C" __global__ void tf_dsn_dec_asm_quant_kernel(const __nv_bfloat16* __restrict__ part0,
+                                                       const __nv_bfloat16* __restrict__ part1,
+                                                       const int* __restrict__ pick, const int* __restrict__ owner,
+                                                       __nv_bfloat16* __restrict__ out, int P, int ig, int ir,
+                                                       uint8_t* __restrict__ q, int64_t ldq, float* __restrict__ s,
+                                                       int64_t lds) {
+    dec::pdl_launch();
+    dec::pdl_wait();
+    const int width = 2 * ig + ir, groups = width / kBlk;
+    const int64_t warp = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= int64_t(P) * groups) return;
+    const int m = int(warp / groups), g = int(warp % groups);
+    const int k = g * kBlk + lane;
+    const __nv_bfloat16* src = k < ig       ? part0 + size_t(m) * ig + k
+                               : k < 2 * ig ? part1 + size_t(m) * ig + (k - ig)
+                                            : (owner[pick[m]] == 0 ? part0 : part1) + size_t(P) * ig + size_t(m) * ir + (k - 2 * ig);
+    out[size_t(m) * width + k] = *src;
+    const float v = bf16r(load_x(src, 1, 0));
     float amax = fabsf(v);
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
@@ -4184,4 +4278,5 @@ static_assert(offsetof(GuArgs, sldw) == 136 && offsetof(GuArgs, owner) == 152 &&
 static_assert(offsetof(DnArgs, sldw) == 104 && offsetof(DnArgs, out) == 136 && offsetof(DnArgs, z) == 160 && offsetof(DnArgs, early_exit) == 172 && sizeof(DnArgs) == 176, "DnArgs layout");
 static_assert(sizeof(DecMulti) == 4 * 168 + 24 && offsetof(DecMulti, cta0) == 676, "DecMulti layout");
 static_assert(sizeof(DecArgs) == 168 && offsetof(DecArgs, gq) == 152 && offsetof(DecArgs, z) == 96 && offsetof(DecArgs, y) == 112, "DecArgs layout");
+static_assert(sizeof(CombArgs) == 48 && offsetof(CombArgs, y) == 24 && offsetof(CombArgs, cnt) == 40, "CombArgs layout");
 static_assert(offsetof(BfArgs, y) == 64 && offsetof(BfArgs, z) == 112 && offsetof(BfArgs, raster) == 120 && sizeof(BfArgs) == 128, "BfArgs layout");

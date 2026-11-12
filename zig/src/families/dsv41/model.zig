@@ -830,6 +830,16 @@ pub fn sfGuard(gpa: std.mem.Allocator, d: *const cuda.Driver, s: cuda.Stream, k:
         if (n == 0 or n > chunk_rows or seq.len != start + n) return error.BadChunk;
         if (m.waves and n > wave_rows) return m.fillPair(seq, start, n, replay);
         const e = &m.eng;
+/// TF_DS_DECODE_FUSE `asked` in effect on this rank's kernels, one line when asked: on, or off and why (the checkpoint's
+/// own weights and the decode kernels). Its bits are the separate launches' either way.
+fn useDecodeFuse(k: ?*mx.Kernels, d: *const cuda.Driver, asked: bool) void {
+    if (!asked) return;
+    const why: ?[]const u8 = if (k == null) "needs the checkpoint's own FP8 / MXFP4 weights" else if (!k.?.dec_on) "needs the decode tensor-core kernels (TF_DS_DECODE_DEC=0 turns them off)" else null;
+    if (why) |w| return std.log.info("TF_DS_DECODE_FUSE=1: off: {s}", .{w});
+    k.?.useDecodeFuse(d) catch |e| return std.log.info("TF_DS_DECODE_FUSE=1: off: its kernels: {s}", .{@errorName(e)});
+    std.log.info("TF_DS_DECODE_FUSE=1: a decode round's routed sum in the down kernel's launch, and a 2D node's assembly of the experts' intermediate writing down's codes", .{});
+}
+
 /// TF_DS_HC_FUSED `asked` in effect: a prompt chunk's mHC mixes and their finish in one launch from the kit's extra set
 /// (_hc_pre_pf_fused), one line saying so. A launch the set has no variant for keeps the baseline two kernels (tri_hc.hcPrePf
 /// counts it). A kit whose extra set (aot-extra/) did not load (`why`) or holds no _hc_pre_pf_fused (`variants`,
@@ -1296,6 +1306,16 @@ fn useQgateCanary(asked: prompt2d.Qgate, native: bool) void {
             std.log.info("TF_DS_QGATE_CANARY=3: layer 0's MoE partials move one fp32 ulp away from zero (a reduction order's size) before their gather, in every prompt chunk and every round: the body perturbed on purpose, a quality gate's floor, not a serving setting", .{});
         },
     }
+/// TF_DS_HC_LATE_FORK `asked` in effect on this rank's round, one line when asked: on, or off and why (the
+/// checkpoint's own weights and the mixes' side stream). The same kernels on the same inputs either way.
+fn useLateFork(rd: *round.Round, asked: bool, native: bool) void {
+    if (!asked) return;
+    const why: ?[]const u8 = if (!native) "needs the checkpoint's own FP8 / MXFP4 weights" else if (rd.side == null) "needs the mixes' side stream (TF_DS_HC_SIDE)" else null;
+    if (why) |w| return std.log.info("TF_DS_HC_LATE_FORK=1: off: {s}", .{w});
+    rd.useLateFork();
+    std.log.info("TF_DS_HC_LATE_FORK=1: a decode mix's side work (the dots and the Sinkhorn) launched after the main stream's next launch, the router or the attention's input projections", .{});
+}
+
 /// Why the decode exchanges cannot all ride the rings on this rank (null: they can): the rings are open and every decode exchange fits
 /// them (prompt2d.decodeOff).
 pub fn decodeOff(rings: bool, shape: prompt2d.DecodeShape) ?[]const u8 {
@@ -1559,6 +1579,8 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     img_buf: ?cuda.DeviceBuffer = null,
     // profiling (lanes' --profile): the last round's forward and absorb, synchronized apart (ns)
     prof: bool = false,
+    cand_first: bool = false, // TF_DS_CAND_FIRST: the leader's verifyHead (a round's head reads before the absorb)
+    head_ready: ?cuda.Event = null, // verifyHead's event after the head reads
     // TF_DS_ROCI_STAGGER: the second lane of a pair of passes in flight: its node of the 2D split (own scratch, own transport), chunk,
     // stream, cuBLAS handle, the per-layer cache events and its host id and position arrays.
     pair: bool = false,
@@ -1662,6 +1684,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         prompt2d.pass_tail_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_PASS_TAIL")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.readPassFillingEnv(); // rank 0's TF_DS_PASS_FILLING (the pass sizes are its frames'; its start line prints here)
         try prompt2d.readPromptOrderEnv(); // rank 0's TF_DS_PROMPT_ORDER and TF_DS_PROMPT_QOS (the host's prompt-step order; its start line prints here)
+        prompt2d.decode_fuse_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_DECODE_FUSE")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.mma_sf_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_MMA_SF")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.mma_sf_exact_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_MMA_SF_EXACT")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.gemm_w16_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_GEMM_W16")) |v| std.mem.span(v) else null); // every rank alike (Settings)
@@ -1670,6 +1693,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         prompt2d.gemm_r2_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_GEMM_R2")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.draft_4way_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_DRAFT_4WAY")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.draft_main_4way_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_DRAFT_MAIN_4WAY")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.hc_late_fork_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_HC_LATE_FORK")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.attn_u_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ATTN_U")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.hc_fused_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_HC_FUSED")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.attn_epi_fused_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ATTN_EPI_FUSED")) |v| std.mem.span(v) else null); // every rank alike (Settings)
@@ -1833,6 +1857,14 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             break :blk try cuda.Stream.initPriority(d, roci_pair.prioritiesOf(m.pair_prio, range.least, range.greatest)[0]);
         } else try cuda.Stream.init(d, true);
         errdefer m.stream.deinit();
+        // (Model.open starts from undefined, so the field's default never applies: unset, null here)
+        m.head_ready = null;
+        m.cand_first = prompt2d.switchAsked(if (std.c.getenv("TF_DS_CAND_FIRST")) |v| std.mem.span(v) else null);
+        if (m.cand_first) {
+            m.head_ready = try cuda.Event.init(d, false);
+            std.log.info("{s}", .{candFirstLine()});
+        }
+        errdefer if (m.head_ready) |*x| x.deinit();
         // TF_DS_WINDOW_ONCE (on unless 0): a chunk uploads its window indices and low position once, not in every layer. Bytes unchanged.
         prompt.window_once = prompt.windowOnceWanted(if (std.c.getenv("TF_DS_WINDOW_ONCE")) |v| std.mem.span(v) else null);
         std.log.info("TF_DS_WINDOW_ONCE={s}: rank {d}: a prompt chunk's window gather indices, window low position and ring-write indices are uploaded {s}", .{ if (prompt.window_once) "1" else "0", o.rank, if (prompt.window_once) "once per chunk, into buffers of their own" else "in every layer, as before" });
@@ -1977,6 +2009,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         if (prompt2d.pf_raster_asked != 0) {
             if (mx.pf_raster != 0) std.log.info("TF_DS_PF_RASTER={d}: a prompt GEMM whose activation slab is {d} MiB or more (the tile FP8 GEMMs, the block-scaled MMA's and the bf16 tile GEMM) walks its tiles {d} row tiles at a time across all the column tiles; the output bytes are the default order's", .{ mx.pf_raster, mx.raster_slab_bytes >> 20, mx.pf_raster }) else std.log.info("TF_DS_PF_RASTER={d}: off: needs the checkpoint's own FP8 / MXFP4 weights (the EXL3 GEMMs are cuBLAS's)", .{prompt2d.pf_raster_asked});
         }
+        useDecodeFuse(if (m.mxk) |*x| x else null, d, prompt2d.decode_fuse_asked);
         var sf_buf: [256]u8 = undefined;
         try useMmaSf(d, &m.comm, m.stream, if (m.mxk) |*x| x else null, prompt2d.mma_sf_asked, sfCovers(m.w.layers, false, &sf_buf));
         try useMmaSfExact(gpa, d, &m.comm, m.stream, if (m.mxk) |*x| x else null, prompt2d.mma_sf_exact_asked, m.w.layers, sfCovers(m.w.layers, true, &sf_buf));
@@ -2080,6 +2113,9 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
                 var devices: std.ArrayList([]const u8) = .empty;
                 var dit = std.mem.splitScalar(u8, devs, ',');
                 while (dit.next()) |x| try devices.append(a, x);
+                const rk = try rdma.Kernels.load(m.rdma_mod.?);
+                const peers = rdmaCollectPeers();
+                if (peers) std.log.info("{s}", .{collectPeersLine(rk.collect_peers != null)});
                 const sw = ringSwitches(prompt2d.ring_wc_asked, prompt2d.ring_inplace_asked, rk.hasInplace());
                 if (prompt2d.ring_wc_asked) std.log.info("{s}", .{ringWcLine(sw.wc)});
                 if (prompt2d.ring_inplace_asked) {
@@ -2159,6 +2195,9 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             m.graphs.?.lazy.fallbacks = &m.graph_fallbacks;
         }
         if (o.side) try m.rd.useSide(&m.eng);
+        useLateFork(&m.rd, prompt2d.hc_late_fork_asked, c.format == .native);
+        if (o.prefetch) try m.rd.usePrefetch(&m.eng);
+        if (m.two) |t| if (t.ir != 0 and o.side and m.par == null) try m.rd.usePar(&m.eng); // parity in two launches: the rest beside the main gate / up
         try useHeadCand(m, a, d, prompt2d.head_cand_asked);
         try useHeadKey(m, a, d, prompt2d.head_key_asked);
         if (o.drafts) {
@@ -2281,6 +2320,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         m.cache_file.close(m.io);
         m.ix.deinit();
         m.cache_dir.close(m.io);
+        if (m.head_ready) |*x| x.deinit();
     /// The decode plan's G0.2 controls (TF_DS_DEC_PDL, TF_DS_RDMA_PDL, TF_DS_TRITON_PDL_ATTR, TF_DS_PDL), one line on each
     /// rank when any is off, so a run can show that every rank has the same ones.
     fn logPdlControls(rank: usize) void {
@@ -2379,6 +2419,17 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     pub fn ringWordDeadlineNs() u64 {
         const ms: u64 = if (std.c.getenv("TF_DS_RING_WORD_DEADLINE_MS")) |v| std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0 else 0;
         return (if (ms == 0) 120_000 else ms) * std.time.ns_per_ms;
+    }
+
+    /// TF_DS_RDMA_COLLECT_PEERS=1: the four-node rings' gather_into copy-out reads every peer's slot at once
+    /// (rdma.Settings.collect_peers); unset or 0: the baseline kernel. The same bytes either way, so each rank's own choice.
+    pub fn rdmaCollectPeers() bool {
+        return prompt2d.switchAsked(if (std.c.getenv("TF_DS_RDMA_COLLECT_PEERS")) |v| std.mem.span(v) else null);
+    }
+
+    /// TF_DS_RDMA_COLLECT_PEERS' start line: on with the kernel in the rings' fatbin (`have`), else off and why.
+    pub fn collectPeersLine(have: bool) []const u8 {
+        return if (have) "TF_DS_RDMA_COLLECT_PEERS=1: the rings' gather_into copy-out reads every peer's slot at once (a row of blocks a peer, each waiting for its own peer's flag): the same bytes" else "TF_DS_RDMA_COLLECT_PEERS=1: off: the rings' kernels (TF_DS_RDMA_KERNELS, else the build's own) have no dsv41_rdma_collect_peers";
     }
 
     /// The rings' switches after their own checks: the in-place path needs the write-combined slots and both of its
@@ -3058,7 +3109,23 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         return m.ch.head_g;
     }
 
+    /// What the leader reads of a round's logits: the device's argmax, its first `count` candidates a row, or nothing
+    /// there (the whole rows: roundLogits).
+    pub const Head = union(enum) { none, argmax, candidates: usize };
+
+    /// TF_DS_CAND_FIRST's start line.
+    pub fn candFirstLine() []const u8 {
+        return "TF_DS_CAND_FIRST=1: a round's argmax or first candidates run before the drafter's absorb; the host waits for them alone and draws while the absorb runs";
+    }
+
+    /// TF_DS_CAND_FIRST: verify with the round's head reads (`head`) between the forward and the drafter's absorb on
+    /// the stream; the host waits for an event after them alone, and the absorb runs on while it draws and sends the
+    /// next round's frames (the next round's work queues behind it). headArgmax / headCandidates read the results. The
+    /// reads take only the round's logits and write only their own buffers, and the absorb neither, so every byte is
+    /// as before. Head none, or a profiled round: verify, then the reads as before.
+    pub fn verifyHead(m: *Model, rows: round.Rows, absorb: []const bool, head: Head) !void {
         try m.pairJoin();
+        const R = rows.ids.len;
         // TF_DS_HEAD_CAND: the device's merge needs the count each node keeps (the frame's head byte); without it, 0.
         const hb: u8 = switch (head) {
             .none => 0,
@@ -3066,23 +3133,87 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             .candidates => |count| if (m.head_cand) head_cand.kFor(count) else 0,
         };
         m.rd.head_k = hb;
+        if (head == .none or m.prof) {
             try m.verify(rows, absorb, hb);
             if (hb == 0) try m.launchHead(head, R); // (hb != 0: round.forward's last stretch ran it)
             try m.stream.synchronize();
+            return;
+        }
+        try m.forwardRows(rows);
         if (hb == 0) try m.launchHead(head, R); // (hb != 0: round.forward's last stretch ran it)
         try m.head_ready.?.record(m.stream);
+        try m.absorbRows(rows, absorb);
+        if (m.erows) |r| try r.roundCheck(); // the forward's stream host steps came before the event
+    }
+
+    /// The round's head reads on the stream: the device's argmax into m.amax, or its first `count` candidates a row
+    /// into m.cand.
+    fn launchHead(m: *Model, head: Head, R: usize) !void {
+        switch (head) {
+            .none => {},
+            .argmax => try m.ops.argmaxRows(m.stream, m.rd.logits, m.vocab, m.vocab, R, m.amax),
+            .candidates => |count| {
+                const p = m.candPtrs();
+                try m.ops.topCandRows(m.stream, m.rd.logits, m.vocab, m.vocab, R, count, p.vals, p.ids, p.flags);
+            },
+        }
+    }
+
+    /// m.cand's three arrays: vals [max_rows, max_candidates] fp32, ids [.., ..] i64, flags [max_rows] i32.
+    fn candPtrs(m: *const Model) struct { vals: u64, ids: u64, flags: u64 } {
+        const mc = sampling.max_candidates;
+        const ids = m.cand + round.max_rows * mc * 4;
+        return .{ .vals = m.cand, .ids = ids, .flags = ids + round.max_rows * mc * 8 };
+    }
+
+    /// The round's greedy tokens, R rows, on the host, once the argmax is done (roundArgmax's, or verifyHead's).
+    pub fn headArgmax(m: *Model, R: usize) ![]const u32 {
+        const d = m.ctx.d;
+        try d.check(d.api.cuMemcpyDtoH_v2(&m.amax_host, m.amax, R * 4), "cuMemcpyDtoH");
+        return m.amax_host[0..R];
+    }
+
+    /// The round's first `count` candidates a row on the host, once their kernel is done (roundCandidates', or
+    /// verifyHead's).
+    pub fn headCandidates(m: *Model, R: usize, count: usize) !Cands {
+        const d = m.ctx.d;
+        const p = m.candPtrs();
+        try d.check(d.api.cuMemcpyDtoH_v2(&m.cand_vals, p.vals, R * count * 4), "cuMemcpyDtoH");
+        try d.check(d.api.cuMemcpyDtoH_v2(&m.cand_ids, p.ids, R * count * 8), "cuMemcpyDtoH");
+        try d.check(d.api.cuMemcpyDtoH_v2(&m.cand_flags, p.flags, R * 4), "cuMemcpyDtoH");
+        return .{ .vals = m.cand_vals[0 .. R * count], .ids = m.cand_ids[0 .. R * count], .flags = m.cand_flags[0..R] };
+    }
+
+    /// One round over every stream's window (rows.windows, each with its stream's slot and extent), then each window
+    /// whose stream drafts has its rows' taps absorbed into its slot's drafter rings at its positions (the served
+    /// eager absorb: rows past the ones the round keeps sit where the drafter never reads, and the next window
+    /// overwrites them). absorb[i]: window i's stream drafts.
     /// `head`: the round's head (Lanes' frame): 0 the whole rows (rd.logits), head_cand.key TF_DS_HEAD_KEY's bests,
     /// else TF_DS_HEAD_CAND's count a node.
     pub fn verify(m: *Model, rows: round.Rows, absorb: []const bool, head: u8) !void {
         try m.pairJoin();
         if (head != 0 and !(if (head == head_cand.key) m.head_key else m.head_cand)) return error.HeadCandOff;
         m.rd.head_k = head;
+        try m.forwardRows(rows);
+        try m.absorbRows(rows, absorb);
+        if (m.erows) |r| try r.roundCheck(); // a stream host step's failed read fails the round
+        if (m.prof) m.t_absorb = m.now() - t1;
+    }
+
+    /// verify's forward over the round's rows, on the stream (a profiled round: timed, the stream synchronized).
+    fn forwardRows(m: *Model, rows: round.Rows) !void {
+        const e = &m.eng;
+        if (m.prof) try m.stream.synchronize(); // (the GPU idle, so the issue time shows whether the host keeps it fed)
                 }
                 m.clk_rounds += 1;
             }
         }
-        try prompt.head(e, ch);
-        if (pt) |t| try t.mark(m.stream, .head);
+    }
+
+    /// verify's absorb: each window whose stream drafts has its rows' taps absorbed into its slot's drafter rings, on
+    /// the stream (nothing waited for).
+    fn absorbRows(m: *Model, rows: round.Rows, absorb: []const bool) !void {
+        const e = &m.eng;
         if (m.dr) |*dr| {
             const wins = rows.windows orelse return error.BadRound;
             var items: [max_streams]draft.Item = undefined;
@@ -3143,13 +3274,22 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     /// The round's logits, R rows of the vocabulary, on the host (after verify).
     /// The round's greedy tokens, R rows (the device's argmax of the round's logits, as sampling.argmax), on the host.
     pub fn roundArgmax(m: *Model, R: usize) ![]const u32 {
+        try m.launchHead(.argmax, R);
+        try m.stream.synchronize();
+        return m.headArgmax(R);
+    }
+
     /// A round's candidates on the host: vals and ids [R, count], flags [R] (non-zero: that row must be read whole).
     pub const Candidates = struct { vals: []const f32, ids: []const i64, flags: []const i32 };
 
     /// Track B: the round's first `count` candidates a row (sampling.topCandidates' set and order) on the host, from the
     /// device's logits: vals and ids [R, count], flags [R] (non-zero: that row must be read whole, roundLogits).
     pub const Cands = Candidates;
+
     pub fn roundCandidates(m: *Model, R: usize, count: usize) !Candidates {
+        try m.launchHead(.{ .candidates = count }, R);
+        try m.stream.synchronize();
+        return m.headCandidates(R, count);
     }
 
     /// TF_DS_HEAD_CAND: a round's first `count` candidates a row merged from the four nodes' parts (their first `k`
@@ -3161,6 +3301,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         const tw = m.two orelse return error.HeadCandNeeds2D;
         if (!m.head_cand or m.rd.head_k != k or count == 0 or count > k or R > round.max_rows) return error.HeadCandOff;
         const lay = head_cand.layout(R, k);
+        // (no wait on the stream: rd.call's only writer is the last stretch's head exchange, enqueued before the round's head event, which verifyHead's wait or verify's sync has passed; the drafter's absorb behind it never writes it)
         try d.check(d.api.cuMemcpyDtoH_v2(m.cand_parts.ptr, m.rd.call, 4 * lay.bytes), "cuMemcpyDtoH");
         if (!head_cand.merge(m.cand_parts[0 .. 4 * lay.bytes], lay, head_cand.vocabOffsets(tw.hw), count, m.cand_vals[0 .. R * count], m.cand_ids[0 .. R * count])) return null;
         @memset(m.cand_flags[0..R], 0);
@@ -3174,6 +3315,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         const tw = m.two orelse return error.HeadCandNeeds2D;
         if (!m.head_key or m.rd.head_k != head_cand.key or R > round.max_rows) return error.HeadCandOff;
         const n = 4 * R * head_cand.key_row;
+        // (no wait on the stream: as headCandidatesMerged, the head event ordered rd.call)
         try d.check(d.api.cuMemcpyDtoH_v2(m.cand_parts.ptr, m.rd.call, n), "cuMemcpyDtoH");
         head_cand.mergeKeys(m.cand_parts[0..n], R, head_cand.vocabOffsets(tw.hw), m.amax_host[0..R]);
         return m.amax_host[0..R];
@@ -3279,6 +3421,11 @@ test "the start-up settings carry TF_DS_PF_SPLIT and the kernel switches as Mode
     prompt2d.pf_run128_asked = true;
     try std.testing.expectEqual(prompt2d.kern_pf_run128, startSettings(o).kern);
     prompt2d.pf_run128_asked = false;
+    const was_df = prompt2d.decode_fuse_asked;
+    defer prompt2d.decode_fuse_asked = was_df;
+    prompt2d.decode_fuse_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_decode_fuse, startSettings(o).kern);
+    prompt2d.decode_fuse_asked = false;
     const was_d4 = prompt2d.draft_4way_asked;
     defer prompt2d.draft_4way_asked = was_d4;
     prompt2d.draft_4way_asked = true;
@@ -3289,6 +3436,11 @@ test "the start-up settings carry TF_DS_PF_SPLIT and the kernel switches as Mode
     prompt2d.draft_main_4way_asked = true;
     try std.testing.expectEqual(prompt2d.kern_draft_main_4way, startSettings(o).kern);
     prompt2d.draft_main_4way_asked = false;
+    const was_lf = prompt2d.hc_late_fork_asked;
+    defer prompt2d.hc_late_fork_asked = was_lf;
+    prompt2d.hc_late_fork_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_hc_late_fork, startSettings(o).kern);
+    prompt2d.hc_late_fork_asked = false;
     const was_au = prompt2d.attn_u_asked;
     defer prompt2d.attn_u_asked = was_au;
     prompt2d.attn_u_asked = true;
@@ -3708,6 +3860,23 @@ test "TF_DS_QGATE_CANARY: the text read once (none asked, no collective); anothe
     const same = std.mem.indexOf(u8, body, "    if (differ == 0) return;\n").?;
     const refuse = std.mem.indexOf(u8, body, "return error.CanariesDiffer;").?;
     try std.testing.expect(off < gather and gather < same and same < refuse);
+test "TF_DS_HC_LATE_FORK takes effect with the checkpoint's own weights and the mixes' side stream, else stays off" {
+    var rd: round.Round = undefined;
+    rd.late_fork = false;
+    rd.side = null;
+    useLateFork(&rd, true, true);
+    try std.testing.expect(!rd.late_fork); // no side stream
+    rd.useLateFork();
+    try std.testing.expect(!rd.late_fork); // (the round's own guard)
+    rd.side = @as(cuda.Stream, undefined);
+    useLateFork(&rd, false, true);
+    try std.testing.expect(!rd.late_fork); // not asked
+    useLateFork(&rd, true, false);
+    try std.testing.expect(!rd.late_fork); // the EXL3 checkpoint
+    useLateFork(&rd, true, true);
+    try std.testing.expect(rd.late_fork);
+}
+
 
 test "TF_DS_MMA_SF's line: on every rank with the GEMMs it covers, or off on every rank, which ranks and why" {
     var buf: [320]u8 = undefined;
@@ -3847,7 +4016,24 @@ test "TF_DS_MMA_SF_EXACT's line: experts kept for their packing, apart from a sc
     try std.testing.expectEqualStrings("more GEMMs than its guard keeps have a weight scale outside the proven range", guardWhy(&wb, error.TooManyKept));
     try std.testing.expectEqualStrings("more GEMMs than its guard can prove", guardWhy(&wb, error.TooManyProven));
 }
+
+test "TF_DS_RDMA_COLLECT_PEERS: read as a switch (the text 1); its line on with the kernel, off without it" {
+    try std.testing.expect(prompt2d.switchAsked("1") and !prompt2d.switchAsked("0") and !prompt2d.switchAsked(null));
+    const src = @embedFile("model.zig");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "return prompt2d.switchAsked(if (std.c.getenv(\"TF_DS_RDMA_COLLECT_PEERS\")) |v| std.mem.span(v) else null);"));
+    try std.testing.expectEqualStrings("TF_DS_RDMA_COLLECT_PEERS=1: the rings' gather_into copy-out reads every peer's slot at once (a row of blocks a peer, each waiting for its own peer's flag): the same bytes", Model.collectPeersLine(true));
+    try std.testing.expectEqualStrings("TF_DS_RDMA_COLLECT_PEERS=1: off: the rings' kernels (TF_DS_RDMA_KERNELS, else the build's own) have no dsv41_rdma_collect_peers", Model.collectPeersLine(false));
+}
+
+test "Model.open puts TF_DS_RDMA_COLLECT_PEERS in the four-node rings' settings when the rings' kernels have it, with its line" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    const k = std.mem.indexOf(u8, code, "const rk = try rdma.Kernels.load(m.rdma_mod.?);") orelse return error.TestUnexpectedResult;
+    const line = std.mem.indexOf(u8, code, "if (peers) std.log.info(\"{s}\", .{collectPeersLine(rk.collect_peers != null)});") orelse return error.TestUnexpectedResult;
     const open = std.mem.indexOf(u8, code, "m.rdma_rings = try ring2d.Rings.open(gpa, d, rk, devices.items, role, ord, .{ .max_bytes = ring_bytes, .gid_index = rdmaGid(), .pdl = rdmaPdl(), .collect_peers = peers and rk.collect_peers != null, .wc = sw.wc, .inplace = sw.inplace, .roci = ringWordOf(), .roci_deadline_ns = ringWordDeadlineNs(), .wait = ring_wait_on, .wait_explicit = prompt2d.ring_wait_explicit }, &m.comm, m.stream, !weights.draft_4way);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(k < line and line < open);
+}
+
 test "TF_DS_RING_WORD_SIGNAL: unset and atomic name the fetch-and-add (the guaranteed arrival), word the inline word, other text is refused" {
     try std.testing.expectEqual(@as(?rdma.Roci, .atomic), Model.ringWordSignal(null));
     try std.testing.expectEqual(@as(?rdma.Roci, .word), Model.ringWordSignal("word"));
@@ -3888,6 +4074,59 @@ test "TF_DS_RING_WC and TF_DS_RING_INPLACE: the settings after their checks, and
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "prompt2d.ring_inplace_asked = prompt2d.switchAsked(if (std.c.getenv(\"TF_DS_RING_INPLACE\")) |v| std.mem.span(v) else null);"));
 }
 
+test "verify: the forward, the drafter's absorb, then the stream's sync and the round's check (as before)" {
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn verify(m: *Model,") orelse return error.TestUnexpectedResult;
+    const body = src[at .. at + (std.mem.indexOf(u8, src[at..], "\n    }\n") orelse return error.TestUnexpectedResult)];
+    var last: usize = 0;
+    for ([_][]const u8{ "try m.forwardRows(rows);", "try m.absorbRows(rows, absorb);", "try m.stream.synchronize();", "if (m.erows) |r| try r.roundCheck();" }) |step| {
+        const i = std.mem.indexOf(u8, body, step) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(i >= last);
+        last = i;
+    }
+}
+
+test "verifyHead (TF_DS_CAND_FIRST): the forward, the head's reads, their event, the absorb, then the event's wait and the round's check; none or a profiled round: verify, then the reads as before" {
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn verifyHead(") orelse return error.TestUnexpectedResult;
+    const body = src[at .. at + (std.mem.indexOf(u8, src[at..], "\n    }\n") orelse return error.TestUnexpectedResult)];
+    var last: usize = 0;
+        const i = std.mem.indexOf(u8, body[last..], step) orelse return error.TestUnexpectedResult;
+        last += i + step.len;
+    }
+    // roundArgmax / roundCandidates: the baseline launch, the stream's sync, then the same reads; the reads launch nothing
+    for ([_][2][]const u8{ .{ "    pub fn roundArgmax(", "try m.launchHead(.argmax, R);" }, .{ "    pub fn roundCandidates(", "try m.launchHead(.{ .candidates = count }, R);" } }, [_][]const u8{ "return m.headArgmax(R);", "return m.headCandidates(R, count);" }) |f, read| {
+        const fa = std.mem.indexOf(u8, src, f[0]) orelse return error.TestUnexpectedResult;
+        const fb = src[fa .. fa + (std.mem.indexOf(u8, src[fa..], "\n    }\n") orelse return error.TestUnexpectedResult)];
+        const l = std.mem.indexOf(u8, fb, f[1]) orelse return error.TestUnexpectedResult;
+        const y = std.mem.indexOf(u8, fb, "try m.stream.synchronize();") orelse return error.TestUnexpectedResult;
+        const r = std.mem.indexOf(u8, fb, read) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(l < y and y < r);
+    }
+    for ([_][]const u8{ "    pub fn headArgmax(", "    pub fn headCandidates(" }) |f| {
+        const fa = std.mem.indexOf(u8, src, f) orelse return error.TestUnexpectedResult;
+        const fb = src[fa .. fa + (std.mem.indexOf(u8, src[fa..], "\n    }\n") orelse return error.TestUnexpectedResult)];
+        try std.testing.expect(std.mem.indexOf(u8, fb, "launch") == null and std.mem.indexOf(u8, fb, "synchronize") == null);
+    }
+}
+
+test "the merged head reads wait for the head event alone: headCandidatesMerged and headTokens never synchronize the stream (the drafter's absorb runs behind it)" {
+    const src = @embedFile("model.zig");
+    for ([_][]const u8{ "    pub fn headCandidatesMerged(", "    pub fn headTokens(" }) |f| {
+        const fa = std.mem.indexOf(u8, src, f) orelse return error.TestUnexpectedResult;
+        const fb = src[fa .. fa + (std.mem.indexOf(u8, src[fa..], "\n    }\n") orelse return error.TestUnexpectedResult)];
+        try std.testing.expect(std.mem.indexOf(u8, fb, "cuMemcpyDtoH_v2(m.cand_parts.ptr, m.rd.call") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fb, "synchronize") == null);
+    }
+}
+
+test "TF_DS_CAND_FIRST is read as a switch at Model.open, with its line and its event" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "m.cand_first = prompt2d.switchAsked(if (std.c.getenv(\"TF_DS_CAND_FIRST\")) |v| std.mem.span(v) else null);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "if (m.cand_first) {\n            m.head_ready = try cuda.Event.init(d, false);\n            std.log.info(\"{s}\", .{candFirstLine()});\n        }"));
+    try std.testing.expectEqualStrings("TF_DS_CAND_FIRST=1: a round's argmax or first candidates run before the drafter's absorb; the host waits for them alone and draws while the absorb runs", Model.candFirstLine());
+}
 
 test "TF_DS_HEAD_CAND's line: on every rank, or off on every rank, which ranks and why" {
     var buf: [400]u8 = undefined;

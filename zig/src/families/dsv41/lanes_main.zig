@@ -151,7 +151,7 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, key, "--vision-bias")) {
             o.vision_bias = val;
         } else if (std.mem.eql(u8, key, "--logits-sha")) {
-            dsv41.lanes.logits_sha = !std.mem.eql(u8, val, "0");
+            dsv41.lanes.logits_sha = dsv41.lanes.logitsSha(val) orelse return error.BadLogitsSha;
         } else return error.BadArgument;
     }
     const par = parallel orelse o.streams;
@@ -243,6 +243,10 @@ pub fn main(init: std.process.Init) !u8 {
         const v = std.mem.span(t);
         ln.served_k = if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "all")) .all else if (std.mem.eql(u8, v, "solo")) .solo else .off;
     }
+    // a lone stream's wide copies, as native.zig's start reads them (the gates' one-stream windows past six rows); the
+    // tool's other copy settings stay the Lanes defaults
+    ln.copy_rows = dsv41.lanes.copyRows(if (std.c.getenv("TF_DS_COPY_ROWS")) |t| std.mem.span(t) else null) orelse return error.BadCopyRows;
+    if (ln.copy_rows != 0) std.log.info("TF_DS_COPY_ROWS={d}: a lone stream's copied continuation spans up to {d} rows", .{ ln.copy_rows, ln.copy_rows });
     if (profile) {
         ln.prof = .{};
         m.prof = true;
@@ -324,6 +328,15 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }.f;
         try w.print("{{\"rank\": 0, \"profile\": {{\"rounds\": {d}, \"rows_a_round\": {d:.2}, \"step_ms\": {d:.2}, \"send_ms\": {d:.3}, \"enqueue_ms\": {d:.2}, \"forward_ms\": {d:.2}, \"absorb_ms\": {d:.2}, \"logits_ms\": {d:.2}, \"sample_ms\": {d:.2}, \"passes\": {d}, \"streams_a_pass\": {d:.2}, \"pass_ms\": {d:.2}, \"prefills\": {d}, \"prefill_ms\": {d:.1}}}}}\n", .{ p.rounds, ms(p.rows * 1000000, p.rounds), ms(step_ns, core.steps), ms(p.send, p.rounds), ms(p.enqueue, p.rounds), ms(p.forward, p.rounds), ms(p.absorb, p.rounds), ms(p.logits, p.rounds), ms(p.sample, p.rounds), p.passes, ms(p.pass_streams * 1000000, p.passes), ms(p.pass, p.passes), p.prefills, ms(p.prefill, p.prefills) });
+        try w.flush();
+        // a lone stream's rounds by their rows: [rounds, ms a round] (each row count that ran)
+        try w.print("{{\"rank\": 0, \"lone_round_ms_by_rows\": {{", .{});
+        var first = true;
+        for (p.lone_rounds, p.lone_ns, 0..) |n, ns, r| if (n > 0) {
+            try w.print("{s}\"{d}\": [{d}, {d:.3}]", .{ if (first) "" else ", ", r, n, ms(ns, n) });
+            first = false;
+        };
+        try w.print("}}}}\n", .{});
         try w.flush();
         dsv41.draft.printProf();
         try printClock(w, 0, m);

@@ -52,6 +52,13 @@
 //!     every staged piece is read: one byte of a weight set changed in each K block of a pair (down's tail pair too)
 //!     and in each stage word's scales changes the twin's own output; a soak of the twins, 200 launches on one input at
 //!     512 rows, each output the first's.
+//!   - TF_DS_DECODE_FUSE: a decode window's gate / up and down on the same experts at 1, 6, 16 and 48 rows (accumulated
+//!     too; the served early exit of the CTAs past the active experts, and at 6 rows without it), the routed sum in the
+//!     down launch against tf_dsn_combine after it: down's entry outputs and the combined rows byte-equal; one down
+//!     input value set to 64 differs.
+//!   - TF_DS_DECODE_FUSE: a 2D round's parity assembly with down's quant (mx.assembleQuant) against
+//!     tf_ds_assemble_rest then quantDec at 1, 6, 16 and 48 rows of 7 slots: the assembled rows, the codes and the
+//!     scales byte-equal; one changed pack value differs.
 //!   - TF_DS_HC_STRIDE: a quarter-HC mix on the chunk's own gathered planes (plane 0 at the owned rows' offset,
 //!     cap * D elements between planes) against the tight repack it reads in the baseline (rows * D between them): PART and
 //!     h_out byte-equal at two caps and owned ranges past row 0; one plane value changed differs.
@@ -120,6 +127,14 @@
 //!     order, and with TF_DS_GEMM_HALVES on beside it: every output byte equal; the gate (a 1,024-row launch keeps the default
 //!     order, a launch of 14 MiB of activation takes the group) asserted; one code byte changed differs; the GB10 timing lines
 //!     (default, each group, halves) at 8,192 and 16,384 rows on wq_a, wo_b and the block-scaled wq_a.
+//!   - TF_DS_RDMA_COLLECT_PEERS: rdma.launchCollect's two copy-outs (dsv41_rdma_collect_peers against the baseline
+//!     dsv41_rdma_collect_into) on a receive ring as the rings keep one (slots in registered pinned pages, every
+//!     peer's slot written and its flag set before a launch), into poisoned destinations: the all4 quarters (2,560
+//!     fp32 a node) at 1 .. 34 rows and a row block of a longer exchange, the head's quarters (32,384 / 32,256 fp32),
+//!     the column ring's catRank, parity pack and pair gather, odd widths and a null destination, every rank: every
+//!     destination byte equal, and the baseline equal to the slots' bytes where they land; with each peer's data and flag
+//!     after the launch, 2 ms apart, both kernels give the late data; the switch runs the per-peer kernel (the baseline
+//!     counts itself in the ring's probe, the switch's does not); one slot word changed differs.
 //!   - TF_DS_RING_WC: a ring's data slots from cudaHostAlloc(Mapped | WriteCombined) against the baseline mmap +
 //!     cuMemHostRegister, on the real staging, publish and collecting kernels: the staging kernel's slot and the
 //!     publish kernel's fixed slot read back from the host byte for byte; the doorbell, size, slot name and last
@@ -285,6 +300,7 @@ const Run = struct {
     k: *mx.Kernels,
     a: std.mem.Allocator,
     ops: ?*const dsv41.ops.Ops = null,
+    io: ?std.Io = null,
     ok: bool = true,
 
     fn report(r: *Run, what: []const u8, n: usize, want_equal: bool) void {
@@ -1380,11 +1396,33 @@ fn scalesOf(n: usize, rng: std.Random, a: std.mem.Allocator) ![]u8 {
     return v;
 }
 
+fn upKeep(d: *const cuda.Driver, bytes: []const u8, keep: *std.ArrayList(cuda.DeviceBuffer), a: std.mem.Allocator) !u64 {
+    const b = try upload(d, bytes);
+    try keep.append(a, b);
     return b.ptr;
 }
+
+/// A 2D node's experts on random weights: 384 MXFP4 routed experts over X_SETS weight sets (expert e on set e % 8; gate
+/// / up [640, 2,560 B] with scales [640, 160], down [2,560, 576 B] with [2,560, 36]), the FP8 shared expert last (gate /
+/// up [640, 5,120] with [20, 160] scales, down [2,560, 1,152] with [80, 36]), the pack's rest with a random owner an
+/// expert. Its buffers in `keep`.
+fn xExperts(d: *const cuda.Driver, rng: std.Random, ha: std.mem.Allocator, keep: *std.ArrayList(cuda.DeviceBuffer)) !weights.Experts {
     var sets: [X_SETS][6]u64 = undefined;
     for (&sets) |*st| {
+        st[0] = try upKeep(d, try bytesOf(X_W * X_D / 2, rng, ha, false), keep, ha);
+        st[1] = try upKeep(d, try bytesOf(X_W * X_D / 2, rng, ha, false), keep, ha);
+        st[2] = try upKeep(d, try scalesOf(X_W * X_D / 32, rng, ha), keep, ha);
+        st[3] = try upKeep(d, try scalesOf(X_W * X_D / 32, rng, ha), keep, ha);
+        st[4] = try upKeep(d, try bytesOf(X_N * X_I / 2, rng, ha, false), keep, ha);
+        st[5] = try upKeep(d, try scalesOf(X_N * X_I / 32, rng, ha), keep, ha);
+    }
     const shared = [6]u64{
+        try upKeep(d, try bytesOf(X_W * X_D, rng, ha, true), keep, ha),
+        try upKeep(d, try bytesOf(X_W * X_D, rng, ha, true), keep, ha),
+        try upKeep(d, try scalesOf((X_W / 32) * (X_D / 32), rng, ha), keep, ha),
+        try upKeep(d, try scalesOf((X_W / 32) * (X_D / 32), rng, ha), keep, ha),
+        try upKeep(d, try bytesOf(X_N * X_I, rng, ha, true), keep, ha),
+        try upKeep(d, try scalesOf((X_N / 32) * (X_I / 32), rng, ha), keep, ha),
     };
     var tables: [6][]u64 = undefined;
     for (&tables, 0..) |*t, j| {
@@ -1392,6 +1430,7 @@ fn scalesOf(n: usize, rng: std.Random, a: std.mem.Allocator) ![]u8 {
         for (t.*, 0..) |*p, e| p.* = if (e == X_E - 1) shared[j] else sets[e % X_SETS][j];
     }
     var tp: [6]u64 = undefined;
+    for (&tp, tables) |*p, t| p.* = try upKeep(d, std.mem.sliceAsBytes(t), keep, ha);
     const owner = try ha.alloc(i32, X_E + 1);
     for (owner) |*o| o.* = @intFromBool(rng.boolean());
     owner[X_E] = 0;
@@ -1403,15 +1442,35 @@ fn scalesOf(n: usize, rng: std.Random, a: std.mem.Allocator) ![]u8 {
     ex.down_n = X_N;
     // (scales_match: every expertScaleLens range lies inside its tensor here)
     ex.native = .{ .w1 = tp[0], .w3 = tp[1], .s1 = tp[2], .s3 = tp[3], .w2 = tp[4], .s2 = tp[5], .owner = try upKeep(d, std.mem.sliceAsBytes(owner), keep, ha), .tiles = X_TILES, .rest_tiles = X_REST, .scales_match = true };
+    return ex;
+}
+
+/// The experts' scratch for `rows` rows of X_SL slots, with a prompt chunk's tile list (`tiles`) or without (a round's).
+fn xScratch(d: *const cuda.Driver, rows: usize, tiles: bool, ha: std.mem.Allocator, keep: *std.ArrayList(cuda.DeviceBuffer)) !mx.ExpertScratch {
+    const sz = mx.ExpertScratch.sizes(rows, X_SL, X_E, X_D, X_I, X_N);
     var sb: [sz.len]u64 = undefined;
     for (&sb, sz) |*p, n| {
         const b = try cuda.DeviceBuffer.alloc(d, n);
         try keep.append(ha, b);
         p.* = b.ptr;
     }
+    var sc: mx.ExpertScratch = .{ .rows = rows, .slots = X_SL, .q = sb[0], .s = sb[1], .cnt = sb[2], .off = sb[3], .fill = sb[4], .act = sb[5], .nact = sb[6], .ent = sb[7], .erow = sb[8], .hq = sb[9], .hs = sb[10], .out = sb[11] };
+    if (tiles) {
+        const tl = try cuda.DeviceBuffer.alloc(d, mx.ExpertScratch.tileBytes(rows, X_SL, X_E));
         const nt = try cuda.DeviceBuffer.alloc(d, 4);
         try keep.append(ha, tl);
         try keep.append(ha, nt);
+        sc.tiles = tl.ptr;
+        sc.ntiles = nt.ptr;
+    }
+    return sc;
+}
+
+/// `rows` rows' picks (6 distinct routed experts, the shared expert in the last slot) and their weights.
+fn xPicks(rows: usize, rng: std.Random, ha: std.mem.Allocator) !struct { pick: []i32, wts: []f32 } {
+    const pick = try ha.alloc(i32, rows * X_SL);
+    const wts = try ha.alloc(f32, rows * X_SL);
+    for (0..rows) |row| {
         var used: [6]i32 = undefined;
         for (0..6) |sl| {
             var e: i32 = undefined;
@@ -1426,6 +1485,25 @@ fn scalesOf(n: usize, rng: std.Random, a: std.mem.Allocator) ![]u8 {
         pick[row * X_SL + 6] = X_E - 1;
         wts[row * X_SL + 6] = 1;
     }
+    return .{ .pick = pick, .wts = wts };
+}
+
+fn pfRun128(r: *Run, rng: std.Random) !void {
+    const d = r.d;
+    var line: [256]u8 = undefined;
+    var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sarena.deinit();
+    const ha = sarena.allocator();
+    var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer for (keep.items) |*b| b.free();
+    const ex = try xExperts(d, rng, ha, &keep);
+    const P = R * X_SL;
+    const sc = try xScratch(d, R, true, ha, &keep);
+    const x = try upload(d, try bf16s(R * X_D, rng, 0.5, ha));
+    const hdn = try upload(d, try bf16s(P * X_I, rng, 0.5, ha));
+    const pw = try xPicks(R, rng, ha);
+    const pb = try upload(d, std.mem.sliceAsBytes(pw.pick));
+    const wb = try upload(d, std.mem.sliceAsBytes(pw.wts));
     const h = try cuda.DeviceBuffer.alloc(d, P * X_W * 2);
     const out = try cuda.DeviceBuffer.alloc(d, R * X_N * 4);
     for ([_]cuda.DeviceBuffer{ x, hdn, pb, wb, h, out }) |b| try keep.append(ha, b);
@@ -1524,6 +1602,147 @@ fn scalesOf(n: usize, rng: std.Random, a: std.mem.Allocator) ![]u8 {
         }
         r.note(try std.fmt.bufPrint(&line, "pf_run128 soak: the twins at 512 rows, {d} launches on one input, {d} differ from the first (the pack, down's entry outputs, the combined rows)", .{ soak_launches, bad }), bad == 0);
     }
+}
+
+// -- TF_DS_DECODE_FUSE -----------------------------------------------------------------------------------------------
+
+/// mx.gateUp then mx.down of a decode window (split: the decode tensor-core kernels, a round's one-CTA grouping) on
+/// xExperts' tables at 1, 6, 16 and 48 rows, the routed sum in the down launch against tf_dsn_combine after it: down's
+/// fp32 entry outputs and the combined rows byte-equal, accumulated onto random rows too; one down input value
+/// changed differs.
+fn decodeFuse(r: *Run, rng: std.Random) !void {
+    const d = r.d;
+    var line: [256]u8 = undefined;
+    var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sarena.deinit();
+    const ha = sarena.allocator();
+    var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer for (keep.items) |*b| b.free();
+    const ex = try xExperts(d, rng, ha, &keep);
+    const R: usize = 48;
+    const P = R * X_SL;
+    const sc = try xScratch(d, R, false, ha, &keep);
+    const x = try upload(d, try bf16s(R * X_D, rng, 0.5, ha));
+    const hdn = try upload(d, try bf16s(P * X_I, rng, 0.5, ha));
+    const pw = try xPicks(R, rng, ha);
+    const pb = try upload(d, std.mem.sliceAsBytes(pw.pick));
+    const wb = try upload(d, std.mem.sliceAsBytes(pw.wts));
+    const h = try cuda.DeviceBuffer.alloc(d, P * X_W * 2);
+    const out = try cuda.DeviceBuffer.alloc(d, R * X_N * 4);
+    for ([_]cuda.DeviceBuffer{ x, hdn, pb, wb, h, out }) |b| try keep.append(ha, b);
+    const base = try f32s(R * X_N, rng, ha);
+    const Dec = struct {
+        /// gate / up of rows m, then down of hdn's entries (accumulated onto `acc` when given): down's entry
+        /// outputs, the combined rows
+        fn run(rr: *Run, e_: weights.Experts, s_: mx.ExpertScratch, xp: u64, hd: u64, pk: u64, wt: u64, hb: cuda.DeviceBuffer, ob: cuda.DeviceBuffer, m: usize, fuse: bool, acc: ?[]const u8, exit: bool) ![2][]u8 {
+            rr.k.decode_fuse = fuse;
+            defer rr.k.decode_fuse = false;
+            const was = rr.k.expert_exit;
+            rr.k.expert_exit = exit;
+            defer rr.k.expert_exit = was;
+            try poison(hb.ptr, hb.len, rr.d, rr.s);
+            try poison(s_.out, m * X_SL * X_N * 4, rr.d, rr.s);
+            try poison(ob.ptr, ob.len, rr.d, rr.s);
+            try rr.s.synchronize();
+            try mx.gateUp(rr.k, rr.s, rr.d, e_, s_, xp, X_D, pk, wt, m, 7.0, hb.ptr, X_MAIN, true);
+            try mx.down(rr.k, rr.s, e_, s_, hd, X_I, pk, m, ob.ptr, X_N, acc != null, true);
+            try rr.s.synchronize();
+            const eo = try get(s_.out, m * X_SL * X_N * 4, rr.d);
+            errdefer free(eo);
+            return .{ eo, try get(ob.ptr, m * X_N * 4, rr.d) };
+        }
+    };
+    const names = [_][]const u8{ "down's fp32 entry outputs", "the combined fp32 rows" };
+    // the served build's early exit of the CTAs past the active experts (TF_DS_EXPERT_EXIT=1) at every row count, and
+    // without it at 6 rows
+    const Case = struct { m: usize, exit: bool };
+    const cases = [_]Case{ .{ .m = 1, .exit = true }, .{ .m = 6, .exit = true }, .{ .m = 16, .exit = true }, .{ .m = 48, .exit = true }, .{ .m = 6, .exit = false } };
+    for (cases) |cs| for ([_]bool{ false, true }) |accumulate| {
+        const acc: ?[]const u8 = if (accumulate) std.mem.sliceAsBytes(base) else null;
+        const want = try Dec.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, cs.m, false, acc, cs.exit);
+        defer for (want) |w| free(w);
+        const got = try Dec.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, cs.m, true, acc, cs.exit);
+        defer for (got) |g| free(g);
+        for (names, want, got) |nm, w, g| r.report(try std.fmt.bufPrint(&line, "decode_fuse rows={d}{s}{s}: {s} with the routed sum in the down launch against tf_dsn_combine", .{ cs.m, if (accumulate) " accumulated" else "", if (cs.exit) "" else " without the early exit", nm }), differs(w, g), true);
+    };
+    // the control: one down input value of row 0's first slot set to 64
+    const want = try Dec.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 6, false, null, true);
+    defer for (want) |w| free(w);
+    const at = hdn.ptr + 70 * 2;
+    const big = [2]u8{ 0x80, 0x42 };
+    var was: [2]u8 = undefined;
+    const got = try Dec.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 6, true, null, true);
+    defer for (got) |g| free(g);
+    r.report("decode_fuse control: the combined rows with one down input value of row 0's first slot set to 64", differs(want[1], got[1]), false);
+}
+
+/// mx.assembleQuant against tf_ds_assemble_rest then mx.quantDec (TF_DS_DECODE_FUSE: a 2D round's parity assembly with
+/// down's quant) at 1, 6, 16 and 48 rows of 7 slots (512 main columns a pair, a 128-column rest from a random owner): the
+/// assembled bf16 rows, down's codes and scales byte-equal; one changed value of pair 1's pack differs.
+fn decodeAsmQuant(r: *Run, rng: std.Random) !void {
+    const d = r.d;
+    var line: [256]u8 = undefined;
+    var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sarena.deinit();
+    const ha = sarena.allocator();
+    var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer for (keep.items) |*b| b.free();
+    const ops = r.ops orelse return error.NoOps;
+    const ig: usize = X_MAIN;
+    const ir: usize = X_W - X_MAIN;
+    const w = 2 * ig + ir;
+    const R: usize = 48;
+    const P = R * X_SL;
+    const sc = try xScratch(d, R, false, ha, &keep);
+    const part0 = try upload(d, try bf16s(P * (ig + ir), rng, 0.5, ha));
+    const part1 = try upload(d, try bf16s(P * (ig + ir), rng, 0.5, ha));
+    const pick = try ha.alloc(i32, P);
+    for (pick) |*e| e.* = @intCast(rng.uintLessThan(usize, X_E));
+    const owner = try ha.alloc(i32, X_E + 1);
+    for (owner) |*o| o.* = @intFromBool(rng.boolean());
+    owner[X_E] = 0;
+    const pb = try upload(d, std.mem.sliceAsBytes(pick));
+    const ob = try upload(d, std.mem.sliceAsBytes(owner));
+    const out = try cuda.DeviceBuffer.alloc(d, P * w * 2);
+    for ([_]cuda.DeviceBuffer{ part0, part1, pb, ob, out }) |b| try keep.append(ha, b);
+    const Asm = struct {
+        /// p slot rows assembled into out and quantized into sc's hq / hs, fused or in two launches: the three
+        fn run(rr: *Run, o: *const dsv41.ops.Ops, s_: mx.ExpertScratch, p0: u64, p1: u64, pk: u64, own: u64, ob_: cuda.DeviceBuffer, p: usize, fused: bool) ![3][]u8 {
+            const wd = 2 * X_MAIN + (X_W - X_MAIN);
+            try poison(ob_.ptr, ob_.len, rr.d, rr.s);
+            try poison(s_.hq, p * wd, rr.d, rr.s);
+            try poison(s_.hs, p * wd / 32 * 4, rr.d, rr.s);
+            if (fused) {
+                try mx.assembleQuant(rr.k, rr.s, p0, p1, pk, own, ob_.ptr, p, X_MAIN, X_W - X_MAIN, s_);
+            } else {
+                try o.assembleRest(rr.s, p0, p1, pk, own, ob_.ptr, p, X_MAIN, X_W - X_MAIN);
+                try mx.quantDec(rr.k, rr.s, ob_.ptr, .bf16, wd, p, wd, s_.hq, wd, s_.hs, wd / 32);
+            }
+            try rr.s.synchronize();
+            const xa = try get(ob_.ptr, p * wd * 2, rr.d);
+            errdefer free(xa);
+            const qa = try get(s_.hq, p * wd, rr.d);
+            errdefer free(qa);
+            return .{ xa, qa, try get(s_.hs, p * wd / 32 * 4, rr.d) };
+        }
+    };
+    const names = [_][]const u8{ "the assembled bf16 rows", "down's codes", "down's scales" };
+    for ([_]usize{ 1, 6, 16, 48 }) |m| {
+        const want = try Asm.run(r, ops, sc, part0.ptr, part1.ptr, pb.ptr, ob.ptr, out, m * X_SL, false);
+        defer for (want) |x| free(x);
+        const got = try Asm.run(r, ops, sc, part0.ptr, part1.ptr, pb.ptr, ob.ptr, out, m * X_SL, true);
+        defer for (got) |x| free(x);
+        for (names, want, got) |nm, a, b| r.report(try std.fmt.bufPrint(&line, "decode_fuse rows={d}: {s} of the assembly with down's quant against assemble_rest and the quant", .{ m, nm }), differs(a, b), true);
+    }
+    // the control: one value of pair 1's main row 3 set to 64
+    const want = try Asm.run(r, ops, sc, part0.ptr, part1.ptr, pb.ptr, ob.ptr, out, 6 * X_SL, false);
+    defer for (want) |x| free(x);
+    const at = part1.ptr + (3 * ig + 40) * 2;
+    const big = [2]u8{ 0x80, 0x42 };
+    var was: [2]u8 = undefined;
+    const got = try Asm.run(r, ops, sc, part0.ptr, part1.ptr, pb.ptr, ob.ptr, out, 6 * X_SL, true);
+    defer for (got) |x| free(x);
+    r.report("decode_fuse control: down's codes with one value of pair 1's main row 3 set to 64", differs(want[1], got[1]), false);
 }
 
 // -- TF_DS_HC_STRIDE -------------------------------------------------------------------------------------------------
@@ -4049,12 +4268,276 @@ fn gemmW16(r: *Run, rng: std.Random) !void {
     }
 }
 
+// -- TF_DS_RDMA_COLLECT_PEERS ---------------------------------------------------------------------------------------
+
+/// A receive ring on one GPU as the rings keep theirs (rdma.Pinned pages registered with CUDA): world_max ranks' slots
+/// at `slots` deep, the flags [slots][world] and the abort word in pages of their own, the sequence on the device, and
+/// a destination buffer. A case writes every peer's slot and flag, as the proxy leaves them, then launches.
+const CollectRig = struct {
+    d: *const cuda.Driver,
+    s: cuda.Stream,
+    io: std.Io,
+    hr: dsv41.rdma.HostReg,
+    recv: dsv41.rdma.Pinned,
+    meta: dsv41.rdma.Pinned,
+    seq: cuda.DeviceBuffer,
+    out: cuda.DeviceBuffer,
+    module: cuda.Module,
+    k: dsv41.rdma.Kernels,
+    const slots: u32 = 2;
+    const world_max: usize = 4;
+    const max_bytes: usize = 4_456_448; // the engine's slot (model.zig ring_bytes)
+    const out_bytes: usize = 24 << 20;
+    const q: u64 = 7; // the sequence a case runs at: slot q % slots
+
+    fn init(d: *const cuda.Driver, s: cuda.Stream, io: std.Io) !CollectRig {
+        var hr = try dsv41.rdma.HostReg.open();
+        errdefer hr.lib.close();
+        var recv = try dsv41.rdma.Pinned.alloc(d, &hr, slots * world_max * max_bytes);
+        errdefer recv.free(&hr);
+        var meta = try dsv41.rdma.Pinned.alloc(d, &hr, 4096);
+        errdefer meta.free(&hr);
+        var seq = try cuda.DeviceBuffer.alloc(d, 8);
+        errdefer seq.free();
+        var out = try cuda.DeviceBuffer.alloc(d, out_bytes);
+        errdefer out.free();
+        var module = try cuda.Module.load(d, cuda.kernels.dsv41_rdma);
+        errdefer module.unload();
+        return .{ .d = d, .s = s, .io = io, .hr = hr, .recv = recv, .meta = meta, .seq = seq, .out = out, .module = module, .k = try dsv41.rdma.Kernels.load(module) };
+    }
+
+    fn deinit(g: *CollectRig) void {
+        g.module.unload();
+        g.out.free();
+        g.seq.free();
+        g.meta.free(&g.hr);
+        g.recv.free(&g.hr);
+        g.hr.lib.close();
+    }
+
+    fn flags(g: *CollectRig) []u64 {
+        return @as([*]u64, @ptrCast(@alignCast(g.meta.mem.ptr)))[0 .. slots * world_max + 1];
+    }
+
+    /// Peer p's slot at the case's sequence (world ranks).
+    fn slot(g: *CollectRig, world: usize, p: usize) []u8 {
+        const at = ((q % slots) * world + p) * max_bytes;
+        return g.recv.mem[at..][0..max_bytes];
+    }
+
+    /// Every peer's slot (but `rank`'s) filled with random bytes for `rows` rows of its width, every flag at q.
+    fn fill(g: *CollectRig, rng: std.Random, world: usize, rank: usize, rows: usize, dd: dsv41.rdma.Dsts) void {
+        for (0..world) |p| if (p != rank and dd.ptr[p] != 0) rng.bytes(g.slot(world, p)[0 .. rows * @as(usize, @intCast(dd.row4[p])) * 16]);
+        const f = g.flags();
+        @memset(f, 0);
+        for (0..world) |p| f[(q % slots) * world + p] = q;
+    }
+
+    /// A copy-out launched before the peers' data is there: then, as the proxy does, each peer's slot written and its
+    /// flag released, `order`'s peers 2 ms apart (this rank's own flag never set). The destination buffer read back once
+    /// the launch ends (the caller frees it), or null when it did not end within 5 s of the last flag.
+    fn runLate(g: *CollectRig, rng: std.Random, world: usize, rank: usize, rows: usize, dd: dsv41.rdma.Dsts, peers: bool, order: []const usize) !?[]u8 {
+        const f = g.flags();
+        @memset(f, 0);
+        for (0..world) |p| if (p != rank and dd.ptr[p] != 0) @memset(g.slot(world, p)[0 .. rows * @as(usize, @intCast(dd.row4[p])) * 16], 0);
+        try poison(g.out.ptr, out_bytes, g.d, g.s);
+        const qv = q;
+        var copy4: u64 = 0;
+        for (0..world) |p| if (p != rank and dd.ptr[p] != 0) {
+            copy4 += @as(u64, rows) * @as(u64, @intCast(dd.row4[p]));
+        };
+        const ring: dsv41.rdma.CollectRing = .{ .recv = g.recv.dev, .flags = g.meta.dev, .seq = g.seq.ptr, .abort = g.meta.dev + (slots * world_max) * 8, .rank = @intCast(rank), .world = @intCast(world) };
+        try dsv41.rdma.launchCollect(g.k, .{ .max_bytes = max_bytes, .slots = slots, .collect_peers = peers }, g.s, dd, @intCast(rows), ring, copy4);
+        for (order) |p| {
+            std.Io.sleep(g.io, .fromMilliseconds(2), .awake) catch {};
+            rng.bytes(g.slot(world, p)[0 .. rows * @as(usize, @intCast(dd.row4[p])) * 16]);
+            @atomicStore(u64, &f[(q % slots) * world + p], q, .release); // the data before the flag, as the proxy
+        }
+        var waited: usize = 0;
+        while (!(try g.s.done())) : (waited += 1) {
+            if (waited == 5000) {
+                f[slots * world_max] = 1;
+                try g.s.synchronize();
+                f[slots * world_max] = 0;
+                return null;
+            }
+            std.Io.sleep(g.io, .fromMilliseconds(1), .awake) catch {};
+        }
+        return try get(g.out.ptr, out_bytes, g.d);
+    }
+
+    /// One copy-out (`peers`: TF_DS_RDMA_COLLECT_PEERS's kernel, else the baseline) of a case into the poisoned
+    /// destinations; the whole destination buffer read back (the caller frees it), or null when the launch did not end
+    /// within 5 s (its abort word then set, so it does).
+    fn run(g: *CollectRig, world: usize, rank: usize, rows: usize, dd: dsv41.rdma.Dsts, peers: bool) !?[]u8 {
+        return g.runProbed(world, rank, rows, dd, peers, 0);
+    }
+
+    /// run's copy-out with `probe` (a device address, 0: none) handed to the launch as the ring's.
+    fn runProbed(g: *CollectRig, world: usize, rank: usize, rows: usize, dd: dsv41.rdma.Dsts, peers: bool, probe: u64) !?[]u8 {
+        try poison(g.out.ptr, out_bytes, g.d, g.s);
+        const qv = q;
+        var copy4: u64 = 0;
+        for (0..world) |p| if (p != rank and dd.ptr[p] != 0) {
+            copy4 += @as(u64, rows) * @as(u64, @intCast(dd.row4[p]));
+        };
+        const meta_dev = g.meta.dev;
+        const ring: dsv41.rdma.CollectRing = .{ .recv = g.recv.dev, .flags = meta_dev, .seq = g.seq.ptr, .abort = meta_dev + (slots * world_max) * 8, .probe = probe, .rank = @intCast(rank), .world = @intCast(world) };
+        try dsv41.rdma.launchCollect(g.k, .{ .max_bytes = max_bytes, .slots = slots, .collect_peers = peers }, g.s, dd, @intCast(rows), ring, copy4);
+        var waited: usize = 0;
+        while (!(try g.s.done())) : (waited += 1) {
+            if (waited == 5000) {
+                g.flags()[slots * world_max] = 1; // the abort word: the kernel leaves its wait
+                try g.s.synchronize();
+                g.flags()[slots * world_max] = 0;
+                return null;
+            }
+            std.Io.sleep(g.io, .fromMilliseconds(1), .awake) catch {};
+        }
+        return try get(g.out.ptr, out_bytes, g.d);
+    }
+
+    /// Where the baseline copy-out puts every byte: the poison, and each copied peer's slot rows at their destinations.
+    fn expected(g: *CollectRig, world: usize, rank: usize, rows: usize, dd: dsv41.rdma.Dsts) ![]u8 {
+        const e = try std.heap.page_allocator.alloc(u8, out_bytes);
+        @memset(e, 0xa5);
+        for (0..world) |p| {
+            if (p == rank or dd.ptr[p] == 0) continue;
+            const r4: usize = @intCast(dd.row4[p]);
+            const s4: usize = @intCast(dd.stride4[p]);
+            const off: usize = @intCast(dd.ptr[p] - g.out.ptr);
+            const src = g.slot(world, p);
+            for (0..rows) |rr| @memcpy(e[off + rr * s4 * 16 ..][0 .. r4 * 16], src[rr * r4 * 16 ..][0 .. r4 * 16]);
+        }
+        return e;
+    }
+
+    /// A case both ways: the bytes the two copy-outs differ in, plus those the baseline differs from the slots' placement
+    /// in (a launch that did not end counts the whole buffer).
+    fn case(g: *CollectRig, rng: std.Random, world: usize, rank: usize, rows: usize, dd: dsv41.rdma.Dsts) !usize {
+        g.fill(rng, world, rank, rows, dd);
+        const today = (try g.run(world, rank, rows, dd, false)) orelse return out_bytes;
+        defer free(today);
+        const mine = (try g.run(world, rank, rows, dd, true)) orelse return out_bytes;
+        defer free(mine);
+        const e = try g.expected(world, rank, rows, dd);
+        defer free(e);
+        return differs(today, mine) + differs(today, e);
+    }
+};
+
+/// rdma.Dsts from the rings' own destinations (ring2d's), each pointer an offset into the rig's buffer.
+fn dstsOf(dsts: []const dsv41.rdma.Ring.Dst) dsv41.rdma.Dsts {
+    var dd: dsv41.rdma.Dsts = .{};
+    for (dsts, 0..) |t, p| {
+        dd.ptr[p] = t.ptr;
+        dd.row4[p] = @intCast(t.row4);
+        dd.stride4[p] = @intCast(t.stride4);
+    }
+    return dd;
+}
+
+fn collectPeers(r: *Run, rng_in: std.Random) !void {
+    _ = rng_in;
+    // its own seed: TF_DS_REPLAY_ONLY=collect_peers runs the inputs the whole replay runs
+    var prng = std.Random.DefaultPrng.init(0xc011);
+    const rng = prng.random();
+    var g = try CollectRig.init(r.d, r.s, r.io orelse return error.NoIo);
+    defer g.deinit();
+    const base = g.out.ptr;
+    r.note("collect_peers: the build's rdma_gather fatbin has dsv41_rdma_collect_peers", g.k.collect_peers != null);
+    if (g.k.collect_peers == null) {
+        for (0..8) |_| r.note("collect_peers: no kernel to compare", false);
+        return;
+    }
+    // the all4 quarters (attention's and the MoE's: 2,560 fp32 a node, 10,240-byte rows) at a round's row counts, every
+    // rank; and a row block of a longer exchange (quartersRows: rows 5 .. 10 of 34)
+    var all4: usize = 0;
+    for ([_]usize{ 1, 2, 3, 5, 16, 26, 34 }) |rows| for (0..4) |rank| {
+        all4 += try g.case(rng, 4, rank, rows, dstsOf(&(try dsv41.ring2d.quartersDsts(base, rows, 0, .{ 2560, 2560 }, 4))));
+    };
+    for (0..4) |rank| all4 += try g.case(rng, 4, rank, 6, dstsOf(&(try dsv41.ring2d.quartersDsts(base, 34, 5, .{ 2560, 2560 }, 4))));
     r.report("collect_peers all4 quarters (2,560 fp32 a node) at 1, 2, 3, 5, 16, 26 and 34 rows and rows 5 .. 10 of 34, every rank: against the baseline copy-out, and the baseline against the slots' bytes", all4, true);
+    // the head's quarters: 32,384 and 32,256 fp32 a node (8,096 / 8,064 float4 a row, eight units each)
+    var head: usize = 0;
+    for ([_]usize{ 1, 2, 34 }) |rows| for (0..4) |rank| {
+        head += try g.case(rng, 4, rank, rows, dstsOf(&(try dsv41.ring2d.quartersDsts(base, rows, 0, .{ 32384, 32256 }, 4))));
+    };
     r.report("collect_peers head quarters (32,384 / 32,256 fp32 a node) at 1, 2 and 34 rows, every rank: against the baseline's, and the baseline against the slots' bytes", head, true);
+    // the column ring (two ranks): catRank (2,048 bf16 a rank side by side: ring2d.Rings.catRank's destinations),
+    // the parity pack (8,960-byte rows to the partner alone: prompt2d's packExchange), the pair gather (2,560 fp32
+    // planes: Rings.pairGather's)
+    var col: usize = 0;
+    for ([_]usize{ 1, 2, 16 }) |rows| for (0..2) |rank| {
+        var cat: [2]dsv41.rdma.Ring.Dst = undefined;
+        for (0..2) |pp| cat[pp] = .{ .ptr = base + pp * 2048 * 2, .row4 = 2048 * 2 / 16, .stride4 = 4096 * 2 / 16 };
+        col += try g.case(rng, 2, rank, rows, dstsOf(&cat));
+        var pack: [2]dsv41.rdma.Ring.Dst = .{ .{}, .{} };
+        pack[1 - rank] = .{ .ptr = base, .row4 = 8960 / 16, .stride4 = 8960 / 16 };
+        col += try g.case(rng, 2, rank, rows, dstsOf(&pack));
+        var pair: [2]dsv41.rdma.Ring.Dst = undefined;
+        for (0..2) |rr| pair[rr] = .{ .ptr = base + rr * rows * 2560 * 4, .row4 = 2560 * 4 / 16, .stride4 = 2560 * 4 / 16 };
+        col += try g.case(rng, 2, rank, rows, dstsOf(&pair));
+    };
     r.report("collect_peers column ring: catRank (2,048 bf16 a rank), the parity pack (8,960-byte rows, the partner's alone) and the pair gather (2,560 fp32) at 1, 2 and 16 rows, both ranks: against the baseline's, and the baseline against the slots' bytes", col, true);
+    // odd widths (1 .. 2,049 float4, a unit's edge both sides), rows apart by a gap of 3 float4, one peer without a
+    // destination
+    var odd: usize = 0;
+    for ([_]u32{ 1, 3, 255, 1023, 1024, 1025, 2049 }) |w4| for ([_]usize{ 1, 2, 5 }) |rows| {
+        var dsts: [4]dsv41.rdma.Ring.Dst = undefined;
+        for (0..4) |p| dsts[p] = .{ .ptr = base + p * rows * (w4 + 3) * 16, .row4 = w4, .stride4 = w4 + 3 };
+        dsts[0] = .{}; // rank 0 copied out nowhere
+        odd += try g.case(rng, 4, 2, rows, dstsOf(&dsts));
+    };
     r.report("collect_peers odd widths (1, 3, 255, 1,023, 1,024, 1,025, 2,049 float4) at 1, 2 and 5 rows, a gap of 3 float4 between rows, rank 0 without a destination, on rank 2: against the baseline's, and the baseline against the slots' bytes", odd, true);
+    // a zero-width destination in the middle of the peer list: rank 1's pointer is set but row4 is 0. The host's
+    // peersGrid leaves it out (2 rows: ranks 2 and 3), so the kernel's y-th row must land on 2 and 3, not 1 and 2.
+    var zero: dsv41.rdma.Dsts = dstsOf(&(try dsv41.ring2d.quartersDsts(base, 2, 0, .{ 2560, 2560 }, 4)));
+    zero.row4[1] = 0;
+    const zw = try g.case(rng, 4, 0, 2, zero);
     r.report("collect_peers zero-width destination: rank 1's destination has a pointer and row4 0 in the 4-rank gather at 2 rows on rank 0: against the baseline's, and the baseline against the slots' bytes", zw, true);
+    // the flags late: each peer's data and flag after the launch, 2 ms apart, rank 3's first, then 0, then 2 (rank 1's
+    // own never set): each block row waits for its own peer, so every byte is the late data, both kernels
+    var late: usize = 0;
+    for ([_]usize{ 2, 34 }) |rows| for ([_]bool{ false, true }) |pk| {
+        const ld = dstsOf(&(try dsv41.ring2d.quartersDsts(base, rows, 0, .{ 2560, 2560 }, 4)));
+        const got = (try g.runLate(rng, 4, 1, rows, ld, pk, &.{ 3, 0, 2 })) orelse {
+            late += CollectRig.out_bytes;
+            continue;
+        };
+        defer free(got);
+        const e = try g.expected(4, 1, rows, ld);
+        defer free(e);
+        late += differs(got, e);
+    };
+    r.report("collect_peers late flags: each peer's slot written and its flag released after the launch, 2 ms apart (rank 3, 0, then 2; rank 1's own never), at 2 and 34 rows, both kernels: against the late data's placement", late, true);
+    // which kernel ran (the bytes cannot tell them apart): the baseline counts its launch in the ring's probe (probe[3]),
+    // TF_DS_RDMA_COLLECT_PEERS's takes no probe and leaves it
+    var probe = try cuda.DeviceBuffer.alloc(r.d, 64);
+    defer probe.free();
+    var counts: [2]u64 = undefined;
+    for ([_]bool{ false, true }, 0..) |pk, i| {
+        try r.d.check(r.d.api.cuMemsetD8Async(probe.ptr, 0, 64, r.s.handle), "cuMemsetD8Async");
+        const pd = dstsOf(&(try dsv41.ring2d.quartersDsts(base, 2, 0, .{ 2560, 2560 }, 4)));
+        g.fill(rng, 4, 0, 2, pd);
+        const out = (try g.runProbed(4, 0, 2, pd, pk, probe.ptr)) orelse return error.CollectHung;
+        free(out);
+        const pb = try get(probe.ptr, 64, r.d);
+        defer free(pb);
+        counts[i] = std.mem.readInt(u64, pb[24..32], .little);
+    }
     r.note("collect_peers: the switch runs dsv41_rdma_collect_peers (the ring's probe counts the baseline launch, 1, and not the switch's, 0)", counts[0] == 1 and counts[1] == 0);
+    // the control: one 16-byte unit of rank 3's slot changed between two of the kernel's runs of the same case
+    const dd = dstsOf(&(try dsv41.ring2d.quartersDsts(base, 2, 0, .{ 2560, 2560 }, 4)));
+    g.fill(rng, 4, 1, 2, dd);
+    const before = (try g.run(4, 1, 2, dd, true)) orelse return error.CollectHung;
+    defer free(before);
+    g.slot(4, 3)[16 * 700] ^= 0x5a;
+    const after = (try g.run(4, 1, 2, dd, true)) orelse return error.CollectHung;
+    defer free(after);
+    r.report("collect_peers control: one byte of rank 3's slot changed (row 1, its float4 60) between two of the kernel's copy-outs on rank 1", differs(before, after), false);
+}
+
 // -- TF_DS_HEAD_CAND -------------------------------------------------------------------------------------------------
 
 /// The head's columns of the four nodes in the vocabulary's order (g0, g2, g1, g3: a rank's half, pair 0's columns then
@@ -10852,6 +11335,7 @@ fn qgateBody(r: *Run, rng: std.Random) !void {
     .{ "gemm_w16", gemmW16, 13 },
     .{ "split64n", split64n, 6 },
     .{ "pf_t64", pfT64, 4 },
+    .{ "collect_peers", collectPeers, 9 },
     .{ "ring_wc", ringWc, 6 },
     .{ "ring_inplace", ringInplace, 8 },
     .{ "ring_word", ringWord, 9 },
@@ -10927,6 +11411,8 @@ pub fn main(init: std.process.Init) !u8 {
     k.topk_tiles = false;
     try k.useRun128();
     k.run128 = false;
+    try k.useDecodeFuse(&driver);
+    k.decode_fuse = false;
     try k.useQgateBody();
     // TF_DS_MMA_SF's kernels (sm_121a: another GPU leaves them unloaded, and the section says so); each check sets the
     // arithmetic it runs

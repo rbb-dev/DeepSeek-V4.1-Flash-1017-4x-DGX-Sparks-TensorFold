@@ -51,6 +51,8 @@ pub const Fake = struct {
     cycle_after: ?usize = null,
     probe_prompt: usize = 0,
     pattern: []const u32 = &.{ 11, 12, 13 },
+    // the reply's tokens at these indexes are 5 instead of the pattern's (a copy of the pattern fails there)
+    holes: []const usize = &.{},
     answer_cycles: bool = false,
     prefill_chunks: usize = 0,
     prefill_count: usize = 0,
@@ -174,7 +176,10 @@ pub const Fake = struct {
                 const answer = [_]u32{ 40, 41, 42, 96 };
                 return answer[@min(after, 3)];
             }
-            if (reply.len >= start) return x.pattern[(reply.len - start) % x.pattern.len];
+            if (reply.len >= start) {
+                for (x.holes) |h| if (reply.len == h) return 5;
+                return x.pattern[(reply.len - start) % x.pattern.len];
+            }
         };
         return next(history, sampling, position);
     }

@@ -86,6 +86,8 @@ pub fn pow2(n: usize) usize {
 pub const Log = struct {
     gpa: std.mem.Allocator,
     items: std.ArrayList(Kept) = .empty,
+    marks: std.ArrayList(Mark) = .empty,
+
     /// `extra`: a launch of the extra set's variant (runExtra, runTwin). `fallback`: a runTwin launch's base kernel, which
     /// runs when the extra set has no variant of the twin (null for runExtra: the base set is not searched).
     pub const Kept = struct {
@@ -105,6 +107,10 @@ pub const Log = struct {
         }
     };
 
+    /// A side stream's fork between launches: its event recorded on the main stream, or the side stream's wait on it,
+    /// after the first `at` launches (tri_hc's forks).
+    pub const Mark = struct { at: usize, what: enum { fork, wait } };
+
     fn add(l: *Log, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const, extra: bool) !void {
         try l.items.append(l.gpa, .{ .name = name, .grid = grid, .args = try l.gpa.dupe(aot.Arg, args), .consts = try l.gpa.dupe(aot.Const, consts), .extra = extra });
     }
@@ -114,8 +120,8 @@ pub const Log = struct {
         try l.items.append(l.gpa, .{ .name = twin, .grid = grid, .args = try l.gpa.dupe(aot.Arg, args), .consts = try l.gpa.dupe(aot.Const, consts), .extra = true, .fallback = fallback });
     }
 
-    fn add(l: *Log, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !void {
-        try l.items.append(l.gpa, .{ .name = name, .grid = grid, .args = try l.gpa.dupe(aot.Arg, args), .consts = try l.gpa.dupe(aot.Const, consts) });
+    pub fn mark(l: *Log, what: @FieldType(Mark, "what")) !void {
+        try l.marks.append(l.gpa, .{ .at = l.items.items.len, .what = what });
     }
 
     pub fn deinit(l: *Log) void {
@@ -124,6 +130,7 @@ pub const Log = struct {
             l.gpa.free(k.consts);
         }
         l.items.deinit(l.gpa);
+        l.marks.deinit(l.gpa);
     }
 };
 

@@ -1,12 +1,19 @@
 //! tf-dsv41-rdma-bench: the RDMA ring (rdma.zig) across real nodes, one process a rank. Rank 0 listens on
 //! `--port` for the other ranks' queue-pair infos and sends every rank the whole table; once all are connected, each
 //! rank runs back-to-back gathers at each row count (50 a CUDA graph, replayed, as the Python ring's --gather-bench),
-//! the plain gather and the strided gather_into, and checks every float it received. One JSON line a rank and row count.
+//! the plain gather and the strided gather_into, and checks every float it received. One JSON line a rank, row count,
+//! round and collecting kernel.
 //!   tf-dsv41-rdma-bench RANK WORLD MASTER_IP FATBIN DEVICES [--port P] [--rows 1,6,16,48] [--width 2560] [--reps 500]
-//!                       [--pdl 0|1] [--gid N]
+//!                       [--pdl 0|1] [--gid N] [--collect rank,peers] [--rounds N] [--stream GBPS]
+//! FATBIN `-`: the build's own rdma_gather fatbin. --collect: gather_into's copy-out kernels, measured in this order at
+//! each row count, every rank alike: `rank` the baseline (the peers' slots one after another), `peers`
+//! TF_DS_RDMA_COLLECT_PEERS's (every peer's at once); the plain gather is the baseline in both, the run's null control.
 //! --wc: the rings' send and landing data slots from cudaHostAlloc(Mapped | WriteCombined) (TF_DS_RING_WC's memory);
 //! --inplace: the timed gathers take the ring's fixed send slot as their source and wait for its previous send before
 //! each publish (TF_DS_RING_INPLACE's path), the row set copied there once (the bytes are the same every gather).
+//! --rounds: the list again, N times. --stream: the served paced L2 prefetch (tf_ds_l2_prefetch_kernel of the build's
+//! dsv41_ops, its served delay, waves of 128 x 8 KiB) at GBPS on a stream of its own over a 1 GiB buffer no gather
+//! touches, beside every timed loop; each line gives the rate it ran at and whether it outlasted the loop.
 //! --roci word|atomic: TF_DS_RING_WORD's arrival signal (each lane's data a plain RDMA WRITE, then its 64-bit
 //! generation word as an inline 8-byte WRITE or an ATOMIC fetch-and-add on the same queue pair; the collecting kernel
 //! waits on the words in-kernel), against the baseline path when unset: the same bytes, timed here.
@@ -40,6 +47,9 @@ pub fn main(init: std.process.Init) !u8 {
     var reps: u32 = 500;
     var pdl = true;
     var gid: ?u8 = null;
+    var collects_text: []const u8 = "rank";
+    var rounds: u32 = 1;
+    var stream_gbps: f64 = 0;
     var wc = false;
     var inplace = false;
     var mixed: u32 = 0;
@@ -65,12 +75,24 @@ pub fn main(init: std.process.Init) !u8 {
     var devices: std.ArrayList([]const u8) = .empty;
     var dit = std.mem.splitScalar(u8, args[5], ',');
     while (dit.next()) |t| try devices.append(a, t);
+    var collects: std.ArrayList(bool) = .empty; // true: TF_DS_RDMA_COLLECT_PEERS's kernel
+    var cit = std.mem.splitScalar(u8, collects_text, ',');
+    while (cit.next()) |t| {
+        if (std.mem.eql(u8, t, "rank")) try collects.append(a, false) else if (std.mem.eql(u8, t, "peers")) try collects.append(a, true) else {
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }
+    }
     if (inplace and !wc) {
         std.debug.print("--inplace needs --wc 1 (its send slot is the write-combined one)\n", .{});
         return 2;
     }
     if (mixed > 0 and !inplace) {
         std.debug.print("--mixed needs --inplace 1 --wc 1 (two in-place users and a staged send on one ring)\n", .{});
+        return 2;
+    }
+    if (rounds == 0 or stream_gbps < 0) {
+        std.debug.print("{s}", .{usage});
         return 2;
     }
     const per_graph = 50;
@@ -82,10 +104,20 @@ pub fn main(init: std.process.Init) !u8 {
     defer driver.close();
     var ctx = try cuda.Context.init(&driver, 0);
     defer ctx.deinit();
-    const image = try std.Io.Dir.cwd().readFileAlloc(io, args[4], a, .limited(1 << 26));
+    if (!cuda.kernels.available and (std.mem.eql(u8, args[4], "-") or stream_gbps > 0)) {
+        std.debug.print("FATBIN - and --stream take the build's own kernel images, which this build has not\n", .{});
+        return 2;
+    }
+    const image: []const u8 = if (std.mem.eql(u8, args[4], "-")) cuda.kernels.dsv41_rdma else try std.Io.Dir.cwd().readFileAlloc(io, args[4], a, .limited(1 << 26));
     var module = try cuda.Module.load(&driver, image);
     defer module.unload();
-    const r = try ring.Ring.create(init.gpa, &driver, try ring.Kernels.load(module), devices.items, rank, world, .{ .max_bytes = std.mem.alignForward(usize, @as(usize, most) * width * 4, 64), .pdl = pdl, .gid_index = gid });
+    const kernels = try ring.Kernels.load(module);
+    for (collects.items) |peers| if (peers and kernels.collect_peers == null) {
+        std.debug.print("--collect peers: the fatbin has no dsv41_rdma_collect_peers\n", .{});
+        return 2;
+    };
+    var paced: ?Paced = if (stream_gbps > 0) try Paced.init(&driver, stream_gbps) else null;
+    defer if (paced) |*p| p.deinit();
     if (inplace and !kernels.hasInplace()) {
         std.debug.print("--inplace: the fatbin has no dsv41_rdma_publish / dsv41_rdma_await_send\n", .{});
         return 2;
@@ -136,25 +168,12 @@ pub fn main(init: std.process.Init) !u8 {
         } else send.ptr;
         var dsts: [ring.max_ranks]ring.Ring.Dst = undefined;
         for (0..world) |q| dsts[q] = .{ .ptr = into.ptr + @as(u64, q) * width * 4, .row4 = width / 4, .stride4 = world * width / 4 };
-        for (0..20) |_| try r.gather(stream, send.ptr, n4, recv.ptr);
-        try stream.synchronize();
-        // 50 gathers captured in one graph and replayed, as the Python ring's --gather-bench times them
-        try cuda.graph.beginCapture(stream, .thread_local);
-        for (0..per_graph) |_| try r.gather(stream, send.ptr, n4, recv.ptr);
-        var g1 = try cuda.graph.endCapture(stream);
-        defer g1.deinit();
-        var e1 = try g1.instantiate();
-        defer e1.deinit();
-        try e1.launchOn(stream);
-        try stream.synchronize();
-        var t0 = std.Io.Timestamp.now(io, .awake);
-        for (0..loops) |_| try e1.launchOn(stream);
-        try stream.synchronize();
-        const us_gather = micros(t0, io) / @as(f64, @floatFromInt(loops * per_graph));
-        try recv.download(0, std.mem.sliceAsBytes(host));
-        var bad: usize = 0;
-        for (0..world) |q| for (0..n) |j| {
-            if (host[q * n + j] != value(@intCast(q), j)) bad += 1;
+        for (0..rounds) |round| for (collects.items) |peers| {
+            r.s.collect_peers = peers;
+            // both outputs poisoned (0xff: NaN, equal to no value sent) on the gathers' stream, so the check below
+            // sees only this kernel's writes, not an earlier one's
+            try driver.check(driver.api.cuMemsetD8Async(recv.ptr, 0xff, n * world * 4, stream.handle), "cuMemsetD8Async");
+            try driver.check(driver.api.cuMemsetD8Async(into.ptr, 0xff, n * world * 4, stream.handle), "cuMemsetD8Async");
             for (0..20) |_| {
                 if (inplace) _ = try r.prepareSend(stream);
                 try r.gather(stream, send_src, n4, recv.ptr);
@@ -170,6 +189,22 @@ pub fn main(init: std.process.Init) !u8 {
             defer g1.deinit();
             var e1 = try g1.instantiate();
             defer e1.deinit();
+            var t0 = std.Io.Timestamp.now(io, .awake);
+            try e1.launchOn(stream);
+            try stream.synchronize();
+            // the paced prefetch sized to outlast the timed loop: twice the warm graph's time a loop, and 5 ms
+            const one_s = micros(t0, io) / 1e6;
+            if (paced) |*p| try p.start(2 * one_s * @as(f64, @floatFromInt(loops)) + 0.005);
+            t0 = std.Io.Timestamp.now(io, .awake);
+            for (0..loops) |_| try e1.launchOn(stream);
+            try stream.synchronize();
+            const us_gather = micros(t0, io) / @as(f64, @floatFromInt(loops * per_graph));
+            const ran_gather = if (paced) |*p| try p.end() else Paced.Ran{};
+            try recv.download(0, std.mem.sliceAsBytes(host));
+            var bad: usize = 0;
+            for (0..world) |q| for (0..n) |j| {
+                if (host[q * n + j] != value(@intCast(q), j)) bad += 1;
+            };
             for (0..20) |_| {
                 if (inplace) _ = try r.prepareSend(stream);
                 try r.gatherInto(stream, send_src, n_rows, width / 4, dsts[0..world]);
@@ -184,6 +219,21 @@ pub fn main(init: std.process.Init) !u8 {
             defer g2.deinit();
             var e2 = try g2.instantiate();
             defer e2.deinit();
+            t0 = std.Io.Timestamp.now(io, .awake);
+            try e2.launchOn(stream);
+            try stream.synchronize();
+            const one_i = micros(t0, io) / 1e6;
+            if (paced) |*p| try p.start(2 * one_i * @as(f64, @floatFromInt(loops)) + 0.005);
+            t0 = std.Io.Timestamp.now(io, .awake);
+            for (0..loops) |_| try e2.launchOn(stream);
+            try stream.synchronize();
+            const us_into = micros(t0, io) / @as(f64, @floatFromInt(loops * per_graph));
+            const ran_into = if (paced) |*p| try p.end() else Paced.Ran{};
+            try into.download(0, std.mem.sliceAsBytes(host));
+            var bad_into: usize = 0;
+            for (0..n_rows) |row| for (0..world) |q| for (0..width) |c| {
+                if (host[row * world * width + q * width + c] != value(@intCast(q), row * width + c)) bad_into += 1;
+            };
             try out.interface.print("{{\"rank\": {d}, \"world\": {d}, \"rows\": {d}, \"bytes\": {d}, \"gathers\": {d}, \"pdl\": {d}, \"us_gather\": {d:.2}, \"us_into\": {d:.2}, \"bad\": {d}, \"bad_into\": {d}, \"collect\": \"{s}\", \"wc\": {d}, \"inplace\": {d}, \"roci\": \"{s}\", \"round\": {d}, \"stream_gbps\": {d:.0}, \"stream_ran_gbps\": [{d:.1}, {d:.1}], \"stream_outlasted\": [{}, {}], \"failure\": \"{s}\"}}\n", .{ rank, world, n_rows, n * 4, loops * per_graph, @intFromBool(pdl), us_gather, us_into, bad, bad_into, if (peers) "peers" else "rank", @intFromBool(wc), @intFromBool(inplace), if (roci.on()) roci.signalName() else "", round, stream_gbps, ran_gather.gbps, ran_into.gbps, ran_gather.outlasted, ran_into.outlasted, r.failure() orelse "" });
             try out.interface.flush();
         };
@@ -263,8 +313,72 @@ fn mixedReplay(gpa: std.mem.Allocator, driver: *const cuda.Driver, r: *ring.Ring
     return bad;
 }
 
+/// The served paced L2 prefetch beside a measurement: tf_ds_l2_prefetch_kernel of the build's dsv41_ops at `gbps`
+/// with the served delay (ops.l2_delay_ns) and waves (ops.pacedWaveNs), on a stream of its own, over a 1 GiB buffer no
+/// gather touches (the whole buffer again and again: past any L2, every line from DRAM).
+const Paced = struct {
+    module: cuda.Module,
+    f: cuda.Function,
+    buf: cuda.DeviceBuffer,
+    side: cuda.Stream,
+    e0: cuda.Event,
+    e1: cuda.Event,
+    gbps: f64,
+    bytes: u64 = 0,
+    const buf_bytes: u64 = 1 << 30;
+
+    /// What one prefetch did: the rate it ran at over its own span, and whether it was still running when the
+    /// measurement beside it ended (else the measurement's end ran without it); zero without a stream.
+    const Ran = struct { gbps: f64 = 0, outlasted: bool = false };
+
+    fn init(d: *const cuda.Driver, gbps: f64) !Paced {
+        var module = try cuda.Module.load(d, cuda.kernels.dsv41_ops);
+        errdefer module.unload();
+        const f = try module.function("tf_ds_l2_prefetch_kernel");
+        var buf = try cuda.DeviceBuffer.alloc(d, buf_bytes);
+        errdefer buf.free();
+        try d.check(d.api.cuMemsetD8_v2(buf.ptr, 0, buf_bytes), "cuMemsetD8"); // every page backed before the first wave
+        var side = try cuda.Stream.init(d, true);
+        errdefer side.deinit();
+        var e0 = try cuda.Event.init(d, true);
+        errdefer e0.deinit();
+        const e1 = try cuda.Event.init(d, true);
+        return .{ .module = module, .f = f, .buf = buf, .side = side, .e0 = e0, .e1 = e1, .gbps = gbps };
+    }
+
+    fn deinit(p: *Paced) void {
+        p.side.synchronize() catch {};
+        p.e1.deinit();
+        p.e0.deinit();
+        p.side.deinit();
+        p.buf.free();
+        p.module.unload();
+    }
+
+    /// `seconds` of prefetch at the rate (16 GiB at most) queued on its stream.
+    fn start(p: *Paced, seconds: f64) !void {
+        const a = dsv41.ops.pacedRanges(p.buf.ptr, buf_bytes, @intFromFloat(p.gbps * 1e9 * seconds));
+        p.bytes = 0;
+        for (a.bytes[0..@intCast(a.n)]) |b| p.bytes += b;
+        try p.e0.record(p.side);
+        var args: cuda.Args = .{};
+        args.add(a);
+        args.add(dsv41.ops.l2_delay_ns);
         args.add(dsv41.ops.waveNs(p.gbps, dsv41.ops.l2_chunk_bytes));
         args.add(@as(c_longlong, @intCast(dsv41.ops.l2_chunk_bytes)));
+        try cuda.launch.launch(p.f, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, p.side, &args);
+        try p.e1.record(p.side);
+    }
+
+    /// Called as the measurement beside it ends: whether the prefetch still ran, then (once it is done) its rate.
+    fn end(p: *Paced) !Ran {
+        const outlasted = !(try p.side.done());
+        try p.side.synchronize();
+        const ms = try cuda.Event.elapsedMs(p.e0, p.e1);
+        return .{ .gbps = @as(f64, @floatFromInt(p.bytes)) / (@as(f64, ms) * 1e6), .outlasted = outlasted };
+    }
+};
+
 /// The float rank `q` sends at index `j`: exact in f32 (below 2^24).
 fn value(q: u32, j: usize) f32 {
     return @floatFromInt(@as(u32, q) * 1_000_000 + @as(u32, @intCast(j % 1_000_000)));

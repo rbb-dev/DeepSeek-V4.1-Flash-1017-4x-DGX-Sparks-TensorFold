@@ -363,7 +363,10 @@ pub const kern_topk_tiles: u32 = 1 << 4;
 pub const kern_idx_proj_owned: u32 = 1 << 5;
 pub const kern_bf16_rows: u32 = 1 << 6;
 pub const kern_pf_run128: u32 = 1 << 7;
+pub const kern_decode_fuse: u32 = 1 << 8;
 pub const kern_draft_4way: u32 = 1 << 9;
+pub const kern_head_pack12: u32 = 1 << 10; // (its switch's code is the packed target head's)
+pub const kern_hc_late_fork: u32 = 1 << 11;
 pub const kern_attn_u: u32 = 1 << 12;
 pub const kern_idx_u: u32 = 1 << 13;
 pub const kern_idx_v: u32 = 1 << 19;
@@ -422,9 +425,15 @@ pub var bf16_rows_asked: bool = false;
 /// TF_DS_PF_RUN128 as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useRun128).
 pub var pf_run128_asked: bool = false;
 
+/// TF_DS_DECODE_FUSE as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useDecodeFuse).
+pub var decode_fuse_asked: bool = false;
+
 /// TF_DS_DRAFT_4WAY as Model.open read it (switchAsked), once (Settings.kern; in effect: weights.draft_4way, decided
 /// before the weights load).
 pub var draft_4way_asked: bool = false;
+
+/// TF_DS_HC_LATE_FORK as Model.open read it (switchAsked), once (Settings.kern, round.Round.useLateFork).
+pub var hc_late_fork_asked: bool = false;
 
 /// TF_DS_ATTN_EPI_FUSED as Model.open read it (switchAsked), once (Settings.kern, tri_attn.attn_epi_fused): a prompt chunk's
 /// attention epilogue (inverse RoPE and wo_a's quant) in the final store of the part kernel from the kit's extra set.
@@ -576,7 +585,9 @@ pub fn kernAsked() u32 {
     if (idx_proj_owned_asked) x |= kern_idx_proj_owned;
     if (bf16_rows_asked) x |= kern_bf16_rows;
     if (pf_run128_asked) x |= kern_pf_run128;
+    if (decode_fuse_asked) x |= kern_decode_fuse;
     if (draft_4way_asked) x |= kern_draft_4way;
+    if (hc_late_fork_asked) x |= kern_hc_late_fork;
     if (attn_u_asked) x |= kern_attn_u;
     if (idx_u_asked) x |= kern_idx_u;
     if (idx_v_asked) x |= kern_idx_v;
@@ -950,24 +961,15 @@ pub const Two = struct {
         try e.ops.assembleRest(e.s, part0, part1, pick, rest.owner, t.xd_full, p, ig, t.ir);
     }
 
-    /// Every node's part over NCCL into `parts` [4, n, wmax] (bytes), this node's `src` [n, w[p]] padded to wmax.
-    fn allParts(t: *const Two, e: *const prompt.Engine, src: u64, n: usize, w: [2]usize, esize: usize) !usize {
-        const wmax = @max(w[0], w[1]);
-        if (n * wmax * esize > t.part_bytes) return error.PartTooBig;
-        var send = src;
-        if (w[t.p] != wmax) {
-            try e.ops.copyRows(e.s, src, w[t.p] * esize, t.pad, wmax * esize, w[t.p] * esize, n);
-            send = t.pad;
-        }
-        const bytes = n * wmax * esize;
-        if (t.neighbor_gather) |ng| {
-            if (neighbor.eligible(bytes)) {
-                try ng.gather(e.s, send, t.parts, bytes);
-                return wmax;
-            }
-        }
-        try e.comm.allGather(send, t.parts, bytes, .u8, e.s);
-        return wmax;
+    /// assembleParity with the assembly and down's quant of it in one launch (TF_DS_DECODE_FUSE, mx.assembleQuant):
+    /// t.xd_full as assembleParity leaves it, its codes and scales in sc.hq / sc.hs for mx.downDecCodes.
+    pub fn assembleParityCodes(t: *const Two, e: *const prompt.Engine, k: *const mx.Kernels, ex: weights.Experts, xd: u64, pick: u64, p: usize, sc: mx.ExpertScratch) !void {
+        const rest = ex.rest orelse return error.NoRest;
+        const ig = t.gu[t.p];
+        try t.packExchange(e, xd, p, ig + t.ir);
+        const part0 = if (t.p == 0) xd else t.peer;
+        const part1 = if (t.p == 1) xd else t.peer;
+        try mx.assembleQuant(k, e.s, part0, part1, pick, rest.owner, t.xd_full, p, ig, t.ir, sc);
     }
 
     /// Whether a ring took the exchange: false when there is none or the part does not fit it (nothing sent then).

@@ -22,6 +22,7 @@ const model = @import("model.zig");
 const where = @import("where.zig");
 const round = @import("round.zig");
 const draft = @import("draft.zig");
+const prompt = @import("prompt.zig");
 const draft_vocab = @import("draft_vocab.zig");
 const sampling = @import("sampling.zig");
 const head_cand = @import("head_cand.zig");
@@ -31,7 +32,7 @@ const cuda = @import("cuda");
 const be = lanes.backend;
 const Model = model.Model;
 const max_streams = model.max_streams;
-const pass_rows = 128; // a drafter pass's rows at most (prompt.grouped's decode window)
+const draft_pass_rows = 128; // a drafter pass's rows at most (prompt.grouped's decode window)
 const max_rows = round.max_rows;
 
 /// A window of the pending row and the drafter's block: the widest one the gates checked row for row.
@@ -40,8 +41,26 @@ pub const window_rows = 6;
 /// The image rows a fill_images frame carries at most.
 pub const image_piece = 32 << 10;
 
-/// A gate's diagnostic (the tools' --logits-sha 1): each prompt's logits' sha256 on stderr.
-pub var logits_sha = false;
+/// A gate's diagnostic (the tools' --logits-sha): 1 each prompt's logits' sha256 on stderr; 2 those and every verified
+/// row's (rowShaLine), so a run's window rows compare byte for byte with the same rows of a run without drafts.
+pub var logits_sha: u8 = 0;
+/// The verifies under --logits-sha 2, counted: each row line's round.
+var sha_round: u64 = 0;
+
+/// --logits-sha's text: 0, 1 or 2; null: not a setting.
+pub fn logitsSha(text: []const u8) ?u8 {
+    for ([_][]const u8{ "0", "1", "2" }, 0..) |t, n| if (std.mem.eql(u8, text, t)) return @intCast(n);
+    return null;
+}
+
+/// One verified row's logits line: its stream, the verify's count, the row in the window, the window's rows, the row's
+/// position, its input token, and the sha256 of its logits' bytes.
+pub fn rowShaLine(buf: []u8, id: []const u8, round_n: u64, row: usize, rows: usize, position: u64, input: i64, logits: []const f32) ![]const u8 {
+    var dg: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &dg, .{});
+    return std.fmt.bufPrint(buf, "{{\"row_logits\": \"{s}\", \"round\": {d}, \"row\": {d}, \"rows\": {d}, \"position\": {d}, \"input\": {d}, \"sha256\": \"{s}\"}}", .{ id, round_n, row, rows, position, input, std.fmt.bytesToHex(dg, .lower) });
+}
+
 /// Why a run that reads every round's whole rows on the host (`reads_rows`: --logits-log, --logits-sha 2) cannot, or null.
 /// TF_DS_HEAD_KEY (`head_key`) and TF_DS_HEAD_CAND (`head_cand_on`) make a round's head each node's own bests or candidates,
 /// which leave rd.logits unwritten (round.zig: headWhole runs only at head_k 0): the rows read would be stale memory, not
@@ -54,6 +73,43 @@ pub fn wholeRowsRefusal(reads_rows: bool, head_key: bool, head_cand_on: bool) ?[
     return null;
 }
 
+/// TF_DS_NO_COPIES's text: "1" keeps a decode window off copied continuations (the lane core's copyProposal: the
+/// drafter's drafts alone); unset or any other text: copies as served.
+pub fn noCopies(text: ?[]const u8) bool {
+    const v = text orelse return false;
+    return std.mem.eql(u8, v, "1");
+}
+
+/// The matching tokens a copied continuation needs unless TF_DS_COPY_MATCH says otherwise (the lane core's enter_match).
+pub const copy_match_default: i64 = 8;
+
+/// TF_DS_COPY_MATCH's text: the matching tokens a copied continuation needs, 4 (the proposer's own least match, the lane
+/// host's min_match) .. 64 (its longest); unset or empty: copy_match_default; null: not a setting (the start refuses).
+pub fn copyMatch(text: ?[]const u8) ?i64 {
+    const v = text orelse return copy_match_default;
+    if (v.len == 0) return copy_match_default;
+    const n = std.fmt.parseInt(i64, v, 10) catch return null;
+    return if (n >= 4 and n <= 64) n else null;
+}
+
+/// A window's rows at most whose last row cannot overwrite a window key its first row reads: a row reads the 128 keys
+/// to its own position, and the window rings (the target's and the drafter's) keep ring_extra slots past the window.
+pub const copy_rows_most: u32 = 1 + prompt.ring_extra;
+
+/// TF_DS_COPY_ROWS's text: a lone stream's copied window's rows at most (the lane core's copy_rows: its copies start at
+/// 8 drafts and double, on rungs of 8, 12 and 16), past the drafter's window_rows .. copy_rows_most; unset, empty or
+/// 0: 0, every window's window_rows; null: not a setting (the start refuses).
+pub fn copyRows(text: ?[]const u8) ?u32 {
+    const v = text orelse return 0;
+    if (v.len == 0 or std.mem.eql(u8, v, "0")) return 0;
+    const n = std.fmt.parseInt(u32, v, 10) catch return null;
+    return if (n > window_rows and n <= copy_rows_most) n else null;
+}
+
+/// The start's line for TF_DS_COPY_ROWS=`rows` (past window_rows): the rows, the drafts at most and the first.
+pub fn copyRowsLine(buf: []u8, rows: u32) ![]const u8 {
+    return std.fmt.bufPrint(buf, "TF_DS_COPY_ROWS={d}: a lone stream's copied continuation spans up to {d} rows ({d} drafts, from {d}; every other window {d})", .{ rows, rows, rows - 1, lanes.config.aloneFirst(rows - 1), window_rows });
+}
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
 pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_switch = 10 };
@@ -651,6 +707,9 @@ pub const Profile = struct {
     passes: u64 = 0,
     pass_streams: u64 = 0,
     prefills: u64 = 0,
+    // a lone stream's rounds by their rows, and their time from the frame's send to the rows' draws (ns)
+    lone_rounds: [max_rows + 1]u64 = @splat(0),
+    lone_ns: [max_rows + 1]u64 = @splat(0),
 };
 
 /// A round-cost table "30.0,35.2,..." (TF_DS_ROUND_MS's form): ms by rows from 1.
@@ -801,8 +860,12 @@ pub const Lanes = struct {
     // draft ms, the other live streams at their table depth), so a round takes at most those drafts: at any number of
     // streams (all), or with one stream live (solo: the served one-stream choice; more keep the lane core's allocation)
     served_k: enum { off, all, solo } = .off,
-    solo_overhead: bool = false, // TF_DS_SOLO_OVERHEAD=1: a lone drafted stream's head windows cost the fixed draft allowance
-    no_copies: bool = false, // TF_DS_NO_COPIES=1: a drafted stream proposes no suffix-lookup copy windows
+    // TF_DS_NO_COPIES / TF_DS_COPY_MATCH / TF_DS_COPY_ROWS (native.zig's start, rank 0's: it plans every window and the
+    // followers run its frames): decode windows take copied continuations, of at least copy_match matching tokens, a
+    // lone stream's up to copy_rows rows (0: window_rows) (facts)
+    copies: bool = true,
+    copy_match: i64 = copy_match_default,
+    copy_rows: u32 = 0,
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
@@ -982,6 +1045,9 @@ pub const Lanes = struct {
             .shared_costs = self.sc[0..self.m.eng.round_rows],
             .draft_probabilities = drafting,
             .draft_streams = drafting,
+            .copies = self.copies,
+            .enter_match = self.copy_match,
+            .copy_rows = self.copy_rows,
         };
     }
 
@@ -1342,6 +1408,11 @@ pub const Lanes = struct {
         m.joinAhead();
         m.fill_seq = &.{};
         if (!head) return error.NoPromptLogits;
+        if (logits_sha >= 1) {
+            var dg: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &dg, .{});
+            std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\"}}\n", .{ s.id, std.fmt.bytesToHex(dg, .lower) });
+        }
         // a stream with a grammar: the row stays for its first token's draw among the grammar's tokens
         if (s.grammar != null) {
             self.first_row = try self.gpa.realloc(self.first_row, logits.len);
@@ -1404,7 +1475,9 @@ pub const Lanes = struct {
             if (w.parents != null) return error.TreesNotBuilt;
             const l = self.streams.getPtr(w.stream) orelse return error.UnknownStream;
             const rows = w.rows();
-            if (rows > window_rows) return error.WindowTooWide;
+            // a lone stream's copied continuation (host tokens alone) may span copy_rows rows; every other window window_rows
+            const most: usize = if (windows.len == 1 and w.held == 0 and self.copy_rows > window_rows) self.copy_rows else window_rows;
+            if (rows > most) return error.WindowTooWide;
             const start: usize = @intCast(w.stream.cache_len);
             for (w.positions, 0..) |p, r| if (p != start + 1 + r) return error.PositionMismatch;
             if (w.held > l.nheld) return error.HeldMismatch;
@@ -1481,8 +1554,22 @@ pub const Lanes = struct {
             p.sample += m.now() - t3;
             p.rounds += 1;
             p.rows += rows.ids.len;
+            if (windows.len == 1) {
+                p.lone_rounds[rows.ids.len] += 1;
+                p.lone_ns[rows.ids.len] += m.now() - t0;
+            }
         };
         const V = m.vocab;
+        // the tools' --logits-sha 2: every row's logits, hashed (a greedy round reads them from the device for it)
+        if (logits_sha >= 2) {
+            const all = if (logits.len > 0) logits else try m.roundLogits(rows.ids.len);
+            sha_round += 1;
+            var line: [256]u8 = undefined;
+            for (windows, 0..) |w, k| {
+                const row0 = self.built.wins[k].row;
+                for (0..w.rows()) |r| std.debug.print("{s}\n", .{try rowShaLine(&line, w.stream.id, sha_round, r, w.rows(), w.positions[r], ids[k][r], all[(row0 + r) * V ..][0..V])});
+            }
+        }
         for (windows, out, 0..) |w, *o, k| {
             const row0 = self.built.wins[k].row;
             for (0..w.rows()) |r| o.sampled[r] = if (greedy)
@@ -2424,9 +2511,184 @@ test "a prefix two conversations share: the second one resuming it in place woul
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }, // 11: the same kinds, fill_pair carries the third pass's rows
     m.watch = .{}; // (finish and deinit end the watch)
     m.watch = .{}; // (finish and deinit end the watch)
+
+test "TF_DS_NO_COPIES: \"1\" keeps copied continuations out of decode windows; unset, \"0\" or any other text: copies" {
+    for ([_]?[]const u8{ null, "", "0", "yes", "11", " 1" }) |t| try std.testing.expect(!noCopies(t));
+    try std.testing.expect(noCopies("1"));
+}
+
+test "TF_DS_COPY_MATCH: the matching tokens a copy needs, 4 .. 64; unset or empty 8; anything else no setting" {
+    try std.testing.expectEqual(@as(?i64, 8), copyMatch(null));
+    try std.testing.expectEqual(@as(?i64, 8), copyMatch(""));
+    for ([_][]const u8{ "4", "8", "16", "64" }, [_]i64{ 4, 8, 16, 64 }) |t, n| try std.testing.expectEqual(@as(?i64, n), copyMatch(t));
+    for ([_][]const u8{ "3", "65", "0", "-8", "8.5", "x", " 16" }) |t| try std.testing.expectEqual(@as(?i64, null), copyMatch(t));
+}
+
+test "the lane core takes rank 0's copy settings: facts carry Lanes.copies and copy_match, the start reads both" {
+    const src = @embedFile("lanes.zig");
+    const at = std.mem.indexOf(u8, src, "pub fn facts(self: *const Lanes) lanes.Model {").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, ".copies = self.copies,"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, ".enter_match = self.copy_match,"));
+    const nat = @embedFile("native.zig");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, nat, "const copies = !lanes_mod.noCopies(getenv(\"TF_DS_NO_COPIES\"));"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, nat, "st.lanes.copies = copies;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, nat, "const copy_match = lanes_mod.copyMatch(getenv(\"TF_DS_COPY_MATCH\")) orelse return error.BadCopyMatch;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, nat, "st.lanes.copy_match = copy_match;"));
+    try std.testing.expect(std.mem.indexOf(u8, nat, "error.BadCopyMatch => \"TF_DS_COPY_MATCH: ") != null);
+}
+
+test "the leader decides a round's head reads before verify; with TF_DS_CAND_FIRST it verifies with them, then reads them back" {
+    const src = @embedFile("lanes.zig");
+    const at = std.mem.indexOf(u8, src, "    fn verifyFn(") orelse return error.TestUnexpectedResult;
+    const body = src[at .. at + (std.mem.indexOf(u8, src[at..], "\n    }\n") orelse return error.TestUnexpectedResult)];
+    var last: usize = 0;
+    for ([_][]const u8{
+        "var greedy = !masked;",
+        "var cand_count: usize = 0;",
         "if (m.cand_first) try m.verifyHead(rows, self.built.absorb[0..windows.len], if (greedy) .argmax else if (cand_count > 0) .{ .candidates = cand_count } else .none) else try m.verify(rows, self.built.absorb[0..windows.len], head);",
         "const keyed = head == head_cand.key;\n        const tokens: []const u32 = if (!greedy) &.{} else if (keyed) try m.headTokens(rows.ids.len) else if (m.cand_first) try m.headArgmax(rows.ids.len) else try m.roundArgmax(rows.ids.len);",
         "const cand = if (cand_count > 0) try self.candidates(rows.ids.len, cand_count, head, &merged) else null;",
+    }) |step| {
+        const i = std.mem.indexOf(u8, body[last..], step) orelse return error.TestUnexpectedResult;
+        last += i + step.len;
+    }
+}
+
+test "TF_DS_COPY_ROWS: a lone stream's copied window's rows, past window_rows to copy_rows_most; unset, empty or 0 off; anything else no setting" {
+    try std.testing.expectEqual(@as(?u32, 0), copyRows(null));
+    try std.testing.expectEqual(@as(?u32, 0), copyRows(""));
+    try std.testing.expectEqual(@as(?u32, 0), copyRows("0"));
+    for ([_][]const u8{ "7", "9", "13", "17" }, [_]u32{ 7, 9, 13, 17 }) |t, n| try std.testing.expectEqual(@as(?u32, n), copyRows(t));
+    for ([_][]const u8{ "6", "18", "00", "-17", "17.0", "x", " 17" }) |t| try std.testing.expectEqual(@as(?u32, null), copyRows(t));
+    // a row reads the window's keys to its own position (the kit's _sparse_attn_part: p - (WIN - 1) .. p): the 17th row
+    // of a window writes the slot of the key 128 before its first row, the one past that row's window; both rings keep
+    // the same slots past the window
+    try std.testing.expectEqual(@as(u32, 17), copy_rows_most);
+    try std.testing.expectEqual(prompt.ring_extra, draft.ring_extra);
+    try std.testing.expect(copy_rows_most <= max_rows);
+}
+
+test "TF_DS_COPY_ROWS's start line names the first width the lane core takes: min(8, rows - 1) drafts" {
+    var buf: [256]u8 = undefined;
+    for ([_]u32{ 7, 8, 9, 13, 17 }, [_][]const u8{ "(6 drafts, from 6;", "(7 drafts, from 7;", "(8 drafts, from 8;", "(12 drafts, from 8;", "(16 drafts, from 8;" }) |rows, want| {
+        const line = try copyRowsLine(&buf, rows);
+        try std.testing.expect(std.mem.indexOf(u8, line, want) != null);
+        // the lane core's own first width for these rows (Config.init: wide_first up to copy_rows - 1)
+        var c = try lanes.Config.init(std.testing.allocator, .{ .exact_width = window_rows, .drafts = window_rows - 1, .copy_rows = rows }, max_rows, max_rows - 1);
+        defer c.deinit(std.testing.allocator);
+        var first: [16]u8 = undefined;
+        try std.testing.expect(std.mem.indexOf(u8, line, try std.fmt.bufPrint(&first, "from {d};", .{c.alone_first})) != null);
+    }
+}
+
+test "the copy settings refuse a bad start before the weights load: TF_DS_COPY_ROWS and TF_DS_COPY_MATCH read before Model.open" {
+    const nat = @embedFile("native.zig");
+    const open_at = std.mem.indexOf(u8, nat, "st.m = try model.Model.open(gpa, io, ctx, .{").?;
+    const rows_at = std.mem.indexOf(u8, nat, "lanes_mod.copyRows(getenv(\"TF_DS_COPY_ROWS\")) orelse return error.BadCopyRows;").?;
+    const match_at = std.mem.indexOf(u8, nat, "lanes_mod.copyMatch(getenv(\"TF_DS_COPY_MATCH\")) orelse return error.BadCopyMatch;").?;
+    try std.testing.expect(rows_at < open_at and match_at < open_at);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, nat, "lanes_mod.copyRows(getenv(\"TF_DS_COPY_ROWS\"))"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, nat, "lanes_mod.copyMatch(getenv(\"TF_DS_COPY_MATCH\"))"));
+}
+
+test "a lone wide window keeps every key its first row reads: copy_rows_most - 1 rows fit the slots each window ring keeps past WIN" {
+    // a row reads WIN keys to its own position (the kit's _sparse_attn_part, launched with WIN = the window); a window's
+    // row j writes the slot of the key ring - j before its first row: rows past the first fit ring - WIN of them
+    var base = try cuda.aot.Manifest.parse(std.testing.allocator, @embedFile("fixtures/kit-drafter.json"));
+    defer base.deinit();
+    var extra = try cuda.aot.Manifest.parse(std.testing.allocator, @embedFile("fixtures/kit-drafter-extra.json"));
+    defer extra.deinit();
+    const window: u32 = 128; // the checkpoint's sliding window (config.zig pins it)
+    var variants: usize = 0;
+    for ([_]*const cuda.aot.Manifest{ &base, &extra }) |m| for (m.parsed.value.kernels) |k| {
+        if (!std.mem.eql(u8, k.@"fn", "_sparse_attn_part") and !std.mem.eql(u8, k.@"fn", "_sparse_attn_part_u")) continue;
+        try std.testing.expectEqual(@as(?i64, window), (k.consts.map.get("WIN") orelse return error.TestUnexpectedResult).int);
+        variants += 1;
+    };
+    try std.testing.expect(variants >= 76);
+    // the target's ring (round.zig) and the drafter's (draft.zig): the window and ring_extra slots past it
+    const round_src = @embedFile("round.zig");
+    try std.testing.expect(std.mem.indexOf(u8, round_src, "const ring_rows = c.window + ring_extra;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, round_src, "const ring_extra = prompt.ring_extra;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, @embedFile("draft.zig"), ".ring = e.c.window + ring_extra,") != null);
+    for ([_]u32{ window + prompt.ring_extra, window + draft.ring_extra }) |slots| try std.testing.expect(copy_rows_most - 1 <= slots - window);
+    try std.testing.expectEqual(prompt.ring_extra, draft.ring_extra);
+}
+
+test "a lone stream's wide copies reach the lane core and the verify: facts carry copy_rows, the window's limit takes them, the start and the gates' tool read the setting" {
+    const src = @embedFile("lanes.zig");
+    const at = std.mem.indexOf(u8, src, "pub fn facts(self: *const Lanes) lanes.Model {").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, ".copy_rows = self.copy_rows,"));
+    // a window past window_rows only alone, the backend holding none of its drafts (a copy: the host's tokens)
+    const vat = std.mem.indexOf(u8, src, "    fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {").?;
+    const vbody = src[vat .. vat + std.mem.indexOf(u8, src[vat..], "\n    }\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, vbody, "const most: usize = if (windows.len == 1 and w.held == 0 and self.copy_rows > window_rows) self.copy_rows else window_rows;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, vbody, "if (rows > most) return error.WindowTooWide;"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, vbody, "if (rows > window_rows)"));
+    const nat = @embedFile("native.zig");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, nat, "const copy_rows = lanes_mod.copyRows(getenv(\"TF_DS_COPY_ROWS\")) orelse return error.BadCopyRows;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, nat, "st.lanes.copy_rows = copy_rows;"));
+    try std.testing.expect(std.mem.indexOf(u8, nat, "error.BadCopyRows => std.fmt.comptimePrint(\"TF_DS_COPY_ROWS: ") != null);
+    const tool = @embedFile("lanes_main.zig");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, tool, "ln.copy_rows = dsv41.lanes.copyRows(if (std.c.getenv(\"TF_DS_COPY_ROWS\")) |t| std.mem.span(t) else null) orelse return error.BadCopyRows;"));
+    // the tool's other copy settings keep their defaults
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, tool, "TF_DS_COPY_MATCH"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, tool, "TF_DS_NO_COPIES"));
+}
+
+test "the tool's profile times a lone stream's rounds by their rows: verifyFn keeps them, tf-dsv41-lanes prints them" {
+    const src = @embedFile("lanes.zig");
+    const vat = std.mem.indexOf(u8, src, "    fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {").?;
+    const vbody = src[vat .. vat + std.mem.indexOf(u8, src[vat..], "\n    }\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, vbody, "if (windows.len == 1) {"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, vbody, "p.lone_rounds[rows.ids.len] += 1;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, vbody, "p.lone_ns[rows.ids.len] += m.now() - t0;"));
+    const p: Profile = .{};
+    try std.testing.expectEqual(@as(usize, max_rows + 1), p.lone_rounds.len);
+    const tool = @embedFile("lanes_main.zig");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, tool, "lone_round_ms_by_rows"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, tool, "for (p.lone_rounds, p.lone_ns, 0..) |n, ns, r| if (n > 0) {"));
+}
+
+test "--logits-sha: 0 off, 1 each prompt's logits, 2 each prompt's and every verified row's; anything else no setting" {
+    for ([_][]const u8{ "0", "1", "2" }, [_]u8{ 0, 1, 2 }) |t, n| try std.testing.expectEqual(@as(?u8, n), logitsSha(t));
+    for ([_][]const u8{ "", "3", "yes", " 1", "-1" }) |t| try std.testing.expectEqual(@as(?u8, null), logitsSha(t));
+}
+
+test "a verified row's logits line: its stream, round, row, window rows, position and input, and the sha256 of its bytes" {
+    var row: [5]f32 = .{ 1.5, -2.0, 0.0, 3.25, -0.125 };
+    var buf: [256]u8 = undefined;
+    const line = try rowShaLine(&buf, "s7", 41, 3, 17, 4093, 1234, &row);
+    const R = struct { row_logits: []const u8, round: u64, row: usize, rows: usize, position: u64, input: i64, sha256: []const u8 };
+    const p = try std.json.parseFromSlice(R, std.testing.allocator, line, .{});
+    defer p.deinit();
+    try std.testing.expectEqualStrings("s7", p.value.row_logits);
+    try std.testing.expectEqual(@as(u64, 41), p.value.round);
+    try std.testing.expectEqual(@as(usize, 3), p.value.row);
+    try std.testing.expectEqual(@as(usize, 17), p.value.rows);
+    try std.testing.expectEqual(@as(u64, 4093), p.value.position);
+    try std.testing.expectEqual(@as(i64, 1234), p.value.input);
+    var dg: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(&row), &dg, .{});
+    try std.testing.expectEqualStrings(&std.fmt.bytesToHex(dg, .lower), p.value.sha256);
+    row[4] = -0.25; // one value's bits changed: another hash
+    var buf2: [256]u8 = undefined;
+    const other = try rowShaLine(&buf2, "s7", 41, 3, 17, 4093, 1234, &row);
+    try std.testing.expect(std.mem.indexOf(u8, other, p.value.sha256) == null);
+}
+
+test "the verify hashes every row's logits under --logits-sha 2 alone; prompts from 1; the served start never sets it" {
+    const src = @embedFile("lanes.zig");
+    const vat = std.mem.indexOf(u8, src, "    fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {").?;
+    const vbody = src[vat .. vat + std.mem.indexOf(u8, src[vat..], "\n    }\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, vbody, "if (logits_sha >= 2) {"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, vbody, "rowShaLine("));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "if (logits_sha >= " ++ "1) {"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, @embedFile("native.zig"), "logits_sha"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, @embedFile("lanes_main.zig"), "dsv41.lanes.logits_sha = dsv41.lanes.logitsSha(val) orelse return error.BadLogitsSha;"));
+}
 
 test "a decode round's head path: argmax when greedy, the nodes' merged candidates or the GPU's unless a flag sent them on to whole rows, else whole" {
     try std.testing.expectEqual(HeadPath.argmax, headPath(true, false, false, false, false));

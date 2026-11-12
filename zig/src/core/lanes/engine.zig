@@ -401,9 +401,13 @@ pub const Engine = struct {
                     if (p.recalled) {
                         if (s.recall) |r| r.observe(@intCast(own), @intCast(own_kept), s.rounds);
                     } else if (s.proposer) |pr| pr.observe(@intCast(own), @intCast(own_kept));
+                    // a lone stream's copy width: doubled (2w + 1, to alone_max) when every own draft lands, a copy
+                    // shorter than the width (its source's end, the stream's room) as well; back to alone_first after a
+                    // miss. Shared steps leave it (their copies take every window's width): alone again, a stream copies
+                    // at the width it had.
                     if (e.alone) {
-                        const width = s.copy_width orelse e.cfg.first_copy;
-                        s.copy_width = if (own_kept == own) @min(e.cfg.max_copy, 2 * width + 1) else e.cfg.first_copy;
+                        const width = s.copy_width orelse e.cfg.alone_first;
+                        s.copy_width = if (own_kept == own) @min(e.cfg.alone_max, 2 * width + 1) else e.cfg.alone_first;
                     }
                 } else if (p.kind == .head) {
                     if (p.lanes) |l| if (s.odds != null) s.observeLanes(l, path);

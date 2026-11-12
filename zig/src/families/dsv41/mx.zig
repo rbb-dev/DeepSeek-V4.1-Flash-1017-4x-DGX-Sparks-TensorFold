@@ -104,6 +104,18 @@ pub const DnArgs = extern struct {
     early_exit: c_int = 0, // Track C (TF_DS_EXPERT_EXIT)
 };
 
+/// native.cu's CombArgs: tf_dsn_combine's arguments for a down launch that sums the slots itself (TF_DS_DECODE_FUSE).
+pub const CombArgs = extern struct {
+    pick: u64 = 0,
+    R: c_int = 0,
+    S: c_int = 0,
+    E: c_int = 0,
+    accumulate: c_int = 0,
+    y: u64 = 0,
+    ldy: i64 = 0,
+    cnt: u64 = 0,
+};
+
 /// native.cu's BfArgs.
 pub const BfArgs = extern struct {
     x: u64 = 0,
@@ -212,6 +224,15 @@ fn decRg(m: usize) usize {
 }
 const dec_counters = 16384;
 
+/// The column groups a down launch with the routed sum in it (TF_DS_DECODE_FUSE) counts in at most: a count each.
+const comb_counters = 4096;
+
+/// Whether a decode down launch of gx column groups sums the routed slots itself (TF_DS_DECODE_FUSE: the switch, and
+/// a count for each group), else tf_dsn_combine after it.
+pub fn decSumIn(fuse: bool, gx: usize) bool {
+    return fuse and gx <= comb_counters;
+}
+
 comptime {
     // the layouts native.cu was compiled with (pointers and int64 8 bytes, ints and floats 4, C padding)
     std.debug.assert(@sizeOf(MxArgs) == 136 and @offsetOf(MxArgs, "z") == 96 and @offsetOf(MxArgs, "raster") == 128);
@@ -219,6 +240,7 @@ comptime {
     std.debug.assert(@offsetOf(DnArgs, "sldw") == 104 and @offsetOf(DnArgs, "out") == 136 and @offsetOf(DnArgs, "z") == 160 and @offsetOf(DnArgs, "early_exit") == 172 and @sizeOf(DnArgs) == 176);
     std.debug.assert(@offsetOf(BfArgs, "y") == 64 and @offsetOf(BfArgs, "z") == 112 and @offsetOf(BfArgs, "raster") == 120 and @sizeOf(BfArgs) == 128);
     std.debug.assert(@sizeOf(W8Args) == 144 and @offsetOf(W8Args, "M") == 64 and @offsetOf(W8Args, "y") == 80 and @offsetOf(W8Args, "raster") == 96 and @offsetOf(W8Args, "gq") == 104 and @offsetOf(W8Args, "gy") == 136);
+    std.debug.assert(@sizeOf(CombArgs) == 48 and @offsetOf(CombArgs, "y") == 24 and @offsetOf(CombArgs, "cnt") == 40);
 }
 
 /// The kernels of cuda.kernels.dsv41_native.
@@ -315,6 +337,13 @@ pub const Kernels = struct {
     /// TF_DS_PACK_EPILOGUE in effect: tf_dsn_sf_gu_exact_q_kernel, gate/up's launch that also writes the expert pack's codes and scales.
     gu_q: ?cuda.Function = null,
     pf_dn_r128: ?cuda.Function = null,
+    // TF_DS_DECODE_FUSE in effect (useDecodeFuse): a decode round's routed sum in the down launch (decSumIn); its
+    // kernels (one a row group) and their column groups' counts
+    decode_fuse: bool = false,
+    dec_dn_cb: ?[4]cuda.Function = null,
+    comb_cnt: ?cuda.DeviceBuffer = null,
+    // and a 2D node's assembly of the experts' intermediate with down's quant of it in one launch (assembleQuant)
+    dec_asm_quant: ?cuda.Function = null,
     // TF_DS_QGATE_CANARY 2 or 3 in effect (useQgateBody): the body canary's kernel (qgateBody); null until then
     qgate_body_fn: ?cuda.Function = null,
     // TF_DS_ASSEMBLE_QUANT in effect (useAssembleQuant): the same assembly-and-quant launch for a prompt chunk's
@@ -398,6 +427,25 @@ pub const Kernels = struct {
         const f = try m.function(name);
         try f.allowDynamicShared(smem);
         return f;
+    }
+
+    /// TF_DS_DECODE_FUSE in effect: tf_dsn_dec_dn_cb_r{1,2,4,8} (dec_dn's shared memory), their zeroed counts,
+    /// tf_dsn_dec_asm_quant, then the switch. An error leaves it off.
+    pub fn useDecodeFuse(k: *Kernels, d: *const cuda.Driver) !void {
+        const aq = try k.module.function("tf_dsn_dec_asm_quant_kernel");
+        var fs: [4]cuda.Function = undefined;
+        for (&fs, 0..) |*f, r| {
+            var nb: [64]u8 = undefined;
+            f.* = try k.module.function(try std.fmt.bufPrintSentinel(&nb, "tf_dsn_dec_dn_cb_r{d}_kernel", .{@as(usize, 1) << @intCast(r)}, 0));
+            try f.allowDynamicShared(decShared(dec_experts_cfg, @as(usize, 1) << @intCast(r)));
+        }
+        var cnt = try cuda.DeviceBuffer.alloc(d, comb_counters * 4);
+        errdefer cnt.free();
+        try d.check(d.api.cuMemsetD32_v2(cnt.ptr, 0, comb_counters), "cuMemsetD32");
+        k.dec_dn_cb = fs;
+        k.comb_cnt = cnt;
+        k.dec_asm_quant = aq;
+        k.decode_fuse = true;
     }
 
     /// TF_DS_ASSEMBLE_QUANT in effect: tf_dsn_dec_asm_quant (the parity assembly with down's quant in one launch),
@@ -513,6 +561,7 @@ pub const Kernels = struct {
 
     pub fn unload(k: *Kernels) void {
         k.counters.free();
+        if (k.comb_cnt) |*c| c.free();
         if (k.sfk) |*x| x.module.unload();
         k.module.unload();
         k.* = undefined;
@@ -2401,7 +2450,37 @@ pub fn down(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertSc
     return downOf(k, s, ex, sc, h, ldh, pick, r, out, ldo, accumulate, split, false, null);
 }
 
+/// down of a decode window's r rows whose intermediate's codes and scales are in sc.hq / sc.hs already (assembleQuant's:
+/// the bytes quantDec would write): down's decode launches without the quant.
+pub fn downDecCodes(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScratch, pick: u64, r: usize, out: u64, ldo: usize, accumulate: bool) !void {
     return downOf(k, s, ex, sc, 0, ex.down_k, pick, r, out, ldo, accumulate, true, true, null);
+}
+
+/// The width of a 2D node's assembled intermediate (pair 0's main ig, pair 1's, the rest ir) that assembleQuant takes:
+/// whole 32-value groups in each part, else none.
+pub fn asmQuantWidth(ig: usize, ir: usize) ?usize {
+    if (ig % 32 != 0 or ir % 32 != 0 or ig == 0) return null;
+    return 2 * ig + ir;
+}
+
+/// TF_DS_DECODE_FUSE: tf_ds_assemble_rest's assembly of a 2D node's expert intermediate into out [p, 2 ig + ir] bf16
+/// (pair 0's main, pair 1's, each slot's rest from owner[pick]) and quantDec's codes and scales of it into sc.hq / sc.hs
+/// (row strides the width and width / 32), in one ordinary launch: the bytes of the two launches.
+pub fn assembleQuant(k: *const Kernels, s: cuda.Stream, part0: u64, part1: u64, pick: u64, owner: u64, out: u64, p: usize, ig: usize, ir: usize, sc: ExpertScratch) !void {
+    const f = k.dec_asm_quant orelse return error.NoDecodeFuseKernel;
+    if (p == 0) return;
+    const w = asmQuantWidth(ig, ir) orelse return error.UnsupportedShape;
+    if (p > sc.rows * sc.slots) return error.ScratchTooSmall;
+    var a: cuda.Args = .{};
+    for ([_]u64{ part0, part1, pick, owner, out }) |v| a.add(v);
+    for ([_]usize{ p, ig, ir }) |v| a.add(@as(c_int, @intCast(v)));
+    a.add(sc.hq);
+    a.add(@as(i64, @intCast(w)));
+    a.add(sc.hs);
+    a.add(@as(i64, @intCast(w / 32)));
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(cdiv(p * (w / 32) * 32, 256)), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &a);
+}
+
 /// down of a prompt chunk's r rows whose intermediate's codes and scales are in sc.hq / sc.hs already (act_quant of
 /// the assembled intermediate [r * slots, down_k], the bytes down's quant would write): the same launches without the
 /// quant.
@@ -2463,6 +2542,15 @@ fn downOf(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScra
         da.add(b);
         const tpc = dec_warps / dec_dn_ks;
         const rg = decRg(r);
+        const gx = cdiv(n / 16, tpc);
+        const cfg: cuda.launch.Config = .{ .grid = .{ .x = @intCast(gx), .y = @intCast(ny), .z = 1 }, .block = .{ .x = 32 * dec_warps }, .shared = decShared(dec_experts_cfg, @as(usize, 1) << @intCast(rg)), .pdl = k.dec_pdl };
+        if (decSumIn(k.decode_fuse, gx)) {
+            // the routed sum in this launch (tf_dsn_dec_dn_cb: tf_dsn_combine's arithmetic): no combine launch after it
+            const f = k.dec_dn_cb orelse return error.NoDecodeFuseKernel;
+            da.add(CombArgs{ .pick = pick, .R = @intCast(r), .S = @intCast(sc.slots), .E = @intCast(ex.count), .accumulate = @intFromBool(accumulate), .y = out, .ldy = @intCast(ldo), .cnt = k.comb_cnt.?.ptr });
+            return cuda.launch.launch(f[rg], cfg, s, &da);
+        }
+        try cuda.launch.launch(k.dec[4][rg], cfg, s, &da);
     } else if (split) {
         if (k.sab) try launch(k.dn_sab, s, .{ cdiv(n, 16), ny, 1 }, 256, &args) else try launch(k.dn_gemv, s, .{ cdiv(n, 8), ny, 1 }, 256, &args);
     } else if (pfExperts(k, sc, i, n, 0)) {
@@ -2913,6 +3001,39 @@ test "gate / up and down launch their prefill tiles through pfExpertsLaunch" {
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, launch_));
     }
 }
+
+test "TF_DS_DECODE_FUSE: a decode down launch sums the routed slots itself with the switch and a count for each column group; unset, tf_dsn_combine after it" {
+    try std.testing.expect(!decSumIn(false, 1));
+    try std.testing.expect(!decSumIn(false, 40));
+    try std.testing.expect(decSumIn(true, 1));
+    try std.testing.expect(decSumIn(true, 40)); // a 2D node's down at 2,560 columns: 40 groups of 64
+    try std.testing.expect(decSumIn(true, comb_counters));
+    try std.testing.expect(!decSumIn(true, comb_counters + 1));
+    try std.testing.expectEqual(@as(usize, 40), cdiv(2560 / 16, dec_warps / dec_dn_ks));
+}
+
+test "down's decode launch takes the summing kernel through decSumIn, the same configuration, and returns before the combine" {
+    const src = @embedFile("mx.zig");
+    const at = std.mem.indexOf(u8, src, "fn downOf(").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n}\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "if (decSumIn(k.decode_fuse, gx)) {"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "da.add(CombArgs{ .pick = pick, .R = @intCast(r), .S = @intCast(sc.slots), .E = @intCast(ex.count), .accumulate = @intFromBool(accumulate), .y = out, .ldy = @intCast(ldo), .cnt = k.comb_cnt.?.ptr });"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "return cuda.launch.launch(f[rg], cfg, s, &da);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "try cuda.launch.launch(k.dec[4][rg], cfg, s, &da);"));
+    // the summing launch returns before the combine (mx.combine, down's last launch); the other paths reach it
+    const fused = std.mem.indexOf(u8, body, "return cuda.launch.launch(f[rg], cfg, s, &da);").?;
+    const comb = std.mem.indexOf(u8, body, "try combine(k, s, sc, pick, r, ex.count, n, out, ldo, accumulate);").?;
+    try std.testing.expect(fused < comb);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "try combine("));
+    // tf_dsn_combine's arguments are CombArgs' (the same pick, rows, slots, experts, output and accumulate)
+    const cat = std.mem.indexOf(u8, src, "pub fn combine(").?;
+    const cbody = src[cat .. cat + std.mem.indexOf(u8, src[cat..], "\n}\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, cbody, "try launch(k.combine, s, .{ cdiv(r * n, 256), 1, 1 }, 256, &ca);"));
+    for ([_][]const u8{ "ca.add(pick);", "ca.add(@as(c_int, @intCast(r)));", "ca.add(@as(c_int, @intCast(sc.slots)));", "ca.add(@as(c_int, @intCast(experts)));", "ca.add(out);", "ca.add(@as(i64, @intCast(ldo)));", "ca.add(@as(c_int, @intFromBool(accumulate)));" }) |line| {
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, cbody, line));
+    }
+}
+
 test "TF_DS_ROCI_COMBINE_FIRST: the two stages' blocks are the four row quarters, each once" {
     var dummy: u8 = 0;
     const F = struct {
@@ -2949,7 +3070,25 @@ test "TF_DS_ROCI_COMBINE_FIRST: a stage's launch is the combine's launch at row 
     try std.testing.expect(std.mem.indexOf(u8, dn, "if (cf != null and split) return error.CombineFirstOnDecode;").? < 300);
 }
 
+test "TF_DS_DECODE_FUSE: the assembly with down's quant takes a 2D node's widths in whole 32-value groups" {
+    try std.testing.expectEqual(@as(?usize, 1152), asmQuantWidth(512, 128)); // a 2D node's 512 main a pair and 128 rest
+    try std.testing.expectEqual(@as(?usize, 1024), asmQuantWidth(512, 0));
+    try std.testing.expectEqual(@as(?usize, null), asmQuantWidth(500, 128));
+    try std.testing.expectEqual(@as(?usize, null), asmQuantWidth(512, 112));
+    try std.testing.expectEqual(@as(?usize, null), asmQuantWidth(0, 128));
+    // the codes' and scales' rows are down's quant rows: down_k bytes and down_k / 32 scales
+    try std.testing.expectEqual(@as(usize, 36), asmQuantWidth(512, 128).? / 32);
+}
+
+test "a decode window's coded down is down's decode path without its quant" {
+    const src = @embedFile("mx.zig");
+    const at = std.mem.indexOf(u8, src, "pub fn downDecCodes(").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n}\n").?];
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "return downOf(k, s, ex, sc, 0, ex.down_k, pick, r, out, ldo, accumulate, true, true, null);"));
+    const dn = std.mem.indexOf(u8, src, "fn downOf(").?;
+    const dbody = src[dn .. dn + std.mem.indexOf(u8, src[dn..], "\n}\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, dbody, "if (!coded) {"));
+}
 
 test "TF_DS_MMA_SF: a dense FP8 GEMM's block-scaled kernel by its split and rows; off, and exact below pf_min_rows, the baseline's" {
     for ([_]usize{ 1, 63, 64, 1024, 1025, 4096 }) |m| {

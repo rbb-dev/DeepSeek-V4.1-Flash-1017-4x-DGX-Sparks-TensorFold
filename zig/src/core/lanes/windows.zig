@@ -166,20 +166,33 @@ fn headTrunk(e: *Engine, s: *Stream, p: Plan, levels: usize) !?fill.Trunk {
     return .{ .tokens = chain, .others = others };
 }
 
-/// A copy from the context backed by `enter_match` ids (Python `_copy_proposal`), else Recall's when it should pay.
+/// A copy from the context backed by `enter_match` ids (Python `_copy_proposal`), else Recall's when it should pay. A
+/// lone stream's copy past every window's width (Config.alone_max) takes a rung of `rung`.
 /// Without copy_proposals (TF_DS_NO_COPIES=1 on a drafted DeepSeek stream) the suffix-lookup copies are skipped.
 pub fn copyProposal(e: *Engine, s: *Stream) !Copy {
-    if (e.cfg.max_copy == 0 or s.force.items.len > 0) return .{};
-    const width: u32 = if (e.alone) (s.copy_width orelse e.cfg.first_copy) else e.cfg.first_copy;
+    if (!e.cfg.copies or e.cfg.max_copy == 0 or s.force.items.len > 0) return .{};
+    const width: u32 = if (e.alone) (s.copy_width orelse e.cfg.alone_first) else e.cfg.first_copy;
     const most = @min(@as(i64, width), s.draftRoom() - 1);
     if (s.proposer) |p| if (copyAllowed(e.cfg.copy_proposals, e.cfg.max_copy, s.force.items.len) and (!e.alone or e.cfg.lone_copies)) {
         const copied = p.propose(s.context.items, most) catch &.{};
-        if (copied.len >= 2 and p.lastMatch() >= e.cfg.enter_match) return .{ .tokens = copied };
+        if (copied.len >= 2 and p.lastMatch() >= e.cfg.enter_match) return .{ .tokens = copied[0..rung(copied.len, e.cfg.max_copy, e.cfg.alone_max)] };
     };
     const r = s.recall orelse return .{};
     if (most < 2) return .{};
     const got = r.propose(s.context.items, @intCast(most), s.rounds);
     return if (got.len >= 2) .{ .tokens = got, .recalled = true } else .{};
+}
+
+/// The drafts a copy of `n` takes: n up to every window's width (max_copy); past it the largest rung of 8, 12 and 16
+/// drafts under `most`, or `most`, at or under n (a few window rows, so a few round shapes), else max_copy.
+pub fn rung(n: usize, max_copy: u32, most: u32) usize {
+    if (n <= max_copy) return n;
+    var best: usize = max_copy;
+    for ([_]u32{ 8, 12, 16 }) |r| {
+        if (r < most and r <= n) best = @max(best, r);
+    }
+    if (most <= n) best = @max(best, most);
+    return best;
 }
 
 pub fn copyAhead(ptr: *anyopaque, w: *const depth.Who) bool {

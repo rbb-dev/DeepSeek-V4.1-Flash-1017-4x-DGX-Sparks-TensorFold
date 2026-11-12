@@ -12,6 +12,7 @@
 namespace {
 constexpr int STAGE_THREADS = 512;
 constexpr int COLLECT_THREADS = 256;
+static_assert(COLLECT_THREADS == 256, "COLLECT_THREADS must equal rdma.zig's collect_threads (256): the host's unit4 = 4 * collect_threads and the kernel's c0 + k * COLLECT_THREADS must agree");
 
 __device__ __forceinline__ uint64_t load_sys(const uint64_t* p) {
     uint64_t v;
@@ -296,6 +297,57 @@ extern "C" __global__ void __launch_bounds__(COLLECT_THREADS) dsv41_rdma_collect
     }
 }
 
+
+
+// The rows of a peer's slot a block copies in one go: four float4 in flight a thread.
+constexpr int PEER_UNIT4 = 4 * COLLECT_THREADS;
+
+// dsv41_rdma_collect_into with every peer's slot read at once (TF_DS_RDMA_COLLECT_PEERS): block row y copies the y-th
+// peer that has a destination (this rank and null or zero-width destinations left out), so the peers' ring reads are in
+// flight together, not one peer after another. Its thread 0 alone waits for that peer's flag. A peer's slot is cut into
+// units of up to PEER_UNIT4 float4 of one row (a row of r4 float4 takes ceil(r4 / PEER_UNIT4) of them); the row's
+// blocks take units blockIdx.x, + gridDim.x, ...; a thread loads its four float4 of the unit, then stores them. A
+// destination is copied when its pointer is set and its row4 is not 0 (rdma.zig's peerCopied); a zero-width
+// destination consumes no row. The same float4 from the same slot words to the same destination words as
+// dsv41_rdma_collect_into, so the same bytes. No probe.
+extern "C" __global__ void __launch_bounds__(COLLECT_THREADS) dsv41_rdma_collect_peers(Dsts d, int rows,
+        const char* recv_ring, const uint64_t* flags, const uint64_t* seq, int rank, int world, int slots,
+        uint64_t max_bytes, const uint64_t* abort_word, int pdl) {
+    pdl_enter(pdl);                              // the staging kernel's sequence and own slice are written
+    // rdma.zig's peerCopied: a pointer and a nonzero row width. A zero-width destination (a pointer with row4 0)
+    // consumes no row, so the host's grid's y-th row lands on the same peer as here.
+    int p = -1;
+    for (int k = 0, y = (int)blockIdx.y; k < world; ++k)
+        if (k != rank && d.ptr[k] != nullptr && d.row4[k] != 0 && y-- == 0) {
+            p = k;
+            break;
+        }
+    if (p < 0) return;                           // no peer for this row of blocks (a grid of one with none to copy)
+    const uint64_t q = *seq;
+    const int slot = (int)(q % slots);
+    if (threadIdx.x == 0)
+        for (uint32_t i = 1; load_sys(flags + (size_t)slot * world + p) < q; ++i)
+            if ((i & 1023) == 0 && load_sys(abort_word)) break;
+    __syncthreads();
+    const float4* in = reinterpret_cast<const float4*>(recv_ring + ((size_t)slot * world + p) * max_bytes);
+    float4* out = d.ptr[p];
+    const int r4 = d.row4[p];
+    const long long s4 = d.stride4[p];
+    const int per_row = (r4 + PEER_UNIT4 - 1) / PEER_UNIT4;
+    for (int u = blockIdx.x; u < rows * per_row; u += gridDim.x) {
+        const int r = u / per_row;               // once a unit, not once a float4
+        const int c0 = (u - r * per_row) * PEER_UNIT4 + threadIdx.x;
+        const float4* src = in + (size_t)r * r4;
+        float4* dst = out + (size_t)r * s4;
+        float4 v[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+            if (c0 + k * COLLECT_THREADS < r4) v[k] = __ldcv(src + c0 + k * COLLECT_THREADS);
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+            if (c0 + k * COLLECT_THREADS < r4) dst[c0 + k * COLLECT_THREADS] = v[k];
+    }
+}
 
 
 // TF_DS_RING_WORD: the arrival signal is the sending lane's 64-bit generation word, written by its NIC after the

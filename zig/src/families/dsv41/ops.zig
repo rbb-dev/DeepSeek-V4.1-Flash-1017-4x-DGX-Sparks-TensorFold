@@ -39,12 +39,30 @@ pub fn l2ChunkWanted(v: ?[]const u8) ?u64 {
 /// tf_ds_l2_prefetch_kernel's argument: up to 16 device ranges (their first byte and length).
 pub const Prefetch = extern struct { ptr: [16]u64 = @splat(0), bytes: [16]u64 = @splat(0), n: c_int = 0 };
 
+/// A paced prefetch of `want` bytes over one buffer (a stand-in for the served prefetch's traffic beside a measurement):
+/// the buffer whole, again and again, the last range cut to what is left, 16 ranges at most.
+pub fn pacedRanges(buf: u64, buf_bytes: u64, want: u64) Prefetch {
+    var a: Prefetch = .{};
+    var left = want;
+    while (left > 0 and a.n < 16) : (a.n += 1) {
+        const take = @min(left, buf_bytes);
+        a.ptr[@intCast(a.n)] = buf;
+        a.bytes[@intCast(a.n)] = take;
+        left -= take;
+    }
+    return a;
+}
+
+/// The served prefetch's wave period at `gbps`: 128 chunks of 8 KiB a wave, as l2Prefetch paces it (0: no pacing).
+pub fn pacedWaveNs(gbps: f64) c_longlong {
     return waveNs(gbps, 8192);
 }
 
 /// A wave's period at `gbps` for chunks of `chunk` bytes: 128 chunks a wave (0 gbps: no pacing).
 pub fn waveNs(gbps: f64, chunk: u64) c_longlong {
     return if (gbps > 0) @intFromFloat(128.0 * @as(f64, @floatFromInt(chunk)) / gbps) else 0;
+}
+
 pub const Ops = struct {
     pointwise: cuda.Module,
     movement: cuda.Module,
@@ -532,6 +550,22 @@ test "launch geometry of the development launchers" {
     try std.testing.expectEqual(@as(u32, 2), blocks(257, 256));
     try std.testing.expectEqual(@as(u32, 65535), blocks(1 << 40, 256));
 }
+
+test "a paced prefetch over one buffer: the whole buffer again and again, the last range cut, 16 at most; the served wave period" {
+    const gib: u64 = 1 << 30;
+    const a = pacedRanges(0x7000_0000, gib, 2 * gib + gib / 2);
+    try std.testing.expectEqual(@as(c_int, 3), a.n);
+    try std.testing.expectEqualSlices(u64, &.{ gib, gib, gib / 2 }, a.bytes[0..3]);
+    for (a.ptr[0..3]) |p| try std.testing.expectEqual(@as(u64, 0x7000_0000), p);
+    const b = pacedRanges(0x7000_0000, gib, 40 * gib);
+    try std.testing.expectEqual(@as(c_int, 16), b.n);
+    for (b.bytes[0..16]) |x| try std.testing.expectEqual(gib, x);
+    try std.testing.expectEqual(@as(c_int, 0), pacedRanges(0x7000_0000, gib, 0).n);
+    try std.testing.expectEqual(@as(c_int, 1), pacedRanges(0x7000_0000, gib, 4096).n);
+    // l2Prefetch's own period at the served 230 GB/s: 128 x 8,192 B / 230 GB/s
+    try std.testing.expectEqual(@as(c_longlong, 4559), pacedWaveNs(230));
+    try std.testing.expectEqual(@as(c_longlong, @intFromFloat(128.0 * 8192.0 / l2_rate_gbps)), pacedWaveNs(l2_rate_gbps));
+    try std.testing.expectEqual(@as(c_longlong, 0), pacedWaveNs(0));
     // TF_DS_L2_CHUNK_KIB: the wave's period scales with the chunk so the rate (and every byte touched) stays: 128 x chunk / period = 230 GB/s within the rounding
     try std.testing.expectEqual(@as(c_longlong, 4559), waveNs(230, 8192));
     try std.testing.expectEqual(@as(c_longlong, 2279), waveNs(230, 4096));
@@ -552,6 +586,7 @@ test "TF_DS_L2_CHUNK_KIB: unset or empty is 8 KiB, 1 / 2 / 4 / 8 / 16 are KiB, a
     try std.testing.expectEqual(@as(?u64, 8192), l2ChunkWanted("8"));
     try std.testing.expectEqual(@as(?u64, 16384), l2ChunkWanted("16"));
     for ([_][]const u8{ "0", "3", "32", "2048", "-2", " 2", "02", "two", "2k" }) |bad| try std.testing.expectEqual(@as(?u64, null), l2ChunkWanted(bad));
+}
 
 test "TF_DS_ADD2_VEC: the four-wide add takes whole fours at 16-byte operands and an 8-byte output, anything else the scalar kernel; off unless asked" {
     const O = Ops;
