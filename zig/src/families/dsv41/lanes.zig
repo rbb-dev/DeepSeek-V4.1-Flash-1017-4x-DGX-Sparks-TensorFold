@@ -1622,13 +1622,26 @@ test "a window's masks are none or every row's bits" {
     try std.testing.expect(!masksFit(with, words));
 }
 
-test "passCap: resume_rows below pass_from, then pass_rows" {
-    var ln: Lanes = undefined;
-    ln.pass_rows = model.chunk_rows;
-    ln.pass_from = 0;
-    try std.testing.expectEqual(@as(usize, model.chunk_rows), ln.passCap(0));
-    ln.pass_from = 4 * model.resume_rows;
-    try std.testing.expectEqual(@as(usize, model.resume_rows), ln.passCap(0));
-    try std.testing.expectEqual(@as(usize, model.resume_rows), ln.passCap(3 * model.resume_rows));
-    try std.testing.expectEqual(@as(usize, model.chunk_rows), ln.passCap(4 * model.resume_rows));
+test "retained histories preserve their replay and output reservations (PR #10: eight 100K histories)" {
+    var m: Model = undefined;
+    m.pool_cap = 1 << 20;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
+    defer ln.snaps.deinit(std.testing.allocator);
+    var snapshots: [8]Snap = undefined;
+    for (&snapshots, 0..) |*sn, i| {
+        const base = try ln.placeKept(&.{}, 102400, null);
+        sn.* = .{ .id = i, .at = 98304, .base = base, .end = base + 102400, .buf = undefined };
+        try ln.snaps.append(std.testing.allocator, sn);
+    }
+    // All eight 100K histories can resume within their reservations without invalidating a neighbor.
+    for (&snapshots) |*sn| {
+        try std.testing.expect(!ln.keptOver(sn.base + sn.at, sn.end, sn));
+        ln.staleOver(sn.base + sn.at, sn.end, sn);
+    }
+    for (snapshots) |sn| try std.testing.expect(!sn.stale);
+    // At genuine capacity pressure, kept states may still be evicted; a live range never is.
+    const live = [_][2]usize{.{ 0, 102400 }};
+    try std.testing.expectEqual(@as(usize, 102400), try ln.placeKept(&live, 409600, null));
+    try std.testing.expect(!ln.snaps.items[0].stale); // its rows lie in the live stream: that stream holds the room
+}
 }
