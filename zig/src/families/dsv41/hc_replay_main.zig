@@ -11,6 +11,8 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
+/// Every copy between the host and the device, in the replay stream's order (replay_io).
+const rio = dsv41.replay_io;
 const tri_hc = dsv41.tri_hc;
 
 const D: usize = 5120;
@@ -28,6 +30,7 @@ fn fillF32(buf: cuda.DeviceBuffer, rng: *std.Random.DefaultPrng, a: std.mem.Allo
     const host = try a.alloc(f32, n);
     defer a.free(host);
     for (host) |*v| v.* = rng.random().floatNorm(f32) * 0.5;
+    try rio.write(buf, 0, std.mem.sliceAsBytes(host));
 }
 
 /// Zero `n` bytes of `buf` at `off` -- the kernel may mix INTO its outputs (XO reads its own prior content, per
@@ -36,6 +39,7 @@ fn fillF32(buf: cuda.DeviceBuffer, rng: *std.Random.DefaultPrng, a: std.mem.Allo
 fn zero(buf: cuda.DeviceBuffer, off: usize, n: usize, a: std.mem.Allocator) !void {
     const z = try a.alloc(u8, n);
     @memset(z, 0);
+    try rio.write(buf, off, z);
 }
 
 fn fillBf16(buf: cuda.DeviceBuffer, rng: *std.Random.DefaultPrng, a: std.mem.Allocator) !void {
@@ -46,6 +50,7 @@ fn fillBf16(buf: cuda.DeviceBuffer, rng: *std.Random.DefaultPrng, a: std.mem.All
         const f: f32 = rng.random().floatNorm(f32) * 0.5;
         v.* = @truncate(@as(u32, @bitCast(f)) >> 16);
     }
+    try rio.write(buf, 0, std.mem.sliceAsBytes(host));
 }
 
 fn eqBytes(d: *const cuda.Driver, a: std.mem.Allocator, buf: cuda.DeviceBuffer, off: usize, len: usize, other: cuda.DeviceBuffer, ooff: usize) !bool {
@@ -53,6 +58,8 @@ fn eqBytes(d: *const cuda.Driver, a: std.mem.Allocator, buf: cuda.DeviceBuffer, 
     defer a.free(x);
     const y = try a.alloc(u8, len);
     defer a.free(y);
+    try rio.read(buf, off, x);
+    try rio.read(other, ooff, y);
     _ = d;
     return std.mem.eql(u8, x, y);
 }
@@ -72,6 +79,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer ctx.deinit();
     var stream = try cuda.Stream.init(&driver, true);
     defer stream.deinit();
+    dsv41.replay_io.stream = stream;
+    defer dsv41.replay_io.stream = null;
     var set = try cuda.aot.Set.load(init.gpa, io, &driver, ctx.device, args[1]);
     const t: dsv41.tri.Tri = .{ .set = &set, .stream = stream, .pdl = true };
 
@@ -128,10 +137,15 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Snapshot the full run's outputs before the quarter runs overwrite the same buffers.
     const full_h_out = try a.alloc(u8, h_out.len);
+    try rio.read(h_out, 0, full_h_out);
     const full_out = try a.alloc(u8, out.len);
+    try rio.read(out, 0, full_out);
     const full_pre_out = try a.alloc(u8, pre_out.len);
+    try rio.read(pre_out, 0, full_pre_out);
     const full_post = try a.alloc(u8, post.len);
+    try rio.read(post, 0, full_post);
     const full_comb = try a.alloc(u8, comb.len);
+    try rio.read(comb, 0, full_comb);
 
     // Control: repeat the SAME full 2048-row launch again, untouched inputs (but freshly zeroed outputs -- see
     // above), and check it reproduces itself -- isolates whether a mismatch below is from row-slicing or
@@ -145,6 +159,7 @@ pub fn main(init: std.process.Init) !u8 {
     try stream.synchronize();
     {
         const repeat_out = try a.alloc(u8, out.len);
+        try rio.read(out, 0, repeat_out);
         if (std.mem.eql(u8, repeat_out, full_out)) {
             std.debug.print("control: repeating the SAME full 2048-row launch reproduces x exactly\n", .{});
         } else {
@@ -196,6 +211,7 @@ pub fn main(init: std.process.Init) !u8 {
         const qbytes_hc4 = QROWS * HC * 4;
         const qbytes_hc2_4 = QROWS * HC * HC * 4;
         var buf = try a.alloc(u8, qbytes_hc);
+        try rio.read(h_out, row0 * HC * D * 2, buf);
         const ref_hc = full_h_out[row0 * HC * D * 2 ..][0..qbytes_hc];
         if (!std.mem.eql(u8, buf, ref_hc)) {
             const qu16 = std.mem.bytesAsSlice(u16, buf);
@@ -214,21 +230,25 @@ pub fn main(init: std.process.Init) !u8 {
             ok = false;
         }
         buf = try a.alloc(u8, qbytes_d);
+        try rio.read(out, row0 * D * 2, buf);
         if (!std.mem.eql(u8, buf, full_out[row0 * D * 2 ..][0..qbytes_d])) {
             std.debug.print("DIFFERS: x (normed output) quarter {d}\n", .{qi});
             ok = false;
         }
         buf = try a.alloc(u8, qbytes_hc4);
+        try rio.read(pre_out, row0 * HC * 4, buf);
         if (!std.mem.eql(u8, buf, full_pre_out[row0 * HC * 4 ..][0..qbytes_hc4])) {
             std.debug.print("DIFFERS: pre_out quarter {d}\n", .{qi});
             ok = false;
         }
         buf = try a.alloc(u8, qbytes_hc4);
+        try rio.read(post, row0 * HC * 4, buf);
         if (!std.mem.eql(u8, buf, full_post[row0 * HC * 4 ..][0..qbytes_hc4])) {
             std.debug.print("DIFFERS: post (coefficients) quarter {d}\n", .{qi});
             ok = false;
         }
         buf = try a.alloc(u8, qbytes_hc2_4);
+        try rio.read(comb, row0 * HC * HC * 4, buf);
         if (!std.mem.eql(u8, buf, full_comb[row0 * HC * HC * 4 ..][0..qbytes_hc2_4])) {
             std.debug.print("DIFFERS: comb (coefficients) quarter {d}\n", .{qi});
             ok = false;

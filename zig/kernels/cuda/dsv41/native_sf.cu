@@ -1197,6 +1197,127 @@ extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_dn_exact_r2_kerne
     sf::dn_r2<sf::kExact, sf::DnR2Cfg>(a, tiles, ntiles);
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// The tensor core's accumulation window, probed (the replay's mma_window): how far apart in exponent two groups of products may lie in one
+// MMA, or one MMA and the C it accumulates onto, for the result to be the exact sum rounded to nearest. Each trial is a random operand set
+// split in two groups whose scales / exponents differ by `spread`; the reference is the two groups' isolated results (each an exact fp32:
+// a group's sum is a few-bit integer times a power of two) added in double and rounded to fp32 (nearest, and toward zero for the second
+// class). The operands are random bits, so no fragment layout is assumed: a group is the set of operands one scale byte (E2M1, blocks
+// of 32) or one register set (bf16, k 0-7 and k 8-15) covers, and the isolated runs zero the other group (scale byte 0 / zero registers).
+namespace probe {
+
+constexpr int kSpreads = 30;  // 0 .. 29 binades: the double reference is exact to 29
+// counts[instr][mode][order][spread][class]: instr 0 bf16 m16n8k16, 1 E2M1 m16n8k64 (kind::mxf4nvf4, scale_vec::2X); mode 0 one MMA,
+// 1 the second group's MMA accumulating onto the first's result, 2 the control (an operand changed after the references); class 0 the
+// nearest-rounded exact sum, 1 equal to it rounded toward zero (and not the other), 2 neither
+constexpr int kCounts = 2 * 3 * 2 * kSpreads * 3;
+__device__ __forceinline__ int idx(int instr, int mode, int order, int spread, int cls) {
+    return (((instr * 3 + mode) * 2 + order) * kSpreads + spread) * 3 + cls;
+}
+
+__device__ __forceinline__ uint32_t next(uint32_t& s) {
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    return s;
+}
+
+__device__ __forceinline__ void mma16(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2], const float (&c)[4]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+}
+
+__device__ __forceinline__ void mma64(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2], uint32_t sfa, uint32_t sfb, const float (&c)[4]) {
+    asm volatile(
+        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13}, %14, {%16,%17}, %15, {%16,%17};\n"
+        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]), "r"(sfa), "r"(sfb),
+          "h"((uint16_t)0), "h"((uint16_t)0));
+}
+
+// a bf16 pair of values (random sign, a 3-bit mantissa, an exponent within +-2 of `base`)
+__device__ __forceinline__ uint32_t bf_pair(uint32_t& s, int base) {
+    uint32_t w = 0;
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+        const uint32_t r = next(s);
+        const uint32_t e = uint32_t(127 + base + int(r % 5u) - 2);
+        const uint32_t bits = ((r >> 8) & 1u) << 15 | e << 7 | ((r >> 12) & 7u) << 4;
+        w |= bits << (16 * h);
+    }
+    return w;
+}
+
+__device__ __forceinline__ void tally(unsigned* counts, int instr, int mode, int order, int spread, float got, float d0, float d1) {
+    const double exact = double(d0) + double(d1);
+    const float rn = float(exact), rz = __double2float_rz(exact);
+    const int cls = __float_as_uint(got) == __float_as_uint(rn) || (got == rn) ? 0 : (got == rz ? 1 : 2);
+    atomicAdd(&counts[idx(instr, mode, order, spread, cls)], 1u);
+}
+
+}  // namespace probe
+
+// One warp: `draws` random operand sets for every (instruction, order, spread), each of the MMA's 128 outputs a trial.
+extern "C" __global__ void __launch_bounds__(32) tf_dsn_sf_probe_kernel(unsigned* __restrict__ counts, int draws, unsigned seed) {
+    using namespace probe;
+    const int lane = threadIdx.x;
+    uint32_t s = seed * 2654435761u + uint32_t(lane) * 40503u + 1u;
+    for (int rep = 0; rep < draws; rep++)
+        for (int order = 0; order < 2; order++)
+            for (int spread = 0; spread < kSpreads; spread++) {
+                const float z[4] = {0.f, 0.f, 0.f, 0.f};
+                // ---- bf16 m16n8k16: group 0 = k 0-7 (a0, a1, b0), group 1 = k 8-15 (a2, a3, b1); the smaller group's exponent is lower by `spread`
+                {
+                    const int b0 = order == 0 ? 0 : -spread, b1 = order == 0 ? -spread : 0;
+                    uint32_t a[4] = {bf_pair(s, b0), bf_pair(s, b0), bf_pair(s, b1), bf_pair(s, b1)};
+                    uint32_t b[2] = {bf_pair(s, 0), bf_pair(s, 0)};
+                    const uint32_t a_g0[4] = {a[0], a[1], 0, 0}, a_g1[4] = {0, 0, a[2], a[3]};
+                    const uint32_t b_g0[2] = {b[0], 0}, b_g1[2] = {0, b[1]};
+                    float d0[4], d1[4], all[4], chain[4], ctl[4];
+                    mma16(d0, a_g0, b_g0, z);
+                    mma16(d1, a_g1, b_g1, z);
+                    mma16(all, a, b, z);
+                    mma16(chain, a_g1, b_g1, d0);
+                    uint32_t a_bad[4] = {a[0] ^ 0x00100010u, a[1], a[2], a[3]};
+                    mma16(ctl, a_bad, b, z);
+#pragma unroll
+                    for (int c = 0; c < 4; c++) {
+                        tally(counts, 0, 0, order, spread, all[c], d0[c], d1[c]);
+                        tally(counts, 0, 1, order, spread, chain[c], d0[c], d1[c]);
+                        tally(counts, 0, 2, order, spread, ctl[c], d0[c], d1[c]);
+                    }
+                }
+                // ---- E2M1 m16n8k64: group 0 = scale byte 0's 32 values, group 1 = scale byte 1's; a scale byte 127 + base is 2^base
+                {
+                    uint32_t a[4], b[2];
+#pragma unroll
+                    for (int i = 0; i < 4; i++) a[i] = next(s);
+                    b[0] = next(s);
+                    b[1] = next(s);
+                    const uint32_t e_hi = 127u + 8u, e_lo = e_hi - uint32_t(spread);
+                    const uint32_t big = order == 0 ? e_hi : e_lo, small = order == 0 ? e_lo : e_hi;
+                    const uint32_t sfb = 127u | 127u << 8;
+                    const uint32_t sf_both = big | small << 8, sf_g0 = big, sf_g1 = small << 8;
+                    float d0[4], d1[4], all[4], chain[4], ctl[4];
+                    mma64(d0, a, b, sf_g0, sfb, z);
+                    mma64(d1, a, b, sf_g1, sfb, z);
+                    mma64(all, a, b, sf_both, sfb, z);
+                    mma64(chain, a, b, sf_g1, sfb, d0);
+                    uint32_t a_bad[4] = {a[0] ^ 0x11111111u, a[1], a[2], a[3]};
+                    mma64(ctl, a_bad, b, sf_both, sfb, z);
+#pragma unroll
+                    for (int c = 0; c < 4; c++) {
+                        tally(counts, 1, 0, order, spread, all[c], d0[c], d1[c]);
+                        tally(counts, 1, 1, order, spread, chain[c], d0[c], d1[c]);
+                        tally(counts, 1, 2, order, spread, ctl[c], d0[c], d1[c]);
+                    }
+                }
+            }
+}
+
 #ifdef TF_SF_LOAD_ONLY
 // ---------------------------------------------------------------------------------------------------------------------
 // The scale spreads of the indexer's FP4 dots on real prompts (a test-instruments build; the host's idx_spread.zig launches it beside a chunk's

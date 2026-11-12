@@ -10,6 +10,8 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
+/// Every copy between the host and the device, in the replay stream's order (replay_io).
+const rio = dsv41.replay_io;
 const tri_index = dsv41.tri_index;
 
 const IH: usize = 32;
@@ -24,6 +26,7 @@ fn fillBf16(buf: cuda.DeviceBuffer, rng: *std.Random.DefaultPrng, a: std.mem.All
         const f: f32 = rng.random().floatNorm(f32) * 0.5;
         v.* = @truncate(@as(u32, @bitCast(f)) >> 16);
     }
+    try rio.write(buf, 0, std.mem.sliceAsBytes(host));
 }
 
 /// K's packed FP4 codes (random nibbles: every bit pattern is a valid E2M1 code, no NaN/Inf to worry about) and
@@ -32,9 +35,11 @@ fn fillK(codes: cuda.DeviceBuffer, scales: cuda.DeviceBuffer, rng: *std.Random.D
     const cb = try a.alloc(u8, codes.len);
     defer a.free(cb);
     for (cb) |*v| v.* = rng.random().int(u8);
+    try rio.write(codes, 0, cb);
     const sb = try a.alloc(u8, scales.len);
     defer a.free(sb);
     for (sb) |*v| v.* = 23 + rng.random().uintLessThan(u8, 127 - 23 + 1);
+    try rio.write(scales, 0, sb);
 }
 
 /// VIS: strictly increasing with row index (causal: row r sees up to roughly its own position), varied so an
@@ -44,11 +49,13 @@ fn fillVis(buf: cuda.DeviceBuffer, rows: usize, a: std.mem.Allocator) !void {
     const host = try a.alloc(i64, rows);
     defer a.free(host);
     for (host, 0..) |*v, r| v.* = @intCast(@min(N, 16 + r * 3));
+    try rio.write(buf, 0, std.mem.sliceAsBytes(host));
 }
 
 fn zero(buf: cuda.DeviceBuffer, a: std.mem.Allocator) !void {
     const z = try a.alloc(u8, buf.len);
     @memset(z, 0);
+    try rio.write(buf, 0, z);
 }
 
 fn runCase(t: dsv41.tri.Tri, stream: cuda.Stream, a: std.mem.Allocator, q: cuda.DeviceBuffer, kcodes: cuda.DeviceBuffer, kscales: cuda.DeviceBuffer, wt: cuda.DeviceBuffer, vis: cuda.DeviceBuffer, out: cuda.DeviceBuffer, tmax: ?cuda.DeviceBuffer, keyed: bool, rows: usize) !void {
@@ -74,6 +81,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer ctx.deinit();
     var stream = try cuda.Stream.init(&driver, true);
     defer stream.deinit();
+    dsv41.replay_io.stream = stream;
+    defer dsv41.replay_io.stream = null;
     var set = try cuda.aot.Set.load(init.gpa, io, &driver, ctx.device, args[1]);
     const t: dsv41.tri.Tri = .{ .set = &set, .stream = stream, .pdl = true };
     const d = &driver;
@@ -114,7 +123,9 @@ pub fn main(init: std.process.Init) !u8 {
             try runCase(t, stream, a, q, kcodes, kscales, wt, vis, out2, tmax2, keyed, rows);
 
             const b1 = try a.alloc(u8, out1.len);
+            try rio.read(out1, 0, b1);
             const b2 = try a.alloc(u8, out2.len);
+            try rio.read(out2, 0, b2);
             const label = if (keyed) "keyed" else "plain";
             if (std.mem.eql(u8, b1, b2)) {
                 std.debug.print("ok   rows={d} {s}: OUT bit-identical RB=1 vs RB=2\n", .{ rows, label });
@@ -145,7 +156,9 @@ pub fn main(init: std.process.Init) !u8 {
             }
             if (keyed) {
                 const t1 = try a.alloc(u8, tmax1.?.len);
+                try rio.read(tmax1.?, 0, t1);
                 const t2 = try a.alloc(u8, tmax2.?.len);
+                try rio.read(tmax2.?, 0, t2);
                 if (std.mem.eql(u8, t1, t2)) {
                     std.debug.print("ok   rows={d} {s}: TMAX bit-identical RB=1 vs RB=2\n", .{ rows, label });
                 } else {

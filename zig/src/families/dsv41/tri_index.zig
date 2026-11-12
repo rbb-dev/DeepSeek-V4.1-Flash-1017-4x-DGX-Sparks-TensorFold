@@ -63,6 +63,13 @@ pub const IndexK = union(enum) {
         return if (k == .fp4) "*u8" else "*bf16";
     }
 
+    /// KS's type: the E8M0 scale tensor, u8 in every captured variant. A bf16-key launch (PACKED 0) does not read it, but the kit
+    /// captured those variants with KS as *u8, and a variant is found by its arguments' types (the replay's idx_deq probe asked
+    /// for *bf16 and found none).
+    fn scalesTy(_: IndexK) []const u8 {
+        return "*u8";
+    }
+
     fn codes(k: IndexK) u64 {
         return switch (k) {
             .fp4 => |f| f.codes,
@@ -81,6 +88,13 @@ pub const IndexK = union(enum) {
 /// index_keys' cand: the candidate pool's block mask (bool [R, >= cdiv(n, cand_block)], read as u8) and its row stride.
 pub const Cand = struct { mask: u64, stride: usize };
 
+/// _idx_keys_deq (the kit's extra set): the indexer's `n` packed keys dequantized once to bf16 [n, id] in `out`, the keys
+/// _index_score_rows_u builds in every program. A TIMING PROBE (replay section idx_deq): scores read from them are not the packed
+/// kernel's bytes. Error.MissingTritonVariant when the set has no kernel.
+pub fn idxKeysDeq(t: Tri, codes: u64, scales: u64, out: u64, n: usize, id: usize) !void {
+    try t.runExtra("_idx_keys_deq", .{ tri.cdiv(n, tile), 1, 1 }, &.{ p("K", "*u8", codes), p("KS", "*u8", scales), p("OUT", "*bf16", out), int("n", n) }, &.{ ci("ID", id), ci("BN", tile) });
+}
+
 /// index_score: q [R, IH, ID], k, w [R, IH], vis [R] -> out [R, n] fp32 scores; `keys`: int64 keys; `tmax`: tile maxima.
 pub fn indexScore(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, out: u64, base: ?u64, keys: bool, tmax: ?u64, rowwise: bool, rows: usize, ih: usize, id: usize) !void {
     const nt = tri.cdiv(n, tile);
@@ -92,9 +106,9 @@ pub fn indexScore(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, out: u6
         // HAS_CAND, CB and DEAD_PAD at the kernel's defaults (index_score passes none of them)
         // SKIP_DEAD: switch "tile_skip" (served on), a tile wholly at or past vis skips its dots
         return t.run("_index_score", .{ u(rows), nt, 1 }, &.{
-            p("Q", "*bf16", q),     p("K", k.ty(), k.codes()), p("KS", k.ty(), k.scales()), p("Wt", "*bf16", w),
-            p("VIS", "*i64", vis),  p("OUT", ot, out),         int("n", n),                 p("KB", "*i64", base orelse vis),
-            p("CAND", "*i64", vis), int("cs", 0),              tm,                          int("nt", nt),
+            p("Q", "*bf16", q),     p("K", k.ty(), k.codes()), p("KS", k.scalesTy(), k.scales()), p("Wt", "*bf16", w),
+            p("VIS", "*i64", vis),  p("OUT", ot, out),         int("n", n),                       p("KB", "*i64", base orelse vis),
+            p("CAND", "*i64", vis), int("cs", 0),              tm,                                int("nt", nt),
         }, &.{
             ci("IH", ih),          ci("ID", id), ci("BN", tile),   cb("PACKED", k == .fp4),               cb("HAS_BASE", base != null), t.pdlConst(),
             cb("HAS_CAND", false), ci("CB", 8),  cb("KEYS", keys), cb("HAS_TMAX", tmax != null and keys), cb("SKIP_DEAD", true),        cb("DEAD_PAD", false),
@@ -102,6 +116,8 @@ pub fn indexScore(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, out: u6
     }
     std.debug.assert(base == null);
     const rb_args = [_]aot.Arg{
+        p("Q", "*bf16", q),    p("K", k.ty(), k.codes()), p("KS", k.scalesTy(), k.scales()), p("Wt", "*bf16", w),
+        p("VIS", "*i64", vis), p("OUT", ot, out),         int("n", n),                       int("rows", rows),
         tm,                    int("nt", nt),
     };
     const rb_base_consts = [_]aot.Const{
@@ -149,7 +165,7 @@ pub fn indexKeys(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, base: ?u
     const cv = if (cand) |m| p("CAND", "*u8", m.mask) else p("CAND", "*i64", vis);
     const cs: usize = if (cand) |m| m.stride else 0;
     try t.run("_index_score", .{ u(rows), nt, 1 }, &.{
-        p("Q", "*bf16", q),    p("K", k.ty(), k.codes()), p("KS", k.ty(), k.scales()),        p("Wt", "*bf16", w),
+        p("Q", "*bf16", q),    p("K", k.ty(), k.codes()), p("KS", k.scalesTy(), k.scales()),  p("Wt", "*bf16", w),
         p("VIS", "*i64", vis), p("OUT", "*i64", out),     int("n", n),                        p("KB", "*i64", base orelse vis),
         cv,                    int("cs", cs),             p("TMAX", "*i64", tmax orelse out), int("nt", nt),
     }, &.{
@@ -163,8 +179,8 @@ pub fn indexKeysCand(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, cblk
     std.debug.assert(rows <= tri.decode_rows);
     const nout = nblk * cand_block;
     try t.run("_index_score_cand", .{ u(rows), tri.cdiv(nout, tile), 1 }, &.{
-        p("Q", "*bf16", q),               p("K", k.ty(), k.codes()), p("KS", k.ty(), k.scales()), p("Wt", "*bf16", w),
-        p("VIS", "*i64", vis),            p("OUT", "*i64", out),     int("n", n),                 int("nout", nout),
+        p("Q", "*bf16", q),               p("K", k.ty(), k.codes()), p("KS", k.scalesTy(), k.scales()), p("Wt", "*bf16", w),
+        p("VIS", "*i64", vis),            p("OUT", "*i64", out),     int("n", n),                       int("nout", nout),
         p("KB", "*i64", base orelse vis), p("CBLK", "*i32", cblk),   int("cbs", cbs),
     }, &.{ ci("IH", ih), ci("ID", id), ci("BN", tile), cb("PACKED", k == .fp4), cb("HAS_BASE", base != null), ci("CB", cand_block), t.pdlConst() });
 }
@@ -284,6 +300,31 @@ test "index_score (prompt chunks) launches _index_score_rows as recorded" {
             try indexScore(t, c.ptr("Q"), caseK(c), c.ptr("Wt"), c.ptr("VIS"), c.dim("OUT", 1), c.ptr("OUT"), null, c.constInt("KEYS") != 0, tmax, false, c.dim("Q", 0), c.dim("Q", 1), c.dim("Q", 2));
         }
     }.call);
+}
+
+test "bf16 keys: K is *bf16 and KS the scale tensor's own type *u8 in every launch (the kit's PACKED 0 variants were captured so; a variant is found by its arguments' types)" {
+    const keep_rb = idx_rb;
+    defer idx_rb = keep_rb;
+    for ([_]usize{ 1, 2 }) |rb| for ([_]usize{ 1, 512 }) |rows| for ([_]bool{ true, false }) |bf16| {
+        idx_rb = rb;
+        var log: tri.Log = .{ .gpa = std.testing.allocator };
+        defer log.deinit();
+        const k: IndexK = if (bf16) .{ .bf16 = 0x200 } else .{ .fp4 = .{ .codes = 0x200, .scales = 0x300 } };
+        try indexScore(.{ .log = &log }, 0x100, k, 0x400, 0x500, 40000, 0x600, null, false, null, false, rows, 32, 128);
+        try std.testing.expectEqual(@as(usize, 1), log.items.items.len);
+        var seen: usize = 0;
+        for (log.items.items[0].args) |a| {
+            if (std.mem.eql(u8, a.name, "K")) {
+                try std.testing.expectEqualStrings(if (bf16) "*bf16" else "*u8", a.value.ptr.ty);
+                seen += 1;
+            }
+            if (std.mem.eql(u8, a.name, "KS")) {
+                try std.testing.expectEqualStrings("*u8", a.value.ptr.ty);
+                seen += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 2), seen);
+    };
 }
 
 test "TF_DS_IDX_U: a prompt chunk's index score launches _index_score_rows' twin with its arguments; decode windows, rowwise and unset as the baseline" {

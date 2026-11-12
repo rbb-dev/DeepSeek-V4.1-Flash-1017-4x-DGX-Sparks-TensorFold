@@ -227,6 +227,12 @@
 //!     16 streams' five steps with each step's best planted: the list's drafts the whole vocabulary's wherever the plant
 //!     is in the list (ties across and within nodes to the lower id), another list id where it is not; a moved plant
 //!     changes a stream's drafts.
+//! Each section prints a set number of lines; another count fails it. TF_DS_REPLAY_ONLY=name[,name]: those sections
+//! alone. TF_DS_REPLAY_SAN=1: each soak 2 launches instead of 200, for a run under compute-sanitizer (its tools see a
+//! race or a stray access in the launch it happens in); every other launch and line as without it.
+//! TF_DS_REPLAY_CONTROLS=1: each section its controls and soak alone (pf_run128's: its normal lines' launches at 64 to
+//! 16,384 rows left out, so a slow tool's run reaches them); a section without that part refuses the run (exit 2).
+//! Exit 0 when every check holds, 1 otherwise, 2 for a usage or build problem.
 //!   tf-dsv41-kernels-replay AOT_DIR
 const std = @import("std");
 const cuda = @import("cuda");
@@ -236,6 +242,7 @@ const weights = dsv41.weights;
 const tri_attn = dsv41.tri_attn;
 const tri_hc = dsv41.tri_hc;
 const tri_norm = dsv41.tri_norm;
+const tri_index = dsv41.tri_index;
 const tri_basic = dsv41.tri_basic;
 const tri = dsv41.tri;
 
@@ -245,8 +252,14 @@ fn bf16Rne(x: f32) u16 {
     return @truncate((u + 0x7fff + ((u >> 16) & 1)) >> 16);
 }
 
+/// Every copy and fill between the host and the device, in the replay stream's order (replay_io: main sets its stream).
+const rio = dsv41.replay_io;
+const put = rio.put;
+const take = rio.take;
+
 fn upload(d: *const cuda.Driver, bytes: []const u8) !cuda.DeviceBuffer {
     const b = try cuda.DeviceBuffer.alloc(d, bytes.len);
+    try rio.write(b, 0, bytes);
     return b;
 }
 
@@ -254,10 +267,16 @@ fn upload(d: *const cuda.Driver, bytes: []const u8) !cuda.DeviceBuffer {
 fn get(buf: u64, n: usize, d: *const cuda.Driver) ![]u8 {
     const x = try std.heap.page_allocator.alloc(u8, n);
     errdefer std.heap.page_allocator.free(x);
+    try take(d, x.ptr, buf, n);
     return x;
 }
 
 /// A soak's launches: one input, each output against the first's (a race or a read of stale memory shows as a launch
+/// that differs; a wrong but steady result is the other lines' to find). TF_DS_REPLAY_SAN=1 (a run under
+/// compute-sanitizer, whose tools see a race, a stray access or a barrier slip in the launch it happens in): 2.
+var soak_launches: usize = 200;
+/// TF_DS_REPLAY_CONTROLS=1: a section's controls and soak alone (its normal lines left out).
+var controls_only = false;
 
 fn poison(buf: u64, n: usize, d: *const cuda.Driver, s: cuda.Stream) !void {
     try d.check(d.api.cuMemsetD8Async(buf, 0xa5, n, s.handle), "cuMemsetD8Async");
@@ -316,15 +335,18 @@ const Run = struct {
     ops: ?*const dsv41.ops.Ops = null,
     io: ?std.Io = null,
     ok: bool = true,
+    lines: usize = 0,
 
     fn report(r: *Run, what: []const u8, n: usize, want_equal: bool) void {
         const pass = (n == 0) == want_equal;
         if (!pass) r.ok = false;
+        r.lines += 1;
         std.debug.print("{s}: {d} bytes differ: {s}\n", .{ what, n, if (pass) "as it must" else "WRONG" });
     }
 
     fn note(r: *Run, what: []const u8, holds: bool) void {
         if (!holds) r.ok = false;
+        r.lines += 1;
         std.debug.print("{s}: {s}\n", .{ what, if (holds) "as it must" else "WRONG" });
     }
 };
@@ -357,6 +379,7 @@ const Mode = enum { bf16, f32, acc };
 fn gemmOnce(r: *Run, sw: mx.PfSplit, pf_off: bool, l: weights.Linear, q: u64, s: u64, z: u64, r0: usize, m: usize, y: u64, mode: Mode, init: ?[]const u8) ![]u8 {
     const esz: usize = if (mode == .bf16) 2 else 4;
     const bytes = m * l.n * esz;
+    if (init) |v| try put(r.d, y, v.ptr, bytes) else try poison(y, bytes, r.d, r.s);
     r.k.split = sw;
     r.k.pf_off = pf_off;
     defer {
@@ -447,10 +470,13 @@ fn pfSplit(r: *Run, rng: std.Random) !void {
             defer free(want);
             var code: [1]u8 = undefined;
             const at = q.ptr + 700 * sh.k + 5;
+            try take(d, &code, at, 1);
             const changed = [1]u8{code[0] ^ 0x08};
+            try put(d, at, &changed, 1);
             const cfg_on: mx.PfSplit = if (mx.pfSplitCfg(.b, 1024, sh.k, sh.n) != null) .b else .c7;
             const got = try gemmOnce(r, cfg_on, false, l, q.ptr, s.ptr, z.ptr, 0, 1024, y.ptr, .bf16, null);
             defer free(got);
+            try put(d, at, &code, 1);
             r.report(try std.fmt.bufPrint(&line, "pf_split {s} control: one code of row 700 changed ({s})", .{ sh.name, config_names[@backingInt(cfg_on) - 2] }), differs(want, got), false);
         }
     };
@@ -500,10 +526,13 @@ fn pfGemm5(r: *Run, rng: std.Random) !void {
             defer free(want);
             var code: [1]u8 = undefined;
             const at = q.ptr + 700 * K + 9;
+            try take(d, &code, at, 1);
             const changed = [1]u8{code[0] ^ 0x08};
+            try put(d, at, &changed, 1);
             r.k.gemm5 = true;
             const got = try gemmOnce(r, .off, false, l, q.ptr, s.ptr, 0, 0, 1000, y.ptr, .f32, null);
             defer free(got);
+            try put(d, at, &code, 1);
             r.report("pf_gemm5 control: one code of row 700 changed", differs(want, got), false);
         }
     }
@@ -556,6 +585,7 @@ fn readGrouping(r: *Run, sc: mx.ExpertScratch, a: std.mem.Allocator) !Grouping {
     const ints = struct {
         fn of(dd: *const cuda.Driver, ptr: u64, n: usize, aa: std.mem.Allocator) ![]i32 {
             const x = try aa.alloc(i32, n);
+            if (n > 0) try take(dd, x.ptr, ptr, n * 4);
             return x;
         }
     }.of;
@@ -668,6 +698,7 @@ fn groupTiles(r: *Run, rng: std.Random) !void {
     // the control: one pick of B changed (expert 12's first to expert 15, which had none)
     const at = std.mem.indexOfScalar(i32, pb_host, 12).?;
     const changed = [1]i32{15};
+    try put(d, pb.ptr + at * 4, &changed, 4);
     const moved = try Two.run(r, sc, .{ pa.ptr, pb.ptr }, true, &bufs, ha);
     r.report("group_tiles control: one pick moved from expert 12 to expert 15 (ints)", groupingDiff(want, moved), false);
 }
@@ -741,13 +772,18 @@ fn decGroup2(r: *Run, rng: std.Random) !void {
         fn diff(rr: *Run, s: mx.ExpertScratch, w: Want, a: std.mem.Allocator) !usize {
             const dd = rr.d;
             const off = try a.alloc(i32, e_n + 1);
+            try take(dd, off.ptr, s.off, 4 * (e_n + 1));
             var nact: [1]i32 = undefined;
+            try take(dd, &nact, s.nact, 4);
             var n: usize = @intFromBool(nact[0] != w.nact);
             for (off, w.off) |u, v| n += @intFromBool(u != v);
             const act = try a.alloc(i32, w.act.len);
             const ent = try a.alloc(i32, w.ent.len);
             const erow = try a.alloc(i32, w.ent.len);
+            if (act.len > 0) try take(dd, act.ptr, s.act, 4 * act.len);
             if (ent.len > 0) {
+                try take(dd, ent.ptr, s.ent, 4 * ent.len);
+                try take(dd, erow.ptr, s.erow, 4 * erow.len);
             }
             for (act, w.act) |u, v| n += @intFromBool(u != v);
             for (ent, w.ent) |u, v| n += @intFromBool(u != v);
@@ -769,6 +805,7 @@ fn decGroup2(r: *Run, rng: std.Random) !void {
                 else if (roll < 36) -1 // another node's
                 else @intCast(rng.uintLessThan(usize, e_n + 40)); // past 384: another node's
         }
+        try put(d, pick_dev.ptr, picks.ptr, 4 * rs);
         const w = try Host.want(picks, ha);
         for ([_]bool{ false, true }) |g2| {
             for (bufs) |b| try d.check(d.api.cuMemsetD8Async(b.ptr, 0x7f, b.len, r.s.handle), "cuMemsetD8Async");
@@ -783,6 +820,7 @@ fn decGroup2(r: *Run, rng: std.Random) !void {
     }
     // the control: one pick of the last case moved to another expert; the scan-and-rank kernel's output differs from the unchanged host grouping
     last[0] = if (last[0] == 100) 101 else 100;
+    try put(d, pick_dev.ptr, last.ptr, 4 * last.len);
     for (bufs) |b| try d.check(d.api.cuMemsetD8Async(b.ptr, 0x7f, b.len, r.s.handle), "cuMemsetD8Async");
     r.k.group2 = true;
     defer r.k.group2 = false;
@@ -958,6 +996,8 @@ fn topkWidth(r: *Run, n: usize, ks: usize, head: bool, chain: bool, soak: bool, 
     const m0 = [1]i64{std.mem.max(i64, k0[tile * 64 .. @min(tile * 64 + 64, n)])};
     const changed = try ha.dupe(i64, exact);
     try topkExact(k0, KK, h.vis[0], changed[0..KK], ha);
+    try put(d, kb.ptr + mx_t * 8, &low, 8);
+    try put(d, tb.ptr + tile * 8, &m0, 8);
     try poison(bufs[3].ptr, ob, d, r.s);
     try mx.topkTiles(r.k, r.s, kb.ptr, ks, tb.ptr, n, KK, vb.ptr, bufs[3].ptr, R);
     try r.s.synchronize();
@@ -1140,12 +1180,15 @@ fn passTail(r: *Run, rng: std.Random) !void {
             // one code byte of the key at position 300, visible to the rows with vis past it
             const at = codes_b.ptr + 300 * (ID / 2) + 7;
             var was: [1]u8 = undefined;
+            try take(d, &was, at, 1);
             const changed = [1]u8{was[0] ^ 0x40};
+            try put(d, at, &changed, 1);
             try dsv41.tri_index.indexScore(r.t, q.ptr, k, w.ptr, vis_b.ptr, c.merged, keys_merged.ptr, null, true, tmax_merged.ptr, false, c.rows, IH, ID);
             try r.s.synchronize();
             const km2 = try get(keys_merged.ptr, keys_merged.len, d);
             defer free(km2);
             for (0..c.rows) |row| control += differs(km[row * c.merged * 8 ..][0 .. c.merged * 8], km2[row * c.merged * 8 ..][0 .. c.merged * 8]);
+            try put(d, at, &was, 1);
         }
     }
     r.report("pass_tail control: one visible key's code byte changed at 1,112 compressed keys: the keys", control, false);
@@ -1262,8 +1305,10 @@ fn attnU(r: *Run, rng: std.Random) !void {
             // the control: a code byte of the first row's first pick changed
             const row: usize = @intCast(idx[0]);
             var one = [1]u8{codes[row * HD / 2] ^ 0x11};
+            try put(d, cb.ptr + row * HD / 2, &one, 1);
             const moved = try Got.of(r, a, bufs, sizes);
             defer std.heap.page_allocator.free(moved);
+            try put(d, cb.ptr + row * HD / 2, codes.ptr + row * HD / 2, 1);
             r.report(try std.fmt.bufPrint(&line, "attn_{s} control: a code byte of row 0's first pick changed", .{tag}), differs(want, moved), false);
         }
     }
@@ -1348,8 +1393,11 @@ fn idxProjOwned(r: *Run, rng: std.Random) !void {
     // the control: one qr value of row 700 set to 64, the owned quarter holding it
     const at = qr.ptr + (700 * I_QW + 17) * 2;
     var was: [2]u8 = undefined;
+    try take(d, &was, at, 2);
     const big = [2]u8{ 0x80, 0x42 };
+    try put(d, at, &big, 2);
     try idxProject(r, sc, wqb, qr.ptr, x.ptr, proj.ptr, cos.ptr, sin.ptr, pos.ptr, .{ .start = 512, .n = 512 }, bufs[1]);
+    try put(d, at, &was, 2);
     const got = try Read.all(r, bufs[1]);
     defer for (got) |g| free(g);
     r.report("idx_proj_owned control: iq with one qr value of row 700 set to 64", differs(want[0][512 * I_IH * I_ID * 2 .. 1024 * I_IH * I_ID * 2], got[0][512 * I_IH * I_ID * 2 .. 1024 * I_IH * I_ID * 2]), false);
@@ -1393,9 +1441,12 @@ fn bf16Rows(r: *Run, rng: std.Random) !void {
     defer free(want);
     const at = x.ptr + (3000 * I_D + 77) * 2;
     var was: [2]u8 = undefined;
+    try take(d, &was, at, 2);
     const big = [2]u8{ 0x80, 0x42 };
+    try put(d, at, &big, 2);
     const got = try Launch.run(r, x.ptr, w.ptr, y, M, true);
     defer free(got);
+    try put(d, at, &was, 2);
     r.report("bf16_rows control: one x value of row 3000 set to 64", differs(want, got), false);
 }
 
@@ -1558,6 +1609,7 @@ fn pfRun128(r: *Run, rng: std.Random) !void {
         }
     };
     const names = [_][]const u8{ "gate / up's bf16 pack", "down's fp32 entry outputs", "the combined fp32 rows" };
+    if (!controls_only) {
         for ([_]usize{ 64, 512, 2048, 4096, 8192, 16384 }) |m| {
             const want = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, m, false);
             defer for (want) |w| free(w);
@@ -1565,14 +1617,18 @@ fn pfRun128(r: *Run, rng: std.Random) !void {
             defer for (got) |g| free(g);
             for (names, want, got) |nm, w, g| r.report(try std.fmt.bufPrint(&line, "pf_run128 rows={d}: {s} on the 128-byte-run tiles against the baseline's", .{ m, nm }), differs(w, g), true);
         }
+    }
     // the controls: one x value of row 30 and one down input value of entry 30 x 7 set to 64
     const want = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 64, false);
     defer for (want) |w| free(w);
     const big = [2]u8{ 0x80, 0x42 };
     var was: [2]u8 = undefined;
     for ([_]u64{ x.ptr + (30 * X_D + 300) * 2, hdn.ptr + (30 * X_SL * X_I + 70) * 2 }, [_]usize{ 0, 1 }) |at, which| {
+        try take(d, &was, at, 2);
+        try put(d, at, &big, 2);
         const got = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 64, true);
         defer for (got) |g| free(g);
+        try put(d, at, &was, 2);
         r.report(if (which == 0) "pf_run128 control: gate / up's pack with one x value of row 30 set to 64" else "pf_run128 control: down's entry outputs with one input value of row 30's first slot set to 64", differs(want[which], got[which]), false);
     }
     // the staged pieces: one byte of weight set 0's (experts 0, 8, .. 376) changed at a time, each launch against the
@@ -1580,11 +1636,15 @@ fn pfRun128(r: *Run, rng: std.Random) !void {
     // K block 35, its tail pair's last), a scale byte in each stage word (and down's tail word)
     const nx = ex.native.?;
     var set0: [4]u64 = undefined; // gate's rows and scales, down's rows and scales
+    for (&set0, [_]u64{ nx.w1, nx.s1, nx.w2, nx.s2 }) |*p, t| try take(d, @ptrCast(p), t, 8);
     // gate / up's pack is bf16 and clamped: column 5's scales of the pair's K blocks at 2^0 first, so that one changed
     // byte moves its sums by more than a pack value's rounding (down's entry outputs are fp32)
     const gsc = set0[1] + 5 * (X_D / 32);
     var gsc_was: [8]u8 = undefined;
+    try take(d, &gsc_was, gsc, 8);
     const unit: [8]u8 = @splat(127);
+    try put(d, gsc, &unit, 8);
+    defer put(d, gsc, &gsc_was, 8) catch {};
     const own = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 64, true);
     defer for (own) |w| free(w);
     const Piece = struct { at: u64, out: usize };
@@ -1612,12 +1672,15 @@ fn pfRun128(r: *Run, rng: std.Random) !void {
     var fewest = [2]usize{ std.math.maxInt(usize), std.math.maxInt(usize) };
     for (pieces[0..np], 0..) |pc, i| {
         var b: [1]u8 = undefined;
+        try take(d, &b, pc.at, 1);
         const was0 = b[0];
         // a weight byte: both codes' magnitudes; a scale byte: its block's scale doubled
         b[0] = if ((i < gu_n and i < 8) or (i >= gu_n and i < gu_n + 9)) b[0] ^ 0x77 else b[0] + 1;
+        try put(d, pc.at, &b, 1);
         const got = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 64, true);
         defer for (got) |g| free(g);
         b[0] = was0;
+        try put(d, pc.at, &b, 1);
         fewest[pc.out] = @min(fewest[pc.out], differs(own[pc.out], got[pc.out]));
     }
     r.note(try std.fmt.bufPrint(&line, "pf_run128 control: gate / up's pack with one byte of weight set 0 changed, in each K block of a pair (8 launches) and each stage word's scales (2): each differs from the twin's own (fewest {d} bytes)", .{fewest[0]}), fewest[0] > 0);
@@ -1678,6 +1741,7 @@ fn decodeFuse(r: *Run, rng: std.Random) !void {
             try poison(s_.out, m * X_SL * X_N * 4, rr.d, rr.s);
             try poison(ob.ptr, ob.len, rr.d, rr.s);
             try rr.s.synchronize();
+            if (acc) |v| try put(rr.d, ob.ptr, v.ptr, m * X_N * 4);
             try mx.gateUp(rr.k, rr.s, rr.d, e_, s_, xp, X_D, pk, wt, m, 7.0, hb.ptr, X_MAIN, true);
             try mx.down(rr.k, rr.s, e_, s_, hd, X_I, pk, m, ob.ptr, X_N, acc != null, true);
             try rr.s.synchronize();
@@ -1705,8 +1769,11 @@ fn decodeFuse(r: *Run, rng: std.Random) !void {
     const at = hdn.ptr + 70 * 2;
     const big = [2]u8{ 0x80, 0x42 };
     var was: [2]u8 = undefined;
+    try take(d, &was, at, 2);
+    try put(d, at, &big, 2);
     const got = try Dec.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 6, true, null, true);
     defer for (got) |g| free(g);
+    try put(d, at, &was, 2);
     r.report("decode_fuse control: the combined rows with one down input value of row 0's first slot set to 64", differs(want[1], got[1]), false);
 }
 
@@ -1774,8 +1841,11 @@ fn decodeAsmQuant(r: *Run, rng: std.Random) !void {
     const at = part1.ptr + (3 * ig + 40) * 2;
     const big = [2]u8{ 0x80, 0x42 };
     var was: [2]u8 = undefined;
+    try take(d, &was, at, 2);
+    try put(d, at, &big, 2);
     const got = try Asm.run(r, ops, sc, part0.ptr, part1.ptr, pb.ptr, ob.ptr, out, 6 * X_SL, true);
     defer for (got) |x| free(x);
+    try put(d, at, &was, 2);
     r.report("decode_fuse control: down's codes with one value of pair 1's main row 3 set to 64", differs(want[1], got[1]), false);
 }
 
@@ -1850,8 +1920,11 @@ fn hcStride(r: *Run, rng: std.Random) !void {
         const at = full.ptr + (cs.start * D + 40) * 4;
         const big = [_]u8{ 0, 0, 0x80, 0x42 }; // 64.0f
         var was: [4]u8 = undefined;
+        try take(d, &was, at, 4);
+        try put(d, at, &big, 4);
         _ = try tri_hc.hcMixPf(r.t, h.ptr, fn_w.ptr, part.ptr, .{ .gathered = full.ptr + cs.start * D * 4, .rs = plane, .world = WORLD, .h_out = out.ptr }, post.ptr, comb.ptr, cs.rows, D);
         try r.s.synchronize();
+        try put(d, at, &was, 4);
         const got_p = try get(part.ptr, P * 4, d);
         defer free(got_p);
         const got_o = try get(out.ptr, cs.rows * HC * D * 2, d);
@@ -1956,9 +2029,12 @@ fn hcFused(r: *Run, rng: std.Random) !void {
         if (cs.posted and rows == 4096) {
             const at = h.ptr + @as(u64, @intCast((3 * HC + 2) * D + 17)) * 2;
             var old: [2]u8 = undefined;
+            try take(d, &old, at, 2);
             const big = [2]u8{ 0x00, 0x42 };
+            try put(d, at, &big, 2);
             _ = try tri_hc.hcPrePf(r.t, h.ptr, fn_w.ptr, scale.ptr, base.ptr, pre_in.ptr, norm_w.ptr, 1e-20, 1e-6, 20, out_b.ptr, pre_b.ptr, post_b.ptr, comb_b.ptr, part.ptr, .{ .gathered = g.ptr, .world = WORLD, .h_out = hout_b.ptr }, rows, D);
             try r.s.synchronize();
+            try put(d, at, &old, 2);
             r.report("hc_fused control: one stream value of row 3 set to 32", try cmpBytes(out_a.ptr, out_b.ptr, rows * D * 2, d), false);
         }
     }
@@ -2098,11 +2174,89 @@ fn gemmR2(r: *Run, rng_in: std.Random) !void {
         defer for (base) |b| free(b);
         const at = x.ptr + (30 * X_D + 300) * 2;
         var was: [2]u8 = undefined;
+        try take(d, &was, at, 2);
         const big = [2]u8{ 0x80, 0x42 };
+        try put(d, at, &big, 2);
         const ctl = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 64, true);
         defer for (ctl) |g| free(g);
+        try put(d, at, &was, 2);
         r.report("gemm_r2 experts control: gate / up's pack with one x value of row 30 set to 64", differs(base[0], ctl[0]), false);
     }
+}
+
+// -- the tensor core's accumulation window ------------------------------------------------------------------------------------------------
+
+/// How far apart in exponent two groups of products may lie, in one MMA and in an MMA accumulating onto a result, for the result to be the exact
+/// sum rounded to nearest (native_sf.cu's tf_dsn_sf_probe_kernel): the bf16 m16n8k16 the indexer's score and the dense GEMMs' fallbacks run, and
+/// the E2M1 kind::mxf4nvf4 m16n8k64 the FP4 indexer would run. Random operands, 128 outputs a MMA, 512 draws for each of the 30 spreads and two
+/// orders of the groups (the larger first or second); the reference is the two groups' isolated results added in double and rounded to
+/// nearest (a result equal to it rounded toward zero instead is a truncating accumulator; any other a wider loss). The verdict names the largest
+/// spread through which every trial was the nearest-rounded exact sum. Control: one operand changed after the references must differ.
+fn mmaWindow(r: *Run, rng_in: std.Random) !void {
+    _ = rng_in;
+    const d = r.d;
+    const sk = r.k.sfk orelse return r.note("mma_window: the block-scaled kernels (native_sf.cu) load on this GPU", false);
+    const f = sk.module.function("tf_dsn_sf_probe_kernel") catch return r.note("mma_window: tf_dsn_sf_probe_kernel is in this image", false);
+    r.note("mma_window: tf_dsn_sf_probe_kernel is in this image", true);
+    const spreads = 30;
+    const n = 2 * 3 * 2 * spreads * 3;
+    var buf = try cuda.DeviceBuffer.alloc(d, n * 4);
+    defer buf.free();
+    try rio.fill(d, buf.ptr, 0, n * 4);
+    var args: cuda.Args = .{};
+    args.add(buf.ptr);
+    args.add(@as(c_int, 512));
+    args.add(@as(c_uint, 0x5eed));
+    try cuda.launch.launch(f, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 32 } }, r.s, &args);
+    try r.s.synchronize();
+    const raw = try get(buf.ptr, n * 4, d);
+    defer free(raw);
+    const c = std.mem.bytesAsSlice(u32, raw);
+    const at = struct {
+        fn of(instr: usize, mode: usize, order: usize, spread: usize, cls: usize) usize {
+            return (((instr * 3 + mode) * 2 + order) * 30 + spread) * 3 + cls;
+        }
+    }.of;
+    const names = [_][]const u8{ "bf16 m16n8k16", "E2M1 kind::mxf4nvf4 m16n8k64" };
+    const modes = [_][]const u8{ "one MMA, two groups", "the second group's MMA accumulating onto the first's result" };
+    var ctl: usize = 0;
+    for (0..2) |instr| {
+        for (0..2) |mode| {
+            var first: ?usize = null;
+            var trunc: u64 = 0;
+            var other: u64 = 0;
+            var total: u64 = 0;
+            for (0..spreads) |sp| {
+                var bad: u64 = 0;
+                var rz: u64 = 0;
+                var ot: u64 = 0;
+                var tot: u64 = 0;
+                for (0..2) |o| {
+                    rz += c[at(instr, mode, o, sp, 1)];
+                    ot += c[at(instr, mode, o, sp, 2)];
+                    tot += c[at(instr, mode, o, sp, 0)] + c[at(instr, mode, o, sp, 1)] + c[at(instr, mode, o, sp, 2)];
+                }
+                bad = rz + ot;
+                if (bad != 0 and first == null) {
+                    first = sp;
+                    trunc = rz;
+                    other = ot;
+                    total = tot;
+                }
+            }
+            var t: WcText = .{};
+            if (first) |fi| {
+                try t.add("mma_window {s}, {s}: the nearest-rounded exact sum through a spread of {d} binades between the groups (none below 0: {s}); first mismatch at {d}: {d} toward-zero, {d} other of {d} trials", .{ names[instr], modes[mode], if (fi == 0) 0 else fi - 1, if (fi == 0) "a mismatch at spread 0" else "exact there", fi, trunc, other, total });
+            } else {
+                try t.add("mma_window {s}, {s}: the nearest-rounded exact sum through every spread tried (29 binades)", .{ names[instr], modes[mode] });
+            }
+            r.note(t.buf[0..t.n], true);
+        }
+        for (0..2) |o| for (0..spreads) |sp| {
+            ctl += c[at(instr, 2, o, sp, 1)] + c[at(instr, 2, o, sp, 2)];
+        };
+    }
+    r.report("mma_window control: an operand changed after the references makes the results differ from them", ctl, false);
 }
 
 // -- TF_DS_ATTN_EPILOGUE ----------------------------------------------------------------------------------------------
@@ -2187,9 +2341,12 @@ fn attnEpilogue(r: *Run, rng: std.Random) !void {
     const at = o.ptr + (3 * K + 500) * 2;
     const big = [2]u8{ 0x80, 0x42 };
     var was: [2]u8 = undefined;
+    try take(d, &was, at, 2);
+    try put(d, at, &big, 2);
     try d.check(d.api.cuMemcpyDtoDAsync_v2(o_fused.ptr, o.ptr, bytes, r.s.handle), "cuMemcpyDtoDAsync");
     try mx.attnEpilogue(r.k, r.s, o_fused.ptr, cos.ptr, sin.ptr, pb.ptr, rows, H, HD, RD, qf.ptr, sf.ptr, 0, true);
     try r.s.synchronize();
+    try put(d, at, &was, 2);
     const got = try get(qf.ptr, rows * K, d);
     defer free(got);
     r.report("attn_epilogue control: o's row 3, column 500 set to 64", differs(want, got), false);
@@ -2260,8 +2417,11 @@ fn assembleQuant(r: *Run, rng: std.Random) !void {
     const at = part1.ptr + (3 * ig + 40) * 2;
     const big = [2]u8{ 0x80, 0x42 };
     var was: [2]u8 = undefined;
+    try take(d, &was, at, 2);
+    try put(d, at, &big, 2);
     try mx.assembleQuant(r.k, r.s, part0.ptr, part1.ptr, pb.ptr, ob.ptr, xd[1].ptr, P, ig, ir, s1);
     try r.s.synchronize();
+    try put(d, at, &was, 2);
     const moved_q = try get(hq[1].ptr, P * w, d);
     defer free(moved_q);
     r.report("assemble_quant control: down's codes with one value of pair 1's main row 3 set to 64", differs(want_q, moved_q), false);
@@ -2347,9 +2507,12 @@ fn woaW8(r: *Run, rng: std.Random) !void {
         defer free(want);
         const at = o.ptr + (100 * kk + 4100) * 2;
         var was: [2]u8 = undefined;
+        try take(d, &was, at, 2);
         const big = [2]u8{ 0x80, 0x42 }; // 64.0
+        try put(d, at, &big, 2);
         try mx.woA8Prefill(r.k, r.s, sc, lay.w8, W8_GROUPS, o.ptr, kk, m, u.ptr, n_all);
         try r.s.synchronize();
+        try put(d, at, &was, 2);
         const got = try get(u.ptr, m * n_all * 2, d);
         defer free(got);
         r.report("woa_w8 control: one o value of row 100 set to 64", differs(want, got), false);
@@ -2422,6 +2585,8 @@ fn woaW8(r: *Run, rng: std.Random) !void {
                 checked += 1;
             };
         }
+        var line: [256]u8 = undefined;
+        r.note(try std.fmt.bufPrint(&line, "woa_w8: the kernel's conversion of {d} weights (every admitted code at every scale byte, finite products) against weights.woABf16: {d} differ", .{ checked, bad }), bad == 0);
     }
 }
 
@@ -2495,10 +2660,13 @@ fn quantOnce(r: *Run, rng: std.Random) !void {
         defer free(want);
         const at = x.ptr + (700 * D + 33) * 2;
         var was: [2]u8 = undefined;
+        try take(d, &was, at, 2);
         const big = [2]u8{ 0x80, 0x42 }; // 64.0
+        try put(d, at, &big, 2);
         for (out ++ sb) |b| try poison(b.ptr, b.len, d, r.s);
         try Front.once(r, lay, sc, x.ptr, n, out);
         try r.s.synchronize();
+        try put(d, at, &was, 2);
         const got = try get(out[0].ptr, n * QW * 2, d);
         defer free(got);
         r.report("quant_once control: qa with one x value of row 700 set to 64", differs(want, got), false);
@@ -2595,8 +2763,10 @@ fn attnUDecode(r: *Run, rng: std.Random) !void {
             // the control: a code byte of row 0's first pick changed (its pool row: the pick past the row's base)
             const row: usize = @intCast(idx[0] + cbase[0]);
             var one = [1]u8{codes[row * HD / 2] ^ 0x11};
+            try put(d, cb.ptr + row * HD / 2, &one, 1);
             const moved = try Got.of(r, a, bufs, sizes);
             defer std.heap.page_allocator.free(moved);
+            try put(d, cb.ptr + row * HD / 2, codes.ptr + row * HD / 2, 1);
             r.report(try std.fmt.bufPrint(&line, "attn_{s}_decode control: a code byte of row 0's first pick changed", .{tag}), differs(want, moved), false);
         }
     }
@@ -2678,8 +2848,10 @@ fn mergeD(r: *Run, rng: std.Random) !void {
                 // the control: a value of the ring row the first row's window reads last, changed
                 const slot: usize = @intCast(wbase[0] + @mod(pos[0], @as(i64, RING)));
                 const one = [2]u8{ 0x80, 0x42 }; // 64.0
+                try put(d, ring.ptr + slot * HD * 2, &one, 2);
                 const moved = try Got.of(r, a, bufs, sizes, db);
                 defer std.heap.page_allocator.free(moved);
+                try put(d, ring.ptr + slot * HD * 2, ring_host.ptr + slot * HD * 2, 2);
                 r.report("merge_d control: a value of the first row's current ring slot set to 64", differs(want, moved), false);
             }
         }
@@ -3017,6 +3189,8 @@ fn idxTwin(r: *Run, rng: std.Random, which: Which) !void {
             try rr.s.synchronize();
             const all = try std.heap.page_allocator.alloc(u8, ob + if (keyed) tb else 0);
             errdefer std.heap.page_allocator.free(all);
+            try take(rr.d, all.ptr, in.out.ptr, ob);
+            if (keyed) try take(rr.d, all[ob..].ptr, in.tmax.ptr, tb);
             return all;
         }
     };
@@ -3046,9 +3220,12 @@ fn idxTwin(r: *Run, rng: std.Random, which: Which) !void {
         defer free(want);
         const at = ins[0].codes.ptr + 300 * (ID / 2) + 7;
         var was: [1]u8 = undefined;
+        try take(d, &was, at, 1);
         const changed = [1]u8{was[0] ^ 0x11};
+        try put(d, at, &changed, 1);
         const got = try Idx.run(r, ins[0], shapes[0], true, which);
         defer free(got);
+        try put(d, at, &was, 1);
         r.report(try std.fmt.bufPrint(&line, "{s} control: RB 2 keys with one visible key's code byte changed", .{label}), differs(want, got), false);
     }
     // (a call the extra set has no twin for would have run the baseline kernel: the comparisons above would hold vacuously)
@@ -3120,9 +3297,12 @@ fn draftMain4(r: *Run, rng: std.Random) !void {
         const want = try Gemv.run(r, sc, z, full, x.ptr, m, yw.ptr, N);
         defer free(want);
         var was: [2]u8 = undefined;
+        try take(d, &was, x.ptr + 7 * 2, 2);
         const big = [2]u8{ 0x80, 0x42 }; // 64.0
+        try put(d, x.ptr + 7 * 2, &big, 2);
         const got = try Gemv.run(r, sc, z, Part.of(full, 0), x.ptr, m, yq.ptr, Q);
         defer free(got);
+        try put(d, x.ptr + 7 * 2, &was, 2);
         var n: usize = 0;
         for (0..m) |i| n += differs(want[i * N * 2 ..][0 .. Q * 2], got[i * Q * 2 ..][0 .. Q * 2]);
         r.report("draft_main4 control: one taps value of row 0 set to 64, quarter 0 against the unchanged whole output", n, false);
@@ -3319,7 +3499,9 @@ fn refRow(codes: []const u8, scales: []const u8, rows: Rows, c: usize) [2]f64 {
 /// back once.
 fn expertRows(r: *Run, table: u64, e: usize, bytes: usize, ha: std.mem.Allocator) ![]u8 {
     var p: [8]u8 = undefined;
+    try take(r.d, &p, table + e * 8, 8);
     const x = try ha.alloc(u8, bytes);
+    try take(r.d, x.ptr, std.mem.readInt(u64, &p, .little), bytes);
     return x;
 }
 
@@ -3412,9 +3594,12 @@ fn mmaSf(r: *Run, rng_in: std.Random) !void {
         // the control: one code of row 700 changed
         var code: [1]u8 = undefined;
         const at = q.ptr + 700 * sh.k + 5;
+        try take(d, &code, at, 1);
         const changed = [1]u8{code[0] ^ 0x08};
+        try put(d, at, &changed, 1);
         const ctl = try gemmSf(r, .chained, l, q.ptr, s.ptr, z.ptr, 1024, y.ptr);
         defer free(ctl);
+        try put(d, at, &code, 1);
         r.report(try std.fmt.bufPrint(&line, "mma_sf {s} control: one code of row 700 changed", .{sh.name}), differs(full[0 .. 1024 * sh.n * 4], ctl), false);
     }
     try mmaSfExperts(r, rng, &line);
@@ -3576,8 +3761,11 @@ fn mmaSfExperts(r: *Run, rng: std.Random, line: []u8) !void {
     const at = x.ptr + (30 * X_D + 300) * 2;
     const base = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 64, .chained);
     defer for (base) |w| free(w);
+    try take(d, &was, at, 2);
+    try put(d, at, &big, 2);
     const got = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 64, .chained);
     defer for (got) |g| free(g);
+    try put(d, at, &was, 2);
     r.report("mma_sf experts control: gate / up's pack with one x value of row 30 set to 64", differs(base[0], got[0]), false);
 }
 
@@ -3612,6 +3800,7 @@ fn exactDense(r: *Run, rng: std.Random, sh: Shape, xs: f32, sbyte: ?u8, rows: []
     var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
     defer for (keep.items) |*b| b.free();
     const l = try fp8Linear(d, sh.n, sh.k, .fast, rng, ha, &keep);
+    if (sbyte) |b| try rio.fill(d, l.s, b, (sh.n / 32) * (sh.k / 32));
     const max_m = rows[rows.len - 1];
     const x = try upload(d, try bf16s(max_m * sh.k, rng, xs, ha));
     try keep.append(ha, x);
@@ -3778,9 +3967,12 @@ fn mmaSfExact(r: *Run, rng_in: std.Random) !void {
         const taken = sfTaken(r, .exact, l, q.ptr, s.ptr, y.ptr, 1024);
         var code: [1]u8 = undefined;
         const at = q.ptr + 700 * sh.k + 5;
+        try take(d, &code, at, 1);
         const changed = [1]u8{code[0] ^ 0x08};
+        try put(d, at, &changed, 1);
         const e = try gemmExact(r, true, l, q.ptr, s.ptr, z.ptr, 1024, y.ptr, .bf16);
         defer free(e);
+        try put(d, at, &code, 1);
         r.report("mma_sf_exact control: one code of row 700 changed for the block-scaled kernel (its key proven, its route asserted)", if (taken) differs(t, e) else 0, false);
     }
 }
@@ -3788,6 +3980,7 @@ fn mmaSfExact(r: *Run, rng_in: std.Random) !void {
 /// A device byte set on the replay's stream (stream-ordered: the guard's kernel runs on that stream).
 fn pokeByte(r: *Run, at: u64, v: u8) !void {
     const b = [1]u8{v};
+    try put(r.d, at, &b, 1);
 }
 
 /// Whether the guard saw these extremes (mx.Kernels.sf_seen: FP8 dense, MXFP4, the shared expert's; 255, 0: none).
@@ -3872,10 +4065,12 @@ fn exactCoverage(r: *Run, rng: std.Random) !void {
             for (0..3) |j| {
                 const b = try cuda.DeviceBuffer.alloc(d, 3 * 8);
                 try keep.append(std.heap.page_allocator, b);
+                try rio.write(b, 0, std.mem.sliceAsBytes(&tabs[j]));
                 tp[j] = b.ptr;
             }
             const ob = try cuda.DeviceBuffer.alloc(d, 3 * 4);
             try keep.append(std.heap.page_allocator, ob);
+            try rio.write(ob, 0, std.mem.sliceAsBytes(&owner));
             tp[3] = ob.ptr;
             try r.s.synchronize();
             x.native.?.s1 = tp[0];
@@ -3937,10 +4132,12 @@ fn exactCoverage(r: *Run, rng: std.Random) !void {
             for (0..3) |j| {
                 const b = try cuda.DeviceBuffer.alloc(d, 3 * 8);
                 try keep.append(std.heap.page_allocator, b);
+                try rio.write(b, 0, std.mem.sliceAsBytes(&tabs[j]));
                 tp[j] = b.ptr;
             }
             const ob = try cuda.DeviceBuffer.alloc(d, 3 * 4);
             try keep.append(std.heap.page_allocator, ob);
+            try rio.write(ob, 0, std.mem.sliceAsBytes(&owner));
             tp[3] = ob.ptr;
             try r.s.synchronize();
             x.native.?.s1 = tp[0];
@@ -4004,7 +4201,9 @@ fn mmaSfExactExperts(r: *Run, rng: std.Random, line: []u8) !void {
     };
     // the guard over the layer's experts: every tensor's range against the host's of the same bytes read back
     const tabs = try ha.alloc(u64, 3 * X_E);
+    for ([_]u64{ nx.s1, nx.s3, nx.s2 }, 0..) |t, j| try take(d, @ptrCast(tabs[j * X_E ..].ptr), t, X_E * 8);
     const owner = try ha.alloc(i32, X_E);
+    try take(d, @ptrCast(owner.ptr), nx.owner, X_E * 4);
     const rs = try ha.alloc(mx.ByteRange, 3 * X_E);
     mx.expertScales(ex, tabs[0..X_E], tabs[X_E .. 2 * X_E], tabs[2 * X_E ..], owner, rs);
     const got = try ha.alloc([2]u8, rs.len);
@@ -4050,6 +4249,7 @@ fn mmaSfExactExperts(r: *Run, rng: std.Random, line: []u8) !void {
         .{ .at = set0[2], .len = X_N * (X_I / 32), .b = 33 },           .{ .at = shared[0], .len = (X_W / 32) * (X_D / 32), .b = 41 },
         .{ .at = shared[1], .len = (X_W / 32) * (X_D / 32), .b = 127 }, .{ .at = shared[2], .len = (X_N / 32) * (X_I / 32), .b = 41 },
     };
+    for (fills) |fl| try rio.fill(d, fl.at, fl.b, fl.len);
     const edge_proven = (try Guard.verdict(r, lay)) == null;
     r.k.sf_nkept = 0;
     var edge_diff: usize = 0;
@@ -4063,6 +4263,7 @@ fn mmaSfExactExperts(r: *Run, rng: std.Random, line: []u8) !void {
     r.report("mma_sf_exact guard's edges on the experts: weight set 0's MXFP4 scale bytes 33 (2^-94) and 137 (2^10), the shared expert's FP8 41 and 127, proven and on the block-scaled kernels, at 512 rows against the baseline's", if (edge_proven) edge_diff else 1, true);
     // outside it: one MXFP4 scale byte 32 keeps the layer's experts on the baseline kernels
     const one = [1]u8{32};
+    try put(d, set0[2] + 7, &one, 1);
     const out_verdict = try Guard.verdict(r, lay);
     defer r.k.sf_nkept = 0;
     const out_proven = !(out_verdict != null and std.mem.eql(u8, out_verdict.?, "kept"));
@@ -4077,7 +4278,9 @@ fn mmaSfExactExperts(r: *Run, rng: std.Random, line: []u8) !void {
     r.report("mma_sf_exact guard over the experts: one MXFP4 scale byte 32 keeps the layer's experts on the baseline kernels (model.sfGuard: \"the experts in 1 layer\"), at 512 rows against the baseline's", if (out_proven) 1 else out_diff, true);
     // the shared expert's FP8 rule: one of its scale bytes 128 (inside MXFP4's range, outside FP8's) keeps them too
     const back = [1]u8{33};
+    try put(d, set0[2] + 7, &back, 1);
     const big = [1]u8{128};
+    try put(d, shared[0] + 3, &big, 1);
     const sh_verdict = try Guard.verdict(r, lay);
     const sh_kept = sh_verdict != null and std.mem.eql(u8, sh_verdict.?, "kept");
     var sh_diff: usize = 0;
@@ -4251,9 +4454,12 @@ fn gemmW16(r: *Run, rng: std.Random) !void {
         defer for (base) |o| free(o);
         const at = x.ptr + (30 * X_D + 300) * 2;
         var was: [2]u8 = undefined;
+        try take(d, &was, at, 2);
         const big = [2]u8{ 0x80, 0x42 };
+        try put(d, at, &big, 2);
         const got = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 64, true);
         defer for (got) |o| free(o);
+        try put(d, at, &was, 2);
         r.report("gemm_w16 experts control: gate / up's pack with one x value of row 30 set to 64", differs(base[0], got[0]), false);
     }
     // wo_a's bf16 rows on the 16-warp kernel
@@ -4308,9 +4514,12 @@ fn gemmW16(r: *Run, rng: std.Random) !void {
         defer free(base);
         const at = o.ptr + (100 * kk + 4100) * 2;
         var was: [2]u8 = undefined;
+        try take(d, &was, at, 2);
         const big = [2]u8{ 0x80, 0x42 };
+        try put(d, at, &big, 2);
         const got = try W.run(r, sc, lay.w8, o.ptr, kk, m, u.ptr, n_all, true);
         defer free(got);
+        try put(d, at, &was, 2);
         r.report("gemm_w16 wo_a control: one o value of row 100 set to 64", differs(base, got), false);
     }
 }
@@ -4389,6 +4598,7 @@ const CollectRig = struct {
         for (0..world) |p| if (p != rank and dd.ptr[p] != 0) @memset(g.slot(world, p)[0 .. rows * @as(usize, @intCast(dd.row4[p])) * 16], 0);
         try poison(g.out.ptr, out_bytes, g.d, g.s);
         const qv = q;
+        try put(g.d, g.seq.ptr, @ptrCast(&qv), 8);
         var copy4: u64 = 0;
         for (0..world) |p| if (p != rank and dd.ptr[p] != 0) {
             copy4 += @as(u64, rows) * @as(u64, @intCast(dd.row4[p]));
@@ -4424,6 +4634,7 @@ const CollectRig = struct {
     fn runProbed(g: *CollectRig, world: usize, rank: usize, rows: usize, dd: dsv41.rdma.Dsts, peers: bool, probe: u64) !?[]u8 {
         try poison(g.out.ptr, out_bytes, g.d, g.s);
         const qv = q;
+        try put(g.d, g.seq.ptr, @ptrCast(&qv), 8);
         var copy4: u64 = 0;
         for (0..world) |p| if (p != rank and dd.ptr[p] != 0) {
             copy4 += @as(u64, rows) * @as(u64, @intCast(dd.row4[p]));
@@ -4636,10 +4847,12 @@ fn hcRound(r: *Run, logits: []const f32, R: usize, c: usize) !HcRound {
         made += 1;
     }
     // stream-ordered copies: every launch below reads what was copied
+    try rio.write(whole, 0, std.mem.sliceAsBytes(logits[0 .. R * V]));
     const cols = try r.a.alloc(f32, R * hc_widths[0]);
     for (0..4) |j| {
         const w = hc_widths[j];
         for (0..R) |row| @memcpy(cols[row * w ..][0..w], logits[row * V + hc_off[j] ..][0..w]);
+        try rio.write(node[j], 0, std.mem.sliceAsBytes(cols[0 .. R * w]));
         try r.s.synchronize(); // (cols is reused for the next node)
     }
     try poison(parts.ptr, 4 * lay.bytes, d, r.s);
@@ -4652,7 +4865,11 @@ fn hcRound(r: *Run, logits: []const f32, R: usize, c: usize) !HcRound {
     const want_v = try r.a.alloc(f32, R * c);
     const want_i = try r.a.alloc(i64, R * c);
     const flags = try r.a.alloc(i32, R);
+    try rio.read(tv, 0, std.mem.sliceAsBytes(want_v));
+    try rio.read(ti, 0, std.mem.sliceAsBytes(want_i));
+    try rio.read(tf, 0, std.mem.sliceAsBytes(flags));
     const host = try r.a.alloc(u8, 4 * lay.bytes);
+    try rio.read(parts, 0, host);
     const vals = try r.a.alloc(f32, R * c);
     const ids = try r.a.alloc(i64, R * c);
     const merged = dsv41.head_cand.merge(host, lay, hc_off, c, vals, ids);
@@ -4760,6 +4977,7 @@ fn headCand(r: *Run, rng: std.Random) !void {
         defer whole.free();
         var out = try cuda.DeviceBuffer.alloc(r.d, 4 * lay.bytes);
         defer out.free();
+        try rio.write(whole, 0, std.mem.sliceAsBytes(logits[0 .. R * V]));
         const Time = struct {
             fn us(rr: *Run, o: *const dsv41.ops.Ops, src: u64, ld: usize, n: usize, rows: usize, count: usize, dst: u64, l: dsv41.head_cand.Layout) !f64 {
                 var e0 = try cuda.Event.init(rr.d, true);
@@ -4785,6 +5003,7 @@ fn headCand(r: *Run, rng: std.Random) !void {
             try ops.topCandRows(r.s, whole.ptr + hc_off[j] * 4, V, hc_widths[j], R, k, p, p + lay.ids, p + lay.flags);
         }
         try r.s.synchronize();
+        try rio.read(out, 0, host);
         const vals = try r.a.alloc(f32, R * 28);
         const ids = try r.a.alloc(i64, R * 28);
         const t0 = monoNs();
@@ -4820,10 +5039,12 @@ fn hkRound(r: *Run, logits: []const f32, R: usize) !HkRound {
         node[j] = try cuda.DeviceBuffer.alloc(d, R * hc_widths[j] * 4);
         made += 1;
     }
+    try rio.write(whole, 0, std.mem.sliceAsBytes(logits[0 .. R * V]));
     const cols = try r.a.alloc(f32, R * hc_widths[0]);
     for (0..4) |j| {
         const w = hc_widths[j];
         for (0..R) |row| @memcpy(cols[row * w ..][0..w], logits[row * V + hc_off[j] ..][0..w]);
+        try rio.write(node[j], 0, std.mem.sliceAsBytes(cols[0 .. R * w]));
         try r.s.synchronize(); // (cols is reused for the next node)
     }
     try poison(parts.ptr, 4 * pb, d, r.s);
@@ -4831,7 +5052,9 @@ fn hkRound(r: *Run, logits: []const f32, R: usize) !HkRound {
     for (0..4) |j| try ops.argmaxPart(r.s, node[j].ptr, hc_widths[j], hc_widths[j], R, parts.ptr + j * pb);
     try r.s.synchronize();
     const want = try r.a.alloc(u32, R);
+    try rio.read(amax, 0, std.mem.sliceAsBytes(want));
     const host = try r.a.alloc(u8, 4 * pb);
+    try rio.read(parts, 0, host);
     const tokens = try r.a.alloc(u32, R);
     dsv41.head_cand.mergeKeys(host, R, hc_off, tokens);
     return .{ .equal = std.mem.eql(u32, want, tokens), .tokens = tokens };
@@ -4939,6 +5162,7 @@ fn headKey(r: *Run, rng: std.Random) !void {
         defer whole.free();
         var out = try cuda.DeviceBuffer.alloc(r.d, 4 * R * dsv41.head_cand.key_row);
         defer out.free();
+        try rio.write(whole, 0, std.mem.sliceAsBytes(logits[0 .. R * V]));
         const Time = struct {
             fn us(rr: *Run, o: *const dsv41.ops.Ops, part: bool, src: u64, n: usize, rows: usize, dst: u64) !f64 {
                 var e0 = try cuda.Event.init(rr.d, true);
@@ -4961,6 +5185,7 @@ fn headKey(r: *Run, rng: std.Random) !void {
         for (0..4) |j| try ops.argmaxPart(r.s, whole.ptr + hc_off[j] * 4, V, hc_widths[j], R, out.ptr + j * pb);
         try r.s.synchronize();
         const host = try r.a.alloc(u8, 4 * pb);
+        try rio.read(out, 0, host);
         const tokens = try r.a.alloc(u32, R);
         const t0 = monoNs();
         for (0..100) |_| dsv41.head_cand.mergeKeys(host, R, hc_off, tokens);
@@ -5056,6 +5281,7 @@ const RingRig = struct {
     }
 
     fn setSeq(g: *RingRig, v: u64) !void {
+        try put(g.d, g.seq.ptr, @ptrCast(&v), 8);
         try g.s.synchronize();
     }
 
@@ -5426,6 +5652,7 @@ fn ringWord(r: *Run, rng_in: std.Random) !void {
     var lanes_buf = try cuda.DeviceBuffer.alloc(r.d, 2 * 4);
     defer lanes_buf.free();
     const lane_counts = [2]u32{ 0, 2 };
+    try rio.write(lanes_buf, 0, std.mem.sliceAsBytes(&lane_counts));
     var fault = try cuda.DeviceBuffer.alloc(r.d, 64);
     defer fault.free();
     try fault.fill8(0, null);
@@ -5553,6 +5780,7 @@ fn ringWord(r: *Run, rng_in: std.Random) !void {
     n0.join();
     try r.s.synchronize();
     var rec: [8]u64 = undefined;
+    try rio.read(fault, 0, std.mem.sliceAsBytes(&rec));
     const dead = try get(dst.ptr, 2 * nbytes, r.d);
     defer free(dead);
     var untouched: usize = 0;
@@ -5573,6 +5801,7 @@ fn ringWord(r: *Run, rng_in: std.Random) !void {
     var ab = try std.Thread.spawn(.{}, WordWriter.abort, .{ g.io, &g.words()[RingRig.abort_w], 2 });
     ab.join();
     try r.s.synchronize();
+    try rio.read(fault, 0, std.mem.sliceAsBytes(&rec));
     r.note("ring_word: the abort word ends a waiting kernel well before its 1 s deadline (the record's why is the abort)", rec[0] == 0x524f_4349_0000_0001 and rec[7] == 1 and rec[5] < 900 * std.time.ns_per_ms);
 }
 
@@ -5689,10 +5918,12 @@ fn attnEpiFused(r: *Run, rng: std.Random) !void {
             // the control: a code byte of the first row's first pick changed
             const row: usize = @intCast(idx[0]);
             var one = [1]u8{codes[row * HD / 2] ^ 0x11};
+            try put(d, cb.ptr + row * HD / 2, &one, 1);
             a.epi_ran = null;
             a.epi = .{ .cos = cos.ptr, .sin = sin.ptr, .rd = RD, .codes = qf.ptr, .scales = sf.ptr, .fake = 0 };
             try tri_attn.sparseAttn(r.t, a);
             try r.s.synchronize();
+            try put(d, cb.ptr + row * HD / 2, codes.ptr + row * HD / 2, 1);
             r.report(try std.fmt.bufPrint(&line, "{s} control: a code byte of row 0's first pick changed", .{tag}), try cmpBytes(qr.ptr, qf.ptr, R * K, d), false);
         }
     }
@@ -5768,9 +5999,12 @@ fn hcFused2b(r: *Run, rng: std.Random) !void {
         if (rows == 4096) {
             const at = h.ptr + @as(u64, @intCast((3 * HC + 2) * D + 17)) * 2;
             var old: [2]u8 = undefined;
+            try take(d, &old, at, 2);
             const big = [2]u8{ 0x00, 0x42 };
+            try put(d, at, &big, 2);
             _ = try tri_hc.hcPrePf(r.t, h.ptr, fn_w.ptr, scale.ptr, base.ptr, pre_in.ptr, norm_w.ptr, 1e-20, 1e-6, 20, out_b.ptr, pre_b.ptr, post_b.ptr, comb_b.ptr, part.ptr, posted_b, rows, D);
             try r.s.synchronize();
+            try put(d, at, &old, 2);
             r.report("hc_fused_2b control: one stream value of row 3 set to 32", try cmpBytes(out_a.ptr, out_b.ptr, rows * D * 2, d), false);
         }
     }
@@ -5826,13 +6060,95 @@ fn hc2s(r: *Run, rng: std.Random) !void {
         if (rows == 4096) {
             const at = g.ptr + @as(u64, @intCast(rows * (D / 2) + 100)) * 2;
             var old: [2]u8 = undefined;
+            try take(d, &old, at, 2);
             const big = [2]u8{ 0x00, 0x42 };
+            try put(d, at, &big, 2);
             _ = try tri_hc.hcMixPf(r.t, h.ptr, fn_w.ptr, part_b.ptr, .{ .gathered = g.ptr, .world = 2, .h_out = hout_b.ptr, .blk_rs = rows * (D / 2) }, post.ptr, comb.ptr, rows, D);
             try r.s.synchronize();
+            try put(d, at, &old, 2);
             r.report("hc_2s control: one sum of block 1, row 0 set to 32", try cmpBytes(hout_a.ptr, hout_b.ptr, rows * HC * D * 2, d), false);
         }
     }
     r.note("hc_2s: every launch found the extra set's variant (none kept _hc_mix_pf_2b)", tri_hc.hc_2s_misses.load(.monotonic) == misses0);
+}
+
+// -- the indexer's keys dequantized once (a timing probe) -------------------------------------------------------------
+
+/// Whether dequantizing the indexer's packed keys once a pass (the kit's _idx_keys_deq) and scoring from bf16 keys
+/// (_index_score_rows_u, PACKED 0) is faster than scoring from the packed keys: a prompt chunk's launch (1,024 rows at RB 2, 36,864 and
+/// 262,144 keys), the packed launch alone against the dequantization plus the bf16 launch, 20 launches each. Prints the times and how
+/// many scores differ (they differ: the bf16 operand takes ldmatrix, the packed one is built in registers: one fp32 ulp in about
+/// 18 % of scores, so this is a timing probe and no switch is built on it unless it wins).
+fn idxDeq(r: *Run, rng: std.Random) !void {
+    const IH: usize = 32;
+    const ID: usize = 128;
+    const rows: usize = 1024;
+    var line: [320]u8 = undefined;
+    if (r.t.extra == null) {
+        for (0..2) |_| r.note("idx_deq: the kit's extra set (aot-extra/) holds _idx_keys_deq", false);
+        return;
+    }
+    // the probe's two launches are the u twin's (PACKED 1 and PACKED 0): the v and t twins have no bf16-key variant, so they stay off here
+    const was_rb = tri_index.idx_rb;
+    const was_u = tri_index.idx_u;
+    const was_v = tri_index.idx_v;
+    const was_tpp = tri_index.idx_tpp;
+    defer {
+        tri_index.idx_rb = was_rb;
+        tri_index.idx_u = was_u;
+        tri_index.idx_v = was_v;
+        tri_index.idx_tpp = was_tpp;
+    }
+    tri_index.idx_rb = 2;
+    tri_index.idx_u = true;
+    tri_index.idx_v = false;
+    tri_index.idx_tpp = 0;
+    var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sarena.deinit();
+    const ha = sarena.allocator();
+    var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer for (keep.items) |*b| b.free();
+    const d = r.d;
+    for ([_]usize{ 36864, 262144 }) |n| {
+        const q = try upload(d, try bf16s(rows * IH * ID, rng, 0.5, ha));
+        const w = try upload(d, try bf16s(rows * IH, rng, 0.25, ha));
+        const codes = try ha.alloc(u8, n * ID / 2);
+        rng.bytes(codes);
+        const scales = try ha.alloc(u8, n * ID / 32);
+        for (scales) |*x| x.* = 110 + rng.uintLessThan(u8, 18);
+        const cb = try upload(d, codes);
+        const sb = try upload(d, scales);
+        const vis = try ha.alloc(i64, rows);
+        for (vis) |*x| x.* = @intCast(n);
+        const vb = try upload(d, std.mem.sliceAsBytes(vis));
+        const kb = try cuda.DeviceBuffer.alloc(d, n * ID * 2);
+        const o_a = try cuda.DeviceBuffer.alloc(d, rows * n * 4);
+        const o_b = try cuda.DeviceBuffer.alloc(d, rows * n * 4);
+        for ([_]cuda.DeviceBuffer{ q, w, cb, sb, vb, kb, o_a, o_b }) |b| try keep.append(ha, b);
+        const Time = struct {
+            fn us(rr: *Run, deq: bool, qq: u64, ww: u64, c: u64, s: u64, v: u64, k: u64, o: u64, nn: usize) !f64 {
+                var e0 = try cuda.Event.init(rr.d, true);
+                defer e0.deinit();
+                var e1 = try cuda.Event.init(rr.d, true);
+                defer e1.deinit();
+                for (0..23) |it| {
+                    if (it == 3) try e0.record(rr.s);
+                    if (deq) {
+                        try tri_index.idxKeysDeq(rr.t, c, s, k, nn, ID);
+                        try tri_index.indexScore(rr.t, qq, .{ .bf16 = k }, ww, v, nn, o, null, false, null, false, rows, IH, ID);
+                    } else try tri_index.indexScore(rr.t, qq, .{ .fp4 = .{ .codes = c, .scales = s } }, ww, v, nn, o, null, false, null, false, rows, IH, ID);
+                }
+                try e1.record(rr.s);
+                try e1.synchronize();
+                return @as(f64, try cuda.Event.elapsedMs(e0, e1)) * 1000.0 / 20.0;
+            }
+        };
+        const packed_us = try Time.us(r, false, q.ptr, w.ptr, cb.ptr, sb.ptr, vb.ptr, kb.ptr, o_a.ptr, n);
+        const deq_us = try Time.us(r, true, q.ptr, w.ptr, cb.ptr, sb.ptr, vb.ptr, kb.ptr, o_b.ptr, n);
+        try r.s.synchronize();
+        const diff = try cmpBytes(o_a.ptr, o_b.ptr, rows * n * 4, d);
+        r.note(try std.fmt.bufPrint(&line, "idx_deq PROBE {d} keys, {d} rows at RB 2 (MEASURED, this machine): packed launch {d:.1} us; dequantization + bf16 launch {d:.1} us (x{d:.3}); {d} of {d} score bytes differ (expected, not a defect)", .{ n, rows, packed_us, deq_us, packed_us / deq_us, diff, rows * n * 4 }), true);
+    }
 }
 
 /// The sections in their order, each with the lines it prints when it runs whole: one that prints another count fails
@@ -6225,6 +6541,8 @@ fn draftVocabMarkov(r: *Run, rng_in: std.Random) !void {
     r.report("draft_vocab_markov control: stream 3's step-2 best moved to the next list id, its list drafts", n_moved, false);
 }
 
+/// The sections in their order, each with the lines it prints when it runs whole: one that prints another count fails
+/// the replay, and the counts must sum to replay_lines (a section dropped or added without its count fails the build).
 // -- TF_DS_ROCI's two-block readers ----------------------------------------------------------------------------------
 
 /// bf16 [2, rows, w] sums with the special values the identity argument names scattered in (quiet NaN, +-0, subnormals,
@@ -6472,6 +6790,7 @@ fn rociStage(r: *Run, rng_in: std.Random) !void {
         try keep.append(ha, z);
         const a = try gemmOnce(r, .off, false, l, q.ptr, sc.ptr, z.ptr, 0, 1000, wc, .f32, null);
         defer free(a);
+        try rio.fill(d, q.ptr + 700 * sh.k + 3, 0x40, 1);
         const b = try gemmOnce(r, .off, false, l, q.ptr, sc.ptr, z.ptr, 0, 1000, wc, .f32, null);
         defer free(b);
         r.report("roci_stage control: one activation code of row 700 changed, the arena GEMM's bytes", differs(a, b), false);
@@ -6501,6 +6820,7 @@ fn rociCollect(r: *Run, rng_in: std.Random) !void {
     const host = try std.heap.page_allocator.alloc(u8, 2 * big);
     defer std.heap.page_allocator.free(host);
     rng.bytes(host);
+    try rio.write(src, 0, host);
     var kept: []u8 = &.{};
     defer if (kept.len != 0) free(kept);
     for ([_]usize{ 10_485_760, big }) |bytes| {
@@ -7056,6 +7376,8 @@ fn wcTime(r: *Run, comptime Ctx: type, ctx: Ctx, comptime f: fn (Ctx) anyerror!v
 
 /// One line for a class: ms a launch of each variant (variant 0 is cudaMalloc, variant 1 a second cudaMalloc set: the null
 /// control, which must read within 2 % of variant 0; the others are the page types), each page type over variant 0, and ms a
+/// 4,096-row pass at `launches` launches. The line compares no bytes, so it never fails the replay: its text says how far the
+/// null control lets the percentages be read (holds, too short to time, noisy, or UNRESOLVED past every bar).
 fn wcLine(r: *Run, name: []const u8, res: *const WcRes, launches: usize) !void {
     const ms = res.ms[0..res.n];
     const labels = res.labels[0..res.n];
@@ -7070,10 +7392,13 @@ fn wcLine(r: *Run, name: []const u8, res: *const WcRes, launches: usize) !void {
         try t.add("; null control {d:.1} % on a kernel under {d:.0} us: TOO SHORT TO TIME, the percentages below are launch noise", .{ null_pct, wc_short_ms * 1000 });
     } else if (noisy) {
         try t.add("; null control {d:.1} %: NOISY (outside 2 %, within {d:.0} %{s}), read the percentages below with that error", .{ null_pct, if (vd == .noisy_short) dsv41.wc_verdict.short_noisy_pct else wc_noisy_pct, if (vd == .noisy_short) ", a kernel under 100 us" else "" });
+    } else if (vd == .unresolved) {
+        try t.add("; null control {d:.1} %: UNRESOLVED (the timing disagrees with itself past every bar; no bytes are compared here), the percentages below are not read", .{null_pct});
     } else try t.add("; null control {d:.1} %", .{null_pct});
     for (labels[2..], ms[2..]) |l, v| try t.add("; {s} over cudaMalloc {d:.1} %", .{ l, (v / ms[0] - 1.0) * 100.0 });
     try t.add("; ms a 4,096-row pass at {d} launches:", .{launches});
     for (labels, ms) |l, v| try t.add(" {s} {d:.2},", .{ l, v * @as(f32, @floatFromInt(launches)) });
+    r.note(t.buf[0..t.n], true);
 }
 
 /// mx.quant of bf16 rows into each variant planar, and (the arena type of the baseline) in records: a row's `k` codes then its scales as
@@ -7358,6 +7683,7 @@ fn wcSparseAttn(r: *Run, env: WcEnv, rng: std.Random) !void {
     var res: WcRes = .{};
     for (env.list()) |vr| {
         const ib = try env.buf(vr.w, R * n_idx * 8);
+        try put(r.d, ib, idx.ptr, R * n_idx * 8);
         const a: tri_attn.Attn = .{ .q = q, .out = out, .rows = R, .h = H, .hd = HD, .sink = sink, .wsrc = wsrc, .wsrc_rows = R + WIN, .wlo = wb, .ring = false, .comp = .{ .fp4 = .{ .codes = cb, .scales = sb } }, .idx = ib, .n_idx = n_idx, .pos = pb, .scale = dsv41.prompt.scale(HD), .window = WIN, .parts = .{ .pm = 0, .pl = 0, .po = 0 } };
         res.add(vr.label, try wcTime(r, C, .{ .r = r, .a = a }, C.go));
     }
@@ -7504,6 +7830,8 @@ fn wcAdd2(r: *Run, env: WcEnv, rng: std.Random) !void {
         const a = try env.buf(vr.w, n * 4);
         const b = try env.buf(vr.w, n * 4);
         const out = try env.buf(vr.w, n * 2);
+        try put(r.d, a, a_host.ptr, n * 4);
+        try put(r.d, b, b_host.ptr, n * 4);
         res.add(vr.label, try wcTime(r, C, .{ .ops = ops, .s = r.s, .a = a, .b = b, .out = out }, C.go));
     }
     try wcLine(r, "add2_bf16 reading the partial and the landed stage block, into the sum block (1,024 x 2,560)", &res, 83);
@@ -7544,6 +7872,8 @@ fn wcAdd2Vec(r: *Run, env: WcEnv, ops: *const dsv41.ops.Ops, a_host: []const u8,
         const b = try env.buf(vr.w, n * 4);
         const out_s = try env.buf(vr.w, n * 2);
         const out_v = try env.buf(vr.w, n * 2);
+        try put(r.d, a, a_host.ptr, n * 4);
+        try put(r.d, b, b_host.ptr, n * 4);
         const ms_s = try wcTime(r, C, .{ .ops = ops, .s = r.s, .a = a, .b = b, .out = out_s, .vec = false, .n = n }, C.go);
         const ms_v = try wcTime(r, C, .{ .ops = ops, .s = r.s, .a = a, .b = b, .out = out_v, .vec = true, .n = n }, C.go);
         try r.s.synchronize();
@@ -7562,6 +7892,7 @@ fn wcAdd2Vec(r: *Run, env: WcEnv, ops: *const dsv41.ops.Ops, a_host: []const u8,
     if (locked) |l| if (wc) |ww| {
         const b_wc = try env.buf(ww, n * 4);
         const out = try env.buf(l.w, n * 2);
+        try put(r.d, b_wc, b_host.ptr, n * 4);
         const both = try wcTime(r, C, .{ .ops = ops, .s = r.s, .a = l.a, .b = l.b, .out = out, .vec = false, .n = n }, C.go);
         const split = try wcTime(r, C, .{ .ops = ops, .s = r.s, .a = l.a, .b = b_wc, .out = out, .vec = false, .n = n }, C.go);
         var u: WcText = .{};
@@ -7602,6 +7933,7 @@ fn wcHcMix2b(r: *Run, env: WcEnv, rng: std.Random) !void {
     var res: WcRes = .{};
     for (env.list()) |vr| {
         const blk = try env.buf(vr.w, 2 * rows * W * 2);
+        try put(r.d, blk, blk_host.ptr, blk_host.len);
         res.add(vr.label, try wcTime(r, C, .{ .r = r, .h = h, .fnw = fnw, .blk = blk, .part = part, .h_out = h_out, .post = post, .comb = comb }, C.go));
     }
     try wcLine(r, "_hc_mix_pf_2b reading the landed sum blocks (4,096 rows x 5,120)", &res, 2 * wc_layers);
@@ -7630,6 +7962,7 @@ fn wcEngramGate2b(r: *Run, env: WcEnv, rng: std.Random) !void {
     var res: WcRes = .{};
     for (env.list()) |vr| {
         const blk = try env.buf(vr.w, 2 * rows * EW * 2);
+        try put(r.d, blk, blk_host.ptr, blk_host.len);
         res.add(vr.label, try wcTime(r, C, .{ .r = r, .h = h, .blk = blk, .qk = qk, .out = out }, C.go));
     }
     try wcLine(r, "_engram_gate_2b reading the landed sum blocks (4,096 rows, 12,800 columns)", &res, 2);
@@ -7793,6 +8126,7 @@ fn lauMs(r: *Run, ls: []const Lau) !f32 {
 /// The ints of a device array, read back (memory from `a`).
 fn getInts(d: *const cuda.Driver, ptr: u64, n: usize, a: std.mem.Allocator) ![]i32 {
     const v = try a.alloc(i32, n);
+    try take(d, @ptrCast(v.ptr), ptr, n * 4);
     return v;
 }
 
@@ -8075,6 +8409,7 @@ fn rociLocalFirst(r: *Run, rng_in: std.Random) !void {
         K,                                                     N, ms1, if (kinds[0]) |kd| @tagName(kd) else "the baseline kernels", pct(msn, ms1), resolved(pct(msn, ms1)), ms2, pct(ms2, ms1), if (kinds[1]) |kd| @tagName(kd) else "the baseline kernels", if (kinds[2]) |kd| @tagName(kd) else "the baseline kernels",
         if (pct(ms2, ms1) > 1.5) "crossed" else "not crossed",
     });
+    r.note(t.buf[0..t.n], true); // a time line: its bytes are the lines above, the null control's reading is in its text
     r.report("roci_local_first wq_a: 1,024 rows then 3,072 rows against one launch of 4,096", differs(ref, got), true);
     r.report("roci_local_first wq_a control: row 1,024 not computed", differs(ref, got_cut), false);
 }
@@ -8179,6 +8514,7 @@ fn rociLocalFirstWqb(r: *Run, rng_in: std.Random) !void {
     try t.add("roci_local_first wq_b (K {d}, N {d}) block-scaled exact on the gathered qr rows, kernel only, ms: one launch of 4,096 rows {d:.3} (null control {d:.1} % {s}); the owned quarter alone {d:.3}, then the rows before and after it {d:.3} = {d:.1} % over one launch. Kill line (more than 1.5 % slower): {s}", .{
         K, N, ms1, pct(msn, ms1), resolved(pct(msn, ms1)), owned_only, ms3, pct(ms3, ms1), if (pct(ms3, ms1) > 1.5) "crossed" else "not crossed",
     });
+    r.note(t.buf[0..t.n], true); // a time line: its bytes are the lines above, the null control's reading is in its text
     r.report("roci_local_first wq_b: the owned quarter, the rows before it, the rows after it, against one launch of 4,096", differs(ref, got), true);
     r.report("roci_local_first wq_b control: the row after the owned quarter not computed", differs(ref, got_cut), false);
 }
@@ -8274,7 +8610,9 @@ fn rociTwoBase(r: *Run, rng_in: std.Random) !void {
     const ms_two = try kernelBest(r, C, two, C.go);
     // the control: one code byte of the partner's part changed
     var one: [1]u8 = undefined;
+    try take(d, &one, parts[1] + 5 * uw + 7, 1);
     const flipped = [1]u8{one[0] ^ 0x08};
+    try put(d, parts[1] + 5 * uw + 7, &flipped, 1);
     try poison(y_two, ybytes, d, r.s);
     try two.go();
     try r.s.synchronize();
@@ -8329,6 +8667,8 @@ fn chainedDoor(r: *Run, rng_in: std.Random) !void {
     defer rigd.deinit();
     const ybytes = sf_m * sf_n * 4;
     const rig = (try sfRig(r, rng, ha, &keep, &arena_mem)) orelse return r.note("chained_door: wo_b's 4,096 rows take tf_dsn_sf_split128 here", false);
+    // the twin is loaded with the staged kernels (sfRig's useStaged), so it is looked up here, not before
+    const f = r.k.sfk.?.ch_door orelse return r.note("chained_door: tf_dsn_sf_split128_st_door_kernel loads", false);
     r.k.sf = .chained;
     const route_ok = mx.sentFirstTakes(r.k, rig.l, rig.q, sf_k, rig.s, sf_k / 32, rig.y_new, sf_n, sf_m);
     r.report("chained_door: sentFirstTakes takes wo_b in the chained arithmetic", @intFromBool(!route_ok), true);
@@ -8437,6 +8777,7 @@ fn rociTwoBasePages(r: *Run, rng_in: std.Random) !void {
         }
         p = .{ addr[0], addr[1] };
         y = addr[2];
+        if (v != 0) for (0..2) |i| try d.check(d.api.cuMemcpyDtoDAsync_v2(p[i], src[i].ptr, part_bytes, r.s.handle), "cuMemcpyDtoDAsync");
         try r.s.synchronize();
         try r.k.useStaged(y, y + 2 * ybytes);
         const pl = dsv41.prompt2d.catCodesPlan(1, .{ 0, 1, 2, 3 }, n, .{ uw, uw }, 0, p[0], p[1], q.ptr, qs.ptr);
@@ -8476,7 +8817,9 @@ fn rociTwoBasePages(r: *Run, rng_in: std.Random) !void {
         r.report(try std.fmt.bufPrint(&line, "roci_two_base_pages {s}: the two-base output against the device-parts reference", .{names[v]}), differs(ref.?, b), true);
         if (v == 3) {
             var one: [1]u8 = undefined;
+            try take(d, &one, p[1] + 3 * uw + 7, 1);
             const flipped = [1]u8{one[0] ^ 0x08};
+            try put(d, p[1] + 3 * uw + 7, &flipped, 1);
             try poison(y + ybytes, ybytes, d, r.s);
             try two.go();
             try r.s.synchronize();
@@ -8599,7 +8942,9 @@ fn rociThreeBase(r: *Run, rng_in: std.Random) !void {
     const ms_three = try kernelBest(r, C, three, C.go);
     // the control: a main code of the second part changed
     var one: [1]u8 = undefined;
+    try take(d, &one, parts[1] + 3 * 512 + 7, 1);
     const flipped = [1]u8{one[0] ^ 0x10};
+    try put(d, parts[1] + 3 * 512 + 7, &flipped, 1);
     try poison(o_b.ptr, bytes, d, r.s);
     try three.go();
     try r.s.synchronize();
@@ -8718,6 +9063,7 @@ fn rociThreeBasePages(r: *Run, rng_in: std.Random) !void {
                 },
                 else => (try pool.alloc(.mmapreg, pc.bytes)).dev,
             };
+            try d.check(d.api.cuMemcpyDtoDAsync_v2(parts[i], dev[i], pc.bytes, r.s.handle), "cuMemcpyDtoDAsync");
         };
         try r.s.synchronize();
         const c: C = .{ .r = r, .sc = sc, .nx = nx, .f3 = f3, .parts = parts, .pc = pc, .out = o_a.ptr, .grid_y = grid_y };
@@ -8733,7 +9079,9 @@ fn rociThreeBasePages(r: *Run, rng_in: std.Random) !void {
         r.note(try std.fmt.bufPrint(&line, "roci_three_base_pages {s}: down on the two parts {d:.3} ms (4,096 rows x 7 slots, kernel only)", .{ names[v], ms }), true);
         if (v == 3) {
             var one: [1]u8 = undefined;
+            try take(d, &one, parts[1] + 3 * 512 + 7, 1);
             const flipped = [1]u8{one[0] ^ 0x10};
+            try put(d, parts[1] + 3 * 512 + 7, &flipped, 1);
             try poison(o_a.ptr, bytes, d, r.s);
             try c.go();
             try r.s.synchronize();
@@ -9292,6 +9640,7 @@ fn getParts(d: *const cuda.Driver, parts: []const [2]u64) ![]u8 {
     var at: usize = 0;
     for (parts) |pt| {
         const len: usize = @intCast(pt[1]);
+        try take(d, x.ptr + at, pt[0], len);
         at += len;
     }
     return x;
@@ -9301,7 +9650,10 @@ fn getParts(d: *const cuda.Driver, parts: []const [2]u64) ![]u8 {
 /// of an input value. Synchronous: the runner has synchronized the stream before it.
 fn flipBf16(r: *Run, addr: u64, on: bool, saved: *u16) !void {
     if (on) {
+        try take(r.d, saved, addr, 2);
         const v: u16 = saved.* ^ 0x4000;
+        try put(r.d, addr, &v, 2);
+    } else try put(r.d, addr, saved, 2);
 }
 
 /// The sums a mix posts for a window of d rows in the two forms its two paths read: the baseline fp32 planes [2, d, D] over the window (plane 0
@@ -9947,6 +10299,7 @@ const DoorRig = struct {
         try d.check(d.api.cuMemHostAlloc(&g.mem, 4096, 0x01 | 0x02), "cuMemHostAlloc");
         try d.check(d.api.cuMemHostGetDevicePointer_v2(&g.dev, g.mem, 0), "cuMemHostGetDevicePointer");
         @memset(@as([*]u8, @ptrCast(g.mem.?))[0..4096], 0);
+        try rio.fill(d, g.cnt.ptr, 0, 256);
         return g;
     }
 
@@ -9970,6 +10323,7 @@ const DoorRig = struct {
     /// Whether the line shows the ticket and the arrival count is zero again: the producer rang once and left the count clean.
     fn rang(g: *const DoorRig) !bool {
         var c: u32 = 1;
+        try take(g.d, &c, g.cnt.ptr, 4);
         return g.line().* == g.ticket and c == 0;
     }
 };
@@ -9995,6 +10349,7 @@ fn observed(r: *Run, rig: *DoorRig, wf: cuda.Function, sw: cuda.Stream, ref: [2]
     try r.s.synchronize();
     try sw.synchronize();
     var o: [2]u32 = undefined;
+    try take(r.d, &o, rig.out.ptr, 8);
     return .{ .wrong = o[0], .seen = o[1] != 0 };
 }
 
@@ -10117,6 +10472,7 @@ fn rociDoor(r: *Run, rng_in: std.Random) !void {
     try poison(rig.y_ref, ybytes, d, r.s);
     try today.go();
     try r.s.synchronize();
+    try d.check(d.api.cuMemcpyDtoDAsync_v2(ref_dev.ptr, rig.y_ref, ybytes, r.s.handle), "cuMemcpyDtoDAsync");
     const ref = try get(ref_dev.ptr, ybytes, d);
     defer free(ref);
     var orders: [4]mx.RowOrder = undefined;
@@ -10258,6 +10614,7 @@ fn rociDoor(r: *Run, rng_in: std.Random) !void {
     try poison(rig.y_ref, ybytes, d, r.s);
     try one.go();
     try r.s.synchronize();
+    try d.check(d.api.cuMemcpyDtoDAsync_v2(ref_dev.ptr, rig.y_ref, ybytes, r.s.handle), "cuMemcpyDtoDAsync");
     const cref = try get(ref_dev.ptr, ybytes, d);
     defer free(cref);
     var qos: [4]mx.QuarterOrder = undefined;
@@ -10402,6 +10759,7 @@ fn rociBoundary(r: *Run, rng_in: std.Random) !void {
                 try d.check(d.api.cuMemsetD8Async(b.ptr, 0xee, b.len, r.s.handle), "cuMemsetD8Async");
                 // this node's own groups hold the update's bytes
                 const lo = (start + k * q) * rows[a];
+                try put(d, b.ptr + lo, whole[a][lo..].ptr, q * rows[a]);
                 arrays[k][a] = b.ptr;
             }
             var cs: dsv41.prompt.Caches = undefined;
@@ -10460,6 +10818,7 @@ fn rociBoundary(r: *Run, rng_in: std.Random) !void {
                 const lo = start * rows[a];
                 try d.check(d.api.cuMemsetD8Async(arrays[k][a] + lo, 0xee, world * q * rows[a], r.s.handle), "cuMemsetD8Async");
                 const own = (start + k * q) * rows[a];
+                try put(d, arrays[k][a] + own, whole[a][own..].ptr, q * rows[a]);
             };
             try r.s.synchronize();
             for (0..world) |k| {
@@ -10890,6 +11249,7 @@ fn rociPair(r: *Run, rng_in: std.Random) !void {
         try st[0][0].synchronize();
         try st[1][0].synchronize();
         var got: [1024]u32 = undefined;
+        try take(d, &got, out.ptr + base, 4096);
         for (got) |x| diff[gi] += @intFromBool(x != val);
     }
     r.report("roci_pair: pass B's read of a layer's cache behind pass A's event is A's write", diff[0], true);
@@ -10968,6 +11328,7 @@ fn rociTriple(r: *Run, rng_in: std.Random) !void {
         try st[1][0].synchronize();
         try st[2][0].synchronize();
         var got: [1024]u32 = undefined;
+        try take(d, &got, out.ptr + base, 4096);
         for (got) |x| diff[gi] += @intFromBool(x != val);
     }
     r.report("roci_triple: pass C's read of a layer's cache behind B's event behind A's event is A's write", diff[0], true);
@@ -11351,23 +11712,41 @@ fn qgateBody(r: *Run, rng: std.Random) !void {
     r.report("qgate_body 3: each nonzero finite value's bits plus one, zeros, infinities, NaN and the largest finite values kept", diff3, true);
 }
 
+/// Whether this replay binary was built with the test instruments (-Dtest_instruments): the load-only twins exist in no other build.
+const instruments = dsv41.test_instruments.enabled;
+const loadonly_lines = 5;
+const base_sections = .{
+    .{ "pf_split", pfSplit, 64 },
+    .{ "pf_gemm5", pfGemm5, 3 },
+    .{ "woa_w8", woaW8, 4 },
+    .{ "quant_once", quantOnce, 3 },
+    .{ "group_tiles", groupTiles, 4 },
     .{ "dec_group2", decGroup2, 13 },
+    .{ "topk_tiles", topkTiles, 37 },
     .{ "pass_rule", passRule, 3 },
     .{ "pass_tail", passTail, 7 },
+    .{ "idx_proj_owned", idxProjOwned, 19 },
+    .{ "bf16_rows", bf16Rows, 2 },
     .{ "pf_run128", pfRun128, 23 },
+    .{ "decode_fuse", decodeFuse, 21 },
+    .{ "decode_asm_quant", decodeAsmQuant, 13 },
     .{ "attn_epilogue", attnEpilogue, 3 },
     .{ "hc_stride", hcStride, 3 },
     .{ "hc_fused", hcFused, 6 },
     .{ "gemm_r2", gemmR2, 6 },
+    .{ "mma_window", mmaWindow, 6 },
     .{ "chained_door", chainedDoor, 3 },
     .{ "chained_two_base", rociTwoBaseChained, 3 },
     .{ "chained_three_base", rociThreeBaseChained, 3 },
     .{ "assemble_quant", assembleQuant, 2 },
+    .{ "attn_u", attnU, 14 },
+    .{ "idx_u", idxU, 6 },
     .{ "qgate_body", qgateBody, 3 },
     .{ "idx_v", idxV, 6 },
     .{ "idx_t", idxT, 6 },
     .{ "act_quant", actQuant, 6 },
     .{ "woa_merge", woaMerge, 4 },
+    .{ "attn_u_decode", attnUDecode, 7 },
     .{ "merge_d", mergeD, 14 }, // 10 + the 16-column width at rows 1, 2, 6 and 16 (TF_DS_MERGE_D=3)
     .{ "attn_w", attnW, 14 },
     .{ "attn_x", attnX, 14 },
@@ -11422,9 +11801,101 @@ fn qgateBody(r: *Run, rng: std.Random) !void {
     .{ "attn_epi_xe", attnEpiXe, 5 + 1 + 1 },
     .{ "hc_fused_2b", hcFused2b, 2 + 1 + 1 },
     .{ "hc_2s", hc2s, 3 + 1 + 1 },
+    .{ "idx_deq", idxDeq, 2 },
     .{ "draft_vocab", draftVocab, 2 },
     .{ "draft_vocab_markov", draftVocabMarkov, 3 },
+};
+/// expert_loadonly times kernels only a test-instruments build has: its section is in the table in that build alone.
+const loadonly_sections = if (instruments) .{.{ "expert_loadonly", expertLoadOnly, loadonly_lines }} else .{};
+const sections = base_sections ++ loadonly_sections;
+/// The sections that have a controls-and-soak part (TF_DS_REPLAY_CONTROLS=1) and the lines it prints; a section not here has
+/// none and refuses the run.
+const controls_sections = .{
+    .{ "pf_run128", 5 },
+};
+/// The lines section `name` prints with its controls and soak alone (0: it has no such part).
+fn controlsLines(comptime name: []const u8) usize {
+    inline for (controls_sections) |c| if (comptime std.mem.eql(u8, c[0], name)) return c[1];
+    return 0;
+}
 const replay_lines: usize = (3 + 356 + 9 + 3 + 2 + 5 + 23 + 15 + 5 + 13 + 5 + 6 + 3 + 3 + 3 + 24 + 9 + 8 + 2 + 6 + 5 + 24 + 14 + 3 + 6 + 6 + 13 + 2 + 3 + 3 + 6 + 6 + 6 + 8 + 9 + 10 + 18 + 3 + 3 + 2 + 13 + 10 + 53 + 5 + 21 + 9 + 11 + 5 + 2 + 5 + 1 + 14 + 5 + 1 + 1 + 5 + 1 + 1 + 6 + 4 + 6 + 6 + 4 + 6 + 4) - loadonly_lines + (if (instruments) loadonly_lines else 0); // + 4: merge_d's 16-column width; + 6: idx_t (TF_DS_IDX_TPP=4); + 6: split64n (4 byte lines, 2 kernel time lines); + 4: pf_t64 (loaded, bytes, kernel time, control)
+comptime {
+    var n: usize = 0;
+    for (sections) |sec| {
+        n += sec[2];
+        if (controlsLines(sec[0]) > sec[2]) @compileError("a section's controls print more lines than its whole run");
+    }
+    if (n != replay_lines) @compileError("the sections' lines do not sum to replay_lines");
+}
+
+/// Whether `name` is one of `list`'s comma-separated names.
+fn listed(list: []const u8, name: []const u8) bool {
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |n| if (std.mem.eql(u8, std.mem.trim(u8, n, " "), name)) return true;
+    return false;
+}
+
+/// Runs `table`'s sections (those `only` lists, else all), each held to its line count. A section that returns an error is a
+/// FAILED line naming it and the error, `r.ok` false, and the sections after it still run: one section's error must never hide the
+/// rest (an idx_deq error once ended the run after hc_2s, and draft_vocab, draft_vocab_markov and pf_run128 never ran).
+/// Returns how many sections it ran.
+fn runSections(comptime table: anytype, r: anytype, prng: *std.Random.DefaultPrng, only: ?[]const u8) usize {
+    var ran: usize = 0;
+    inline for (table) |sec| if (only == null or listed(only.?, sec[0])) {
+        const before = r.lines;
+        const want_lines: usize = if (controls_only) controlsLines(sec[0]) else sec[2];
+        if (sec[1](r, prng.random())) {
+            if (r.lines - before != want_lines) {
+                r.ok = false;
+                std.debug.print("kernels-replay: {s} printed {d} lines, not {d}: WRONG\n", .{ sec[0], r.lines - before, want_lines });
+            }
+        } else |err| {
+            r.ok = false;
+            std.debug.print("kernels-replay: {s} FAILED: error.{s} (it printed {d} of its {d} lines; the sections after it still run)\n", .{ sec[0], @errorName(@as(anyerror, err)), r.lines - before, want_lines });
+        }
+        ran += 1;
+    };
+    return ran;
+}
+
+/// What the runner's test drives in a real Run's place: the two fields a section's verdict uses.
+const TestRun = struct { ok: bool = true, lines: usize = 0 };
+fn testSectionErrors(r: *TestRun, _: std.Random) anyerror!void {
+    r.lines += 1;
+    return error.TestSectionBoom;
+}
+fn testSectionPasses(r: *TestRun, _: std.Random) anyerror!void {
+    r.lines += 1;
+}
+fn testSectionPrintsTwo(r: *TestRun, _: std.Random) anyerror!void {
+    r.lines += 2;
+}
+
+test "the kernels replay's runner: a section that returns an error is a FAILED line, the sections after it still run, the verdict is FAILED" {
+    var prng = std.Random.DefaultPrng.init(1);
+    // the error first, then a section that passes: the second still ran (its line is counted) and the verdict is FAILED
+    var r: TestRun = .{};
+    try std.testing.expectEqual(@as(usize, 2), runSections(.{ .{ "boom", testSectionErrors, 1 }, .{ "fine", testSectionPasses, 1 } }, &r, &prng, null));
+    try std.testing.expectEqual(@as(usize, 2), r.lines);
+    try std.testing.expect(!r.ok);
+    // the error last, and in the middle of three: each later section runs
+    var r2: TestRun = .{};
+    try std.testing.expectEqual(@as(usize, 3), runSections(.{ .{ "fine", testSectionPasses, 1 }, .{ "boom", testSectionErrors, 1 }, .{ "two", testSectionPrintsTwo, 2 } }, &r2, &prng, null));
+    try std.testing.expectEqual(@as(usize, 4), r2.lines);
+    try std.testing.expect(!r2.ok);
+    // all passing: ok stays true; a section printing another count than its table says fails the run
+    var r3: TestRun = .{};
+    try std.testing.expectEqual(@as(usize, 2), runSections(.{ .{ "fine", testSectionPasses, 1 }, .{ "two", testSectionPrintsTwo, 2 } }, &r3, &prng, null));
+    try std.testing.expect(r3.ok);
+    var r4: TestRun = .{};
+    _ = runSections(.{.{ "two", testSectionPrintsTwo, 1 }}, &r4, &prng, null);
+    try std.testing.expect(!r4.ok);
+    // TF_DS_REPLAY_ONLY: only the listed sections run
+    var r5: TestRun = .{};
+    try std.testing.expectEqual(@as(usize, 1), runSections(.{ .{ "boom", testSectionErrors, 1 }, .{ "fine", testSectionPasses, 1 } }, &r5, &prng, "fine"));
+    try std.testing.expect(r5.ok);
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
     const io = init.io;
@@ -11443,6 +11914,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer ctx.deinit();
     var stream = try cuda.Stream.init(&driver, true);
     defer stream.deinit();
+    dsv41.replay_io.stream = stream;
+    defer dsv41.replay_io.stream = null;
     var set = try cuda.aot.Set.load(init.gpa, io, &driver, ctx.device, args[1]);
     defer set.deinit();
     // the kit's extra set beside it (aot-extra/: TF_DS_ATTN_U's twins); without one its lines fail
@@ -11474,6 +11947,28 @@ pub fn main(init: std.process.Init) !u8 {
     defer ops.unload();
     var r: Run = .{ .d = &driver, .dev = ctx.device, .s = stream, .t = .{ .set = &set, .extra = if (extra) |*x| x else null, .stream = stream, .pdl = true }, .k = &k, .a = arena.allocator(), .ops = &ops, .io = io };
     var prng = std.Random.DefaultPrng.init(0x6b32);
+    // TF_DS_REPLAY_ONLY, names comma separated: those sections alone (the others' random draws left out: each then
+    // runs on other data)
+    const only: ?[]const u8 = if (std.c.getenv("TF_DS_REPLAY_ONLY")) |v| std.mem.span(v) else null;
+    // TF_DS_REPLAY_SAN=1 (anything but 0): each soak 2 launches, for a run under compute-sanitizer
+    if (std.c.getenv("TF_DS_REPLAY_SAN")) |v| if (!std.mem.eql(u8, std.mem.span(v), "0")) {
+        soak_launches = 2;
+        std.debug.print("kernels-replay: TF_DS_REPLAY_SAN: each soak {d} launches (a run under compute-sanitizer), every other line as it is\n", .{soak_launches});
+    };
+    // TF_DS_REPLAY_CONTROLS=1: each selected section's controls and soak alone; a section without that part refuses the run
+    if (std.c.getenv("TF_DS_REPLAY_CONTROLS")) |v| if (!std.mem.eql(u8, std.mem.span(v), "0")) {
+        controls_only = true;
+        inline for (sections) |sec| if ((only == null or listed(only.?, sec[0])) and controlsLines(sec[0]) == 0) {
+            std.debug.print("kernels-replay: TF_DS_REPLAY_CONTROLS: {s} has no controls-only part (TF_DS_REPLAY_ONLY= the sections that have)\n", .{sec[0]});
+            return 2;
+        };
+        std.debug.print("kernels-replay: TF_DS_REPLAY_CONTROLS: each section's controls and soak alone\n", .{});
+    };
+    const ran = runSections(sections, &r, &prng, only);
+    if (only != null and ran == 0) {
+        std.debug.print("kernels-replay: TF_DS_REPLAY_ONLY={s} names no section\n", .{only.?});
+        return 2;
+    }
     if (r.ok) {
         std.debug.print("kernels-replay: every same-bits switch's launches give the baseline bytes, TF_DS_MMA_SF's within its bound of fp64 beyond the baseline's; every control as it must ({d} lines, {d} sections)\n", .{ r.lines, ran });
         return 0;
@@ -11767,9 +12262,12 @@ fn gemmHalves(r: *Run, rng: std.Random) !void {
             for ([_]usize{ 0, 5000 }, 0..) |row, ci| {
                 var code: [1]u8 = undefined;
                 const at = q.ptr + row * sh.k + 7;
+                try take(d, &code, at, 1);
                 const changed = [1]u8{code[0] ^ 0x08};
+                try put(d, at, &changed, 1);
                 const moved = try Dense.run(r, true, false, l, q.ptr, s.ptr, z.ptr, M, y.ptr, fp32);
                 defer free(moved);
+                try put(d, at, &code, 1);
                 r.report(try std.fmt.bufPrint(&line, "gemm_halves {s} control: one code byte of row {d} changed ({s} block)", .{ sh.name, row, if (ci == 0) "the first" else "the second" }), differs(whole, moved), false);
             }
         }
@@ -12195,9 +12693,12 @@ fn pfRaster(r: *Run, rng: std.Random) !void {
         defer free(base);
         var code: [1]u8 = undefined;
         const at = o.q.ptr + 5000 * dense[0].k + 7;
+        try take(d, &code, at, 1);
         const changed = [1]u8{code[0] ^ 0x08};
+        try put(d, at, &changed, 1);
         const moved = try rasterBytes(r, 8, false, .off, .off, o.l, o.q.ptr, o.s.ptr, o.z.ptr, 8192, o.y.ptr, false);
         defer free(moved);
+        try put(d, at, &code, 1);
         r.report("pf_raster control: one code byte of row 5000 changed, group 8, wq_a at 8,192 rows", differs(base, moved), false);
     }
     // GB10's timing: default, each group and halves, per shape at 8,192 and 16,384 rows

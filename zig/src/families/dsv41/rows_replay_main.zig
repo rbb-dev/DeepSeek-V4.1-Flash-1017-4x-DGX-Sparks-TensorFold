@@ -43,6 +43,8 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
+/// Every copy between the host and the device, in the replay stream's order (replay_io).
+const rio = dsv41.replay_io;
 const mx = dsv41.mx;
 const prompt = dsv41.prompt;
 const tri_basic = dsv41.tri_basic;
@@ -80,9 +82,11 @@ fn bf16Rne(x: f32) u16 {
 }
 
 fn upload(d: *const cuda.Driver, bytes: []const u8) !cuda.DeviceBuffer {
+    return rio.buffer(d, bytes);
 }
 
 fn get(buf: u64, n: usize, d: *const cuda.Driver, a: std.mem.Allocator) ![]u8 {
+    return rio.get(d, buf, n, a);
 }
 
 fn clear(buf: cuda.DeviceBuffer, d: *const cuda.Driver, s: cuda.Stream) !void {
@@ -320,6 +324,7 @@ fn pack(r: *Run, ops: *const dsv41.ops.Ops, rng: std.Random, keep: *std.ArrayLis
     // control: one main value of pair 1's slot row 5 set to 64 (its group's scale another)
     const off = try a.dupe(u8, pack_host[1]);
     std.mem.bytesAsSlice(u16, off)[5 * IG + 3] = 0x4280;
+    try rio.write(packs[1], 0, off);
     try dsv41.prompt2d.packQuant(r.k, r.s, packs[1].ptr, bufs[4].ptr, pc);
     try dsv41.prompt2d.packAssemble(ops, r.s, bufs[3].ptr, bufs[4].ptr, pick.ptr, owner.ptr, sc, pc);
     try r.s.synchronize();
@@ -357,6 +362,7 @@ fn gate(r: *Run, rng: std.Random, keep: *std.ArrayList(cuda.DeviceBuffer)) !void
     // control: one stream value of row 700 set to 64, its owned block of 512 rows again
     const off = try a.dupe(u8, h_host);
     std.mem.bytesAsSlice(u16, off)[700 * hc * D + 4321] = 0x4280;
+    try rio.write(h, 0, off);
     try prompt.engramGateRows(r.t, qk.ptr, h.ptr, kv.ptr, outs[1].ptr, .{ .start = 512, .n = 512 }, EPS, D, h_row, kv_row);
     try r.s.synchronize();
     r.report("gate control: one stream value of row 700 set to 64", differs(whole, try get(outs[1].ptr, whole.len, d, a)), false);
@@ -426,6 +432,7 @@ fn cat(r: *Run, ops: *const dsv41.ops.Ops, rng: std.Random, keep: *std.ArrayList
     // control: one value of pair 1's part, row 5, set to 64 (its group's scale another), the codes path again
     const off = try a.dupe(u8, part_host[1]);
     std.mem.bytesAsSlice(u16, off)[5 * UW + 3] = 0x4280;
+    try rio.write(parts[1], 0, off);
     try catRun(r, ops, wo_b, plans, rows, .{ node[0][4].ptr, node[1][4].ptr }, sc.z);
     try r.s.synchronize();
     const n_off = differs(hq, try get(node[0][2].ptr, hq.len, d, a)) + differs(hp, try get(node[0][4].ptr, hp.len, d, a));
@@ -632,6 +639,8 @@ const Hc = struct {
     /// The earlier mixes' post and comb back at a `rows`-row pass's rows, the outputs 0xa5.
     fn reset(hc: *const Hc, r: *Run, rows: usize) !void {
         try r.s.synchronize();
+        try rio.write(hc.post, 0, hc.post_in[0 .. rows * HC * 4]);
+        try rio.write(hc.comb, 0, hc.comb_in[0 .. rows * HC * HC * 4]);
         for ([_]cuda.DeviceBuffer{ hc.h_out, hc.x, hc.pre_out }) |b| try clear(b, r.d, r.s);
     }
 
@@ -682,8 +691,11 @@ fn hcCase(r: *Run, hc: *const Hc, l: HcLayer, rows: usize) !void {
     const c = pass_replay.controlRow(rows);
     const at = pass_replay.planeAt(1, rows, c, D) + 7 * 4;
     var was: [4]u8 = undefined;
+    try rio.read(hc.g, at, &was);
+    try rio.write(hc.g, at, std.mem.asBytes(&@as(f32, 64)));
     try hc.quarters(r, l, rows);
     const off = try hc.outputs(r, rows, a);
+    try rio.write(hc.g, at, &was);
     for (hc_outputs, whole, off) |name, x, y| r.report(try std.fmt.bufPrint(&line, "hc rows={d} control: {s} with one value of plane 1's row {d} set to 64", .{ rows, name, c }), differs(x, y), false);
 }
 
@@ -739,6 +751,8 @@ fn wp4(r: *Run, hc: *const Hc, bx: *const Boundary, la: HcLayer, lb: HcLayer, ro
     try hc.quarters(r, la, rows);
     try r.s.synchronize();
     const q1 = pass_replay.quarter(rows, 1).start;
+    try rio.write(hc.post, q1 * HC * 4, hc.post_in[q1 * HC * 4 .. rows * HC * 4]);
+    try rio.write(hc.comb, q1 * HC * HC * 4, hc.comb_in[q1 * HC * HC * 4 .. rows * HC * HC * 4]);
     const off = try bx.run(r, hc, lb, rows, a);
     for (hc_outputs, whole, off) |name, x, y| r.report(try std.fmt.bufPrint(&line, "wp4 rows={d} control: the boundary's {s} with quarters 1-3's post and comb not resynced", .{ rows, name }), differs(x, y), false);
 }
@@ -819,6 +833,7 @@ fn idxCase(r: *Run, ix: *const Idx, rows: usize) !void {
     const vis = try a.alloc(i64, rows);
     for (vis, 0..) |*v, i| v.* = @intCast(@min(n, 64 + i));
     try r.s.synchronize();
+    try rio.write(ix.vis, 0, std.mem.sliceAsBytes(vis));
     const rb_was = tri_index.idx_rb;
     defer tri_index.idx_rb = rb_was;
     const c = pass_replay.controlRow(rows);
@@ -837,8 +852,11 @@ fn idxCase(r: *Run, ix: *const Idx, rows: usize) !void {
         const shown: usize = if (keyed) 2 else 1;
         for (names[0..shown], whole[0..shown], got[0..shown]) |name, x, y| r.report(try std.fmt.bufPrint(&line, "idx rows={d} RB={d} {s}: {s} at the four nodes' quarters against the whole pass's", .{ rows, rb, kind, name }), differs(x, y), true);
         var was: [2]u8 = undefined;
+        try rio.read(ix.q, at, &was);
+        try rio.write(ix.q, at, &[2]u8{ 0x80, 0x42 }); // bf16 64
         try ix.quarters(r, rows, n, keyed);
         const off = try ix.outputs(r, rows, n, keyed, 1, a);
+        try rio.write(ix.q, at, &was);
         for (names[0..shown], whole[0..shown], off[0..shown]) |name, x, y| r.report(try std.fmt.bufPrint(&line, "idx rows={d} RB={d} {s} control: {s} with one query value of row {d} set to 64", .{ rows, rb, kind, name, c }), differs(x, y), false);
     };
 }
@@ -865,6 +883,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer ctx.deinit();
     var stream = try cuda.Stream.init(&driver, true);
     defer stream.deinit();
+    dsv41.replay_io.stream = stream;
+    defer dsv41.replay_io.stream = null;
     var set = try cuda.aot.Set.load(init.gpa, io, &driver, ctx.device, args[1]);
     defer set.deinit();
     var k = try mx.Kernels.load(&driver, cuda.kernels.dsv41_native);

@@ -176,3 +176,24 @@ test "the kernels replay's row tables reach a 16,384-row pass: its buffers deriv
     // Rocinante replays', whose arenas are laid out for the transport's own cap (rocinante.max_cap)
     try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, src, "const R: usize = 4096;"));
 }
+
+test "the kernels replay's expert_loadonly section is in the table only in a test-instruments build, and its lines are counted in that build alone" {
+    const src = @embedFile("kernels_replay_main.zig");
+    // not in the unconditional table
+    const base = src[std.mem.indexOf(u8, src, "const base_sections = .{").?..std.mem.indexOf(u8, src, "const loadonly_sections").?];
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, base, "\"expert_loadonly\""));
+    // in the instruments table, with the line count that build adds
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "const loadonly_sections = if (instruments) .{.{ \"expert_loadonly\", expertLoadOnly, loadonly_lines }} else .{};"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "const sections = base_sections ++ loadonly_sections;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, ") - loadonly_lines + (if (instruments) loadonly_lines else 0);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "const instruments = dsv41.test_instruments.enabled;"));
+}
+
+test "the chained door section looks its kernel up after the staged kernels are loaded" {
+    const src = @embedFile("kernels_replay_main.zig");
+    const at = std.mem.indexOf(u8, src, "fn chainedDoor(").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n}\n").?];
+    const rig = std.mem.indexOf(u8, body, "sfRig(r, rng, ha, &keep, &arena_mem)").?;
+    const look = std.mem.indexOf(u8, body, "r.k.sfk.?.ch_door orelse").?;
+    try std.testing.expect(rig < look);
+}

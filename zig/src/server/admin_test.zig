@@ -886,6 +886,7 @@ test "no hidden row is in /schema or /config, and the hidden set is the key file
     defer arena.deinit();
     var expected: usize = 0;
     for (&settings.options) |*o| {
+        const should = o.id == 668 or o.id == 925 or o.id == 454 or o.id == 920 or o.id == 950 or o.id == 987 or (o.id >= 970 and o.id <= 971) or (o.id >= 900 and o.id <= 917); // 950: TF_DS_QGATE_CANARY (the quality gate's ruler); 987: TF_DS_IDX_SPREAD (a test-instruments counter); 970-971: TF_DS_REPLAY_SAN / TF_DS_REPLAY_CONTROLS (the kernel replay's)
         try std.testing.expectEqual(should, o.hidden);
         expected += @intFromBool(should);
     }
@@ -905,6 +906,7 @@ test "no hidden row is in /schema or /config, and the hidden set is the key file
     const rows = (try json.parse(arena.allocator(), config.body)).ok.get("values").?.array;
     for (rows) |row| {
         const id = try std.fmt.parseInt(u32, row.get("id").?.int, 10);
+        try std.testing.expect(id != 668 and id != 925 and id != 454 and id != 920 and id != 950 and id != 987 and !(id >= 970 and id <= 971) and !(id >= 900 and id <= 917));
     }
 }
 

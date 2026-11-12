@@ -11,6 +11,8 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
+/// Every copy between the host and the device, in the replay stream's order (replay_io).
+const rio = dsv41.replay_io;
 const tri_hc = dsv41.tri_hc;
 
 const D: usize = 5120;
@@ -25,6 +27,7 @@ fn fillF32(buf: cuda.DeviceBuffer, rng: *std.Random.DefaultPrng, a: std.mem.Allo
     const host = try a.alloc(f32, n);
     defer a.free(host);
     for (host) |*v| v.* = rng.random().floatNorm(f32) * 0.5;
+    try rio.write(buf, 0, std.mem.sliceAsBytes(host));
 }
 
 fn fillBf16(buf: cuda.DeviceBuffer, rng: *std.Random.DefaultPrng, a: std.mem.Allocator) !void {
@@ -35,11 +38,13 @@ fn fillBf16(buf: cuda.DeviceBuffer, rng: *std.Random.DefaultPrng, a: std.mem.All
         const f: f32 = rng.random().floatNorm(f32) * 0.5;
         v.* = @truncate(@as(u32, @bitCast(f)) >> 16);
     }
+    try rio.write(buf, 0, std.mem.sliceAsBytes(host));
 }
 
 fn zero(buf: cuda.DeviceBuffer, off: usize, n: usize, a: std.mem.Allocator) !void {
     const z = try a.alloc(u8, n);
     @memset(z, 0);
+    try rio.write(buf, off, z);
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -58,6 +63,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer ctx.deinit();
     var stream = try cuda.Stream.init(&driver, true);
     defer stream.deinit();
+    dsv41.replay_io.stream = stream;
+    defer dsv41.replay_io.stream = null;
     var set = try cuda.aot.Set.load(init.gpa, io, &driver, ctx.device, args[1]);
     const t: dsv41.tri.Tri = .{ .set = &set, .stream = stream, .pdl = true };
 
@@ -106,10 +113,15 @@ pub fn main(init: std.process.Init) !u8 {
     try stream.synchronize();
 
     const full_h_out = try a.alloc(u8, h_out.len);
+    try rio.read(h_out, 0, full_h_out);
     const full_out = try a.alloc(u8, out.len);
+    try rio.read(out, 0, full_out);
     const full_pre_out = try a.alloc(u8, pre_out.len);
+    try rio.read(pre_out, 0, full_pre_out);
     const full_post = try a.alloc(u8, post.len);
+    try rio.read(post, 0, full_post);
     const full_comb = try a.alloc(u8, comb.len);
+    try rio.read(comb, 0, full_comb);
 
     // WP4's actual pattern: pointer-offset h/pre_in/pre_out/post/comb/out into the SAME full buffers (not fresh
     // per-quarter ones); a tight, repacked `gathered` (qhc_g); a tight, SHARED `part` scratch (qhc_part).
@@ -147,11 +159,13 @@ pub fn main(init: std.process.Init) !u8 {
         const qbytes_hc4 = QROWS * HC * 4;
         const qbytes_hc2_4 = QROWS * HC * HC * 4;
         var buf = try a.alloc(u8, qbytes_hc);
+        try rio.read(h_out, row0 * HC * D * 2, buf);
         if (!std.mem.eql(u8, buf, full_h_out[row0 * HC * D * 2 ..][0..qbytes_hc])) {
             std.debug.print("DIFFERS: h_out quarter {d}\n", .{qi});
             ok = false;
         }
         buf = try a.alloc(u8, qbytes_d);
+        try rio.read(out, row0 * D * 2, buf);
         if (!std.mem.eql(u8, buf, full_out[row0 * D * 2 ..][0..qbytes_d])) {
             const qu16 = std.mem.bytesAsSlice(u16, buf);
             const ru16 = std.mem.bytesAsSlice(u16, full_out[row0 * D * 2 ..][0..qbytes_d]);
@@ -166,16 +180,19 @@ pub fn main(init: std.process.Init) !u8 {
             ok = false;
         }
         buf = try a.alloc(u8, qbytes_hc4);
+        try rio.read(pre_out, row0 * HC * 4, buf);
         if (!std.mem.eql(u8, buf, full_pre_out[row0 * HC * 4 ..][0..qbytes_hc4])) {
             std.debug.print("DIFFERS: pre_out quarter {d}\n", .{qi});
             ok = false;
         }
         buf = try a.alloc(u8, qbytes_hc4);
+        try rio.read(post, row0 * HC * 4, buf);
         if (!std.mem.eql(u8, buf, full_post[row0 * HC * 4 ..][0..qbytes_hc4])) {
             std.debug.print("DIFFERS: post quarter {d}\n", .{qi});
             ok = false;
         }
         buf = try a.alloc(u8, qbytes_hc2_4);
+        try rio.read(comb, row0 * HC * HC * 4, buf);
         if (!std.mem.eql(u8, buf, full_comb[row0 * HC * HC * 4 ..][0..qbytes_hc2_4])) {
             std.debug.print("DIFFERS: comb quarter {d}\n", .{qi});
             ok = false;
@@ -194,7 +211,9 @@ pub fn main(init: std.process.Init) !u8 {
     // diagnosis is right, the two boundary runs diverge even though every other input is identical.
     {
         const fixed_post = try a.alloc(u8, post.len);
+        try rio.read(post, 0, fixed_post);
         const fixed_comb = try a.alloc(u8, comb.len);
+        try rio.read(comb, 0, fixed_comb);
 
         var fn_w2 = try cuda.DeviceBuffer.alloc(d, 24 * HC * D * 4);
         defer fn_w2.free();
@@ -217,22 +236,30 @@ pub fn main(init: std.process.Init) !u8 {
         defer pre_out2.free();
 
         // Run A: post/comb = the fixed, fully-reassembled state (qhcResyncBoundary's fix).
+        try rio.write(post, 0, fixed_post);
+        try rio.write(comb, 0, fixed_comb);
         try zero(h_out2, 0, h_out2.len, a);
         try zero(out2, 0, out2.len, a);
         try zero(pre_out2, 0, pre_out2.len, a);
         _ = try tri_hc.hcPrePf(t, h.ptr, fn_w2.ptr, scale2.ptr, base2.ptr, pre_in.ptr, norm_w2.ptr, 1e-20, 1e-6, 20, out2.ptr, pre_out2.ptr, post.ptr, comb.ptr, part.ptr, .{ .gathered = gathered2.ptr, .world = WORLD, .h_out = h_out2.ptr }, ROWS, D);
         try stream.synchronize();
         const a_out = try a.alloc(u8, out2.len);
+        try rio.read(out2, 0, a_out);
         const a_h_out = try a.alloc(u8, h_out2.len);
+        try rio.read(h_out2, 0, a_h_out);
 
         // Run B ("buggy"): post/comb = quarter 0's real slice kept, quarters 1-3 overwritten with unrelated
         // random data (simulating qhcResyncBoundary never having run -- stale leftover content, not layer 19's).
+        try rio.write(post, 0, fixed_post);
+        try rio.write(comb, 0, fixed_comb);
         for (1..NQ) |qi| {
             const row0 = qi * QROWS;
             const stale_post = try a.alloc(f32, QROWS * HC);
             for (stale_post) |*v| v.* = rng.random().floatNorm(f32) * 0.5;
+            try rio.write(post, row0 * HC * 4, std.mem.sliceAsBytes(stale_post));
             const stale_comb = try a.alloc(f32, QROWS * HC * HC);
             for (stale_comb) |*v| v.* = rng.random().floatNorm(f32) * 0.5;
+            try rio.write(comb, row0 * HC * HC * 4, std.mem.sliceAsBytes(stale_comb));
         }
         try zero(h_out2, 0, h_out2.len, a);
         try zero(out2, 0, out2.len, a);
@@ -240,7 +267,9 @@ pub fn main(init: std.process.Init) !u8 {
         _ = try tri_hc.hcPrePf(t, h.ptr, fn_w2.ptr, scale2.ptr, base2.ptr, pre_in.ptr, norm_w2.ptr, 1e-20, 1e-6, 20, out2.ptr, pre_out2.ptr, post.ptr, comb.ptr, part.ptr, .{ .gathered = gathered2.ptr, .world = WORLD, .h_out = h_out2.ptr }, ROWS, D);
         try stream.synchronize();
         const b_out = try a.alloc(u8, out2.len);
+        try rio.read(out2, 0, b_out);
         const b_h_out = try a.alloc(u8, h_out2.len);
+        try rio.read(h_out2, 0, b_h_out);
 
         const diverges = !std.mem.eql(u8, a_out, b_out) or !std.mem.eql(u8, a_h_out, b_h_out);
         if (diverges) {

@@ -14,6 +14,8 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
+/// Every copy between the host and the device, in the replay stream's order (replay_io).
+const rio = dsv41.replay_io;
 const tri_index = dsv41.tri_index;
 
 const IH: usize = 32;
@@ -31,15 +33,18 @@ fn fillBf16(buf: cuda.DeviceBuffer, rng: *std.Random.DefaultPrng, a: std.mem.All
         const f: f32 = rng.random().floatNorm(f32) * 0.5;
         v.* = @truncate(@as(u32, @bitCast(f)) >> 16);
     }
+    try rio.write(buf, 0, std.mem.sliceAsBytes(host));
 }
 
 fn fillK(codes: cuda.DeviceBuffer, scales: cuda.DeviceBuffer, rng: *std.Random.DefaultPrng, a: std.mem.Allocator) !void {
     const cb = try a.alloc(u8, codes.len);
     defer a.free(cb);
     for (cb) |*v| v.* = rng.random().int(u8);
+    try rio.write(codes, 0, cb);
     const sb = try a.alloc(u8, scales.len);
     defer a.free(sb);
     for (sb) |*v| v.* = 23 + rng.random().uintLessThan(u8, 127 - 23 + 1);
+    try rio.write(scales, 0, sb);
 }
 
 // strictly increasing with row index, same spirit as idx_replay_main.zig's: no two rows share a visible count,
@@ -48,11 +53,13 @@ fn fillVis(buf: cuda.DeviceBuffer, rows: usize, a: std.mem.Allocator) !void {
     const host = try a.alloc(i64, rows);
     defer a.free(host);
     for (host, 0..) |*v, r| v.* = @intCast(@min(N, 64 + r));
+    try rio.write(buf, 0, std.mem.sliceAsBytes(host));
 }
 
 fn zero(buf: cuda.DeviceBuffer, a: std.mem.Allocator) !void {
     const z = try a.alloc(u8, buf.len);
     @memset(z, 0);
+    try rio.write(buf, 0, z);
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -71,6 +78,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer ctx.deinit();
     var stream = try cuda.Stream.init(&driver, true);
     defer stream.deinit();
+    dsv41.replay_io.stream = stream;
+    defer dsv41.replay_io.stream = null;
     var set = try cuda.aot.Set.load(init.gpa, io, &driver, ctx.device, args[1]);
     const t: dsv41.tri.Tri = .{ .set = &set, .stream = stream, .pdl = true };
     const d = &driver;
@@ -130,7 +139,9 @@ pub fn main(init: std.process.Init) !u8 {
             try stream.synchronize();
 
             const bf = try a.alloc(u8, out_full.len);
+            try rio.read(out_full, 0, bf);
             const bs = try a.alloc(u8, out_shard.len);
+            try rio.read(out_shard, 0, bs);
             const label = if (keyed) "keyed" else "plain";
             if (std.mem.eql(u8, bf, bs)) {
                 std.debug.print("ok   RB={d} {s}: OUT bit-identical, full call vs 4 quarter calls at row offsets 0/512/1024/1536\n", .{ rb, label });
@@ -161,7 +172,9 @@ pub fn main(init: std.process.Init) !u8 {
             }
             if (keyed) {
                 const tf = try a.alloc(u8, tmax_full.?.len);
+                try rio.read(tmax_full.?, 0, tf);
                 const ts = try a.alloc(u8, tmax_shard.?.len);
+                try rio.read(tmax_shard.?, 0, ts);
                 if (std.mem.eql(u8, tf, ts)) {
                     std.debug.print("ok   RB={d} {s}: TMAX bit-identical, full call vs 4 quarter calls\n", .{ rb, label });
                 } else {

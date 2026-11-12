@@ -6990,6 +6990,56 @@
    "env_override": true
   },
   {
+   "id": 970,
+   "name": "tf_ds_replay_san",
+   "env": "TF_DS_REPLAY_SAN",
+   "group": "debug",
+   "tab": "Advanced",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "0",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Kernel replay: short soaks",
+   "doc": "Diagnostics: the kernel replay's soaks launch 2 times instead of 200, for a run under compute-sanitizer, whose tools see a race, a stray access or a barrier slip in the launch it happens in. Anything but 0 turns it on. Used by test tools; not read when serving.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/kernels_replay_main.zig:10958",
+   "secret": false,
+   "hidden": true,
+   "env_override": true
+  },
+  {
+   "id": 971,
+   "name": "tf_ds_replay_controls",
+   "env": "TF_DS_REPLAY_CONTROLS",
+   "group": "debug",
+   "tab": "Advanced",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "0",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Kernel replay: controls only",
+   "doc": "Diagnostics: the kernel replay runs each selected section's controls and soak alone (a section without that part refuses the run), so a slow tool such as compute-sanitizer's racecheck reaches them. Anything but 0 turns it on. Used by test tools; not read when serving.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/kernels_replay_main.zig:10963",
+   "secret": false,
+   "hidden": true,
+   "env_override": true
+  },
+  {
    "id": 980,
    "name": "tf_ds_draft_vocab",
    "env": "TF_DS_DRAFT_VOCAB",
@@ -7155,6 +7205,31 @@
    "seed": "name",
    "first_use": "families/dsv41/model.zig:2731",
    "secret": false
+  },
+  {
+   "id": 987,
+   "name": "tf_ds_idx_spread",
+   "env": "TF_DS_IDX_SPREAD",
+   "group": "debug",
+   "tab": "Advanced",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "0",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Indexer FP4 scale-spread counter",
+   "doc": "Test instruments only: 1 counts the scale spreads of the indexer's FP4 dot products on real prompts and prints their histogram (it decides whether a guard on the FP4 index path ever fires). A release build compiles it out; unset or 0 counts nothing.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/idx_spread.zig:25",
+   "secret": false,
+   "hidden": true,
+   "env_override": true
   },
   {
    "id": 988,
