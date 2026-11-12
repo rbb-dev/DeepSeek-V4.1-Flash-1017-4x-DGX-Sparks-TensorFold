@@ -115,162 +115,15 @@ pub fn parOne() bool {
     return !std.mem.eql(u8, std.mem.span(v), "0");
 }
 
-pub const Model = struct {
-    gpa: std.mem.Allocator,
-    host: std.heap.ArenaAllocator, // allocations that live as long as the model
-    io: std.Io,
-    ctx: *const cuda.Context,
-    stream: cuda.Stream,
-    cfg: Config,
-    rank: u32,
-    world: u32,
-    streams: usize, // the pool's streams (Options.streams)
-    round_ms: []const f64, // the lane core's round costs by rows (Options.round_ms, else draft.round_ms)
-    pool_cap: usize,
-    ctx_cap: usize, // a stream's extent at most (Options.context, else the pool)
-    cache_dir: std.Io.Dir,
-    cache_file: std.Io.File,
-    ix: rank_cache.Index,
-    w: weights.Weights,
-    fan: prompt2d.Fan,
-    comm: comm_mod.Comm,
-    rdma_mod: ?cuda.Module = null, // the RDMA kernels (TP2's ring or world 4's rings)
-    ring: ?*rdma.Ring = null,
-    set: cuda.aot.Set,
-    pf: exl3_prefill.Kernels,
-    lg: exl3_linear.Kernels,
-    exk: exl3_experts.Kernels,
-    ops: ops_mod.Ops,
-    ex: exact.Exact,
-    par: ?exl3_experts2d.ParKernels, // the parity split's one-launch gate / up (parOne)
-    rope_buf: cuda.DeviceBuffer,
-    arena: prompt.Arena,
-    eng: prompt.Engine,
-    ch: prompt.Chunk,
-    // TF_DS_WAVES: the first wave's chunk (ch is the second's), the gathers' stream, communicator, 2D buffers (the
-    // upper half of the parts) and engine, and each wave's events (pa, ga, pm, gm ready)
-    waves: bool,
-    ch2: prompt.Chunk,
-    cs: ?cuda.Stream,
-    comm2: ?comm_mod.Comm,
-    two_c: prompt2d.Two,
-    ec: prompt.Engine,
-    wev: [2][4]cuda.Event,
-    caches: prompt.Caches,
-    blas: cublas.Blas,
-    rings: []u64, // each layer's window rings, max_streams slots
-    ring_view: []u64, // a filling stream's slot of them
-    rd: round.Round,
-    graphs: ?round.Graphs = null,
-    pgraphs: ?draft.PassGraphs = null, // the drafter pass as CUDA graphs (with graphs)
-    dpool: ?draft.Pool = null,
-    dr: ?draft.Drafter = null,
-    tables: ?engram_io.Tables = null,
-    epool: ?*engram_io.Pool = null,
-    aio: ?*engram_aio.Aio = null,
-    paio: ?*engram_aio.Aio = null, // the prompt chunks' Engram reads, on a ring of their own
-    eh: ?prompt.EngramHost = null,
-    host_pos: []i64,
-    ids64: []i64,
-    vocab: usize,
-    logits: []f32, // round.max_rows rows of logits on the host
-    amax: u64, // u32 [round.max_rows]: a round's greedy tokens on the device (roundArgmax)
-    amax_host: [round.max_rows]u32 = undefined,
-    // the stream a fill is running: its slot and its view of the caches (its extent from base)
-    fill_slot: usize = 0,
-    // the prompt a fill's chunks come from (the caller's, set for the fill) and the thread reading the next chunk's
-    // Engram rows during this one (fillChunk), joined before the prompt can change (joinAhead)
-    fill_seq: []const i32 = &.{},
-    ahead: ?std.Thread = null,
-    // the next prompt pass's rows at most (the lanes' pass rule): the Engram read-ahead reads that many, no more
-    next_rows: usize = chunk_rows,
-    view: prompt.Caches = undefined,
-    // the filling prompt's image spans and their rows (setImages; cleared by fillBegin)
-    spans: std.ArrayList(prompt.Span) = .empty,
-    img_buf: ?cuda.DeviceBuffer = null,
-    // profiling (lanes' --profile): the last round's forward and absorb, synchronized apart (ns)
-    prof: bool = false,
-    timer: ?*round.PhaseTimer = null, // a profile's GPU time by phase (eager rounds)
-    ptimer: ?*round.PhaseTimer = null, // the same for prompt chunks (fills), a chunk a 'round'
-    t_enqueue: u64 = 0, // the host's time to issue the forward (the GPU idle before it)
-    // Model.useClock: the rounds' GPU clock gaps summed (ns; gap i = clock i + 1 - clock i: the forward's start to
-    // the first stretch, then each stretch, then the wait before the next), and the rounds counted
-    clk_ph: [256]u64 = @splat(0), // by the phase of the clock that ends it
-    clk_cnt: [256]u64 = @splat(0),
-    clk_rounds: u64 = 0,
-    t_forward: u64 = 0,
-    t_absorb: u64 = 0,
-    // world 4: the 2D split's exchanges (prompt2d.zig, TP4's), with the RDMA rings when asked
-    two: ?prompt2d.Two = null,
-    rdma_rings: ?ring2d.Rings = null,
-    neighbor_gather: ?neighbor.Gather = null,
-    // watchPeers: a peer rank that stops stops this one too (link.Watch)
-    watch: link.Watch = .{},
+/// A kernel set's answer for a start check: whether a launch of these arguments finds its variant, as a launch looks it
+/// up (aot.Set.find).
+const SetFinds = struct {
+    set: *const cuda.aot.Set,
 
-    /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port), opens NCCL
-    /// and sets up every buffer. Needs `ctx` current on this thread.
-    pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, o: Options) !*Model {
-        if (o.world != 2 and o.world != 4) return error.NotPortedYet; // TP2, or the four-node 2D split (prompt2d.zig)
-        const m = try gpa.create(Model);
-        errdefer gpa.destroy(m);
-        m.* = undefined;
-        m.gpa = gpa;
-        if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
-        try prompt.splitEnv(); // TF_DS_IDX_SPLIT: every rank alike too
-        if (std.c.getenv("TF_DS_2D_YX")) |v| prompt2d.y_sums = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
-        if (std.c.getenv("TF_DS_TWO_HOP")) |v| comm_mod.two_hop = std.mem.eql(u8, std.mem.span(v), "1"); // a ring of four: every rank alike
-        m.spans = .empty;
-        m.img_buf = null;
-        m.host = std.heap.ArenaAllocator.init(gpa);
-        errdefer m.host.deinit();
-        const a = m.host.allocator();
-        m.io = io;
-        m.ctx = ctx;
-        m.rank = o.rank;
-        m.world = o.world;
-        if (o.streams == 0 or o.streams > max_streams) return error.BadStreams;
-        m.streams = o.streams;
-        if (std.c.getenv("TF_DS_L2_SKIP")) |v| round.l2_skip = std.fmt.parseInt(u8, std.mem.span(v), 10) catch 0;
-        for ([_][:0]const u8{ "TF_DS_L2_ATTN_MB", "TF_DS_L2_MOE_MB", "TF_DS_L2_NEXT_MB", "TF_DS_L2_STRETCH_END_MB" }, 0..) |name, i| {
-            if (std.c.getenv(name)) |v| round.l2_mb[i] = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_mb[i];
-        }
-        if (std.c.getenv("TF_EXL3_L2_DELAY_NS")) |v| ops_mod.l2_delay_ns = std.fmt.parseInt(c_longlong, std.mem.span(v), 10) catch ops_mod.l2_delay_ns;
-        if (std.c.getenv("TF_EXL3_L2_RATE_GBPS")) |v| ops_mod.l2_rate_gbps = std.fmt.parseFloat(f64, std.mem.span(v)) catch ops_mod.l2_rate_gbps;
-        m.round_ms = o.round_ms orelse &draft.round_ms;
-        if (m.round_ms.len == 0) return error.BadRoundMs;
-        m.pool_cap = o.pool;
-        m.ctx_cap = if (o.context != 0) @min(o.context, o.pool) else o.pool;
-        m.fill_slot = 0;
-        m.prof = false;
-        m.timer = null;
-        m.ptimer = null;
-        m.t_enqueue = 0;
-        m.t_forward = 0;
-        m.t_absorb = 0;
-        m.dpool = null;
-        m.dr = null;
-        m.tables = null;
-        m.epool = null;
-        m.aio = null;
-        m.paio = null;
-        m.eh = null;
-        m.rdma_mod = null;
-        m.ring = null;
-        m.graphs = null;
-        m.pgraphs = null;
-        m.two = null;
-        m.waves = wavesOn();
-        prompt.waves = m.waves;
-        m.cs = null;
-        m.comm2 = null;
-        m.rdma_rings = null;
-        m.neighbor_gather = null;
-        m.watch = .{};
-        const d = ctx.d;
-        m.cfg = try Config.read(a, io, o.model_dir);
-        const c = &m.cfg;
-        m.stream = try cuda.Stream.init(d, true);
-        errdefer m.stream.deinit();
+    pub fn has(f: SetFinds, name: []const u8, args: []const cuda.aot.Arg, consts: []const cuda.aot.Const) bool {
+        _ = f.set.find(name, args, consts) catch return false;
+        return true;
+    }
 
     /// The base set alone: the extra set's launches (the two-block readers) are not looked up by the checks that take this lookup.
     pub fn hasExtra(f: SetFinds, name: []const u8, args: []const cuda.aot.Arg, consts: []const cuda.aot.Const) bool {
@@ -297,6 +150,7 @@ const KitFinds = struct {
         const x = f.extra orelse return false;
         return x.lookup(name, args, consts) != null;
     }
+};
 
 /// The Spark-class box's memory: a default of 4,096-row passes needs about 1.5 GiB more a node (measured) and, with the stagger, the
 /// guard below; a box with less than this much (CUDA's total) keeps 2,048-row passes. The default only: a setting is the operator's.
@@ -788,6 +642,7 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         .graph_cap = @intCast(@min(o.graph_cap, std.math.maxInt(u32))),
         .pool = o.pool,
         .replay_floor = @intFromBool(prompt.replay_floor),
+        .exch = prompt2d.exchAsked(),
     };
 }
 

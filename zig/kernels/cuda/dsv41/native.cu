@@ -1330,12 +1330,41 @@ struct Ops {
     const uint8_t* q1;
     const float* s1;
     int kb_split;
+    // a third base from K block kb_split2 on (load_stage / load_a with THREE): block kb - kb_split2 of q2 / s2
+    const uint8_t* q2;
+    const float* s2;
+    int kb_split2;
+    int64_t ldq2, lds2;  // the third base's row strides (the first two bases use ldq / lds)
     __device__ __forceinline__ const uint8_t* w(int i) const { return i ? w1 : w0; }
     __device__ __forceinline__ const uint8_t* ws(int i) const { return i ? ws1 : ws0; }
 };
 
+// the activation rows' base for K block kb0: the first, from kb_split on the second (TWO), from kb_split2 on the third (THREE)
+struct ABase {
+    const uint8_t* q;
+    const float* s;
+    int kb;
+    int64_t ldq, lds;
+};
+template <bool TWO, bool THREE>
+__device__ __forceinline__ ABase abase(const Ops& o, int kb0) {
+    ABase b{o.q, o.s, kb0, o.ldq, o.lds};
+    if constexpr (TWO || THREE) {
+        if (kb0 >= o.kb_split) b = ABase{o.q1, o.s1, kb0 - o.kb_split, o.ldq, o.lds};
     }
+    if constexpr (THREE) {
+        if (kb0 >= o.kb_split2) b = ABase{o.q2, o.s2, kb0 - o.kb_split2, o.ldq2, o.lds2};
     }
+    return b;
+}
+
+template <class C, bool TWO = false, bool THREE = false>
+__device__ __forceinline__ void load_stage(char* st, const int* srow, const Ops& o, int kb0) {
+    const int tid = threadIdx.x;
+    const ABase ab = abase<TWO, THREE>(o, kb0);
+    const uint8_t* qa = ab.q;
+    const float* sa = ab.s;
+    const int kba = ab.kb;
     char* A = st;
     char* B = A + C::A_BYTES;
     char* AS = B + C::B_BYTES;
@@ -1346,10 +1375,12 @@ struct Ops {
         const int row = srow[r];
         const bool ok = row >= 0;
         void* dst = A + r * C::SA + C::pa(r, cc) * 16;
+        const uint8_t* src = qa + size_t(ok ? row : 0) * ab.ldq + kba * 32 + cc * 16;
         if (o.stream) cp16h(dst, src, ok, pa);
         else cp16(dst, src, ok);
         const int row = srow[r];
         const bool ok = row >= 0;
+        const float* src = sa + size_t(ok ? row : 0) * ab.lds + kba;
         if (C::KBS == 4) cp16(AS + r * 16, src, ok);
         else cp8(AS + r * 8, src, ok);
     constexpr int CPB = C::FMT ? C::KBS : C::KBS * 2;
@@ -1556,6 +1587,10 @@ __device__ __forceinline__ void run_tile(char* smem, const int* srow, const uint
     }
 }
 
+template <class C, bool THREE = false>
+    const ABase ab = abase<false, THREE>(o, kb0);
+        const uint8_t* src = ab.q + size_t(ok ? row : 0) * ab.ldq + ab.kb * 32 + cc * 16;
+        cp16(AS + r * 16, ab.s + size_t(ok ? row : 0) * ab.lds + ab.kb, ok);
 // the tile list of the grouped experts: (expert, first row) for every BM rows of every active expert, in act order
 __device__ __forceinline__ void tiles_of(const int* off, const int* act, const int* nact, int bm, int2* tiles,
                                          int* ntiles) {

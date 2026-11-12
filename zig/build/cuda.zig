@@ -197,6 +197,12 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     ds_wp4_replay.addImport("dsv41", ds_check.import_table.get("dsv41").?);
     ds_wp4_replay.addImport("cuda", cuda);
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-wp4-replay", .root_module = ds_wp4_replay }));
+    // The owned-row paths against a whole chunk's launches on the real kernels (TF_DS_FRONT_OWNED's front,
+    // TF_DS_FFN_CODES's routing): each path's rows the bytes the 2,048-row launches give them, at owned blocks of 512,
+    const ds_rows_replay = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/rows_replay_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    ds_rows_replay.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+    ds_rows_replay.addImport("cuda", cuda);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-rows-replay", .root_module = ds_rows_replay }));
     // WP6: _index_score_rows at TF_DS_IDX_RB=1 (today) vs 2 (the kit's own other capture), random fixed-seed data,
     // keyed and plain, even and odd row counts, bit compared
     const ds_idx_replay = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/idx_replay_main.zig"), .target = target, .optimize = optimize, .link_libc = true });

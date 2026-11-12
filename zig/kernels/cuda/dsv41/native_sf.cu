@@ -1,3 +1,18 @@
+template <class C, int MODE, bool FULL, bool TWO = false, bool THREE = false>
+        if (nx < nst) pf::load_stage<C, TWO, THREE>(smem + (nx % C::STAGES) * C::STAGE, srow, o, kb_lo + nx * C::KBS);
+template <class C, int MODE, bool SPLIT, bool FULL, bool TWO = false, bool THREE = false>
+        if (s < nst) pf::load_stage<C, TWO, THREE>(smem + s * C::STAGE, srow, o, kb_lo + s * C::KBS);
+        for (int st = 0; st < nst; st++) fp8_stage<C, MODE, FULL, TWO, THREE>(smem, srow, wss, o, nkb, kb_lo, nst, st, mvalid, acc);
+            for (; st < st_end; st++) fp8_stage<C, MODE, FULL, TWO, THREE>(smem, srow, wss, o, nkb, kb_lo, nst, st, mvalid, part);
+template <class C, int MODE, bool SPLIT, bool TWO = false, bool THREE = false>
+    if (mvalid >= C::BM) tile_fp8_1<C, MODE, SPLIT, true, TWO, THREE>(smem, srow, wss, o, nkb, kb_lo, kb_hi, fold, mvalid, acc);
+    else tile_fp8_1<C, MODE, SPLIT, false, TWO, THREE>(smem, srow, wss, o, nkb, kb_lo, kb_hi, fold, mvalid, acc);
+template <class C, int MODE, bool FULL, bool THREE = false>
+            pf::load_a<C, THREE>(aring + s * P::A_SLOT, srow, o, s * C::KBS);
+                pf::load_a<C, THREE>(aring + (nx % C::STAGES) * P::A_SLOT, srow, o, nx * C::KBS);
+template <class C, int MODE, bool THREE = false>
+    if (mvalid >= C::BM) tile_fp4_1<C, MODE, true, THREE>(smem, srow, o, nkb, mvalid, acc);
+    else tile_fp4_1<C, MODE, false, THREE>(smem, srow, o, nkb, mvalid, acc);
 // ROWMAP: the order of a launch's CTAs by row quarter. A CTA's place in the launch, order = blockIdx.x + blockIdx.y * gridDim.x,
 // gives its row tile and column tile: the launch is two phases (the CTAs before `span`, then the others) of `1 << per_log2` row
 // tiles each, every column of a phase's row tiles before the next phase's, row tiles fastest within a phase; the row tile at
@@ -51,6 +66,37 @@ __device__ __forceinline__ void gemm(const MxArgs& a, const RowOrder& ro = RowOr
     }
     tile_fp8<C, MODE, SPLIT, TWO>(pf::smem, srow, wss, o, nkb, lo, hi, a.kblocks, a.M - m0, acc);
     if constexpr (STAGE) return ::stage_store<C>(a, m0, o.n0, acc);  // y in write-combined host memory
+// THREE: down's activation rows (the pack, hq / hs) as the two pairs' pack parts where they lie, not assembled. A part is its main block
+// [rows, ig] of codes (row stride a.ldq) then its rest block [rows, ir] (ldq_rest), the scales the same (a.lds, lds_rest). K blocks
+// [0, kb_main) come from the first part's main block (a.q, a.s), [kb_main, 2 kb_main) from the second's (q1, s1), and the rest block from
+// the part of the pair that computed the tile's expert's rest (owner[e], 0: the first), at (qr0, sr0) / (qr1, sr1), the pointers at the
+// first row of the rest block.
+struct Part3 {
+    const uint8_t* q1;
+    const float* s1;
+    const uint8_t* qr0;
+    const float* sr0;
+    const uint8_t* qr1;
+    const float* sr1;
+    const int* owner;
+    int64_t ldq_rest, lds_rest;  // the rest block's row strides (bytes, floats); a.ldq / a.lds are the main blocks'
+    int kb_main;
+};
+
+__device__ __forceinline__ void dn(const DnArgs& a, const int2* __restrict__ tiles, const int* __restrict__ ntiles, const Part3& p3 = Part3{}) {
+    if constexpr (THREE) {
+        const bool second = p3.owner[e] != 0;
+        o.q1 = p3.q1;
+        o.s1 = p3.s1;
+        o.kb_split = p3.kb_main;
+        o.q2 = second ? p3.qr1 : p3.qr0;
+        o.s2 = second ? p3.sr1 : p3.sr0;
+        o.kb_split2 = 2 * p3.kb_main;
+        o.ldq2 = p3.ldq_rest;
+        o.lds2 = p3.lds_rest;
+    }
+        tile_fp8<C, MODE, false, false, THREE>(pf::smem, srow, wss, o, nkb, 0, nkb, nkb, cnt - m0, acc);
+        tile_fp4<C, MODE, THREE>(pf::smem, srow, o, nkb, cnt - m0, acc);
 // The same kernels storing their fp32 tile as whole lines (stage_store), for a y in write-combined host memory.
 extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_gemm_st_kernel(MxArgs a) { sf::gemm<sf::GemmCfg, sf::kChained, false, false, true>(a); }
 extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_gemm_exact_st_kernel(MxArgs a) { sf::gemm<sf::GemmCfg, sf::kExact, false, false, true>(a); }
@@ -118,4 +164,8 @@ extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_split128_exact_st
 }
 extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_split128_exact_st_door_t_kernel(MxArgs a, sf::RowOrder ro, Door d, unsigned long long* __restrict__ ts) {
     gemm_door<false, true, 0>(a, ro, d, ts);
+}
+// tf_dsn_sf_dn_exact_kernel on the pack's two parts and the rest block's owner part where they lie (sf::Part3)
+extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_dn_exact_three_kernel(DnArgs a, const int2* __restrict__ tiles, const int* __restrict__ ntiles, sf::Part3 p) {
+    sf::dn<sf::kExact, true>(a, tiles, ntiles, p);
 }

@@ -7,6 +7,13 @@
 const std = @import("std");
 const cuda = @import("cuda");
 
+/// tf_ds_assemble_rest_kernel's 16-byte units of a main row of `ig` bytes and a rest row of `ir` (assembleRest's ig / 8
+/// and ir / 8 of fp16 values).
+pub fn restUnits(ig: usize, ir: usize) ![2]usize {
+    if (ig % 16 != 0 or ir % 16 != 0) return error.UnsupportedShape;
+    return .{ ig / 16, ir / 16 };
+}
+
 /// launch_shape.h's tf_launch_blocks: a block a `threads` elements, at most 65535.
 fn blocks(count: usize, threads: usize) u32 {
     return @intCast(@min((count + threads - 1) / threads, 65535));
@@ -416,6 +423,18 @@ pub const Ops = struct {
         var a: cuda.Args = .{};
         for ([_]u64{ part0, part1, pick, owner, out }) |v| a.add(v);
         for ([_]usize{ p, ig / 8, ir / 8 }) |v| a.add(@as(c_int, @intCast(v)));
+        try go(o.assemble_rest, s, @intCast(p), 64, &a);
+    }
+
+    /// assemble_rest in bytes: out [P, 2 ig + ir] bytes from the pairs' parts (main rows [P, ig] then rest rows [P, ir]
+    /// bytes each), the rest of a slot from owner[pick]; assembleRest's launch at its 16-byte units (restUnits). The
+    /// pack's codes (a byte a value) or its scales (four bytes a 32-value group).
+    pub fn assembleRestBytes(o: *const Ops, s: cuda.Stream, part0: u64, part1: u64, pick: u64, owner: u64, out: u64, p: usize, ig: usize, ir: usize) !void {
+        if (p == 0) return;
+        const u = try restUnits(ig, ir);
+        var a: cuda.Args = .{};
+        for ([_]u64{ part0, part1, pick, owner, out }) |v| a.add(v);
+        for ([_]usize{ p, u[0], u[1] }) |v| a.add(@as(c_int, @intCast(v)));
         try go(o.assemble_rest, s, @intCast(p), 64, &a);
     }
 

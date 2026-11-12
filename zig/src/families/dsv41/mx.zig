@@ -405,6 +405,8 @@ const split_st_kernels = [4][:0]const u8{ "tf_dsn_pf_gemm_splitA_st_kernel", "tf
     st_door: ?cuda.Function = null,
     // the same kernel on the activation rows' two bases (gemmTwo)
     st_two: ?cuda.Function = null,
+    // down's exact kernel on the pack's two parts and the rest block's owner part where they lie (Part3)
+    dn_three: ?cuda.Function = null,
 
     fn useStaged(sk: *SfKernels) !void {
         // the GPU-scope release with the last arrival's system fence (door_arrive_cta<2>), as combine's door: the per-thread system fence of the
@@ -416,6 +418,49 @@ const split_st_kernels = [4][:0]const u8{ "tf_dsn_pf_gemm_splitA_st_kernel", "tf
         sk.st_split64 = .{ try pf(sk.module, "tf_dsn_sf_split64_st_kernel", sf_split64_smem), try pf(sk.module, "tf_dsn_sf_split64_exact_st_kernel", sf_split64_smem) };
         sk.st_split128 = .{ try pf(sk.module, "tf_dsn_sf_split128_st_kernel", sf_split128_smem), try pf(sk.module, "tf_dsn_sf_split128_exact_st_kernel", sf_split128_smem) };
     }
+        var sk: SfKernels = .{
+        sk.dn_three = pf(m, "tf_dsn_sf_dn_exact_three_kernel", pf_dn_r128_smem) catch null;
+        return sk;
+/// native_sf.cu's sf::Part3 for a pack of `p` slot rows (packCodesPlan): a part is its main block [p, ig] of codes then its rest block
+/// [p, ir], the scales (fp32 a 32-value group) after the codes, main block then rest block; the first part is down's own base
+/// (q, s with ldq ig, lds ig / 32). q1 / s1 the second part's main block, qr0 / sr0 and qr1 / sr1 the rest blocks of the two parts,
+/// ldq_rest = ir and lds_rest = ir / 32 their row strides, the int32 [E + 1] owner table, kb_main the K blocks of one pair's main columns.
+pub const Part3 = extern struct { q1: u64, s1: u64, qr0: u64, sr0: u64, qr1: u64, sr1: u64, owner: u64, ldq_rest: i64, lds_rest: i64, kb_main: c_int };
+
+/// The pack's two parts in pair order (the codes of `rows` slot rows, a main block `ig` and a rest block `ir` wide, packCodesPlan's layout).
+pub const Three = struct { p0: u64, p1: u64, rows: usize, ig: usize, ir: usize };
+
+/// Whether down reads the pack from its two parts (the three-base kernel, native_sf.cu's THREE loader): the exact block-scaled expert kernels
+/// are in use on weights whose scales are proven, the kernel is loaded, the rest blocks have their owner table, and down's K is the two pairs'
+/// main blocks and one rest block. False: the parts are assembled into hq / hs and down reads those.
+pub fn threeTakes(k: *const Kernels, ex: weights.Experts, sc: ExpertScratch, ig: usize, ir: usize) bool {
+    const nx = ex.native orelse return false;
+    const rest = ex.rest orelse return false;
+    _ = rest;
+    const sk = k.sfk orelse return false;
+    if (!pfExperts(k, sc, ex.down_k, ex.down_n, 0)) return false;
+    return ig % 32 == 0 and ir % 32 == 0 and ex.down_k == 2 * ig + ir;
+}
+
+/// The byte offsets, from a part's start, of a pack part's blocks for `p` slot rows of a main block `ig` and a rest block `ir` wide: the
+/// main codes at 0, the rest codes after them, the main scales after all the codes, the rest scales after those.
+pub const PackBlocks = struct { main_q: usize, rest_q: usize, main_s: usize, rest_s: usize };
+pub fn packBlocks(p: usize, ig: usize, ir: usize) PackBlocks {
+    const codes = p * (ig + ir);
+    return .{ .main_q = 0, .rest_q = p * ig, .main_s = codes, .rest_s = codes + p * (ig / 32) * 4 };
+}
+
+/// Where down's K block `kb` of slot row `m` lies when read from the two parts and the owner's rest block (the mapping
+/// native_sf.cu's THREE loader makes): (which part, byte offset in it, bytes in a block, scale float offset in it).
+pub fn packAt(p: usize, ig: usize, ir: usize, owner_second: bool, kb: usize, m: usize) struct { part: u1, q: usize, s: usize } {
+    const b = packBlocks(p, ig, ir);
+    const kmain = ig / 32;
+    if (kb < kmain) return .{ .part = 0, .q = b.main_q + m * ig + kb * 32, .s = b.main_s + (m * kmain + kb) * 4 };
+    if (kb < 2 * kmain) return .{ .part = 1, .q = b.main_q + m * ig + (kb - kmain) * 32, .s = b.main_s + (m * kmain + kb - kmain) * 4 };
+    const r = kb - 2 * kmain;
+    return .{ .part = @intFromBool(owner_second), .q = b.rest_q + m * ir + r * 32, .s = b.rest_s + (m * (ir / 32) + r) * 4 };
+}
+
 /// Whether a dense GEMM's y takes the whole-line kernels: fp32, written (not added to), 16-byte aligned with whole float4 rows,
 /// and in the transport's arena (Kernels.useStaged).
 pub fn stagedY(k: *const Kernels, y: u64, ldy: usize, y_dtype: DType, accumulate: bool) bool {
@@ -1140,6 +1185,8 @@ pub const ExpertScratch = struct {
     // tile kernels
     tiles: u64 = 0,
     ntiles: u64 = 0,
+    /// down's activation read from the pack's two parts where they lie (TF_DS_ROCI_CODES, threeTakes): none, down reads hq / hs
+    three: ?Three = null,
 
     /// Bytes of the prefill tile list for `rows` rows of `slots` slots and `e` experts.
     pub fn tileBytes(rows: usize, slots: usize, e: usize) usize {
@@ -1208,6 +1255,7 @@ fn nactLog(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScr
         // x's codes last: gate / up (a programmatic dependent launch) reads the groups before it waits for them
         return quantDec(k, s, x, .bf16, ldx, r, ex.dims, sc.q, ex.dims, sc.s, ex.dims / 32);
     }
+    if (!coded) try quant(k, s, x, .bf16, ldx, r, ex.dims, sc.q, ex.dims, sc.s, ex.dims / 32);
     try d.check(d.api.cuMemsetD32Async(sc.cnt, 0, e, s.handle), "cuMemsetD32Async");
     var a: cuda.Args = .{};
     a.add(pick);
@@ -1264,8 +1312,16 @@ pub const dec_dn_ks = 2;
 /// split: a decode launch, the GEMV kernels (a warp a column, each row its own arithmetic: its bits at any row count);
 /// prompt chunks: false, the MMA tiles.
 pub fn gateUp(k: *const Kernels, s: cuda.Stream, d: *const cuda.Driver, ex: weights.Experts, sc: ExpertScratch, x: u64, ldx: usize, pick: u64, wts: u64, r: usize, limit: f32, h: u64, ldh: usize, split: bool) !void {
+}
+
+/// gateUp of a prompt chunk's r rows whose codes and scales are in sc.q / sc.s already (act_quant of x's rows [r, D],
+/// the bytes group() would write): the same grouping and launches, without the quant.
+pub fn gateUpCodes(k: *const Kernels, s: cuda.Stream, d: *const cuda.Driver, ex: weights.Experts, sc: ExpertScratch, pick: u64, wts: u64, r: usize, limit: f32, h: u64, ldh: usize) !void {
+}
+
     const nx = ex.native orelse return error.NotNativeExperts;
     if (r > sc.rows) return error.ScratchTooSmall;
+    try group(k, s, d, ex, sc, x, ldx, pick, r, split and k.dec_on, coded);
     const dd: usize = ex.dims;
     const a: GuArgs = .{
         .q = sc.q,
@@ -1349,8 +1405,16 @@ fn pfExperts(k: *const Kernels, sc: ExpertScratch, kdim: usize, n: usize, main: 
 /// split: a decode launch, the GEMV kernel (as gateUp).
 pub fn down(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScratch, h: u64, ldh: usize, pick: u64, r: usize, out: u64, ldo: usize, accumulate: bool, split: bool) !void {
     return downOf(k, s, ex, sc, h, ldh, pick, r, out, ldo, accumulate, split, false, null);
+}
+
     return downOf(k, s, ex, sc, 0, ex.down_k, pick, r, out, ldo, accumulate, true, true, null);
+/// down of a prompt chunk's r rows whose intermediate's codes and scales are in sc.hq / sc.hs already (act_quant of
+/// the assembled intermediate [r * slots, down_k], the bytes down's quant would write): the same launches without the
+/// quant.
+pub fn downCodes(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScratch, pick: u64, r: usize, out: u64, ldo: usize, accumulate: bool) !void {
     return downOf(k, s, ex, sc, 0, ex.down_k, pick, r, out, ldo, accumulate, false, true, null);
+}
+
 /// down of a prompt chunk with its routed sum in two stages (TF_DS_ROCI_COMBINE_FIRST): the same launches as `down`, the
 /// last one (tf_dsn_combine) over the row blocks of `cf` in its order.
 pub fn downFirst(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScratch, h: u64, ldh: usize, pick: u64, r: usize, out: u64, ldo: usize, accumulate: bool, cf: *const CombineFirst) !void {
@@ -1368,7 +1432,9 @@ fn downOf(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScra
     const i: usize = ex.down_k;
     const n: usize = ex.down_n;
     const p = r * sc.slots;
+    if (!coded) {
         if (split) try quantDec(k, s, h, .bf16, ldh, p, i, sc.hq, i, sc.hs, i / 32) else try quant(k, s, h, .bf16, ldh, p, i, sc.hq, i, sc.hs, i / 32);
+    }
     const a: DnArgs = .{
         .q = sc.hq,
         .s = sc.hs,
@@ -1406,8 +1472,25 @@ fn downOf(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScra
     } else if (split) {
         if (k.sab) try launch(k.dn_sab, s, .{ cdiv(n, 16), ny, 1 }, 256, &args) else try launch(k.dn_gemv, s, .{ cdiv(n, 8), ny, 1 }, 256, &args);
     } else if (pfExperts(k, sc, i, n, 0)) {
+        if (sc.three) |th| {
+            // the pack's parts where they lie: the first part is the base (its main block), the second's main block and both rest blocks ride along
+            const rest = ex.rest orelse return error.NoRest;
+            const b = packBlocks(th.rows, th.ig, th.ir);
+            var a3 = a;
+            a3.q = th.p0 + b.main_q;
+            a3.s = th.p0 + b.main_s;
+            a3.ldq = @intCast(th.ig);
+            a3.lds = @intCast(th.ig / 32);
+            var args3: cuda.Args = .{};
+            args3.add(a3);
+            args3.add(sc.tiles);
+            args3.add(sc.ntiles);
+            args3.add(Part3{ .q1 = th.p1 + b.main_q, .s1 = th.p1 + b.main_s, .qr0 = th.p0 + b.rest_q, .sr0 = th.p0 + b.rest_s, .qr1 = th.p1 + b.rest_q, .sr1 = th.p1 + b.rest_s, .owner = rest.owner, .ldq_rest = @intCast(th.ir), .lds_rest = @intCast(th.ir / 32), .kb_main = @intCast(th.ig / 32) });
+            try launchShared(f3, s, .{ n / 128, p / pf_bm + ex.count, 1 }, pf_dn_r128_smem, &args3);
+        } else {
             args.add(sc.tiles);
             args.add(sc.ntiles);
+        }
     } else {
         const t = @min(tiles(r), 2);
         try launch(k.dn[t], s, .{ cdiv(n / 32, 4), ny, 1 }, 128, &args);

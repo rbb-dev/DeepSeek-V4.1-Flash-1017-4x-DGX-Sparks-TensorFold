@@ -2829,6 +2829,260 @@ fn rociTwoBasePages(r: *Run, rng_in: std.Random) !void {
     r.report("roci_two_base_pages control: one code byte of the second part changed, in the last kind's block", control_diff, false);
 }
 
+// -- down on the pack's two parts where they lie ----------------------------------------------------------------------------------
+
+/// Down of the grouped experts (the exact block-scaled kernel, 4,096 rows x 7 slots, the replay's experts with a random owner of each rest block)
+/// reading its activation rows from the two pairs' pack parts where they lie (tf_dsn_sf_dn_exact_three_kernel: K blocks 0 .. 15 from the first
+/// part's main codes, 16 .. 31 from the second's, 32 .. 35 from the part of the pair that computed the tile's expert's rest) against the baseline path:
+/// tf_ds_assemble_rest in codes and in scales (prompt2d.packAssemble) into hq / hs and the exact down kernel on them. Every output byte equal; one
+/// code byte of the second part changed must differ. The ms are the assembly and down, and down on the parts.
+fn rociThreeBase(r: *Run, rng_in: std.Random) !void {
+    _ = rng_in;
+    var prng = std.Random.DefaultPrng.init(0x3ba5e);
+    const rng = prng.random();
+    const d = r.d;
+    const sk = r.k.sfk orelse return r.note("roci_three_base: the block-scaled kernels (native_sf.cu) load on this GPU", false);
+    const ops = r.ops orelse return r.note("roci_three_base: the ops are available", false);
+    if (X_I != 1152 or X_MAIN != 512 or X_W != 640) return r.note("roci_three_base: the pack is 512 + 512 main columns and a 128-column rest", false);
+    var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sarena.deinit();
+    const ha = sarena.allocator();
+    var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer for (keep.items) |*b| b.free();
+    const R: usize = 4096;
+    const P = R * X_SL;
+    const ex = try xExperts(d, rng, ha, &keep);
+    const nx = ex.native.?;
+    const x = try upload(d, try bf16s(R * X_D, rng, 0.5, ha));
+    const p = try xPicks(R, rng, ha);
+    const pb = try upload(d, std.mem.sliceAsBytes(p.pick));
+    try keep.append(ha, x);
+    try keep.append(ha, pb);
+    const sc = try xScratch(d, R, true, ha, &keep);
+    try mx.quant(r.k, r.s, x.ptr, .bf16, X_D, R, X_D, sc.q, X_D, sc.s, X_D / 32);
+    try mx.grouping(r.k, r.s, d, X_E, sc, pb.ptr, R);
+    try mx.tileList(r.k, r.s, sc);
+    const pc = try dsv41.prompt2d.packCodesPlan(P, 512, 128);
+    var parts: [2]u64 = undefined;
+    for (0..2) |i| {
+        const xd = try upload(d, try bf16s(P * X_W, rng, 0.5, ha));
+        const pbuf = try cuda.DeviceBuffer.alloc(d, pc.bytes);
+        try keep.append(ha, xd);
+        try keep.append(ha, pbuf);
+        parts[i] = pbuf.ptr;
+        try dsv41.prompt2d.packQuant(r.k, r.s, xd.ptr, pbuf.ptr, pc);
+    }
+    const o_a = try cuda.DeviceBuffer.alloc(d, P * X_N * 4);
+    const o_b = try cuda.DeviceBuffer.alloc(d, P * X_N * 4);
+    try keep.append(ha, o_a);
+    try keep.append(ha, o_b);
+    const grid_y: usize = P / mx.pf_bm + X_E;
+    const C = struct {
+        r: *Run,
+        sc: mx.ExpertScratch,
+        nx: weights.NativeExperts,
+        f: cuda.Function,
+        f3: cuda.Function,
+        parts: [2]u64,
+        pc: dsv41.prompt2d.PackCodes,
+        pick: u64,
+        out: u64,
+        three: bool,
+        grid_y: usize,
+
+        fn dnArgs(c: @This()) mx.DnArgs {
+            return .{ .q = c.sc.hq, .s = c.sc.hs, .ldq = X_I, .lds = X_I / 32, .ent = c.sc.ent, .off = c.sc.off, .act = c.sc.act, .nact = c.sc.nact, .w2 = c.nx.w2, .s2 = c.nx.s2, .ldw = X_I / 2, .ldws = X_I / 32, .fmt = 1, .shared = X_E - 1, .sldw = X_I, .sldws = X_I / 32, .I = X_I, .N = X_N, .round_bf16 = 0, .out = c.out, .ldo = X_N };
+        }
+
+        fn go(c: @This()) anyerror!void {
+            var args: cuda.Args = .{};
+            var a = c.dnArgs();
+            if (c.three) {
+                // a part: its main block [P, 512] of codes then its rest block [P, 128]; the scales after the codes, main [P, 16] then rest [P, 4]
+                const b = mx.packBlocks(c.pc.p, 512, 128);
+                a.q = c.parts[0] + b.main_q;
+                a.s = c.parts[0] + b.main_s;
+                a.ldq = 512;
+                a.lds = 16;
+                args.add(a);
+                args.add(c.sc.tiles);
+                args.add(c.sc.ntiles);
+                const p3: mx.Part3 = .{ .q1 = c.parts[1] + b.main_q, .s1 = c.parts[1] + b.main_s, .qr0 = c.parts[0] + b.rest_q, .sr0 = c.parts[0] + b.rest_s, .qr1 = c.parts[1] + b.rest_q, .sr1 = c.parts[1] + b.rest_s, .owner = c.nx.owner, .ldq_rest = 128, .lds_rest = 4, .kb_main = 16 };
+                args.add(p3);
+                try cuda.launch.launch(c.f3, .{ .grid = .{ .x = X_N / 128, .y = @intCast(c.grid_y), .z = 1 }, .block = .{ .x = 256 }, .shared = mx.pf_dn_r128_smem }, c.r.s, &args);
+            } else {
+                try dsv41.prompt2d.packAssemble(c.r.ops.?, c.r.s, c.parts[0], c.parts[1], c.pick, c.nx.owner, c.sc, c.pc);
+                args.add(a);
+                args.add(c.sc.tiles);
+                args.add(c.sc.ntiles);
+                try cuda.launch.launch(c.f, .{ .grid = .{ .x = X_N / 128, .y = @intCast(c.grid_y), .z = 1 }, .block = .{ .x = 256 }, .shared = mx.pf_dn_r128_smem }, c.r.s, &args);
+            }
+        }
+    };
+    _ = ops;
+    var three = today;
+    three.out = o_b.ptr;
+    three.three = true;
+    const bytes = P * X_N * 4;
+    try poison(o_a.ptr, bytes, d, r.s);
+    try today.go();
+    try r.s.synchronize();
+    const ref = try get(o_a.ptr, bytes, d);
+    defer free(ref);
+    try poison(o_b.ptr, bytes, d, r.s);
+    try three.go();
+    try r.s.synchronize();
+    const got = try get(o_b.ptr, bytes, d);
+    defer free(got);
+    const ms_today = try kernelBest(r, C, today, C.go);
+    const ms_three = try kernelBest(r, C, three, C.go);
+    // the control: a main code of the second part changed
+    var one: [1]u8 = undefined;
+    const flipped = [1]u8{one[0] ^ 0x10};
+    try poison(o_b.ptr, bytes, d, r.s);
+    try three.go();
+    try r.s.synchronize();
+    const cut = try get(o_b.ptr, bytes, d);
+    defer free(cut);
+    var t: WcText = .{};
+    // where the outputs first differ, and how many entries differ, so a failing run says where to look
+    var first: ?usize = null;
+    var bad_entries: usize = 0;
+    {
+        const row_bytes = X_N * 4;
+        var last_bad: usize = std.math.maxInt(usize);
+        for (ref, got, 0..) |rb, gb, i| if (rb != gb) {
+            if (first == null) first = i;
+            if (i / row_bytes != last_bad) {
+                last_bad = i / row_bytes;
+                bad_entries += 1;
+            }
+        };
+    }
+    if (first) |f| {
+        const ent = f / (X_N * 4);
+        try t.add("; FIRST DIFFERENCE at entry {d} (row {d}, slot {d}), column {d}; {d} of {d} entries differ", .{ ent, ent / X_SL, ent % X_SL, (f % (X_N * 4)) / 4, bad_entries, P });
+    }
+    r.note(t.buf[0..t.n], true);
+    r.report("roci_three_base down: the entries' outputs from the pack's parts where they lie against the assembled input", differs(ref, got), true);
+    r.report("roci_three_base down control: one main code of the second part changed", differs(ref, cut), false);
+}
+
+/// roci_three_base in the engine's own memory kinds: the two parts of the pack in device memory (the earlier replay), in write-combined host memory,
+/// in locked 4 KiB pages as rdma.Pinned makes them, and in locked pages with MADV_HUGEPAGE before first touch. Down on the two parts (the three-base
+/// kernel, kernel only, ms for 4,096 rows x 7 slots) in each kind; the outputs byte for byte against the baseline path on the device parts; a control
+/// changes one main code of the second part in the last kind.
+fn rociThreeBasePages(r: *Run, rng_in: std.Random) !void {
+    _ = rng_in;
+    var prng = std.Random.DefaultPrng.init(0x3ba5f);
+    const rng = prng.random();
+    const d = r.d;
+    const sk = r.k.sfk orelse return r.note("roci_three_base_pages: the block-scaled kernels (native_sf.cu) load on this GPU", false);
+    const f3 = sk.dn_three orelse return r.note("roci_three_base_pages: tf_dsn_sf_dn_exact_three_kernel loads", false);
+    if (X_I != 1152 or X_MAIN != 512 or X_W != 640) return r.note("roci_three_base_pages: the pack is 512 + 512 main columns and a 128-column rest", false);
+    var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sarena.deinit();
+    const ha = sarena.allocator();
+    var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer for (keep.items) |*b| b.free();
+    const R: usize = 4096;
+    const P = R * X_SL;
+    const ex = try xExperts(d, rng, ha, &keep);
+    const nx = ex.native.?;
+    const x = try upload(d, try bf16s(R * X_D, rng, 0.5, ha));
+    const p = try xPicks(R, rng, ha);
+    const pb = try upload(d, std.mem.sliceAsBytes(p.pick));
+    try keep.append(ha, x);
+    try keep.append(ha, pb);
+    const sc = try xScratch(d, R, true, ha, &keep);
+    try mx.quant(r.k, r.s, x.ptr, .bf16, X_D, R, X_D, sc.q, X_D, sc.s, X_D / 32);
+    try mx.grouping(r.k, r.s, d, X_E, sc, pb.ptr, R);
+    try mx.tileList(r.k, r.s, sc);
+    const pc = try dsv41.prompt2d.packCodesPlan(P, 512, 128);
+    var dev: [2]u64 = undefined;
+    for (0..2) |i| {
+        const xd = try upload(d, try bf16s(P * X_W, rng, 0.5, ha));
+        const pbuf = try cuda.DeviceBuffer.alloc(d, pc.bytes);
+        try keep.append(ha, xd);
+        try keep.append(ha, pbuf);
+        dev[i] = pbuf.ptr;
+        try dsv41.prompt2d.packQuant(r.k, r.s, xd.ptr, pbuf.ptr, pc);
+    }
+    const bytes = P * X_N * 4;
+    const o_a = try cuda.DeviceBuffer.alloc(d, bytes);
+    try keep.append(ha, o_a);
+    const grid_y: usize = P / mx.pf_bm + X_E;
+    const C = struct {
+        r: *Run,
+        sc: mx.ExpertScratch,
+        nx: weights.NativeExperts,
+        f3: cuda.Function,
+        parts: [2]u64,
+        pc: dsv41.prompt2d.PackCodes,
+        out: u64,
+        grid_y: usize,
+
+        fn go(c: @This()) anyerror!void {
+            var args: cuda.Args = .{};
+            const b = mx.packBlocks(c.pc.p, 512, 128);
+            const a: mx.DnArgs = .{ .q = c.parts[0] + b.main_q, .s = c.parts[0] + b.main_s, .ldq = 512, .lds = 16, .ent = c.sc.ent, .off = c.sc.off, .act = c.sc.act, .nact = c.sc.nact, .w2 = c.nx.w2, .s2 = c.nx.s2, .ldw = X_I / 2, .ldws = X_I / 32, .fmt = 1, .shared = X_E - 1, .sldw = X_I, .sldws = X_I / 32, .I = X_I, .N = X_N, .round_bf16 = 0, .out = c.out, .ldo = X_N };
+            args.add(a);
+            args.add(c.sc.tiles);
+            args.add(c.sc.ntiles);
+            const p3: mx.Part3 = .{ .q1 = c.parts[1] + b.main_q, .s1 = c.parts[1] + b.main_s, .qr0 = c.parts[0] + b.rest_q, .sr0 = c.parts[0] + b.rest_s, .qr1 = c.parts[1] + b.rest_q, .sr1 = c.parts[1] + b.rest_s, .owner = c.nx.owner, .ldq_rest = 128, .lds_rest = 4, .kb_main = 16 };
+            args.add(p3);
+            try cuda.launch.launch(c.f3, .{ .grid = .{ .x = X_N / 128, .y = @intCast(c.grid_y), .z = 1 }, .block = .{ .x = 256 }, .shared = mx.pf_dn_r128_smem }, c.r.s, &args);
+        }
+    };
+    var hr = try dsv41.rdma.HostReg.open();
+    defer hr.lib.close();
+    var pool: WcPool = .{ .d = d };
+    defer pool.deinit();
+    const names = [_][]const u8{ "parts in device memory (the earlier replay)", "parts in write-combined host memory", "parts in locked 4 KiB pages (rdma.Pinned: no madvise)", "parts in locked pages with MADV_HUGEPAGE before first touch" };
+    var ref: ?[]u8 = null;
+    defer if (ref) |rf| free(rf);
+    var control_diff: usize = 0;
+    var line: [640]u8 = undefined;
+    for (0..4) |v| {
+        var parts: [2]u64 = dev;
+        var pinned: [2]?dsv41.rdma.Pinned = .{ null, null };
+        defer for (&pinned) |*pq| if (pq.*) |*pp| pp.free(&hr);
+        if (v != 0) for (0..2) |i| {
+            parts[i] = switch (v) {
+                1 => (try pool.alloc(.arena, pc.bytes)).dev,
+                2 => blk: {
+                    pinned[i] = try dsv41.rdma.Pinned.alloc(d, &hr, pc.bytes);
+                    break :blk pinned[i].?.dev;
+                },
+                else => (try pool.alloc(.mmapreg, pc.bytes)).dev,
+            };
+        };
+        try r.s.synchronize();
+        const c: C = .{ .r = r, .sc = sc, .nx = nx, .f3 = f3, .parts = parts, .pc = pc, .out = o_a.ptr, .grid_y = grid_y };
+        try poison(o_a.ptr, bytes, d, r.s);
+        try c.go();
+        try r.s.synchronize();
+        const got = try get(o_a.ptr, bytes, d);
+        if (ref == null) ref = got else {
+            defer free(got);
+            r.report(try std.fmt.bufPrint(&line, "roci_three_base_pages {s}: down's output against the device-parts output", .{names[v]}), differs(ref.?, got), true);
+        }
+        const ms = try kernelBest(r, C, c, C.go);
+        r.note(try std.fmt.bufPrint(&line, "roci_three_base_pages {s}: down on the two parts {d:.3} ms (4,096 rows x 7 slots, kernel only)", .{ names[v], ms }), true);
+        if (v == 3) {
+            var one: [1]u8 = undefined;
+            const flipped = [1]u8{one[0] ^ 0x10};
+            try poison(o_a.ptr, bytes, d, r.s);
+            try c.go();
+            try r.s.synchronize();
+            const cut = try get(o_a.ptr, bytes, d);
+            defer free(cut);
+            control_diff = differs(ref.?, cut);
+        }
+    }
+    r.report("roci_three_base_pages control: one main code of the second part changed, in the last kind's block", control_diff, false);
+}
+
 // -- T-ANY: the owned path's launch classes on a node's slab against the whole chunk's launch ----------------------------------------
 
 /// The chunk row counts T-ANY runs: below a block, around the 64-row variants, a tail of the 4,096 pass, and the sizes the lead measures.
@@ -5134,8 +5388,10 @@ fn qgateBody(r: *Run, rng: std.Random) !void {
     .{ "roci_codes", rociCodes, 2 * 2 + 1 + 1 },
     .{ "roci_local_first_wqb", rociLocalFirstWqb, 3 },
     .{ "roci_two_base", rociTwoBase, 3 },
+    .{ "roci_three_base", rociThreeBase, 3 },
     .{ "roci_any_rows", rociAnyRows, 3 * 8 },
     .{ "roci_two_base_pages", rociTwoBasePages, 4 * 2 + 1 },
+    .{ "roci_three_base_pages", rociThreeBasePages, 4 * 2 },
     .{ "roci_any_experts", rociAnyExperts, 2 },
     .{ "roci_any_index", rociAnyIndex, 6 },
     .{ "roci_any_engram", rociAnyEngram, 5 },

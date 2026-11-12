@@ -28,11 +28,7 @@ const Comm = @import("comm.zig").Comm;
 const roci_engine = @import("roci_engine.zig");
 const rocinante = @import("rocinante.zig");
 
-const nccl = cuda.nccl;
-
-/// TF_DS_2D_YX=1 (model.zig sets it, every rank alike; off by default): prompt.gather exchanges the sublayer partials as
-/// their bf16 sums (Two.ySums) instead of the four fp32 quarters.
-pub var y_sums: bool = false;
+const ops_mod = @import("ops.zig");
 
 /// The split of node `g` of `world` nodes: TP over 1 or 2, the 2D split over 4.
 pub fn split(g: u32, world: u32) !plan.Split {
@@ -201,6 +197,7 @@ pub const Settings = extern struct {
     pool: u64, // rank 0's --context (a follower's --pool): a follower's holds rank 0's
 
     pub const tag: u32 = 0x31345344; // "DS41"
+    // the fields or of the follower's answer bumps the last letter, so a follower refuses a rank 0 of another layout.
 
     /// What follower `rank` (its Settings `mine`) would have to change to follow rank 0's `lead`, in words ("": none).
     pub fn differ(mine: Settings, lead: Settings, rank: u32, buf: []u8) []const u8 {
@@ -231,9 +228,18 @@ pub const Settings = extern struct {
         return w.buffered();
     }
 
+            const bit = @as(u32, 1) << @intCast(i);
+            if ((mine ^ lead) & bit == 0) continue;
+            w.print("{s}rank {d} has {s}={d} and rank 0 {d}: set the same on every rank", .{ sepIf(w, sep), rank, name, @intFromBool(mine & bit != 0), @intFromBool(lead & bit != 0) }) catch {};
+        }
+        const other = (mine ^ lead) & ~named;
+    }
+
     fn sepIf(w: *const std.Io.Writer, sep: []const u8) []const u8 {
         return if (w.end > 0) sep else "";
     }
+/// The exchange switches the start-up settings carry (Settings.exch): bit i is exch_names[i], set when asked for. Each
+/// is read once by Model.open, before the settings and its agreement.
 pub const exch_roci_p2_first: u32 = 1 << 8;
 pub const exch_roci_engram_ahead: u32 = 1 << 9;
 pub const exch_roci_sent_first: u32 = 1 << 11;
@@ -245,10 +251,16 @@ pub const exch_ring_word: u32 = 1 << 25;
 pub const exch_ring_word_atomic: u32 = 1 << 26; // the switch's signal is the atomic fetch-and-add (unset: the inline word)
 pub const exch_ring_wait: u32 = 1 << 27; // TF_DS_RING_WAIT: the rings' queue pairs wait in the card (no proxy threads)
 pub const exch_roci_stagger_lanes: u32 = 1 << 28; // TF_DS_ROCI_STAGGER_LANES=3 (unset or 2: clear): three passes in flight, a third lane on every rank
+/// An exchange switch's text: "1" asks for it; unset or any other text does not.
 /// A switch that is on unless set otherwise (TF_DS_ROCI_WAIT, TF_DS_RING_WAIT): unset or "1" is on; any other text, "0" included, is off (a typo
 /// takes the fallback path, never the new one by accident).
 pub fn switchDefaultOn(text: ?[]const u8) bool {
     const v = text orelse return true;
+    return std.mem.eql(u8, v, "1");
+}
+
+pub fn switchAsked(text: ?[]const u8) bool {
+    const v = text orelse return false;
     return std.mem.eql(u8, v, "1");
 }
 
@@ -282,6 +294,9 @@ pub var roci_stagger_lanes: usize = 2;
 pub var roci_stagger3_asked: bool = false;
 pub var roci_stagger_lanes_set: bool = false;
 
+/// Settings.exch of the switches Model.open read.
+pub fn exchAsked() u32 {
+    var x: u32 = 0;
     if (roci_p2_first_asked) x |= exch_roci_p2_first;
     if (roci_engram_ahead_asked) x |= exch_roci_engram_ahead;
     if (roci_sent_first_asked) x |= exch_roci_sent_first;
@@ -293,6 +308,9 @@ pub var roci_stagger_lanes_set: bool = false;
     if (ring_word_asked) x |= exch_ring_word;
     if (ring_word_atomic_asked) x |= exch_ring_word_atomic;
     if (ring_wait_asked) x |= exch_ring_wait;
+    return x;
+}
+
 /// text "1", switchAsked; TF_DS_QGATE_CANARY's "1", "2" or "3", qgateAsked); an empty name is a reserved bit (kern_reserved). Each is read once by Model.open, before the
 };
 
@@ -722,6 +740,8 @@ pub const Two = struct {
     pub fn nodesGather(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, rows: usize) !void {
         const rs = t.rings orelse return error.DecodeNeedsRings;
         try rs.nodesGather(e.s, src, dst, rows, t.rank_of);
+    }
+
     /// This node: 2 p + r.
     pub fn node(t: *const Two) u32 {
         return @intCast(t.r + 2 * t.p);
@@ -739,6 +759,8 @@ pub const Two = struct {
 
     /// wo_2d after wo_a: the rank's four groups (this node's two in ch.u [n, uw[p]], the partner's two), then wo_b
     /// for this pair's output columns: ch.pa [n, ow[p]] fp32, the matching columns of TP2's partial.
+    /// TF_DS_CAT_PARTNER: the rank's four groups from the column partner's part alone (partnerCat), into the same
+    /// bytes of u_full.
     pub fn woB(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer) !void {
         _ = try t.woBOf(e, ch, lay, false);
     }
@@ -772,18 +794,22 @@ pub const Two = struct {
             try mx.gemm(k, e.s, lay.wo_b, pl.q, pl.k, pl.s, pl.k / 32, ch.n, ch.pa, lay.wo_b.n, .f32, false, ch.mxs.z);
             return false;
         }
+        // (the GEMM reading the two pairs' parts where they lie, the two-base read, measured slower on the transport's host pages: 1.860 ms a launch
+        // against the copies and the plain GEMM's 1.302, the A operand's re-reads by the 20 column tiles not served by L2: it stays off)
         return false;
     }
 
     /// moe_2d's experts after the routing: this node's gate / up blocks, the rank's whole intermediate assembled, down
     /// for this node's output columns: ch.pm [n, dw[p]] fp32. A chunk of fewer than EXACT_ROWS rows takes the decode
-    /// window's fused path and scratch (experts2d.fused_ok), as the rounds do.
-    pub fn experts(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer) !void {
+    /// window's fused path and scratch (experts2d.fused_ok), as the rounds do. `x_codes`: x's codes and scales are in
+    /// ch.mxe already (TF_DS_FFN_CODES's routing), gate / up reads them as they are.
     pub fn experts(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer, x_codes: bool, cf: ?*const mx.CombineFirst) !void {
         const c = e.c;
         const n = ch.n;
+        if (e.mx != null) {
             // the pack as codes over the transport (the decode rounds' experts are expertsNative's, through the rings)
             return t.expertsCodes(e, ch, lay.experts, ch.x, c.hidden, ch.pick, ch.wts, ch.xs.xd, ch.pm, n, x_codes, cf);
+        }
         if (x_codes or cf != null) return error.NotNativeExperts;
         if (n < exl3_experts.exact_rows) return round2d.experts(t, e, lay.experts, ch.xsd, ch.x, c.hidden, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
         try exl3_experts2d.gateUp(e.ex, e.s, lay.experts, ch.xs, ch.x, c.hidden, ch.pick, n, c.swiglu_limit);
@@ -800,8 +826,11 @@ pub const Two = struct {
     /// Format.native's experts on a 2D node, chunk or round alike: this node's pack of every expert's gate / up (its main
     /// blocks, its rest block for the experts whose rest is this pair's) into xd [rows * slots, pack] bf16, the rank's
     /// whole intermediate assembled from the two pairs' packs (the same bytes moved as the EXL3 path's fp16 rows), down
+    /// for this node's output columns: out [rows, dw[p]] fp32. split_k: a decode round's (mx.gateUp). x_codes: x's
+    /// codes and scales in ch.mxe already (mx.gateUpCodes).
     pub fn expertsNative(t: *const Two, e: *const prompt.Engine, ch: *const prompt.Chunk, ex: weights.Experts, x: u64, ldx: usize, pick: u64, wts: u64, xd: u64, out: u64, rows: usize, split_k: bool, x_codes: bool, cf: ?*const mx.CombineFirst) !void {
         const k = e.mx.?;
+        if (x_codes) try mx.gateUpCodes(k, e.s, e.d, ex, ch.mxe, pick, wts, rows, e.c.swiglu_limit, xd, ex.width) else try mx.gateUp(k, e.s, e.d, ex, ch.mxe, x, ldx, pick, wts, rows, e.c.swiglu_limit, xd, ex.width, split_k);
         if (!split_k) if (prompt.ptimer) |pt| pt.mark(e.s, .m_gu) catch {};
         }
         if (t.ir != 0) try t.assembleParity(e, ex, xd, pick, rows * ch.mxe.slots) else try t.catRank(e, xd, t.xd_full, rows * ch.mxe.slots, t.gu, 2);
@@ -813,15 +842,34 @@ pub const Two = struct {
         try mx.down(k, e.s, ex, ch.mxe, t.xd_full, ex.down_k, pick, rows, out, t.dw[t.p], false, split_k);
     }
 
+    /// TF_DS_PACK_CODES' experts of a prompt chunk (native, parity; the column ring not taking the pack): gate / up as
+    /// expertsNative into this node's pack xd, the pack quantized as down's quant quantizes it (packQuant: every
+    /// 32-value group of a slot row's main and rest blocks, the groups of down's input), the codes and scales exchanged
+    /// with the column partner in place of the bf16 pack (Two.exchange), both packs' codes and scales assembled as
+    /// assembleParity assembles the values (packAssemble: each slot's rest from its owner pair) into down's input
+    /// (ch.mxe.hq / hs), and down from them (mx.downCodes): out [rows, dw[p]] fp32, the bytes expertsNative gives.
     pub fn expertsCodes(t: *const Two, e: *const prompt.Engine, ch: *const prompt.Chunk, ex: weights.Experts, x: u64, ldx: usize, pick: u64, wts: u64, xd: u64, out: u64, rows: usize, x_codes: bool, cf: ?*const mx.CombineFirst) !void {
+        const k = e.mx.?;
+        const rest = ex.rest orelse return error.NoRest;
+        const pc = try packCodesPlan(rows * ch.mxe.slots, t.gu[t.p], t.ir);
         const mine = t.rc.?.addr(.pack_send);
         const theirs = t.rc.?.addr(.pack_land);
         try t.rc.?.send(e.s, .pack, shape);
         try t.rc.?.wait(e.s, .pack);
+        if (prompt.ptimer) |pt| pt.mark(e.s, .m_x) catch {};
         const part0 = if (t.p == 0) mine else theirs;
         const part1 = if (t.p == 1) mine else theirs;
+        // TF_DS_ROCI_CODES: down reads the two parts where they lie and the owner's rest block (the three-base kernel), no assembly
+        // and no hq / hs; where the kernels do not take the shape, the assembly and down on its output
         if (t.gu[0] == t.gu[1] and mx.threeTakes(k, ex, ch.mxe, t.gu[t.p], t.ir)) {
+            var sc3 = ch.mxe;
+            sc3.three = .{ .p0 = part0, .p1 = part1, .rows = pc.p, .ig = t.gu[t.p], .ir = t.ir };
+            if (cf) |f| return mx.downCodesFirst(k, e.s, ex, sc3, pick, rows, out, t.dw[t.p], false, f);
+            return mx.downCodes(k, e.s, ex, sc3, pick, rows, out, t.dw[t.p], false);
+        }
+        try packAssemble(e.ops, e.s, part0, part1, pick, rest.owner, ch.mxe, pc);
         if (cf) |f| return mx.downCodesFirst(k, e.s, ex, ch.mxe, pick, rows, out, t.dw[t.p], false, f);
+        try mx.downCodes(k, e.s, ex, ch.mxe, pick, rows, out, t.dw[t.p], false);
     }
 
     /// Engram's projection summed over the ranks from its column quarters (model.py esum): the gathered width.
@@ -832,7 +880,19 @@ pub const Two = struct {
 
 /// The ranks of `comm` whose `can` is false, a bit each (bit k: rank k), from one gather of every rank's word over the
 /// host links on `stream`: a start-up agreement, called by every rank together.
+pub fn ranksThatCannot(d: *const cuda.Driver, comm: *const Comm, stream: cuda.Stream, can: bool) !u32 {
+    const w = comm.world;
+    var all: [8]u32 = undefined;
+    if (w > all.len) return error.WorldTooLarge;
+    var dev = try cuda.DeviceBuffer.alloc(d, (1 + w) * 4);
+    defer dev.free();
+    const mine: u32 = @intFromBool(can);
     try comm.gatherHost(d, dev.ptr, dev.ptr + 4, 4, stream);
+    try stream.synchronize();
+    try dev.download(4, std.mem.sliceAsBytes(all[0..w]));
+    return cannotMask(all[0..w]);
+}
+
 /// The ranks whose `word` differs from rank 0's, a bit each (every rank's word gathered over the host links: every rank
 /// the same mask); 0 when every rank gave rank 0's.
 pub fn ranksDiffer(d: *const cuda.Driver, comm: *const Comm, stream: cuda.Stream, word: u32) !u32 {
@@ -855,6 +915,20 @@ pub fn differMask(words: []const u32) u32 {
         if (x != words[0]) m |= @as(u32, 1) << @intCast(k);
     }
     return m;
+}
+
+/// The ranks whose word is 0 (cannot), a bit each.
+pub fn cannotMask(words: []const u32) u32 {
+    var m: u32 = 0;
+    for (words, 0..) |x, k| {
+        if (x == 0) m |= @as(u32, 1) << @intCast(k);
+    }
+    return m;
+}
+
+/// A switch asked for on every rank is in effect when no rank cannot.
+pub fn agreedOn(asked: bool, cannot: u32) bool {
+    return asked and cannot == 0;
 }
 
 /// Why the owner sums over Rocinante cannot run on this rank (null: it can): attention, MoE and Engram all at owned rows,
@@ -900,6 +974,66 @@ pub fn rociGathersOff(native: bool, hidden: usize, qw: usize, hd: usize, index_t
     return null;
 }
 
+/// The ranks of `mask` in words ("rank 2", "ranks 1 and 3", "ranks 0, 1 and 3").
+pub fn rankList(mask: u32, buf: []u8) []const u8 {
+    if (mask == 0) return "no rank";
+    var w: std.Io.Writer = .fixed(buf);
+    const n = @popCount(mask);
+    w.writeAll(if (n == 1) "rank " else "ranks ") catch {};
+    var seen: u32 = 0;
+    var m = mask;
+    while (m != 0) : (m &= m - 1) {
+        const k = @ctz(m);
+        seen += 1;
+        const sep: []const u8 = if (seen == 1) "" else if (seen == n) " and " else ", ";
+        w.print("{s}{d}", .{ sep, k }) catch {};
+    }
+    return w.buffered();
+}
+
+/// Why TF_DS_PACK_CODES, asked for, stays off (null: it runs): the codes are down's (the checkpoint's own weights), the
+/// parity split's packs carry each slot's rest block (rest width `ir`), and a pack of `ig` main and `ir` rest values
+/// splits into whole 32-value groups whose scales (four bytes a group) move in the assembly's 16-byte units.
+pub fn packCodesOff(native: bool, ig: usize, ir: usize) ?[]const u8 {
+    if (!native) return "needs the checkpoint's own FP8 / MXFP4 weights";
+    if (ir == 0) return "needs TF_DS_2D_GU=parity (each slot's rest block in the pack)";
+    if (ig % 128 != 0 or ir % 128 != 0) return "needs a pack of whole 128-value blocks (its scales move in 16-byte units)";
+    return null;
+}
+
+/// Whether a ring of `max_bytes` a part takes a bf16 pack of `rows` slot rows `width` values wide (rdma.Ring.gatherInto's
+/// size rule for packExchange's slice).
+pub fn ringTakes(max_bytes: usize, rows: usize, width: usize) bool {
+    return rows * width * 2 <= max_bytes;
+}
+
+/// A pack as TF_DS_PACK_CODES moves it: `p` slot rows of a main block [p, ig] then a rest block [p, ir] (bf16 values,
+/// gateUp's layout), quantized as one run of 32-value groups (the main block's p ig / 32, then the rest block's
+/// p ir / 32): the codes (a byte a value, the same two blocks) at 0, the scales (fp32 a group, the same two blocks)
+/// at `scales`, `bytes` in all.
+pub const PackCodes = struct { p: usize, ig: usize, ir: usize, groups: usize, scales: usize, bytes: usize };
+
+pub fn packCodesPlan(p: usize, ig: usize, ir: usize) !PackCodes {
+    if (ig % 32 != 0 or ir % 32 != 0) return error.UnsupportedShape;
+    const groups = p * (ig + ir) / 32;
+    const scales = p * (ig + ir);
+    return .{ .p = p, .ig = ig, .ir = ir, .groups = groups, .scales = scales, .bytes = scales + groups * 4 };
+}
+
+/// The pack's codes: act_quant of the bf16 pack `xd` as pc.groups rows of 32 values (one group a row: act_quant's
+/// groups) into `codes` (pc's layout).
+pub fn packQuant(k: *const mx.Kernels, s: cuda.Stream, xd: u64, codes: u64, pc: PackCodes) !void {
+    try mx.quant(k, s, xd, .bf16, 32, pc.groups, 32, codes, 32, codes + pc.scales, 1);
+}
+
+/// The two pairs' pack codes `part0`, `part1` (pc's layout each) into down's input: sc.hq [p, 2 ig + ir] codes and
+/// sc.hs [p, (2 ig + ir) / 32] scales, pair 0's main block, pair 1's, then each slot's rest from owner[pick]
+/// (assembleRestBytes, once for the codes and once for the scales).
+pub fn packAssemble(o: *const ops_mod.Ops, s: cuda.Stream, part0: u64, part1: u64, pick: u64, owner: u64, sc: mx.ExpertScratch, pc: PackCodes) !void {
+    try o.assembleRestBytes(s, part0, part1, pick, owner, sc.hq, pc.p, pc.ig, pc.ir);
+    try o.assembleRestBytes(s, part0 + pc.scales, part1 + pc.scales, pick, owner, sc.hs, pc.p, pc.ig / 32 * 4, pc.ir / 32 * 4);
+}
+
 pub fn catCodesOff(native: bool, layers: []const weights.Layer, uw: [2]usize) ?[]const u8 {
 /// Both pairs' codes and scales into wo_b's input (pl.copies).
 pub fn catCodesCopies(o: *const ops_mod.Ops, s: cuda.Stream, pl: CatCodes) !void {
@@ -910,6 +1044,9 @@ pub fn catCodesCopies(o: *const ops_mod.Ops, s: cuda.Stream, pl: CatCodes) !void
 /// woBCodes of node g (2 p + r) under ranks `rank_of`, n rows: this node's u [n, uw[p]] bf16 quantized into
 pub fn catCodesPlan(g: u32, rank_of: [4]u32, n: usize, uw: [2]usize, u: u64, codes: u64, stage: u64, wob_q: u64, wob_s: u64) CatCodes {
         .peer = rank_of[g ^ 2],
+/// One copyRows: `rows` rows of `width` bytes from `src` (rows `src_stride` bytes apart) to `dst` (`dst_stride` apart).
+pub const RowCopy = struct { src: u64, src_stride: usize, dst: u64, dst_stride: usize, width: usize, rows: usize };
+
 /// Why the owner sums cannot run (null: they can): widening the two pairs' sums into one row needs equal pair widths.
 pub fn ownerYxOff(ow: [2]usize) ?[]const u8 {
     if (ow[0] != ow[1]) return "needs equal pair widths";
@@ -1023,55 +1160,103 @@ test "a follower runs rank 0's replay floor, or says to set the same on every ra
     try std.testing.expectEqualStrings("rank 3 holds 4 streams and rank 0 serves 16: start rank 3 with --streams 16 (or TF_DS_STREAMS=16); rank 3 has TF_DS_REPLAY_FLOOR=0 and rank 0 1: set the same on every rank", both.differ(on, 3, &buf));
 }
 
-test "rank 0's settings go with NCCL's id: the follower answers, and an older rank 0's id alone is taken as before" {
-    const io = std.testing.io;
-    const served: Settings = .{ .world = 2, .streams = 8, .round_rows = 16, .rails = 0, .drafts = 1, .replay_floor = 1, .pool = 1 << 19 };
-    var four = served;
-    four.streams = 4;
-    var neighbor_on = served;
-    neighbor_on.neighbor_rdma = 1;
-    const Case = struct { lead: ?Settings, follower: ?Settings, differs: bool };
-    const cases = [_]Case{
-        .{ .lead = served, .follower = served, .differs = false },
-        .{ .lead = served, .follower = four, .differs = true },
-        .{ .lead = served, .follower = neighbor_on, .differs = true },
-        .{ .lead = neighbor_on, .follower = served, .differs = true },
-        .{ .lead = neighbor_on, .follower = neighbor_on, .differs = false },
-        .{ .lead = null, .follower = four, .differs = false }, // an older rank 0: the id alone, nothing to check
+test "the pack's codes: the main block's groups then the rest block's, codes then scales, 10,321,920 bytes at 2,048 rows" {
+    const pc = try packCodesPlan(2048 * 7, 512, 128);
+    try std.testing.expectEqual(@as(usize, 2048 * 7), pc.p);
+    try std.testing.expectEqual(@as(usize, 2048 * 7 * 20), pc.groups);
+    try std.testing.expectEqual(@as(usize, 2048 * 7 * 640), pc.scales);
+    try std.testing.expectEqual(@as(usize, 10_321_920), pc.bytes);
+    try std.testing.expectError(error.UnsupportedShape, packCodesPlan(7, 500, 128));
+    try std.testing.expectError(error.UnsupportedShape, packCodesPlan(7, 512, 100));
+}
+
+/// tf_ds_assemble_rest_kernel on host bytes: out [p, 2 ig8 + ir8] 16-byte units from part0 / part1 (main rows [p, ig8]
+/// then rest rows [p, ir8] units each), each row's rest from owner[pick[row]].
+fn assembleModel(part0: []const u8, part1: []const u8, pick: []const i32, owner: []const i32, out: []u8, p: usize, ig8: usize, ir8: usize) void {
+    const units = 2 * ig8 + ir8;
+    for (0..p) |row| {
+        const rest = if (owner[@intCast(pick[row])] == 0) part0 else part1;
+        const o = out[row * units * 16 ..];
+        @memcpy(o[0 .. ig8 * 16], part0[row * ig8 * 16 ..][0 .. ig8 * 16]);
+        @memcpy(o[ig8 * 16 .. 2 * ig8 * 16], part1[row * ig8 * 16 ..][0 .. ig8 * 16]);
+        @memcpy(o[2 * ig8 * 16 .. units * 16], rest[(p * ig8 + row * ir8) * 16 ..][0 .. ir8 * 16]);
+    }
+}
+
+/// act_quant's indexing on host values with a stand-in for its arithmetic: x [m, kdim] bf16 (row stride ldx), each
+/// 32-value group (row r, group g) to 32 codes at q[r ldq + 32 g ..] and one scale at s[r lds + g], every byte a
+/// function of that group's values alone (as tf_dsn_act_quant_kernel's: its amax, its scale, each value's code).
+fn quantModel(x: []const u16, ldx: usize, m: usize, kdim: usize, q: []u8, ldq: usize, s: []f32, lds: usize) void {
+    for (0..m) |r| for (0..kdim / 32) |g| {
+        const v = x[r * ldx + 32 * g ..][0..32];
+        var sum: u32 = 0;
+        for (v) |y| sum +%= y;
+        for (v, 0..) |y, i| q[r * ldq + 32 * g + i] = @truncate(y ^ (sum >> 3));
+        s[r * lds + g] = @floatFromInt(sum);
     };
-    const base: u16 = 39500 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 400)));
-    for (cases, 0..) |cs, k| {
-        const Peer = struct {
-            id: [128]u8 = undefined,
-            why: [1024]u8 = undefined,
-            said: []const u8 = "",
-            err: ?anyerror = null,
-            fn run(p: *@This(), port: u16, mine: ?Settings) void {
-                var f: Fan = .{};
-                f.links[0] = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, port, 10) catch |e| {
-                    p.err = e;
-                    return;
-                };
-                defer f.close();
-                p.said = f.follow(1, &p.id, mine, &p.why) catch |e| {
-                    p.err = e;
-                    return;
-                };
-            }
-        };
-        const port = base + @as(u16, @intCast(k));
-        var peer: Peer = .{};
-        const t = try std.Thread.spawn(.{}, Peer.run, .{ &peer, port, cs.follower });
-        var f: Fan = .{};
-        f.links[0] = Link.listen(.{ 127, 0, 0, 1 }, port) catch |e| {
-            t.join();
-            return e;
-        };
-        var id: [128]u8 = undefined;
-        for (&id, 0..) |*b, i| b.* = @intCast(i);
+}
+
+test "the pack's codes assembled into down's input are down's quant of the assembled pack: every slot row, both pairs, each slot's rest from its owner" {
+    const gpa = std.testing.allocator;
+    const p = 9; // slot rows
+    const ig = 256;
+    const ir = 128;
+    const i = 2 * ig + ir;
+    const ne = 10;
+    var prng = std.Random.DefaultPrng.init(0x7a);
+    const rng = prng.random();
+    var pick: [p]i32 = undefined;
+    for (&pick) |*x| x.* = rng.intRangeLessThan(i32, 0, ne);
+    var owner: [ne]i32 = undefined;
+    for (&owner) |*x| x.* = rng.intRangeLessThan(i32, 0, 2);
+    // the pairs' bf16 packs (gateUp's layout: main block [p, ig] then rest block [p, ir])
+    var packs: [2][]u16 = undefined;
+    for (&packs) |*pk| {
+        pk.* = try gpa.alloc(u16, p * (ig + ir));
+        for (pk.*) |*x| x.* = rng.int(u16);
+    }
+    defer for (packs) |pk| gpa.free(pk);
+    // baseline: assembleParity's values (assembleRest: units of 8 fp16 values), then down's quant [p, i]
+    const full = try gpa.alloc(u16, p * i);
+    defer gpa.free(full);
+    assembleModel(std.mem.sliceAsBytes(packs[0]), std.mem.sliceAsBytes(packs[1]), &pick, &owner, std.mem.sliceAsBytes(full), p, ig / 8, ir / 8);
+    const hq = try gpa.alloc(u8, p * i);
+    defer gpa.free(hq);
+    const hs = try gpa.alloc(f32, p * i / 32);
+    defer gpa.free(hs);
+    quantModel(full, i, p, i, hq, i, hs, i / 32);
+    // the codes path: each pair's pack quantized as packQuant does (pc.groups rows of 32), assembled as packAssemble
+    // does (codes, then scales, in restUnits' units)
+    const pc = try packCodesPlan(p, ig, ir);
+    var codes: [2][]align(16) u8 = undefined;
+    for (&codes, packs) |*c, pk| {
+        c.* = try gpa.alignedAlloc(u8, .@"16", pc.bytes);
+        quantModel(pk, 32, pc.groups, 32, c.*[0..pc.scales], 32, @alignCast(std.mem.bytesAsSlice(f32, c.*[pc.scales..pc.bytes])), 1);
+    }
+    defer for (codes) |c| gpa.free(c);
+    const hq2 = try gpa.alloc(u8, p * i);
+    defer gpa.free(hq2);
+    const hs2 = try gpa.alloc(f32, p * i / 32);
+    defer gpa.free(hs2);
+    const uc = try ops_mod.restUnits(pc.ig, pc.ir);
+    assembleModel(codes[0], codes[1], &pick, &owner, hq2, pc.p, uc[0], uc[1]);
+    const us = try ops_mod.restUnits(pc.ig / 32 * 4, pc.ir / 32 * 4);
+    assembleModel(codes[0][pc.scales..], codes[1][pc.scales..], &pick, &owner, std.mem.sliceAsBytes(hs2), pc.p, us[0], us[1]);
+    try std.testing.expectEqualSlices(u8, hq, hq2);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(hs), std.mem.sliceAsBytes(hs2));
+    // assembleRest's own units, in bytes, are restUnits' of twice the values
+    try std.testing.expectEqual([2]usize{ ig / 8, ir / 8 }, try ops_mod.restUnits(2 * ig, 2 * ir));
+    try std.testing.expectError(error.UnsupportedShape, ops_mod.restUnits(24, 16));
+}
+
         const pl = catCodesPlan(@intCast(g), rankOf(orders[0]), 2048, .{ 2048, 2048 }, u, codes, stage, wq, ws);
         const nc = rankOf(ord);
         // one exchange a pair of column partners: each names the other's rank, and what one sends the other takes
+/// copyRows on host bytes `m` (device addresses as offsets into it).
+fn copyRowsHost(m: []u8, cp: RowCopy) void {
+    for (0..cp.rows) |i| @memcpy(m[cp.dst + i * cp.dst_stride ..][0..cp.width], m[cp.src + i * cp.src_stride ..][0..cp.width]);
+}
+
 /// The node that rank `k` serves under `rank_of`.
 fn nodeOfRank(rank_of: [4]u32, k: u32) usize {
     return std.mem.indexOfScalar(u32, &rank_of, k).?;

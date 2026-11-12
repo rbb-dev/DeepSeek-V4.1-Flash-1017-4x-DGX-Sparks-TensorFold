@@ -13,6 +13,8 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
+const config_mod = @import("config.zig");
+const aot = cuda.aot;
 const weights = @import("weights.zig");
 const tri = @import("tri.zig");
 const tri_basic = @import("tri_basic.zig");
@@ -382,6 +384,11 @@ pub const Chunk = struct {
     /// TF_DS_ROCI_COMBINE_FIRST: the MoE's partials' part-1 send was queued inside moe (behind the rows it sends); the gather that follows
     /// takes it as sent, once.
     own1_sent: bool = false,
+    cat_stage: u64 = 0,
+    // TF_DS_PACK_CODES in effect: this node's expert pack as codes and scales, and its column partner's
+    // (prompt2d.PackCodes for cap * slots slot rows each); 0 otherwise
+    pack_codes: u64 = 0,
+    peer_codes: u64 = 0,
     // TF_DS_ROCI_GATHERS in effect: x of the layers whose x is gathered lives in the transport's arena (x_g) and every other
     // layer's x in the device buffer (x_dev); `x` is the one the current layer reads and writes. 0 otherwise.
     x_dev: u64 = 0,
@@ -1014,8 +1021,29 @@ pub fn ownedRange(e: *const Engine, ch: *const Chunk, li: usize) ?QRows {
     return if (!ch.boundary_done) anySlab(e, ch) else null;
 }
 
+/// Whether a layer's attention front can run on owned rows (TF_DS_FRONT_OWNED): without a compressor (kvSourceUpdate)
+/// and an indexer (its weights_proj), only wq_a and wkv read x's rows.
+pub fn frontOwnable(has_compressor: bool, has_indexer: bool) bool {
+    return !has_compressor and !has_indexer;
+}
+
+/// Layer `li`'s owned rows when its attention front runs on them (TF_DS_FRONT_OWNED in effect, a frontOwnable layer,
+/// owned rows): attnMixes gathers no x then, and attention's front gathers qr and y (frontOwned).
+pub fn frontRange(e: *const Engine, ch: *const Chunk, li: usize) ?QRows {
     if (e.two == null) return null;
+    const lay = e.w.layers[li];
+    if (!frontOwnable(lay.comp_wkv != null, lay.idx_wq_b != null)) return null;
+    return ownedRange(e, ch, li);
+}
+
+/// Layer `li`'s owned rows when its router, routing and MoE input codes run on them (TF_DS_FFN_CODES in effect, the
+/// checkpoint's own weights, owned rows): ffnMixes gathers no x then, and moe gathers the codes, picks and weights
+/// (ffnOwned).
+pub fn ffnRange(e: *const Engine, ch: *const Chunk, li: usize) ?QRows {
     if (e.two == null or e.mx == null) return null;
+    return ownedRange(e, ch, li);
+}
+
     if (e.two == null) return null;
 /// The gathered planes of `sub` (ga or gm).
 fn fullOf(ch: *const Chunk, sub: Sub) u64 {
@@ -1143,6 +1171,7 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
             ch.pending = false;
         } else if (r.n != 0) {
         }
+        // the owned front (frontRange) reads x's own rows alone
         if (xGathered(e, ch, li)) {
             try rociGather(e, .ga, try needShape(e, ch));
         }
@@ -1252,11 +1281,14 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     const mode = chunkMode(n, start, floor, c.window, replay_floor);
     const ring_mode = mode.ring;
     const one_split = mode.one_split;
+    // attn_in: wq_a and wkv of x, one prompt GEMM each, or one group up to 128 rows; TF_DS_FRONT_OWNED (frontRange):
+    const front = frontRange(e, ch, li);
     }
     pmark(e, .a_in);
     dump(e, li, "x", ch.x, n * c.hidden * 2);
     dump(e, li, "qa", ch.qa, n * lay.wq_a.n * 2);
     dump(e, li, "y", ch.y, n * hd * 2);
+    if (front == null) try tri_basic.rmsnorm(e.t, ch.qa, lay.wq_a.n, lay.q_norm, ch.qr, lay.wq_a.n, c.eps, n, lay.wq_a.n);
     dump(e, li, "qr", ch.qr, n * lay.wq_a.n * 2);
     try mm(e, ch, lay.wq_b, ch.qr, lay.wq_a.n, ch.q, .bf16, hl * hd);
     dump(e, li, "q_norope", ch.q, n * hl * hd * 2);
@@ -1381,12 +1413,67 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     try mm(e, ch, lay.wo_b, ch.u, uw, ch.pa, .fp32, c.hidden);
 }
 
+/// TF_DS_FRONT_OWNED's attention front at owned rows `r` (frontRange): frontRows, then every rank's rows of qr and y
 /// gathered over the transport (rociGather). qr and y then hold the whole chunk's front, the bytes
+/// the baseline front leaves (every kernel row-wise, the gathers move bytes); x and qa hold rows r alone.
+fn frontOwned(e: *const Engine, ch: *Chunk, lay: weights.Layer, r: QRows) !void {
     if (r.n != 0) try frontRows(e.mx.?, e.t, e.s, ch.mxs, lay, ch.x, e.c.hidden, r, ch.qa, ch.y, ch.qr, e.c.head_dim, e.c.eps);
     return rociGather(e, .gf, try needShape(e, ch));
+}
+
+/// The owned front's kernels at rows `r` of x [*, ldx] bf16: x's rows quantized once (act_quant: a row's 32-value
+/// groups each on its own) into the linears' scratch, wq_a and wkv on the codes (mx.linear's GEMM, a row's bits at any
+/// row count) into qa's rows r [*, wq_a.n] and y's [*, hd], then the q RMSNorm of qa's rows r into qr's (frontNorm).
+/// wq_a and wkv FP8 / FP4 on one K (frontOwnedOff checks it at the start).
+pub fn frontRows(k: *const mx.Kernels, t: tri.Tri, s: cuda.Stream, sc: mx.Scratch, lay: weights.Layer, x: u64, ldx: usize, r: QRows, qa: u64, y: u64, qr: u64, hd: usize, eps: f32) !void {
+    if (!frontCodes(lay)) return error.NotAnMxLinear;
+    const kd: usize = lay.wq_a.k;
+    if (r.n > sc.rows or kd > sc.max_k) return error.ScratchTooSmall;
+    const qw: usize = lay.wq_a.n;
+    try mx.quant(k, s, x + r.start * ldx * 2, .bf16, ldx, r.n, kd, sc.q, kd, sc.s, kd / 32);
+    try mx.gemm(k, s, lay.wq_a, sc.q, kd, sc.s, kd / 32, r.n, qa + r.start * qw * 2, qw, .bf16, false, sc.z);
+    try mx.gemm(k, s, lay.wkv, sc.q, kd, sc.s, kd / 32, r.n, y + r.start * hd * 2, hd, .bf16, false, sc.z);
+}
+
+/// Whether one quant of x's rows feeds both of a layer's front linears: wq_a and wkv FP8 / FP4 on one K.
+fn frontCodes(lay: weights.Layer) bool {
+    const mxl = struct {
+        fn is(l: weights.Linear) bool {
+            return l.fmt == .fp8 or l.fmt == .fp4;
+        }
+    }.is;
+    return mxl(lay.wq_a) and mxl(lay.wkv) and lay.wq_a.k == lay.wkv.k;
+}
+
+/// The owned front's q RMSNorm: qa's rows r [*, wq_a.n] into qr's (one _rmsnorm program a row, the whole chunk's
+/// launch's arguments at the rows' offsets).
+pub fn frontNorm(t: tri.Tri, lay: weights.Layer, qa: u64, qr: u64, r: QRows, eps: f32) !void {
+    const qw: usize = lay.wq_a.n;
+    try tri_basic.rmsnorm(t, qa + r.start * qw * 2, qw, lay.q_norm, qr + r.start * qw * 2, qw, eps, r.n, qw);
+}
+
+/// TF_DS_FRONT_OWNED's start check on this rank (null: it can run; else the reason, for Two.agreeFrontOwned):
+/// quarter-HC, the checkpoint's own FP8 / MXFP4 weights (`native`), every front layer below `half` with wq_a and wkv
+/// on one quant (frontCodes), and every q RMSNorm launch frontNorm makes at each of the `world` ranks' owned rows of
+/// each row count in `qs` found in this rank's kernel set: `finds.has(name, args, consts)` (the engine's: aot.Set.find,
+/// as a launch finds its variant).
 pub fn frontOwnedOff(gpa: std.mem.Allocator, finds: anytype, native: bool, layers: []const weights.Layer, half: usize, eps: f32, qs: []const usize, world: usize) !?[]const u8 {
     return frontOwnedOffAt(gpa, finds, native, layers, half, eps, rows);
 pub fn frontOwnedOffAt(gpa: std.mem.Allocator, finds: anytype, native: bool, layers: []const weights.Layer, half: usize, eps: f32, rows: []const QRows) !?[]const u8 {
+    if (!native) return "needs the checkpoint's own FP8 / MXFP4 weights";
+    var log: tri.Log = .{ .gpa = gpa };
+    defer log.deinit();
+    const t: tri.Tri = .{ .log = &log };
+    // qa and qr as the arena aligns a chunk's buffers (256 bytes)
+    const qa: u64 = 1 << 32;
+    const qr: u64 = 2 << 32;
+    for (layers[0..@min(half, layers.len)]) |lay| {
+        if (!frontOwnable(lay.comp_wkv != null, lay.idx_wq_b != null)) continue;
+        if (!frontCodes(lay)) return "wq_a and wkv are not FP8 / FP4 on one K";
+    }
+    return null;
+}
+
 /// kv_source_update of a kv-source layer on the chunk (no earlier pending row: a chunk starting on a group boundary):
 /// _compress's new latents (ratio 1: RMSNorm of the bf16 projection; ratio 2: of the pairs' softmax-weighted kv), its
 /// positional store's last RAW rows, then the index keys (RMSNorm of idx_wk's projection, RoPE) and the RoPE'd latents
@@ -1805,6 +1892,7 @@ pub fn ffnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
         const old_h = ch.h;
         ch.h = ch.h_alt;
         ch.h_alt = old_h;
+        // the owned routing (ffnRange) reads x's own rows alone
         if (ffnRange(e, ch, li) == null) return error.NotNative; // (the owned routing is the only one: the start requires the checkpoint's own weights)
         return;
     }
@@ -1926,9 +2014,16 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
     const shared_id = lay.experts.count - 1;
     var kc: usize = 0;
     if (e.mx) |k| {
+        // Format.native: Gate.forward's fp32 logits of the bf16 rows and weight (exact products, fp32 sums), any rows;
+        // TF_DS_FFN_CODES (ffnRange): on owned rows with x's codes, then gathered (ffnOwned)
+        const own = ffnRange(e, ch, li);
+        if (own) |r| {
+            try ffnOwned(e, ch, lay, r, shared_id, sl);
+        } else {
             try mx.bf16Gemm(k, e.s, ch.x, d, lay.gate_w, d, n, c.experts, d, ch.logits, c.experts, .f32, 1, false, 1, 0, 0, 0, null);
             try tri_norm.route(e.t, ch.logits, 0, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick, ch.wts, n, c.experts, sl);
             try routeSpans(e, ch, lay, shared_id, sl, 0);
+        }
         pmark(e, .m_rt);
         dump(e, li, "mx", ch.x, n * d * 2);
         dump(e, li, "logits", ch.logits, n * c.experts * 4);
@@ -1974,6 +2069,12 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
 /// decode-sized chunk's chunk sums [n, kc, NE]) routed again with the image bias in a launch of their own, their picks and
 /// weights put over the text ones. Row by row the routing is independent, so the text rows keep theirs.
 fn routeSpans(e: *const Engine, ch: *Chunk, lay: weights.Layer, shared_id: usize, sl: usize, kc: usize) !void {
+    return routeSpansIn(e, ch, lay, shared_id, sl, kc, .{ .start = 0, .n = ch.n });
+}
+
+/// routeSpans over the chunk's rows `within` alone: each span's overlap with them (rowsIn), routed and put as
+/// routeSpans routes and puts it. The owned routing's (ffnOwned): a node routes its owned rows' span rows.
+fn routeSpansIn(e: *const Engine, ch: *Chunk, lay: weights.Layer, shared_id: usize, sl: usize, kc: usize, within: QRows) !void {
     if (ch.spans.len == 0) return;
     if (lay.gate_b_vl == 0) return error.NoImageRoutingBias;
     const c = e.c;
@@ -1981,7 +2082,7 @@ fn routeSpans(e: *const Engine, ch: *Chunk, lay: weights.Layer, shared_id: usize
     const src = if (n <= tri.decode_rows and kc != 0) ch.gl else ch.logits;
     const row = @max(kc, 1) * c.experts * 4;
     for (ch.spans) |sp| {
-        const o = overlap(sp, ch.start, n) orelse continue;
+        const o = rowsIn(overlap(sp, ch.start, n) orelse continue, within) orelse continue;
         const rows = o[1] - o[0];
         try tri_norm.route(e.t, src + o[0] * row, kc, lay.gate_b_vl, c.top_k, c.routed_scaling, shared_id, ch.pick_vl, ch.wts_vl, rows, c.experts, sl);
         const dd = e.d;
@@ -1990,13 +2091,64 @@ fn routeSpans(e: *const Engine, ch: *Chunk, lay: weights.Layer, shared_id: usize
     }
 }
 
+/// A span's chunk rows `o` [lo, hi) within `rows` (null: none).
+pub fn rowsIn(o: [2]usize, rows: QRows) ?[2]usize {
+    const lo = @max(o[0], rows.start);
+    const hi = @min(o[1], rows.start + rows.n);
+    return if (lo < hi) .{ lo, hi } else null;
+}
+
+/// TF_DS_FFN_CODES's routing at owned rows `r` (ffnRange): ffnRows, the image spans' rows within r routed with their
+/// bias (routeSpansIn), then every rank's rows of x's codes and scales, the picks and the weights all-gathered in
 /// place over the transport (rociGather). The MoE then reads the bytes the baseline routing and group() leave (every kernel
+/// row-wise, the gathers move bytes); x and the logits hold rows r alone.
+fn ffnOwned(e: *const Engine, ch: *Chunk, lay: weights.Layer, r: QRows, shared_id: usize, sl: usize) !void {
+    const c = e.c;
     if (r.n != 0) {
+        try ffnRows(e.mx.?, e.t, e.s, lay, ch.x, c.hidden, r, c.experts, c.top_k, c.routed_scaling, shared_id, sl, ch.logits, ch.pick, ch.wts, ch.mxe);
+        try routeSpansIn(e, ch, lay, shared_id, sl, 0, r);
     }
     return rociGather(e, .gm, try needShape(e, ch));
+}
+
+/// The owned routing's kernels at rows `r` of x [*, ldx] bf16: the router's fp32 logits (moe's bf16 GEMM, K whole, a
+/// row's bits at any row count) into logits' rows r [*, ne], the routing (ffnRoute) into pick's and wts's rows r
+/// [*, sl], and x's rows quantized into sc.q / sc.s rows r [*, dims] (group()'s act_quant).
+pub fn ffnRows(k: *const mx.Kernels, t: tri.Tri, s: cuda.Stream, lay: weights.Layer, x: u64, ldx: usize, r: QRows, ne: usize, top_k: usize, scale_: f32, shared_id: usize, sl: usize, logits: u64, pick: u64, wts: u64, sc: mx.ExpertScratch) !void {
+    const dd: usize = lay.experts.dims;
+    if (r.start + r.n > sc.rows) return error.ScratchTooSmall;
+    const xr = x + r.start * ldx * 2;
+    try mx.bf16Gemm(k, s, xr, ldx, lay.gate_w, ldx, r.n, ne, ldx, logits + r.start * ne * 4, ne, .f32, 1, false, 1, 0, 0, 0, null);
+    try ffnRoute(t, lay, logits, pick, wts, r, ne, top_k, scale_, shared_id, sl);
+    try mx.quant(k, s, xr, .bf16, ldx, r.n, dd, sc.q + r.start * dd, dd, sc.s + r.start * (dd / 32) * 4, dd / 32);
+}
+
+/// The owned routing's text-bias routing: logits' rows r [*, ne] into pick's and wts's rows r [*, sl] (one _route
+/// program a row, the whole chunk's launch's arguments at the rows' offsets).
+pub fn ffnRoute(t: tri.Tri, lay: weights.Layer, logits: u64, pick: u64, wts: u64, r: QRows, ne: usize, top_k: usize, scale_: f32, shared_id: usize, sl: usize) !void {
+    try tri_norm.route(t, logits + r.start * ne * 4, 0, lay.gate_b, top_k, scale_, shared_id, pick + r.start * sl * 4, wts + r.start * sl * 4, r.n, ne, sl);
+}
+
+/// TF_DS_FFN_CODES's start check on this rank (null: it can run; else the reason, for Two.agreeFfnCodes): quarter-HC,
+/// the checkpoint's own weights (`native`), and every routing launch ffnRoute makes at each of the `world` ranks'
+/// owned rows of each row count in `qs`, for every layer below `half`, found in this rank's kernel set
+/// (`finds.has`, as frontOwnedOff's).
 pub fn ffnCodesOff(gpa: std.mem.Allocator, finds: anytype, native: bool, layers: []const weights.Layer, half: usize, ne: usize, top_k: usize, scale_: f32, sl: usize, qs: []const usize, world: usize) !?[]const u8 {
     return ffnCodesOffAt(gpa, finds, native, layers, half, ne, top_k, scale_, sl, rows);
 pub fn ffnCodesOffAt(gpa: std.mem.Allocator, finds: anytype, native: bool, layers: []const weights.Layer, half: usize, ne: usize, top_k: usize, scale_: f32, sl: usize, rows: []const QRows) !?[]const u8 {
+    if (!native) return "needs the checkpoint's own FP8 / MXFP4 weights";
+    var log: tri.Log = .{ .gpa = gpa };
+    defer log.deinit();
+    const t: tri.Tri = .{ .log = &log };
+    // logits, pick and wts as the arena aligns a chunk's buffers (256 bytes)
+    const logits: u64 = 1 << 32;
+    const pick: u64 = 2 << 32;
+    const wts: u64 = 3 << 32;
+    for (layers[0..@min(half, layers.len)]) |lay| {
+    }
+    return null;
+}
+
 /// Engram on the host: the hasher (the compressed token map, the multipliers), this rank's hash columns [lo, hi) of
 /// each Engram layer's, its tables and readers, and host buffers for a chunk's rows (model.py's Engram).
 pub const EngramHost = struct {
@@ -2704,6 +2856,115 @@ test "hd ** -0.5 as the served build passes it" {
 fn notPorted(src: std.builtin.SourceLocation) error{NotPortedYet} {
     std.debug.print("{{\"not_ported\": \"{s}:{d}\"}}\n", .{ src.file, src.line });
     return error.NotPortedYet;
+}
+
+/// 40 layers whose compressor and indexer follow the checkpoint's config (weights.zig loads comp_wkv on a kv source,
+/// idx_wq_b on an index source), the front linears FP8 on one K.
+fn checkpointLayers(lays: *[40]weights.Layer) !void {
+    var why: config_mod.Why = .{};
+    const cfg = try config_mod.parse(std.testing.allocator, config_mod.test_config, &why);
+    const one: weights.Linear = .{ .words = 0, .k = 1, .n = 1 };
+    for (lays, 0..) |*l, i| {
+        l.* = .{ .idx = @intCast(i), .ratio = cfg.ratios[i] };
+        l.comp_wkv = if (cfg.kv_sources.has(i)) one else null;
+        l.idx_wq_b = if (cfg.index_sources.has(i)) one else null;
+        l.wq_a = .{ .words = 0, .k = 5120, .n = 1280, .fmt = .fp8 };
+        l.wkv = .{ .words = 0, .k = 5120, .n = 512, .fmt = .fp8 };
+        l.q_norm = 0x7000 + i * 0x1000;
+    }
+}
+
+test "the owned front's q norm is the whole chunk's launch at the owned rows' offsets: one _rmsnorm program a row" {
+    var log: tri.Log = .{ .gpa = std.testing.allocator };
+    defer log.deinit();
+    const t: tri.Tri = .{ .log = &log };
+    var lay: weights.Layer = .{ .idx = 0, .ratio = 0 };
+    lay.wq_a = .{ .words = 0, .k = 5120, .n = 1280, .fmt = .fp8 };
+    lay.q_norm = 0x7000;
+    const qa: u64 = 0x100000;
+    const qr: u64 = 0x900000;
+    try tri_basic.rmsnorm(t, qa, 1280, lay.q_norm, qr, 1280, 1e-20, 2048, 1280); // attention's whole-chunk launch
+    try frontNorm(t, lay, qa, qr, .{ .start = 512, .n = 512 }, 1e-20);
+    try std.testing.expectEqual(@as(usize, 2), log.items.items.len);
+    const all = log.items.items[0];
+    const own = log.items.items[1];
+    try std.testing.expectEqualStrings(all.name, own.name);
+    try std.testing.expectEqual([3]u32{ 512, 1, 1 }, own.grid);
+    try std.testing.expectEqualDeep(all.consts, own.consts);
+    try std.testing.expectEqual(all.args.len, own.args.len);
+    for (all.args, own.args) |a, b| {
+        try std.testing.expectEqualStrings(a.name, b.name);
+        const shift: u64 = if (std.mem.eql(u8, a.name, "X") or std.mem.eql(u8, a.name, "OUT")) 512 * 1280 * 2 else 0;
+        switch (a.value) {
+            .ptr => |pa| try std.testing.expectEqual(pa.addr + shift, b.value.ptr.addr),
+            else => try std.testing.expectEqualDeep(a.value, b.value),
+        }
+    }
+}
+
+/// A kernel set for start checks: every launch found but those of `missing`; counts the lookups.
+const FakeFinds = struct {
+    missing: ?[]const u8 = null,
+    asked: *usize,
+
+    pub fn has(f: FakeFinds, name: []const u8, args: []const aot.Arg, consts: []const aot.Const) bool {
+        _ = .{ args, consts };
+        f.asked.* += 1;
+        const m = f.missing orelse return true;
+        return !std.mem.eql(u8, m, name);
+    }
+};
+
+test "the owned routing's image spans: every span row routed with the image bias by its owner alone, as routeSpans routes it" {
+    const cap = 64;
+    const q = cap / 4;
+    // spans over the chunk's rows (chunk start 100): inside one owner, across one boundary, across three, at the ends
+    const spans = [_]Span{ .{ .at = 102, .len = 5, .row = 0 }, .{ .at = 110, .len = 12, .row = 0 }, .{ .at = 120, .len = 40, .row = 0 }, .{ .at = 90, .len = 12, .row = 0 }, .{ .at = 160, .len = 10, .row = 0 } };
+    var whole: [cap]u8 = @splat(0);
+    var owned: [cap]u8 = @splat(0);
+    for (spans) |sp| {
+        const o = overlap(sp, 100, cap) orelse continue;
+        for (o[0]..o[1]) |i| whole[i] += 1;
+        for (0..4) |k| {
+            const r: QRows = .{ .start = k * q, .n = q };
+            const in = rowsIn(o, r) orelse continue;
+            try std.testing.expect(in[0] >= r.start and in[1] <= r.start + r.n and in[0] < in[1]);
+            for (in[0]..in[1]) |i| owned[i] += 1;
+        }
+    }
+    try std.testing.expectEqualSlices(u8, &whole, &owned);
+    try std.testing.expect(std.mem.indexOfScalar(u8, &whole, 1) != null); // the spans reach the chunk
+    // the whole chunk's rows give the span's own rows back
+    try std.testing.expectEqual([2]usize{ 2, 7 }, rowsIn(.{ 2, 7 }, .{ .start = 0, .n = cap }).?);
+    try std.testing.expect(rowsIn(.{ 2, 7 }, .{ .start = 16, .n = 16 }) == null);
+}
+
+test "the owned routing's text-bias routing is the whole chunk's _route launch at the owned rows' offsets" {
+    var log: tri.Log = .{ .gpa = std.testing.allocator };
+    defer log.deinit();
+    const t: tri.Tri = .{ .log = &log };
+    var lay: weights.Layer = .{ .idx = 0, .ratio = 2 };
+    lay.gate_b = 0x5000;
+    const logits: u64 = 0x100000;
+    const pick: u64 = 0x900000;
+    const wts: u64 = 0xa00000;
+    try tri_norm.route(t, logits, 0, lay.gate_b, 6, 1.5, 384, pick, wts, 2048, 384, 7); // moe's whole-chunk launch
+    try ffnRoute(t, lay, logits, pick, wts, .{ .start = 1536, .n = 512 }, 384, 6, 1.5, 384, 7);
+    try std.testing.expectEqual(@as(usize, 2), log.items.items.len);
+    const all = log.items.items[0];
+    const own = log.items.items[1];
+    try std.testing.expectEqualStrings(all.name, own.name);
+    try std.testing.expectEqual([3]u32{ 512, 1, 1 }, own.grid);
+    try std.testing.expectEqualDeep(all.consts, own.consts);
+    try std.testing.expectEqual(all.args.len, own.args.len);
+    for (all.args, own.args) |a, b| {
+        try std.testing.expectEqualStrings(a.name, b.name);
+        const row: u64 = if (std.mem.eql(u8, a.name, "L")) 384 * 4 else if (std.mem.eql(u8, a.name, "PICK") or std.mem.eql(u8, a.name, "WTS")) 7 * 4 else 0;
+        switch (a.value) {
+            .ptr => |pa| try std.testing.expectEqual(pa.addr + 1536 * row, b.value.ptr.addr),
+            else => try std.testing.expectEqualDeep(a.value, b.value),
+        }
+    }
 }
 
 test "the boundary's in-place gathers put every rank's owned groups of the four cache arrays where the whole chunk's update puts them" {
