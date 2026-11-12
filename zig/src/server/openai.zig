@@ -97,7 +97,7 @@ pub fn errorBody(a: Allocator, cx: *const Cx, param: ?[]const u8) Allocator.Erro
     const o = try json.newObject(a);
     try o.put(a, "message", .{ .string = cx.message });
     if (cx.kind == .other or cx.kind == .server) return .{ .object = o };
-    try o.put(a, "type", .{ .string = "invalid_request_error" });
+    try o.put(a, "type", .{ .string = if (cx.kind == .capacity) "overloaded_error" else "invalid_request_error" });
     if (cx.kind == .context_length) {
         try o.put(a, "param", if (param) |p| .{ .string = p } else .null);
         try o.put(a, "code", .{ .string = "context_length_exceeded" });
@@ -452,9 +452,22 @@ const Run = struct {
     const StreamSink = struct {
         run: *Run,
         tools: bool,
+        prompt_len: usize = 0,
+        begun: bool = false,
+
+        /// Opens the stream and sends its role chunk, once: when the engine has taken the request.
+        fn begin(ctx: *anyopaque) error{Closed}!void {
+            const s: *StreamSink = @ptrCast(@alignCast(ctx));
+            if (s.begun) return;
+            s.begun = true;
+            const r = s.run;
+            try r.out.vt.open(r.out.ctx, s.prompt_len);
+            if (!s.tools and r.is_chat) try r.emit(r.chunk(roleDelta(r.a) catch return error.Closed, null) catch return error.Closed);
+        }
 
         fn call(ctx: *anyopaque, delta: Value) error{Closed}!void {
             const s: *StreamSink = @ptrCast(@alignCast(ctx));
+            try begin(ctx);
             const r = s.run;
             if (!s.tools) {
                 // completions stream text only, with its logprob rows when asked
@@ -530,7 +543,12 @@ const Run = struct {
         var sink_state: StreamSink = .{ .run = r, .tools = tools, .prompt_len = prepared.prompt_len };
         handed = true;
         var live = gone;
+        live.out = r.out; // the stream opens at the submit (begin), before the loop that beats on it
         live.every_ns = @intFromFloat(r.srv.config.sse_keepalive_s * std.time.ns_per_s);
+        const sink: chat.Sink = .{ .ctx = &sink_state, .call = StreamSink.call, .begin = StreamSink.begin, .keep = StreamSink.keep };
+        var reply = (if (r.turn) |t| cortheon.loop.stream(t, r.srv, &cx, &r.plan.input, prepared, sink, live) else chat.generate(r.srv, &cx, prepared, sink, live)) catch |e| {
+            // refused before the engine took it (busy): nothing is open, so it is an HTTP status like any other refusal
+            if (!sink_state.begun) return r.unsent(&cx, e, field);
             switch (e) {
                 error.Cancelled => return,
                 error.Refused => if (cx.kind != .other and cx.kind != .server) {

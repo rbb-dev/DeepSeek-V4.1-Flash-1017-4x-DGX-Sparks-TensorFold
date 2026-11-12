@@ -8,6 +8,10 @@
 //!
 //!   pri           `batch` runs the request as a background request (it yields to foreground prompts); `normal` leaves it be.
 //!   think_budget  the most tokens the stream thinks (0: no budget).
+//!   wait_ms       the most time the request waits for the engine to admit it to a lane before it gives up with a 503 / 529 (0: no
+//!                 bound). An engine that does not report admission is judged at the request's first event. A streamed request
+//!                 with a bound (its own, or its key's wait_ms_default) sends its 200 only once admitted; one without opens
+//!                 as it always did, when it is queued, and keeps its connection alive through the wait.
 //!
 //! The caps come from `admin-policy.json` (TENSORFOLD_ADMIN_POLICY), under `request_caps`, one row per key label:
 //!   {"request_caps": {"gateway": {"headers": true, "wait_ms_max": 1800000},
@@ -78,6 +82,7 @@ pub const Applied = struct {
     think_budget: ?u32 = null,
     /// The cap on any thinking budget, however asked; 0: none.
     think_cap: u32 = 0,
+    /// Give up if the engine has not admitted the request to a lane by then; null: no bound.
     wait_ms: ?u32 = null,
     dropped: Mask = .{},
     clamped: Mask = .{},

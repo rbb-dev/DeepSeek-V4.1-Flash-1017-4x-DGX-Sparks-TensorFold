@@ -915,6 +915,7 @@ pub const LaneHost = struct {
         job.overtaken = 0;
         job.stepped_at = h.clockNs();
         h.unlock();
+        if (job.sink.admitted) |told| told(job.sink.ctx, job.id); // it has a lane: its client may hear so (once a request)
         if (h.info_.fill.on) job.rows_est = h.estimateRows(job);
         if (h.core.fills()) return true;
         if (!h.setup(job)) return true;

@@ -58,6 +58,10 @@ const Engine = struct {
     seen: ?[]u8 = null,
     /// A held engine takes a request and says nothing until it is cancelled (then it ends the request cancelled).
     hold: bool = false,
+    /// A busy engine refuses every submit with Busy.
+    busy: bool = false,
+    /// An admitting engine tells the request it has a lane, then prefills and finishes it at once.
+    admit: bool = false,
     held: ?struct { id: api.Id, sink: api.Sink } = null,
     fn engine(e: *@This()) api.Engine {
         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
@@ -68,6 +72,17 @@ const Engine = struct {
     fn submit(ctx: *anyopaque, id: api.Id, _: *const api.Request, sink: api.Sink) api.SubmitError!void {
         const e: *@This() = @ptrCast(@alignCast(ctx));
         e.submits += 1;
+        if (e.busy) return error.Busy;
+        if (e.admit) {
+            if (sink.admitted) |told| told(sink.ctx, id);
+            var ev: api.Event = .{ .prefilled = 0 };
+            sink.event(sink.ctx, id, &ev);
+            ev = .{ .tokens = &.{ 104, 105 } };
+            sink.event(sink.ctx, id, &ev);
+            ev = .{ .finished = .{ .reason = .stop } };
+            sink.event(sink.ctx, id, &ev);
+            return;
+        }
         if (e.hold) {
             e.held = .{ .id = id, .sink = sink };
             return;
@@ -2887,6 +2902,79 @@ test "per-request fields: the Messages translation carries a tf object to the ch
     try std.testing.expect(plain.get("tf") == null);
 }
 
+// ---- D90: a capacity refusal is 503 overloaded_error (OpenAI shapes) or 529 overloaded_error (Messages), with Retry-After ----
+
+const one_message = "[{\"role\": \"user\", \"content\": \"hi\"}]";
+
+fn expectOverloaded(r: Reply, status: u16, anthropic: bool) !void {
+    try std.testing.expectEqual(status, r.status);
+    try std.testing.expect(r.hasHeader("Retry-After: 5"));
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"type\": \"overloaded_error\"") != null);
+    if (anthropic) try std.testing.expect(std.mem.startsWith(u8, r.body, "{\"type\": \"error\", \"error\": {\"type\": \"overloaded_error\""));
+}
+
+test "D90: a busy engine answers /v1/chat/completions and /v1/completions 503 overloaded_error with Retry-After, streamed or not" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open("shared-key-1", admin_keys_file);
+    defer rig.close();
+    rig.engine.busy = true;
+    inline for ([_][]const u8{ "false", "true" }) |stream| {
+        const body = "{\"model\": \"m\", \"max_tokens\": 4, \"stream\": " ++ stream ++ ", \"messages\": " ++ one_message ++ "}";
+        const r = try exchange(rig.srv, "POST", "/v1/chat/completions", shared_bearer ++ json_head, body);
+        defer r.free();
+        try expectOverloaded(r, 503, false);
+    }
+    const c = try exchange(rig.srv, "POST", "/v1/completions", shared_bearer ++ json_head, "{\"model\": \"m\", \"max_tokens\": 4, \"prompt\": \"hi\"}");
+    defer c.free();
+    try expectOverloaded(c, 503, false);
+}
+
+test "D90: the Messages endpoint answers the same refusal 529 in Anthropic's shape, with Retry-After, streamed or not" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open("shared-key-1", admin_keys_file);
+    defer rig.close();
+    rig.engine.busy = true;
+    inline for ([_][]const u8{ "false", "true" }) |stream| {
+        const body = "{\"model\": \"m\", \"max_tokens\": 4, \"stream\": " ++ stream ++ ", \"messages\": " ++ one_message ++ "}";
+        const r = try exchange(rig.srv, "POST", "/v1/messages", shared_bearer ++ json_head, body);
+        defer r.free();
+        try expectOverloaded(r, 529, true);
+    }
+}
+
+test "D90: the wait_ms timeout and the Responses endpoint refuse the same way; nothing else gets Retry-After or a new status" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open("shared-key-1", admin_keys_file);
+    defer rig.close();
+    rig.engine.hold = true;
+    try loadPolicy(&rig, "{\"request_caps\": {\"cli-1\": {\"wait_ms_max\": 100}}}");
+    const t = try exchange(rig.srv, "POST", "/v1/chat/completions", shared_bearer ++ json_head, "{\"model\": \"m\", \"max_tokens\": 4, \"tf\": {\"wait_ms\": 100}, \"messages\": " ++ one_message ++ "}");
+    defer t.free();
+    try expectOverloaded(t, 503, false);
+    const m = try exchange(rig.srv, "POST", "/v1/messages", shared_bearer ++ json_head, "{\"model\": \"m\", \"max_tokens\": 4, \"tf\": {\"wait_ms\": 100}, \"messages\": " ++ one_message ++ "}");
+    defer m.free();
+    try expectOverloaded(m, 529, true);
+    rig.engine.hold = false;
+    rig.engine.busy = true;
+    const r = try exchange(rig.srv, "POST", "/v1/responses", shared_bearer ++ json_head, "{\"model\": \"m\", \"max_output_tokens\": 4, \"input\": \"hi\"}");
+    defer r.free();
+    try expectOverloaded(r, 503, false);
+    // a bad request stays 400 and carries no Retry-After; a closed scheduler stays a 500
+    rig.engine.busy = false;
+    const bad = try exchange(rig.srv, "POST", "/v1/chat/completions", shared_bearer ++ json_head, "{\"model\": \"m\", \"messages\": 5}");
+    defer bad.free();
+    try std.testing.expectEqual(@as(u16, 400), bad.status);
+    try std.testing.expect(std.mem.indexOf(u8, bad.head, "Retry-After") == null);
+    const closed = try exchange(rig.srv, "POST", "/v1/chat/completions", shared_bearer ++ json_head, "{\"model\": \"m\", \"max_tokens\": 4, \"messages\": " ++ one_message ++ "}");
+    defer closed.free();
+    try std.testing.expectEqual(@as(u16, 500), closed.status);
+    try std.testing.expect(std.mem.indexOf(u8, closed.head, "Retry-After") == null);
+    // and the 529 is the Messages route's alone: its other refusals keep their statuses
+    const badm = try exchange(rig.srv, "POST", "/v1/messages", shared_bearer ++ json_head, "{\"model\": \"m\", \"messages\": []}");
+    defer badm.free();
+    try std.testing.expectEqual(@as(u16, 400), badm.status);
+}
+
 test "set: the graph cap (class A) is live only where the engine runs graphs, travels as a count with 0 for all, and a value past a u32 is refused" {
     var rig: Rig = .{ .arena = undefined, .tmp = undefined };
     try rig.open(null, admin_keys_file);
@@ -2921,6 +3009,7 @@ test "set: the graph cap (class A) is live only where the engine runs graphs, tr
     try std.testing.expect(live.block.turn(&seen, &vals));
     try std.testing.expectEqual(live.unset, vals[@backingInt(live.Slot.graph_cap)]);
 }
+
 test "set: the KV free target (class A) is live only with a virtual-memory pool, travels as whole MiB, and null returns to the start's" {
     var rig: Rig = .{ .arena = undefined, .tmp = undefined };
     try rig.open(null, admin_keys_file);
@@ -2953,6 +3042,45 @@ test "set: the KV free target (class A) is live only with a virtual-memory pool,
     try std.testing.expectEqual(live.unset, vals[@backingInt(live.Slot.kv_free_target)]);
 }
 
+// ---- a stream with a bound wait opens only when the engine has admitted the request ----
+
+test "D90b: a streamed request with a bound wait is refused with a real 503 / 529 while the engine has not admitted it" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open("shared-key-1", admin_keys_file);
+    defer rig.close();
+    rig.engine.hold = true; // takes the request into its queue, admits nothing
+    try loadPolicy(&rig, "{\"request_caps\": {\"cli-1\": {\"wait_ms_max\": 150}}}");
+    const chat = try exchange(rig.srv, "POST", "/v1/chat/completions", shared_bearer ++ json_head, "{\"model\": \"m\", \"max_tokens\": 4, \"stream\": true, \"tf\": {\"wait_ms\": 100}, \"messages\": " ++ one_message ++ "}");
+    defer chat.free();
+    try expectOverloaded(chat, 503, false);
+    try std.testing.expect(std.mem.indexOf(u8, chat.head, "text/event-stream") == null);
+    try std.testing.expectEqual(@as(u32, 1), rig.engine.cancels);
+    const msg = try exchange(rig.srv, "POST", "/v1/messages", shared_bearer ++ json_head, "{\"model\": \"m\", \"max_tokens\": 4, \"stream\": true, \"tf\": {\"wait_ms\": 100}, \"messages\": " ++ one_message ++ "}");
+    defer msg.free();
+    try expectOverloaded(msg, 529, true);
+    // the policy's own default bounds a request that names no wait
+    try loadPolicy(&rig, "{\"request_caps\": {\"cli-1\": {\"wait_ms_default\": 100}}}");
+    const dflt = try exchange(rig.srv, "POST", "/v1/chat/completions", shared_bearer ++ json_head, "{\"model\": \"m\", \"max_tokens\": 4, \"stream\": true, \"messages\": " ++ one_message ++ "}");
+    defer dflt.free();
+    try expectOverloaded(dflt, 503, false);
+}
+
+test "D90b: once the engine admits a request its stream opens (200 and the role chunk), with or without a bound wait" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open("shared-key-1", admin_keys_file);
+    defer rig.close();
+    rig.engine.admit = true;
+    try loadPolicy(&rig, "{\"request_caps\": {\"cli-1\": {\"wait_ms_max\": 5000}}}");
+    for ([_][]const u8{ "{\"model\": \"m\", \"max_tokens\": 4, \"stream\": true, \"tf\": {\"wait_ms\": 4000}, \"messages\": " ++ one_message ++ "}", "{\"model\": \"m\", \"max_tokens\": 4, \"stream\": true, \"messages\": " ++ one_message ++ "}" }) |body| {
+        const r = try exchange(rig.srv, "POST", "/v1/chat/completions", shared_bearer ++ json_head, body);
+        defer r.free();
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.head, "text/event-stream") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"role\": \"assistant\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "[DONE]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.head, "Retry-After") == null);
+    }
+}
 
 test "goals: off by default; a mode and a goal set through set are what /goals judges, from the sampler's seconds; nothing is changed" {
     var rig: Rig = .{ .arena = undefined, .tmp = undefined };

@@ -14,6 +14,7 @@ const status = @import("status_routes.zig");
 const admin = @import("admin.zig");
 const admin_requests = @import("admin_requests.zig");
 const request_policy = @import("request_policy.zig");
+const errors = @import("errors.zig");
 const memory = @import("memory_routes.zig");
 const slide = @import("slide.zig");
 const recall = @import("recall_routes.zig");
@@ -40,6 +41,8 @@ pub fn dispatch(srv: *Server, conn: *Conn, a: Allocator) void {
     // the per-request fields carried as headers (request_policy.zig): read only where a policy file is configured
     if (srv.policy.path != null) request_policy.carried = request_policy.fromHeaders(conn, headerOf);
     defer request_policy.carried = .{};
+    errors.retry_after_s = 0;
+    defer errors.retry_after_s = 0;
     const m = conn.method;
     // a GET or DELETE that carries a body leaves it in the socket for the next request on a kept connection
     if (std.mem.eql(u8, m, "GET")) {

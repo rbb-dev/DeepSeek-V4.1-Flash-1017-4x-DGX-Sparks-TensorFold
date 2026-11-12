@@ -265,6 +265,10 @@ pub const Event = union(enum) {
 pub const Sink = struct {
     ctx: *anyopaque,
     event: *const fn (ctx: *anyopaque, id: Id, event: *const Event) void,
+    /// Called once, on the engine's thread, when the request leaves the queue and takes a lane (its prompt pass is about to
+    /// begin), before any event; an engine that does not report it never calls it, and the first event says as much. Null: not
+    /// listened to. It must return at once.
+    admitted: ?*const fn (ctx: *anyopaque, id: Id) void = null,
 };
 
 /// A reasoning effort name and the number a family's chat template takes for it (DeepSeek-V4.1's: "medium" -> 62).

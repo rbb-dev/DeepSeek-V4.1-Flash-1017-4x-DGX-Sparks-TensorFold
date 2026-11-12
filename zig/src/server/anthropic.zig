@@ -30,7 +30,7 @@ fn errorValue(a: Allocator, message: []const u8, status: u16) Allocator.Error!Va
     const kind = switch (status) {
         400 => "invalid_request_error",
         404 => "not_found_error",
-        503 => "overloaded_error",
+        503, 529 => "overloaded_error",
         else => "api_error",
     };
     const inner = try json.newObject(a);
@@ -42,8 +42,10 @@ fn errorValue(a: Allocator, message: []const u8, status: u16) Allocator.Error!Va
     return .{ .object = o };
 }
 
+/// Anthropic's overload is HTTP 529 `overloaded_error`: the chat route's 503 for the same refusal is sent as 529 here.
 fn sendError(conn: *Conn, a: Allocator, message: []const u8, status: u16) void {
-    routes.sendValue(conn, a, status, errorValue(a, message, status) catch return);
+    const code: u16 = if (status == 503) 529 else status;
+    routes.sendValue(conn, a, code, errorValue(a, message, code) catch return);
 }
 
 /// Rendered like the chat route renders, without generating: the prompt's token count.
@@ -74,7 +76,7 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
         };
         const chat = translate(&cx, body, count) catch return sendError(conn, a, cx.message, cx.status());
         if (count) {
-            const n = countTokens(srv, &cx, chat) catch return sendError(conn, a, cx.message, if (cx.kind == .capacity) 503 else 400);
+            const n = countTokens(srv, &cx, chat) catch return sendError(conn, a, cx.message, if (cx.kind == .capacity) 529 else 400);
             const o = json.newObject(a) catch return;
             o.put(a, "input_tokens", json.intValue(a, n) catch return) catch return;
             return routes.sendValue(conn, a, 200, .{ .object = o });

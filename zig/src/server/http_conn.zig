@@ -3,6 +3,7 @@ const std = @import("std");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const log = @import("log.zig");
+const errors = @import("errors.zig");
 
 pub const max_line = 65536;
 pub const max_headers = 100;
@@ -330,6 +331,10 @@ pub const Conn = struct {
         try c.addHeader("Content-Type", "application/json");
         var len: [24]u8 = undefined;
         try c.addHeader("Content-Length", try std.fmt.bufPrint(&len, "{d}", .{body.len}));
+        if ((code == 503 or code == 529) and errors.retry_after_s > 0) {
+            var secs: [16]u8 = undefined;
+            try c.addHeader("Retry-After", try std.fmt.bufPrint(&secs, "{d}", .{errors.retry_after_s}));
+        }
         if (c.close) try c.addHeader("Connection", "close");
         try c.finish(body);
     }
@@ -407,6 +412,7 @@ pub fn reason(code: u16) []const u8 {
         500 => "Internal Server Error",
         501 => "Not Implemented",
         503 => "Service Unavailable",
+        529 => "Overloaded",
         505 => "HTTP Version Not Supported",
         else => "",
     };

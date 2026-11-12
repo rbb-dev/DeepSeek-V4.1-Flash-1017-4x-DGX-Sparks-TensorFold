@@ -870,46 +870,71 @@ test "a backend that cannot serve any more: status says so and every new request
     try std.testing.expectError(error.Closed, e.submit(1, &req, .{ .ctx = &source, .event = Never.event }));
     try std.testing.expectEqual(@as(usize, 0), host.queued.items.len);
 }
+
+test "a request's admitted call comes once, when it takes a lane: not while another holds the only lane, and before its first event" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 1 });
     try host.start();
     defer host.stop();
-    const Seq = struct {
+    const Box = struct {
         mutex: std.Io.Mutex = .init,
-        n: u32 = 0,
-        a_done: ?u32 = null,
-        b_first: ?u32 = null,
-        b_done: bool = false,
-        fn event(ctx: *anyopaque, id: Id, e: *const Event) void {
-            const q: *@This() = @ptrCast(@alignCast(ctx));
-            q.mutex.lockUncancelable(std.testing.io);
-            defer q.mutex.unlock(std.testing.io);
-            q.n += 1;
+        admitted: u32 = 0,
+        events_before_admitted: u32 = 0,
+        events: u32 = 0,
+        done: ?Reason = null,
+        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
+            const b: *@This() = @ptrCast(@alignCast(ctx));
+            b.mutex.lockUncancelable(std.testing.io);
+            defer b.mutex.unlock(std.testing.io);
+            b.events += 1;
+            if (b.admitted == 0) b.events_before_admitted += 1;
             switch (e.*) {
-                .tokens => if (id == 2 and q.b_first == null) {
-                    q.b_first = q.n;
-                },
-                .finished => if (id == 1) {
-                    q.a_done = q.n;
-                } else {
-                    q.b_done = true;
-                },
+                .finished => |f| b.done = f.reason,
                 else => {},
             }
         }
-        fn done(q: *@This()) bool {
-            q.mutex.lockUncancelable(std.testing.io);
-            defer q.mutex.unlock(std.testing.io);
-            return q.a_done != null and q.b_done;
+        fn told(ctx: *anyopaque, _: Id) void {
+            const b: *@This() = @ptrCast(@alignCast(ctx));
+            b.mutex.lockUncancelable(std.testing.io);
+            defer b.mutex.unlock(std.testing.io);
+            b.admitted += 1;
+        }
+        fn state(b: *@This()) struct { u32, u32, u32, ?Reason } {
+            b.mutex.lockUncancelable(std.testing.io);
+            defer b.mutex.unlock(std.testing.io);
+            return .{ b.admitted, b.events_before_admitted, b.events, b.done };
         }
     };
     const prompt = [_]u32{ 2, 7, 1, 8 };
+    var a: Box = .{};
+    var b: Box = .{};
     const e = host.engine();
-    try e.submit(1, &.{ .prompt = &prompt, .max_tokens = 64 }, .{ .ctx = &seq, .event = Seq.event });
-    try e.submit(2, &.{ .prompt = &prompt, .max_tokens = 64 }, .{ .ctx = &seq, .event = Seq.event });
-    for (0..10000) |_| {
-        if (seq.done()) break;
-        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
-    }
-    try std.testing.expect(seq.done());
-    // the first request (64 tokens: within finish_left) ended before the second's first token
-    try std.testing.expect(seq.a_done.? < seq.b_first.?);
+    try e.submit(1, &.{ .prompt = &prompt, .max_tokens = 1 << 30 }, .{ .ctx = &a, .event = Box.event, .admitted = Box.told });
+    while (a.state()[2] < 2) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    try e.submit(2, &.{ .prompt = &prompt, .max_tokens = 4 }, .{ .ctx = &b, .event = Box.event, .admitted = Box.told });
+    std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake) catch {};
+    try std.testing.expectEqual(@as(u32, 1), a.state()[0]);
+    try std.testing.expectEqual(@as(u32, 0), a.state()[1]); // told before its first event
+    try std.testing.expectEqual(@as(u32, 0), b.state()[0]); // the only lane is A's: B waits in the queue, unadmitted
+    try std.testing.expectEqual(@as(u32, 0), b.state()[2]);
+    e.cancel(1);
+    while (b.state()[3] == null) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    try std.testing.expectEqual(@as(u32, 1), b.state()[0]);
+    try std.testing.expectEqual(@as(u32, 0), b.state()[1]);
+}
+
+test {
+    _ = @import("lane_host_fail_test.zig");
+    _ = @import("lane_host_fill_test.zig");
+    _ = @import("lane_host_reuse_test.zig");
+    // lane_host_admit/lone/recall_test.zig: his lane host (pool-room admission, the lone driver, Recall's record), not merged: ours is kept
+    // lane_host_status/stale/cache_lifetime/borrow/warm/rows_test.zig: his prompt cache (pages, rows, expiry, warming) and his
+    // stepped fake backend and learner hook, not merged: our prompt cache and lane host are kept
 }

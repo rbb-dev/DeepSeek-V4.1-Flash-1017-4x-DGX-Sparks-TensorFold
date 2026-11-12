@@ -16,7 +16,7 @@ const Allocator = std.mem.Allocator;
 const gpa = std.testing.allocator;
 const io = std.testing.io;
 
-test "rewind boundary follows the latest actual user and stops before content" {
+test "rewind boundary (rewindLen) follows the latest actual user and stops before content" {
     var eng: Eng = .{ .window = 256, .cache = true };
     var text: Text = .{};
     const srv = try start(&eng, &text, null, null, null);
@@ -29,7 +29,9 @@ test "rewind boundary follows the latest actual user and stops before content" {
     const messages = parsed.ok;
     const rendered = try prompt_mod.prepare(srv, &cx, .{ .messages = messages, .fields = .null }, false, null);
     const boundary = "system:rules\nuser:first\nassistant:reply\nuser:".len;
-    try std.testing.expectEqual(boundary, rendered.rewind_len);
+    // (rendered.rewind_len is not checked: our lane host keeps no rewind state, so prepare does not compute it; the boundary is
+    // rewindLen's, the warm path's, checked below)
+    _ = rendered;
 
     const warm_messages = try a.alloc(Value, messages.array.len + 2);
     @memcpy(warm_messages[0..messages.array.len], messages.array);
@@ -529,5 +531,7 @@ test "a stream compacts before it opens" {
     try std.testing.expect(watch.opened);
     try std.testing.expect(watch.saw);
     try std.testing.expect(eng.early >= 1);
-    try std.testing.expect(eng.late >= 1);
+    // the stream opens when the engine has taken the final request (a refusal at that submit is still an HTTP status), so
+    // every submit, the compaction's and the reply's, is before the open
+    try std.testing.expectEqual(@as(usize, 0), eng.late);
 }

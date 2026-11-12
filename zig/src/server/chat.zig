@@ -52,6 +52,9 @@ pub const Input = struct {
 pub const Sink = struct {
     ctx: *anyopaque,
     call: *const fn (ctx: *anyopaque, delta: Value) error{Closed}!void,
+    /// Called once, when the engine has taken the request and before its first piece: a stream opens here, so a refusal at the
+    /// submit (the engine is busy) is still an HTTP error status, not an event inside a 200.
+    begin: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
     /// Keeps an idle stream alive (an SSE comment), when Config.sse_keepalive_ms says so; null: never.
     keep: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
 };
@@ -243,7 +246,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     };
     if (srv.keepalive) |k| k.begin(); // the GPU is busy: the idle ticker holds its commits
     defer if (srv.keepalive) |k| k.end();
-    srv.engine.submit(id, &request, .{ .ctx = &box, .event = Mailbox.onEvent }) catch |e| return switch (e) {
+    srv.engine.submit(id, &request, .{ .ctx = &box, .event = Mailbox.onEvent, .admitted = Mailbox.onAdmitted }) catch |e| return switch (e) {
         error.Busy => cx.fail(.capacity, "the engine is busy; retry shortly", .{}),
         error.Closed => cx.fail(.other, "the scheduler is closed", .{}),
         error.InvalidSpans => cx.fail(.request, "the prompt span layout is invalid", .{}),
@@ -255,6 +258,13 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     if (tracked) |t| gen.live = &t.generated;
     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, &box.stats.depths, box.stats.rounds, box.stats.plans, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+    // A stream opens when the engine has taken the request. A request that bound its wait (wait_ms: its own, or its key's default)
+    // opens only once the engine has admitted it to a lane or produced its first event, so until then a refusal (the wait
+    // runs out) is still an HTTP status; one that did not opens now, as it always did, and keeps its connection alive through
+    // the queue.
+    if (sink) |s| if (s.begin) |b| {
+        if (gen.deadline_ns != null) gen.pending_begin = s else b(s.ctx) catch return error.Cancelled;
+    };
     const result: Failure!Reply = blk: {
         if (sink != null and gen.tools.len > 0) {
             gen.calls = tool_stream.Streamer.init(a, gen.tools) catch |e| break :blk e;
@@ -263,6 +273,11 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
             gen.calls.?.calls_off = tool_grammar.writesDsml(srv, a);
         }
         gen.loop(gone) catch |e| break :blk if (gen.timed_out) cx.fail(.capacity, "the engine did not take the request within its wait_ms ({d} ms); retry shortly", .{prepared.wait_ms.?}) else e;
+        // a reply that ended without a first event still opens its stream (unless it failed: that is an HTTP status)
+        if (gen.pending_begin) |s| if (gen.box.reason != .failed) {
+            gen.pending_begin = null;
+            s.begin.?(s.ctx) catch break :blk error.Cancelled;
+        };
         break :blk gen.finish(cx, prepared.prompt_len, received, thinking, effort, prepared.sampled, prepared.drafts);
     };
     done = .{
@@ -346,8 +361,11 @@ const Generation = struct {
     engine_done: bool = false,
     consumed: usize = 0,
     chunk_index: usize = 0,
+    /// When the request gives up waiting for a lane (its `wait_ms`, until the engine's `admitted` call or first event); null: it does not.
     deadline_ns: ?i96 = null,
     timed_out: bool = false,
+    /// The stream's opening, held until the engine admits the request (see `generate`).
+    pending_begin: ?Sink = null,
     sent_ns: i96 = 0, // when the stream last sent the client something (its keepalive's clock)
     lp: ?@import("logprobs.zig").Stream = null, // the request asked for logprobs: its rows, copied with each round
 
@@ -497,6 +515,7 @@ const Generation = struct {
             m.mutex.lockUncancelable(m.io);
             var chunk: ?[]u32 = null;
             var ended = false;
+            const started = m.admitted or m.prefilled_ns != null or m.tokens.items.len > 0;
             if (g.chunk_index < m.chunks.items.len) {
                 const end = m.chunks.items[g.chunk_index];
                 g.chunk_index += 1;
@@ -509,6 +528,13 @@ const Generation = struct {
                 m.cond.waitTimeout(m.io, &m.mutex, .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } }) catch {};
             }
             m.mutex.unlock(m.io);
+            if (started) if (g.pending_begin) |s| {
+                g.pending_begin = null;
+                s.begin.?(s.ctx) catch {
+                    g.cancel();
+                    return error.Cancelled;
+                };
+            };
             if (ended) {
                 g.engine_done = true;
                 return;
@@ -523,6 +549,7 @@ const Generation = struct {
                 g.cancel();
                 return error.Cancelled;
             };
+            if (chunk == null and g.pending_begin == null and @hasDecl(Gone, "beat")) {
                 // Queueing and long prefills send no tokens; keep the connection alive through those gaps.
                 const now = nowNs(g.srv.io);
                 const since = g.wrote_ns orelse now;
