@@ -71,6 +71,8 @@ pub fn predecessor(k: usize, prev_lanes: usize) usize {
     return if (k == 0) prev_lanes - 1 else k - 1;
 }
 
+/// Whether two consecutive passes may run as a pair: the switch, whole passes of the booted `pass_rows` (TF_DS_PASS_ROWS: any
+/// whole number of resume units up to 16,384) back to back, both encoder-only (a pass with decoder rows is the prompt's last and runs alone after a join), the
 /// Engram worker holding their resume units (a ring of twice a pass's units), and nothing else in the engine at work (`pass_rows_now`
 /// is the pass rows the scheduler's rule gives: the resume rows while a stream decodes, fills or waits, which at pass rows of 2,048
 /// is the booted rows too, so the lanes' rule asks the host's facts as well: stream.wholePass).
@@ -251,6 +253,9 @@ pub fn checkGroup(lanes: usize, half: usize, first: bool, steps: []const Step) V
 // ---------------------------------------------------------------------------------------------------------------
 // Tests.
 
+test "a pair is two whole encoder-only passes of the booted rows back to back, with the worker, at every whole number of resume units from 2,048 to 16,384 rows" {
+    var p: usize = 2048;
+    while (p <= 16384) : (p += 2048) {
         try std.testing.expect(eligible(true, p, p, 0, p, p, p, 2 * p, true));
         try std.testing.expect(eligible(true, p, p, 3 * p, p, 4 * p, p, 5 * p + 77, true)); // anywhere in the prompt, a decoder window behind
         try std.testing.expect(!eligible(false, p, p, 0, p, p, p, 2 * p, true)); // switch off
@@ -266,11 +271,16 @@ pub fn checkGroup(lanes: usize, half: usize, first: bool, steps: []const Step) V
     try std.testing.expect(!eligible(true, 4096, 4096, 0, 2048, 2048, 2048, 4096, true));
     try std.testing.expect(!eligible(true, 2048, 2048, 0, 4096, 4096, 4096, 8192, true));
     try std.testing.expect(!eligible(true, 8192, 8192, 0, 4096, 4096, 4096, 8192, true));
+    try std.testing.expect(!eligible(true, 16384, 16384, 0, 8192, 8192, 8192, 16384, true));
 }
 
+test "a pair's Engram group is both passes' resume units: twice a pass's, 2 to 16 chunks at 2,048 to 16,384 rows" {
     try std.testing.expectEqual(@as(usize, 2), groupChunks(2048, 2048));
     try std.testing.expectEqual(@as(usize, 4), groupChunks(4096, 2048));
     try std.testing.expectEqual(@as(usize, 8), groupChunks(8192, 2048));
+    try std.testing.expectEqual(@as(usize, 16), groupChunks(16384, 2048));
+    var units: usize = 1;
+    while (units <= 8) : (units += 1) try std.testing.expectEqual(2 * units, groupChunks(units * 2048, 2048));
 }
 
 test "the pair's issue order: A's layer L, then B's layer L - gap; each pass's layers in order, every layer behind its wait, then the boundaries" {

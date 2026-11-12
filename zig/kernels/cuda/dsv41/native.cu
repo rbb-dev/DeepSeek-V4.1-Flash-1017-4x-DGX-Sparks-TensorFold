@@ -2931,6 +2931,7 @@ struct W8Args {
     int y_dtype;
     void* y;
     int64_t ldy;
+    int raster;  // the prefill tile GEMMs' grouped tile order (pf_tile_of), 0: row tiles fastest
     // TF_DS_WOA_MERGE: the groups of a layer in ONE launch (grid.z = groups): group z's operands are the base pointers above plus z times these byte strides (q's codes, s's scales, w's codes, ws's
     // scales, y's output); 0 in a one-group launch (grid.z 1), so the per-group launches are as they were. Each CTA is one group's tile and runs that group's code unchanged: the bytes are the two launches'.
     int64_t gq, gs, gw, gws, gy;
@@ -2964,6 +2965,9 @@ extern "C" __global__ void __launch_bounds__(512, 1) tf_dsn_pf_bf16w8_w16_kernel
     w8_group(a);  // (TF_DS_WOA_MERGE: this CTA's group; a one-group launch moves nothing)
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     const int wm = warp / 4, wn = warp % 4;  // warp tile 32 rows x 32 columns (pf_bf16's, two m16 tiles)
+    int tr, tc;
+    pf_tile_of(a.raster, tr, tc);  // row tiles fastest by default (the weight tiles shared in L2)
+    const int m0 = tr * kBfBM, n0 = tc * kBfBN;
     const int nst = a.K / kBfKS;  // one 32-column K block a stage
     // the tile's weight scales [BN / 32][K / 32] (fp8_scales' layout for one weight)
     __shared__ uint8_t wss[kWss];
@@ -3103,6 +3107,9 @@ extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_pf_bf16w8_kernel(W8A
     w8_group(a);  // (TF_DS_WOA_MERGE: this CTA's group; a one-group launch moves nothing)
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     const int wm = warp / 4, wn = warp % 4;  // warp tile 64 rows x 32 columns (pf_bf16's)
+    int tr, tc;
+    pf_tile_of(a.raster, tr, tc);  // row tiles fastest by default (the weight tiles shared in L2)
+    const int m0 = tr * kBfBM, n0 = tc * kBfBN;
     const int nst = a.K / kBfKS;  // one 32-column K block a stage
     // the tile's weight scales [BN / 32][K / 32] (fp8_scales' layout for one weight)
     __shared__ uint8_t wss[kWss];

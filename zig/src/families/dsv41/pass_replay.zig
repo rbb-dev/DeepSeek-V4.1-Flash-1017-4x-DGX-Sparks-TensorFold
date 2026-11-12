@@ -86,7 +86,11 @@ test "the replay's passes: unset gives a 1,024-row wave's, a chunk's and a 4,096
 
 test "--rows: whole 1,024-row waves up to the engine's largest pass, in the order given" {
     try std.testing.expectEqualSlices(usize, &.{4096}, (try parseRows("4096")).slice());
+    try std.testing.expectEqualSlices(usize, &.{8192}, (try parseRows("8192")).slice());
+    try std.testing.expectEqualSlices(usize, &.{ 9216, 10240, 16384 }, (try parseRows("9216,10240,16384")).slice());
     try std.testing.expectEqualSlices(usize, &.{ 2048, 1024, 3072 }, (try parseRows("2048,1024,3072")).slice());
+    try std.testing.expectEqualSlices(usize, &.{model.pass_rows_max}, (try parseRows("16384")).slice());
+    const bad = [_][]const u8{ "", "0", "512", "1000", "2047", "17408", "18432", "32768", "2048,", ",2048", "2048,,1024", "x", "-1024", "1024 " };
     for (bad) |text| try std.testing.expectError(error.BadRows, parseRows(text));
     try std.testing.expectError(error.BadRows, parseRows("1024,1024,1024,1024,1024,1024,1024,1024,1024")); // nine
 }
@@ -155,4 +159,20 @@ test "takeSpan: a rank's span into the gathered array; its bytes written outside
     var want: [16]u8 = @splat(0xa5);
     @memcpy(want[8..12], &[_]u8{ 1, 2, 3, 4 });
     try std.testing.expectEqualSlices(u8, &want, &dst);
+}
+
+test "the kernels replay's row tables reach a 16,384-row pass: its buffers derive from the table's largest" {
+    const src = @embedFile("kernels_replay_main.zig");
+    // the split and sf replays' row ceilings become the replay's largest pass, not 4,096 + 37 / 4,096
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, src, "const split_max_rows: usize = 4096"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, src, "const sf_max_rows: usize = 4096"));
+    // the replay's largest pass is the engine's (model.pass_rows_max)
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "const replay_max_rows: usize = " ++ "16384"));
+    try std.testing.expectEqual(@as(usize, model.pass_rows_max), 16384);
+    // every row table the replay sweeps ends at the largest pass
+    try std.testing.expectEqual(@as(usize, 9), std.mem.count(u8, src, "2048, 4096, 8192, " ++ "16384 }"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, src, "2048, 4096, 8192 }"));
+    // the R128 and sf replays' fixed row counts are the replay's largest pass; the 4,096 left are the wide-cache, ring and
+    // Rocinante replays', whose arenas are laid out for the transport's own cap (rocinante.max_cap)
+    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, src, "const R: usize = 4096;"));
 }

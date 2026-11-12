@@ -455,6 +455,7 @@ pub const kern_gemm_w16: u32 = 1 << 28;
 pub const kern_hc_fused: u32 = 1 << 21;
 pub const kern_attn_epi_fused: u32 = 1 << 27;
 pub const kern_gemm_r2: u32 = 1 << 29;
+pub const kern_gemm_halves: u32 = 1 << 30;
 
 /// The kernel switches beyond kern's 32 bits (Settings.kern2): bit i is kern2_names[i], set when asked for. Same rules as
 /// kern_names: read once by Model.open, differ refuses every bit that differs, one this build has no name for included.
@@ -607,6 +608,10 @@ pub var ring_wait_asked: bool = false;
 /// that cannot wait in the card refuses by name.
 pub var ring_wait_explicit: bool = false;
 
+/// TF_DS_GEMM_HALVES as Model.open read it (switchAsked), once (Settings.kern, mx.gemm_halves): a prompt pass of more
+/// than 4,096 rows runs its dense FP8, bf16 and pf GEMMs as 4,096-row blocks at most.
+pub var gemm_halves_asked: bool = false;
+
 /// TF_DS_PF_RASTER as Model.open read it (rasterSetting; 0: unset), once (Settings.pf_raster, mx.pf_raster): the group of
 /// row tiles the prompt tile GEMMs walk their grid in where a launch's activation slab reaches mx.raster_slab_bytes.
 pub var pf_raster_asked: u32 = 0;
@@ -676,6 +681,8 @@ pub fn kernAsked() u32 {
     if (hc_fused_asked) x |= kern_hc_fused;
     if (attn_epi_fused_asked) x |= kern_attn_epi_fused;
     if (gemm_r2_asked) x |= kern_gemm_r2;
+
+    if (gemm_halves_asked) x |= kern_gemm_halves;
     if (qgate_canary_asked != .off) x |= kern_qgate_canary;
     return x;
 }
@@ -751,8 +758,17 @@ pub fn readPromptOrderEnv() error{BadPromptOrder}!void {
     }
 }
 
+/// TF_DS_PASS_ROWS's setting for a resume grid of `resume_rows`: one unit (unset), or any whole number of units by number up to
+/// `max_rows` (the engine's largest pass, prompt.max_pass_rows); null: no setting (any other text).
+pub fn passRowsSetting(text: ?[]const u8, resume_rows: u32, max_rows: u32) ?u32 {
     const t = text orelse return resume_rows;
     const v = std.fmt.parseInt(u32, t, 10) catch return null;
+    return if (v >= resume_rows and v % resume_rows == 0 and v <= max_rows) v else null;
+}
+
+/// The words of a TF_DS_PASS_ROWS that is no setting (passRowsSetting null): the text, the unit and the range.
+pub fn passRowsRefusal(buf: []u8, text: ?[]const u8, resume_rows: u32, max_rows: u32) []const u8 {
+    return std.fmt.bufPrint(buf, "TF_DS_PASS_ROWS={s}: not a setting; a pass is a whole number of {d}-row resume units, from {d} to {d} rows (2048, 4096, 6144, 8192 ... {d})", .{ text orelse "", resume_rows, resume_rows, max_rows, max_rows }) catch "TF_DS_PASS_ROWS: not a whole number of resume units up to the largest pass";
 }
 
 /// TF_DS_PASS_BESIDE as Model.open read it, once: the rows a prompt's pass may run while a stream decodes (the host's step
@@ -931,7 +947,8 @@ pub const Two = struct {
     // rows the scorer reads (prompt.projRows)
     idx_proj_owned: bool = false,
 
-    /// The widths from the split (both pairs'), and the buffers for chunks of up to `cap` rows (and rounds) from `a`.
+    /// The widths from the split (both pairs'), and the buffers for chunks of up to `cap` rows (and rounds) from `a`;
+    /// `links`: this rank's communicator has a two-rank link (Comm.links), whose exchanges pass through `parts`.
     pub fn init(c: *const Config, w: *const weights.Weights, a: *prompt.Arena, s: plan.Split, cap: usize) !Two {
         const pp = s.pair orelse return error.NotA2DSplit;
         const s0 = s.atPair(0);
@@ -1399,8 +1416,11 @@ pub fn agreedOn(asked: bool, cannot: u32) bool {
 }
 
 /// Why the owner sums over Rocinante cannot run on this rank (null: it can): attention, MoE and Engram all at owned rows,
+/// passes of a whole number of resume units up to the largest pass (the transport's arenas and plans follow the booted rows:
+/// rocinante.setCap), no second chunk stream, and the kit's two-block readers.
 pub fn rociOff(ow: [2]usize, pass_rows: usize, readers: bool) ?[]const u8 {
     if (ownerYxOff(ow)) |why| return why;
+    if (pass_rows < chunk_rows or pass_rows % chunk_rows != 0 or pass_rows > prompt.max_pass_rows) return "plans exist for passes of a whole number of 2048-row resume units, 2,048 to 16,384 rows";
     if (!readers) return "the kit's extra set has no _hc_mix_pf_2b / _hc_post_2b / _engram_gate_2b variant";
     return null;
 }
@@ -2359,6 +2379,7 @@ test "rank 0's landing slots travel to every follower and are never compared (a 
     older.protocol = 5; // a follower whose image lacks fill_pair
     try std.testing.expectEqualStrings("rank 2 decodes frame protocol 5 and rank 0 sends 11: run every rank from the same image", older.differ(lead, 2, &buf));
 }
+
 test "the expert pack as codes needs the checkpoint's own weights, the parity rest blocks and whole 128-value blocks" {
     try std.testing.expectEqual(@as(?[]const u8, null), packCodesOff(true, 512, 128));
     try std.testing.expectEqualStrings("needs the checkpoint's own FP8 / MXFP4 weights", packCodesOff(false, 512, 128).?);

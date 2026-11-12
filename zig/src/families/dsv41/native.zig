@@ -205,6 +205,12 @@
 //!                                               replies' bits without it; needs TF_DS_MMA_SF_EXACT=1 in effect and an
 //!                                               image with the kernels; one line says whether it runs; every rank the
 //!                                               same; the SSD tier's math names it
+//!   TF_DS_GEMM_HALVES=1                         a prompt pass of more than 4,096 rows runs its dense FP8, bf16 and pf
+//!                                               GEMMs as row blocks of at most 4,096, each block the launch a
+//!                                               4,096-row pass makes for its rows (the same kernel, split, variant
+//!                                               and grid rule); the experts keep the whole pass. A row's bits are the
+//!                                               same at every row count, so the replies' bits are unchanged; the SSD
+//!                                               tier's math names it; every rank the same
 //!   TF_DS_PF_RASTER=G                           (G = 2, 4, 8 or 16; other text refuses the start) a prompt GEMM whose
 //!                                               activation slab is 14 MiB or more (the tile FP8 GEMMs, the block-scaled
 //!                                               MMA's and the bf16 tile GEMM) walks its grid G row tiles at a time
@@ -612,6 +618,7 @@ pub fn tierMath(two: ?*const prompt2d.Two, k: ?*const mx.Kernels) spill_start.Ma
         .hc_fused = tri_hc.hc_fused,
         .attn_epi_fused = tri_attn.attn_epi_fused,
         .hc_2s = tri_hc.hc_2s,
+        .gemm_halves = mx.gemm_halves,
         .pf_raster = @intCast(mx.pf_raster),
         .qgate_canary = if (prompt.qgate_canary) 1 else @backingInt(prompt.qgate_body),
     };
@@ -936,10 +943,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.BadCopyRows => std.fmt.comptimePrint("TF_DS_COPY_ROWS: a lone stream's copied window's rows at most, {d} .. {d} (unset: {d})", .{ lanes_mod.window_rows + 1, lanes_mod.copy_rows_most, lanes_mod.window_rows }),
         error.BadGraphCap => "TF_DS_GRAPH_CAP: the captured CUDA graphs kept at most, a count (0: all)",
         error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 32",
-        error.BadPassRows => "TF_DS_PASS_ROWS: a multiple of 2,048 from 2,048 to the build's pass rows; TF_DS_PASS_FROM: a position",
-        error.BadFill => "TF_FILL_CHUNKS, TF_FILL_FIRST and TF_FILL_ROUNDS: whole numbers (a prompt piece's chunks of 2,048 tokens, the first piece's, the other streams' rounds between two pieces)",
-        error.BadWindow => "TF_DS_WINDOW: the streams' shared positions, at least --context",
-        error.SettingsDiffer => "a follower rank runs other settings than this server (the line above says which): give every rank the same TF_DS_STREAMS (the followers: --streams), TF_DS_ROUND_ROWS (--round-rows), RDMA devices, drafter, TF_DS_REPLAY_FLOOR and TF_DS_IDX_SPLIT, and every follower a --pool of at least the window (--context, or TF_DS_WINDOW)",
+        error.BadWindow => "TF_DS_WINDOW (the recipe's POOL): the streams' shared positions, at least --context: the pool must hold one full request, the context is never lowered",
         error.BadKvTarget => "TF_DS_KV_FREE_TARGET_GIB: the free memory to keep on each Spark, a number of GiB above 0 and at most 1024 (unset: the pool is TF_DS_WINDOW's, or the context)",
         error.BadKvGrowth => "TF_DS_KV_GROWTH_MIB: the memory left for what the engine takes after the pool, a whole number of MiB (unset: 6144)",
         error.KvTargetAndWindow => "TF_DS_KV_FREE_TARGET_GIB sizes the pool from the free memory; TF_DS_WINDOW (the recipe's POOL) names a fixed one: set one of them",

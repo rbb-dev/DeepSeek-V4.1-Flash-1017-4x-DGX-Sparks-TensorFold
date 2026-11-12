@@ -92,6 +92,7 @@ const optional = [_][2][]const u8{
     .{ "attn_epi_fused", "attn_epi_fused" },
     .{ "hc_2s", "hc_2s" },
     .{ "gemm_r2", "gemm_r2" },
+    .{ "gemm_halves", "gemm_halves" },
 };
 
 fn mathBase(buf: []u8, m: Math) ![]const u8 {

@@ -79,6 +79,13 @@ const plan = @import("plan.zig");
 /// TF_DS_PASS_TAIL the final pass takes the remainder up to the pass rows.
 pub const chunk_rows = prompt2d.chunk_rows;
 
+/// The most rows a prompt pass runs (TF_DS_PASS_ROWS=16384: eight resume units).
+pub const pass_rows_max = 8 * chunk_rows;
+
+comptime {
+    if (pass_rows_max != prompt.max_pass_rows)
+        @compileError("pass_rows_max and prompt.max_pass_rows disagree: the host row tables would cap a pass");
+}
 
 /// TF_DS_ENGRAM_WORKER=0: a fill's Engram rows read by a thread a chunk (the chunk before's end to this one's first
 /// Engram layer) instead of the fill's worker.
@@ -201,34 +208,18 @@ pub fn passRowsFallback(text: ?[]const u8, is_default: bool, total_bytes: usize)
     return "this box's memory is under 96 GiB, too little for the larger pass's buffers";
 }
 
-        // Engram on the host: the compressed token map, the multipliers, the tables and 64 readers
-        if (o.engram_dir) |edir| {
-            const map_text = try std.Io.Dir.cwd().readFileAlloc(io, o.token_map orelse return error.NoTokenMap, a, .limited(1 << 26));
-            const map = try std.json.parseFromSliceLeaky([]i32, a, map_text, .{});
-            const EngramJson = struct { multipliers: [][]i64 };
-            const ej_text = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ o.kit_dir, "engram.json" }), a, .limited(1 << 26));
-            const ej = try std.json.parseFromSliceLeaky(EngramJson, a, ej_text, .{ .ignore_unknown_fields = true });
-            var mult: [engram.max_layers][engram.max_ngram]i64 = @splat(@splat(0));
-            for (ej.multipliers, 0..) |row, l| for (row, 0..) |v, k| {
-                mult[l][k] = v;
-            };
-            m.tables = try engram_io.Tables.open(gpa, io, edir);
-            m.epool = try engram_io.Pool.init(gpa, io, 64);
-            m.eh = try prompt.EngramHost.init(a, c, engram.Hasher.init(c.*, map, mult), &m.tables.?, m.epool.?, sp.rank, sp.world, chunk_rows);
-            if (o.engram_aio) {
-                // a round's reads, 2 x 12 x its rows at most: 1,024 slots for each 16 rows of the round-row setting
-                m.aio = try engram_aio.Aio.init(gpa, io, 1024 * ((o.round_rows + 15) / 16));
-                m.eh.?.aio = m.aio;
-                // a prompt chunk's reads (2 x 12 x 2,048 at most): a ring of 4,096 slots (32 MiB), 1,024 rows a batch
-                m.paio = try engram_aio.Aio.init(gpa, io, 4096);
-                m.eh.?.paio = m.paio;
-            }
-        } else if (c.engram_layers.slice().len > 0) return error.NoEngramTables;
+/// TF_DS_PASS_ROWS's setting (prompt2d.passRowsSetting): any whole number of resume units up to pass_rows_max. Text that is no
+/// setting refuses the start, and says so; a setting of more rows says the rule it serves under.
+fn readPassRows(from: u32, total_bytes: usize) !u32 {
     var v: ?[]const u8 = if (std.c.getenv("TF_DS_PASS_ROWS")) |x| std.mem.span(x) else null;
     if (passRowsFallback(v, speed_defaults.defaulted("TF_DS_PASS_ROWS"), total_bytes)) |why| {
         std.log.warn("TF_DS_PASS_ROWS: 2048 instead of the default 4096: {s}; without 4,096-row passes: {s}", .{ why, speed_defaults.costOf("TF_DS_PASS_ROWS") });
         v = "2048";
     }
+    const rows = prompt2d.passRowsSetting(v, chunk_rows, pass_rows_max) orelse {
+        var buf: [320]u8 = undefined;
+        std.log.err("{s}", .{prompt2d.passRowsRefusal(&buf, v, chunk_rows, pass_rows_max)});
+        return error.BadPassRows;
     };
     if (rows > chunk_rows) std.log.info("TF_DS_PASS_ROWS={d}: a prompt's passes of up to {d} rows on the {d}-row grid from position {d} (TF_DS_PASS_FROM) where nothing decodes, fills or waits", .{ rows, rows, chunk_rows, from });
     return rows;
@@ -1338,14 +1329,31 @@ pub fn rankDigest() prompt2d.Digest {
 
 const EngramPhase = enum { all, pre, finish };
 
+/// The device bytes of a second pass's chunk and node of the 2D split at 4,096 rows, MEASURED on a Spark (the pair line's
+/// "chunk and node take", release with the stagger: 3,370,548,688). A pass's buffers are its rows' widths, so another
+/// pass size takes this times its rows over 4,096 (ESTIMATED: the guard's floor below is the margin for a fixed part).
+const pair_chunk_node_4096: u64 = 3_370_548_688;
+/// What the guard keeps free for the rest of the engine (the host side of the pair, the round buffers, the cache growth).
 const pair_guard_bytes: usize = 6 << 30;
 
+/// The bytes a second pass takes on a rank at `pass_rows`: its chunk and node (scaled from the measured 4,096-row pass), the
+/// second lane's transport arena (`lane_arena`: rocinante.layout().total, which follows the booted rows) and the control block.
+pub fn pairEstimate(pass_rows: usize, lane_arena: u64) u64 {
+    return (pair_chunk_node_4096 * pass_rows + 4095) / 4096 + lane_arena + @sizeOf(rocinante_mod.Control);
+}
+
+/// How many bytes short a start is of running two passes at `pass_rows` with `free` bytes free (0: it fits): the estimate and the
+/// guard's floor both come off `free`.
+pub fn pairShort(free: u64, pass_rows: usize, lane_arena: u64) u64 {
     return pairShortN(free, pass_rows, lane_arena, 2);
 }
 
 /// `pairShort` for `lanes` passes in flight (TF_DS_ROCI_STAGGER_LANES): every pass after the first takes the estimate.
 pub fn pairShortN(free: u64, pass_rows: usize, lane_arena: u64, lanes: usize) u64 {
     const need = (lanes - 1) * pairEstimate(pass_rows, lane_arena) + pair_guard_bytes;
+    return if (free >= need) 0 else need - free;
+}
+
 /// What TF_DS_ROCI_STAGGER_LANES comes to at the start: the lanes asked for (`want`, 2 or 3), whether the operator set it, and whether
 /// every rank has the memory for them. A box under the floor refuses a lane count the operator set, by name; one that was only the
 /// default runs two lanes and warns. Two lanes are never judged here: the pair's own guard runs as it always did.
@@ -1354,6 +1362,63 @@ pub fn lanesChoice(want: usize, set: bool, fits_all: bool) LanesChoice {
     if (want <= 2 or fits_all) return .{ .lanes = want };
     if (set) return .{ .lanes = want, .refuse = true };
     return .{ .lanes = 2, .warn = true };
+}
+
+/// Why a pool of `pool` positions cannot serve streams of `context` (null: it can): it must hold one stream's whole context, a full
+/// request, or the context would be lowered without a word (a pool is the operator's setting; the context is never lowered).
+pub fn poolBelowContext(pool: usize, context: usize) ?[]const u8 {
+    if (context == 0 or pool >= context) return null;
+    return "the KV pool (POOL: TF_DS_WINDOW on rank 0, --pool on the followers) holds fewer positions than one stream's context (--context): the pool must hold one full request, so the context is never lowered";
+}
+
+/// What a rank would give back of its KV pool to make room: the pool's caches (prompt.Caches) by the positions it holds. The
+/// pool is the operator's setting (POOL in the recipe: TF_DS_WINDOW on rank 0, --pool on the followers, one value on every rank).
+pub const PoolView = struct {
+    c: *const Config,
+    layers: []const weights.Layer,
+    slots: usize, // the pool's streams
+    pool: usize, // the positions it holds now
+    floor: usize, // the fewest it may hold: one stream's whole context (a request is never cut)
+
+    /// The device bytes of the pool at `positions`.
+    pub fn bytes(v: PoolView, positions: usize) usize {
+        return prompt.Caches.poolBytes(v.c, v.layers, positions, v.slots);
+    }
+};
+
+/// The granularity of a pool the refusal names: a multiple of 65,536 positions.
+pub const pool_step: usize = 65536;
+
+/// The largest pool (a multiple of pool_step, below the current one) whose caches take at least `short` bytes less, and never one
+/// below the view's floor; null when even the floor frees less than `short`.
+pub fn poolThatFrees(v: PoolView, short: u64) ?usize {
+    if (short == 0) return v.pool;
+    const lo = std.mem.alignForward(usize, v.floor, pool_step);
+    if (lo >= v.pool) return null;
+    const have = v.bytes(v.pool);
+    if (have - v.bytes(lo) < short) return null;
+    // the freed bytes grow as the pool shrinks: the largest multiple whose freed bytes reach `short`
+    var good = lo / pool_step; // (frees enough)
+    var bad = (v.pool + pool_step - 1) / pool_step; // (the pool itself frees nothing)
+    while (bad - good > 1) {
+        const mid = good + (bad - good) / 2;
+        if (have - v.bytes(mid * pool_step) >= short) good = mid else bad = mid;
+    }
+    return good * pool_step;
+}
+
+/// The words that end a start for want of free memory: what it needs, what is free, the GiB short, and the pool (POOL) that would
+/// make it fit (or that none does), or a smaller TF_DS_PASS_ROWS. `what`: "the second pass" or "the pass"; `need` the bytes the
+/// start wants free (the estimate and the floor kept together).
+pub fn memoryRefusal(buf: []u8, what: []const u8, estimated: bool, pass_rows: usize, need: u64, free: u64, v: PoolView) ![]const u8 {
+    const gib: f64 = 1 << 30;
+    const short = if (need > free) need - free else 0;
+    const head = try std.fmt.bufPrint(buf, "not enough free memory for {s} at TF_DS_PASS_ROWS={d}: {d:.2} GiB wanted free ({s}the {d:.1} GiB kept), {d:.2} GiB free, {d:.2} GiB short; ", .{ what, pass_rows, @as(f64, @floatFromInt(need)) / gib, if (estimated) "ESTIMATED from the 4,096-row pass measured, with " else "MEASURED after the start's allocations, ", @as(f64, @floatFromInt(pair_guard_bytes)) / gib, @as(f64, @floatFromInt(free)) / gib, @as(f64, @floatFromInt(short)) / gib });
+    const tail = if (poolThatFrees(v, short)) |p|
+        try std.fmt.bufPrint(buf[head.len..], "POOL={d} frees it (the KV pool holds {d} positions now, {d:.2} GiB on this Spark; a pool is the operator's setting, TF_DS_WINDOW on rank 0 and --pool on the followers, one value on every rank, and the smallest any rank names fits them all), or a smaller TF_DS_PASS_ROWS", .{ p, v.pool, @as(f64, @floatFromInt(v.bytes(v.pool))) / gib })
+    else
+        try std.fmt.bufPrint(buf[head.len..], "no POOL fits: the smallest pool that holds one full request ({d} positions) frees {d:.2} GiB of the {d:.2} GiB short (a smaller TF_DS_PASS_ROWS, or more free memory)", .{ std.mem.alignForward(usize, v.floor, pool_step), @as(f64, @floatFromInt(v.bytes(v.pool) -| v.bytes(std.mem.alignForward(usize, v.floor, pool_step)))) / gib, @as(f64, @floatFromInt(short)) / gib });
+    return buf[0 .. head.len + tail.len];
 }
 
 /// The device memory free now (the driver's count; 0 when it cannot say): the ledger's measure of what an allocation took.
@@ -1478,9 +1543,39 @@ fn gatherLedger(m: *Model, free_after_pool: u64) !void {
     std.log.info("KV pool: rank {d}: the start took {d:.2} GiB after the pool (MEASURED: TF_DS_KV_GROWTH_MIB is the room kept for this, and for what serving grows by); {d:.2} GiB of {d:.2} GiB are free at its end", .{ m.rank, @as(f64, @floatFromInt(kv.report.after_taken)) / (1 << 30), @as(f64, @floatFromInt(info.free)) / (1 << 30), @as(f64, @floatFromInt(info.total)) / (1 << 30) });
 }
 
+/// The pool the start holds, for the refusals above.
+fn poolView(m: *const Model, c: *const Config) PoolView {
+    return .{ .c = c, .layers = m.w.layers, .slots = m.streams, .pool = m.pool_cap, .floor = m.ctx_cap };
+}
+
+/// The refusal line of a start that would leave less than the guard's floor, naming the setting, the GiB short and the pool that fits.
 fn pairShortText(buf: []u8, free: u64, pass_rows: usize, lane_arena: u64, v: PoolView, lanes: usize) ![]const u8 {
     const what = if (lanes >= 3) "the second and third passes (TF_DS_ROCI_STAGGER_LANES=3)" else "the second pass";
     return memoryRefusal(buf, what, true, pass_rows, (lanes - 1) * pairEstimate(pass_rows, lane_arena) + pair_guard_bytes, free, v);
+}
+
+/// Passes above this many rows check the floor of a single pass (the stagger checks its own, whatever the size): 4,096 rows is the
+/// largest the start never checked.
+const single_floor_above: usize = 4096;
+
+/// What passes of more than 4,096 rows leave of a Spark's memory, checked once the start has allocated everything (an 8,192-row
+/// pass took 3.2-3.9 GiB of MemAvailable more than a 4,096-row one, measured; the pass's buffers are its rows' widths): free
+/// memory under the guard's floor ends the start, naming the setting, the GiB short and the pool (POOL) that fits, on every rank
+/// alike. The stagger checks its own, before it allocates.
+fn passFloor(m: *Model, c: *const Config) !void {
+    if (m.pass_rows <= single_floor_above or m.pair) return;
+    const free = (try m.ctx.memInfo()).free;
+    const ok = free >= pair_guard_bytes;
+    if (!try m.eng.agreeAll(ok)) {
+        if (!ok) {
+            var buf: [900]u8 = undefined;
+            std.log.err("{s}", .{memoryRefusal(&buf, "the pass", false, m.pass_rows, pair_guard_bytes, free, poolView(m, c)) catch "not enough free memory for the pass at TF_DS_PASS_ROWS"});
+        } else std.log.err("TF_DS_PASS_ROWS={d}: another rank has too little free memory for it (its line names the GiB short and the pool that fits)", .{m.pass_rows});
+        return error.PassRowsRefused;
+    }
+    std.log.info("TF_DS_PASS_ROWS={d}: rank {d}: {d:.2} GiB free after the start's allocations (the floor is {d:.1} GiB); the KV pool holds {d} positions, {d:.2} GiB on this Spark", .{ m.pass_rows, m.comm.rank, @as(f64, @floatFromInt(free)) / (1 << 30), @as(f64, @floatFromInt(pair_guard_bytes)) / (1 << 30), m.pool_cap, @as(f64, @floatFromInt(poolView(m, c).bytes(m.pool_cap))) / (1 << 30) });
+}
+
 /// TF_DS_ENGRAM_PARTNER's start: the column partners (nodes g and g ^ 2) share the reads of a prompt step's misses over a third Rocinante lane. Every
 /// rank's checks agree before anything is allocated; a rank that cannot run it ends the start naming its reason.
 fn openPartner(m: *Model, gpa: std.mem.Allocator, d: *const cuda.Driver, o: Options, sp: plan.Split) !void {
@@ -1532,6 +1627,7 @@ fn openPartner(m: *Model, gpa: std.mem.Allocator, d: *const cuda.Driver, o: Opti
 /// that issues both passes), a second chunk, node of the split, lane, stream, cuBLAS handle and the per-layer cache events. Every rank's
 /// checks agree before anything is allocated; a rank that cannot run the route ends the start naming its reason.
 fn openPair(m: *Model, gpa: std.mem.Allocator, d: *const cuda.Driver, o: Options, sp: plan.Split, c: *const Config) !void {
+    var why_buf: [900]u8 = undefined;
     var why: ?[]const u8 = null;
     var free: usize = 0;
     const two = if (m.two) |*t| t else null;
@@ -1542,7 +1638,9 @@ fn openPair(m: *Model, gpa: std.mem.Allocator, d: *const cuda.Driver, o: Options
     } else if (c.format != .native) {
         why = "needs the checkpoint's own FP8 / MXFP4 weights";
     } else if (m.pass_rows % chunk_rows != 0 or m.pass_rows > pass_rows_max) {
+        why = "needs whole passes of whole resume units (TF_DS_PASS_ROWS a whole number of 2048-row units, 2048 to 16384)";
     } else if (m.pass_rows < 2 * chunk_rows) {
+        why = "needs passes of two resume units (TF_DS_PASS_ROWS=4096)";
     } else if (connections == null or connections.? < 16) {
         why = "needs CUDA_DEVICE_MAX_CONNECTIONS=16 (the second pass's stream would share the first's queue, and a pending wait on it would block the other)";
     } else if (!pinned) {
@@ -1554,6 +1652,7 @@ fn openPair(m: *Model, gpa: std.mem.Allocator, d: *const cuda.Driver, o: Options
     var lanes: usize = prompt2d.roci_stagger_lanes;
     if (why == null) {
         free = (try m.ctx.memInfo()).free;
+        const lane_arena = rocinante_mod.layoutOf(.prompt).total;
         if (lanes >= 3) {
             // the third lane's bytes count: every rank votes on the memory for three, and a box under the floor either refuses (set) or keeps two (default)
             const fits = pairShortN(free, m.pass_rows, lane_arena, 3) == 0;
@@ -1669,9 +1768,11 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     _ = std.c.close(fd);
 }
 
+/// The most ranges either list holds: the worker's, with every slot of the ring (max_wk): the three scratch arrays, a hash
 /// buffer and two rows a slot, and three ranges for each of a slot's two record stages. The round's list is shorter (11).
 /// Sized by `engram_rows.max_wk`, so a wider ring grows the list with it; a list that is still full is an error, never a
 /// silent drop (a range not listed is one the overlap check calls "no shared byte" without having seen it).
+const keep_ahead_ranges = 3 + 9 * engram_rows.max_wk;
 
 /// Why keepRanges cannot list every region.
 const KeepRangesError = error{KeepAheadRangesFull};
@@ -1939,6 +2040,7 @@ pub const Model = struct {
         prompt2d.bf16_rows_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_BF16_ROWS")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.pf_run128_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_PF_RUN128")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.pass_from_asked = readPassFrom(); // rank 0's (Settings.pass_from: never compared)
+        prompt2d.pass_rows_asked = try readPassRows(prompt2d.pass_from_asked, (ctx.memInfo() catch cuda.Context.MemInfo{ .free = 0, .total = std.math.maxInt(usize) }).total); // every rank alike (Settings)
         prompt2d.pass_beside_asked = try readPassBeside(prompt2d.pass_rows_asked); // rank 0's host decides it (never compared)
         rocinante_mod.setCap(prompt2d.pass_rows_asked); // (the transport's arenas and plans follow the pass rows, before any layout is read)
         prompt2d.rounds_beside_asked = try readRoundsBeside(); // rank 0's host runs the rounds (never compared)
@@ -2020,6 +2122,7 @@ pub const Model = struct {
             prompt2d.ring_wait_asked = false;
         }
         prompt2d.ring_wait_explicit = ring_wait_text != null;
+        prompt2d.gemm_halves_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_GEMM_HALVES")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.qgate_canary_asked = readQgate(); // every rank alike (Settings: any canary; the canary itself, agreeQgateCanary)
         prompt2d.draft_vocab_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_DRAFT_VOCAB")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         if (std.c.getenv("TF_DS_L2_SKIP")) |v| round.l2_skip = std.fmt.parseInt(u8, std.mem.span(v), 10) catch 0;
@@ -2052,6 +2155,11 @@ pub const Model = struct {
         if (ops_mod.l2_chunk_bytes != 8192) std.log.info("TF_DS_L2_CHUNK_KIB={d}: the L2 prefetch's waves are {d} KiB chunks x 128 every {d} ns (the served: 8 KiB, same rate, same bytes)", .{ ops_mod.l2_chunk_bytes / 1024, ops_mod.l2_chunk_bytes / 1024, ops_mod.waveNs(ops_mod.l2_rate_gbps, ops_mod.l2_chunk_bytes) });
         m.round_ms = o.round_ms orelse &draft.round_ms;
         if (m.round_ms.len == 0) return error.BadRoundMs;
+        if (poolBelowContext(o.pool, o.context)) |why| {
+            std.log.err("{s}", .{why});
+            return error.PoolBelowContext;
+        }
+        m.pool_cap = o.pool;
         m.ledger = .{};
         m.ctx_cap = if (o.context != 0) @min(o.context, o.pool) else o.pool;
         m.pass_rows = prompt2d.pass_rows_asked; // (every rank alike: the start-up exchange refuses a follower that differs)
@@ -2307,6 +2415,10 @@ pub const Model = struct {
         mx.pf_raster = if (m.mxk != null) prompt2d.pf_raster_asked else 0;
         if (prompt2d.pf_raster_asked != 0) {
             if (mx.pf_raster != 0) std.log.info("TF_DS_PF_RASTER={d}: a prompt GEMM whose activation slab is {d} MiB or more (the tile FP8 GEMMs, the block-scaled MMA's and the bf16 tile GEMM) walks its tiles {d} row tiles at a time across all the column tiles; the output bytes are the default order's", .{ mx.pf_raster, mx.raster_slab_bytes >> 20, mx.pf_raster }) else std.log.info("TF_DS_PF_RASTER={d}: off: needs the checkpoint's own FP8 / MXFP4 weights (the EXL3 GEMMs are cuBLAS's)", .{prompt2d.pf_raster_asked});
+        }
+        mx.gemm_halves = prompt2d.gemm_halves_asked and m.mxk != null;
+        if (prompt2d.gemm_halves_asked) {
+            if (mx.gemm_halves) std.log.info("TF_DS_GEMM_HALVES=1: a prompt pass of more than {d} rows runs its dense FP8, bf16 and pf GEMMs as row blocks of at most {d} rows, each block the launch a {d}-row pass makes for its rows; the experts keep the whole pass", .{ mx.gemm_halves_rows, mx.gemm_halves_rows, mx.gemm_halves_rows }) else std.log.info("TF_DS_GEMM_HALVES=1: off: needs the checkpoint's own FP8 / MXFP4 weights (the EXL3 GEMMs are cuBLAS's)", .{});
         }
         useDecodeFuse(if (m.mxk) |*x| x else null, d, prompt2d.decode_fuse_asked);
         var sf_buf: [256]u8 = undefined;
@@ -2620,6 +2732,13 @@ pub const Model = struct {
                 var fb: [96]u8 = undefined;
                 std.log.info("TF_DS_ENGRAM_FAULT {s}", .{prompt.engram_fault.describe(&fb, @intCast(o.rank))});
             }
+            m.eh = try prompt.EngramHost.init(a, c, engram.Hasher.init(c.*, map, mult), &m.tables.?, m.epool.?, sp.rank, sp.world, m.pass_rows, chunk_rows, m.workerSlots());
+            if (o.engram_aio) {
+                // a round's reads, 2 x 12 x its rows at most: 1,024 slots for each 16 rows of the round-row setting
+                m.aio = try engram_aio.Aio.init(gpa, io, 1024 * ((o.round_rows + 15) / 16));
+                m.eh.?.aio = m.aio;
+                // a prompt chunk's reads (2 x 12 x 2,048 at most): a ring of 4,096 slots (32 MiB), 1,024 rows a batch
+                m.paio = try engram_aio.Aio.init(gpa, io, 4096);
                 // TF_DS_ENGRAM_AIO_DEPTH: a cap on the prompt ring's reads in flight, 256 unless set (0: none), submitted a slice at a time
                 // (TF_DS_ENGRAM_AIO_SLICE, default 64): the drive loses throughput when over-queued and io_submit then blocks for block-layer tags
                 {
@@ -2674,6 +2793,8 @@ pub const Model = struct {
                     .chunk_dev = try m.arena.take(m.pass_rows * sl * rec),
                     .chunk_dev_b = if (prompt2d.roci_stagger_asked) try m.arena.take(m.pass_rows * sl * rec) else 0,
                     .chunk_dev_c = if (prompt2d.roci_stagger_asked and prompt2d.roci_stagger_lanes >= 3) try m.arena.take(m.pass_rows * sl * rec) else 0,
+                    .wk_slots = m.workerSlots(),
+                    .unit_rows = chunk_rows,
                 });
                 eh.pk = m.erows;
                 if (prefault) logPrefault(m.erows.?, mib, huge0, hugeKiB(io));
@@ -2683,6 +2804,7 @@ pub const Model = struct {
                     std.log.info("TF_DS_ENGRAM_PINNED=1: no effect, the Engram worker is off (TF_DS_ENGRAM_WORKER=0)", .{});
                 } else {
                     const bytes = try prompt.engramPin(&m.eh.?, d);
+                    std.log.info("TF_DS_ENGRAM_PINNED=1: rank {d} stages the fill worker's Engram {s} in {d:.1} MiB of pinned host memory ({d} chunk slots of {d} rows, two Engram layers each); the upload waits for nothing and a slot goes back to the worker when its copy's event is done", .{ m.rank, if (m.erows != null) "records" else "rows", @as(f64, @floatFromInt(bytes)) / (1 << 20), m.eh.?.wk_slots, chunk_rows });
                 }
             }
         } else if (c.engram_layers.slice().len > 0) return error.NoEngramTables;
@@ -2702,12 +2824,17 @@ pub const Model = struct {
         m.ids64 = try a.alloc(i64, m.pass_rows);
         m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
         m.logits = try a.alloc(f32, round.max_rows * m.vocab);
+        if (prompt2d.roci_stagger_asked) try openPair(m, gpa, d, o, sp, c) else try passFloor(m, c);
         if (prompt2d.engram_partner_asked) try openPartner(m, gpa, d, o, sp);
         try gatherLedger(m, free_after_pool);
         return m;
     }
 
+    /// The worker's ring slots for the pass rows booted: a pass's resume units, twice them with two passes in flight.
+    fn workerSlots(m: *const Model) usize {
         return engram_rows.workerSlotsN(m.pass_rows / chunk_rows, if (prompt2d.roci_stagger_asked) prompt2d.roci_stagger_lanes else 1);
+    }
+
     /// A pair's second pass: its lane before the first's (it borrows the first's arena), then its events, handle and stream.
     fn closePair(m: *Model) void {
         if (m.two_c) |*t| if (t.rc) |rc| rc.close(); // (the third lane before the second)
@@ -3505,6 +3632,8 @@ pub const Model = struct {
             if (units > eh.use_rows.len) return error.BadChunk;
             defer {
                 eh.use_n = 0;
+                eh.use_rows = @splat(null);
+                eh.use_stage = @splat(null);
             }
             for (0..units) |u| {
                 if (eh.pk != null) {
@@ -4324,6 +4453,7 @@ pub const Model = struct {
 
 test "TF_DS_PASS_BESIDE is read after TF_DS_PASS_ROWS, refuses a bad start, and reaches the host as its beside rows" {
     const src = @embedFile("model.zig");
+    const rows = std.mem.indexOf(u8, src, "prompt2d.pass_rows_asked = try readPassRows(") orelse return error.TestUnexpectedResult;
     const beside = std.mem.indexOf(u8, src, "prompt2d.pass_beside_asked = try readPassBeside(prompt2d.pass_rows_asked)") orelse return error.TestUnexpectedResult;
     try std.testing.expect(rows < beside);
     try std.testing.expect(std.mem.indexOf(u8, src, "return error.BadPassBeside;") != null);
@@ -4587,6 +4717,21 @@ test "Model.open reads TF_DS_PF_RUN128 into the switch every rank compares, and 
     try std.testing.expect(read < load and load < use);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "useRun128("));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\"TF_DS_PF_RUN128\""));
+}
+
+test "Model.open reads TF_DS_GEMM_HALVES into the switch every rank compares, and puts it into effect once the kernels load" {
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    const read = std.mem.indexOf(u8, body, "prompt2d.gemm_halves_asked = prompt2d.switchAsked(if (std.c.getenv(\"TF_DS_GEMM_HALVES\")) |v| std.mem.span(v) else null);").?;
+    const load = std.mem.indexOf(u8, body, "m.mxk = if (c.format == .native) try mx.Kernels.load(d, cuda.kernels.dsv41_native) else null;").?;
+    const use = std.mem.indexOf(u8, body, "mx.gemm_halves = prompt2d.gemm_halves_asked and m.mxk != null;").?;
+    try std.testing.expect(read < load and load < use);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "mx.gemm_halves = prompt2d.gemm_halves_asked"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "std.c.getenv(\"TF_DS_GEMM_HALVES\")"));
+    // the start line says so when it is on, and why it is off without the checkpoint's own weights
+    try std.testing.expect(std.mem.indexOf(u8, body, "TF_DS_GEMM_HALVES=1: a prompt pass of more than") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "TF_DS_GEMM_HALVES=1: off: needs the checkpoint's own FP8 / MXFP4 weights") != null);
 }
 
 test "Model.open reads TF_DS_PF_RASTER before the kernels load, refuses text that is no setting, and puts the group into effect with them" {
@@ -5451,23 +5596,65 @@ test "TF_DS_ENGRAM_PARTNER: each pass's line of the pair log carries the partner
         try std.testing.expect(std.mem.indexOf(u8, lr, w) != null);
 }
 
-    /// Wave w's partial `src` gathered into `dst` on cs (events k, k + 1: ready on the stream, gathered on cs).
-    fn gatherOnCs(m: *Model, w: usize, k: usize, src: u64, dst: u64) !void {
-        const ch = if (w == 0) &m.ch2 else &m.ch;
-        try m.wev[w][k].record(m.stream);
-        try m.cs.?.wait(m.wev[w][k]);
-        const rs = try prompt.gather(&m.ec, ch, src, dst);
-        if (k == 0) ch.ga_rs = rs else ch.gm_rs = rs;
-        try m.wev[w][k + 1].record(m.cs.?);
+/// Layers as the pool's caches see them (the test config's compress ratios, KV and index sources): what Caches.layerBytes reads.
+fn poolTestLayers(lays: *[40]weights.Layer, cfg: Config) []const weights.Layer {
+    const one: weights.Linear = .{ .words = 0, .k = 1, .n = 1 };
+    for (lays, 0..) |*l, i| {
+        l.* = .{ .idx = @intCast(i), .ratio = cfg.ratios[i] };
+        l.comp_wkv = if (cfg.kv_sources.has(i)) one else null;
+        l.idx_wk = if (cfg.index_sources.has(i)) one else null;
     }
+    return lays;
+}
 
-    /// The stream waits for wave w's MoE gather (on cs) before anything reads its gm.
-    fn waitGm(m: *Model, posted: *[2]bool, w: usize) !void {
-        if (!posted[w]) return;
-        try m.stream.wait(m.wev[w][3]);
-        posted[w] = false;
+test "the memory guard comes from the pass rows at every size: the estimate scales with the pass and the lane's arena, the short is what the floor leaves out" {
+    const keep = rocinante_mod.max_cap;
+    const keep_caps = rocinante_mod.Transport.shape_caps;
+    defer {
+        rocinante_mod.max_cap = keep;
+        rocinante_mod.Transport.shape_caps = keep_caps;
     }
+    var prev_need: u64 = 0;
+    var p: usize = 2048;
+    var lane4096: u64 = 0;
+    while (p <= pass_rows_max) : (p += 2048) {
+        rocinante_mod.setCap(p);
+        const lane = rocinante_mod.layoutOf(.prompt).total;
+        if (p == 4096) lane4096 = lane;
+        const need = pairEstimate(p, lane);
+        // with nothing free the short is the estimate and the floor; with that much free, nothing; one byte less, one byte short
+        try std.testing.expectEqual(need + pair_guard_bytes, pairShort(0, p, lane));
+        try std.testing.expectEqual(@as(u64, 0), pairShort(need + pair_guard_bytes, p, lane));
+        try std.testing.expectEqual(@as(u64, 1), pairShort(need + pair_guard_bytes - 1, p, lane));
+        // the second pass takes more with every unit of rows
+        try std.testing.expect(need > prev_need);
+        prev_need = need;
+        // never less than the measured 4,096-row pass scaled to the rows
+        try std.testing.expect(need >= 3_370_548_688 * p / 4096);
+    }
+    try std.testing.expectEqual(@as(usize, 16384), pass_rows_max);
+    // the measured 4,096-row pass: its chunk and node and its lane's arena
+    try std.testing.expect(pairEstimate(4096, lane4096) >= 3_370_548_688 + lane4096);
+    // on a Spark with 12 GiB free: 2,048 and 4,096 fit, 8,192 and the larger are short
+    const free: u64 = 12 << 30;
+    rocinante_mod.setCap(2048);
+    try std.testing.expectEqual(@as(u64, 0), pairShort(free, 2048, rocinante_mod.layoutOf(.prompt).total));
+    rocinante_mod.setCap(4096);
+    try std.testing.expectEqual(@as(u64, 0), pairShort(free, 4096, rocinante_mod.layoutOf(.prompt).total));
+    for ([_]usize{ 8192, 10240, 16384 }) |big| {
+        rocinante_mod.setCap(big);
+        try std.testing.expect(pairShort(free, big, rocinante_mod.layoutOf(.prompt).total) > 0);
+    }
+    // the source: the guard runs before openPair allocates, the floor of a single pass after the start
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
     try std.testing.expect(std.mem.indexOf(u8, code, "pairShort(free, m.pass_rows, lane_arena) != 0) why = try pairShortText(") != null);
+    // the stagger's start line says the pool and the floor beside the free memory; the single pass's the same
+    try std.testing.expect(std.mem.indexOf(u8, code, "the KV pool holds {d} positions ({d:.2} GiB on this Spark, POOL) and the floor kept free is {d:.1} GiB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "GiB free after the start's allocations (the floor is {d:.1} GiB); the KV pool holds {d} positions, {d:.2} GiB on this Spark") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "try openPair(m, gpa, d, o, sp, c) else try passFloor(m, c);") != null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, code, "pair_estimate_bytes"));
+}
 
 test "TF_DS_ROCI_STAGGER_LANES: the guard counts every lane after the first, a box under the floor refuses a set count and keeps two for a default, and two lanes are judged as they always were" {
     const keep_caps = rocinante_mod.Transport.shape_caps;
@@ -5747,14 +5934,94 @@ test "TF_DS_KV_FREE_TARGET_GIB live: the streams a resize waits for are every St
     try S.same(&Model.pool_stream_round, S.names(round.Round));
 }
 
+test "a start short of memory names the GiB short and the POOL that would make it fit, never one below a full request, and says when none does" {
+    const config_mod = @import("config.zig");
+    const gpa = std.testing.allocator;
+    var why: config_mod.Why = .{};
+    const cfg = try config_mod.parse(gpa, config_mod.test_config, &why);
+    var lays: [40]weights.Layer = undefined;
+    const layers = poolTestLayers(&lays, cfg);
+    const served_pool: usize = 16 * 1048576;
+    const v: PoolView = .{ .c = &cfg, .layers = layers, .slots = 16, .pool = served_pool, .floor = 1048576 };
+    // the pool's caches grow with its positions, and the per-position bytes are the code's (Caches.layerBytes)
+    const b1 = v.bytes(1 << 20);
+    const b16 = v.bytes(served_pool);
+    try std.testing.expect(b16 > 15 * (b1 - v.bytes(0)) and b16 < 17 * b1);
+    const per_position = @as(f64, @floatFromInt(b16 - b1)) / @as(f64, @floatFromInt(served_pool - (1 << 20)));
+    try std.testing.expect(per_position > 100 and per_position < 8192);
+    // nothing short: the pool stays; a little short: a pool just under, a multiple of 65,536; the pool frees what was asked
+    try std.testing.expectEqual(@as(?usize, served_pool), poolThatFrees(v, 0));
+    for ([_]u64{ 1, 1 << 20, 1 << 30, 3 << 30, 5 << 30 }) |short| {
+        const got = poolThatFrees(v, short) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(got < served_pool and got >= 1048576 and got % pool_step == 0);
+        try std.testing.expect(b16 - v.bytes(got) >= short); // it frees enough
+        try std.testing.expect(got + pool_step >= served_pool or b16 - v.bytes(got + pool_step) < short); // and no larger pool does
+    }
+    // more short than the whole pool above a full request holds: none fits
+    const most = b16 - v.bytes(1048576);
+    try std.testing.expect(poolThatFrees(v, most) != null);
+    try std.testing.expectEqual(@as(?usize, null), poolThatFrees(v, most + 1));
+    // a pool at the floor has nothing to give
+    var at_floor = v;
+    at_floor.pool = 1048576;
+    try std.testing.expectEqual(@as(?usize, null), poolThatFrees(at_floor, 1));
+    // the words of a start that fits with a smaller pool
+    var buf: [900]u8 = undefined;
+    const text = try memoryRefusal(&buf, "the second pass", true, 16384, 30 << 30, 22 << 30, v);
+    try std.testing.expect(std.mem.indexOf(u8, text, "TF_DS_PASS_ROWS=16384") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "8.00 GiB short") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "22.00 GiB free") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ESTIMATED from the 4,096-row pass measured") != null);
+    const want = poolThatFrees(v, 8 << 30).?;
+    var pb: [32]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.bufPrint(&pb, "POOL={d} frees it", .{want})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "TF_DS_WINDOW on rank 0 and --pool on the followers") != null);
+    // the words of a start no pool saves
+    const none = try memoryRefusal(&buf, "the pass", false, 16384, 6 << 30 << 10, 0, v);
+    try std.testing.expect(std.mem.indexOf(u8, none, "no POOL fits") != null);
+    try std.testing.expect(std.mem.indexOf(u8, none, "MEASURED after the start's allocations") != null and std.mem.indexOf(u8, none, "ESTIMATED") == null);
+    try std.testing.expect(std.mem.indexOf(u8, none, "1048576 positions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, none, "POOL=") == null);
+    // the pair's refusal and the single pass's are these words
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    try std.testing.expect(std.mem.indexOf(u8, code, "memoryRefusal(&buf, \"the pass\", false, m.pass_rows, pair_guard_bytes, free, poolView(m, c))") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "return memoryRefusal(buf, what, true, pass_rows, (lanes - 1) * pairEstimate(pass_rows, lane_arena) + pair_guard_bytes, free, v);") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "const what = if (lanes >= 3) \"the second and third passes (TF_DS_ROCI_STAGGER_LANES=3)\" else \"the second pass\";") != null);
+    // a pool under one stream's context is refused at the start, whatever its size: the served 1,048,576-token context needs a pool of that many
+    try std.testing.expectEqual(@as(?[]const u8, null), poolBelowContext(1048576, 1048576));
+    try std.testing.expectEqual(@as(?[]const u8, null), poolBelowContext(16 * 1048576, 1048576));
+    try std.testing.expectEqual(@as(?[]const u8, null), poolBelowContext(4096, 0)); // (no context asked: the pool is the window)
+    for ([_]usize{ 1, 262144, 1048575 }) |small| {
+        const w = poolBelowContext(small, 1048576) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, w, "POOL") != null and std.mem.indexOf(u8, w, "the context is never lowered") != null);
     }
+    try std.testing.expect(std.mem.indexOf(u8, code, "if (poolBelowContext(o.pool, o.context)) |why| {") != null);
+    // the floor is the context the stream holds (never the 1M lowered): the view takes it from ctx_cap
+    try std.testing.expect(std.mem.indexOf(u8, code, ".pool = m.pool_cap, .floor = m.ctx_cap") != null);
+}
 
-    /// The monotonic clock (ns).
-    pub fn now(m: *const Model) u64 {
-        return @intCast(std.Io.Timestamp.now(m.io, .awake).nanoseconds);
+test "the keep-ahead overlap list holds every range of the largest ring: no range is dropped for a long list" {
+    const Stage = engram_rows.Stage;
+    var wk: [engram_rows.max_wk][2]Stage = @splat(@splat(Stage.empty));
+    var list: [keep_ahead_ranges]keep_ahead.Range = @splat(.{});
+    // every slot of the largest ring: six ranges (two layers' bytes, ids and destinations); the scratch arrays and the slots'
+    // hash and row buffers come to the rest, three a slot and three
     try std.testing.expectEqual(6 * engram_rows.max_wk, try workerStageRanges(&list, 0, &wk, engram_rows.max_wk));
+    try std.testing.expect(3 + 3 * engram_rows.max_wk + 6 * engram_rows.max_wk <= keep_ahead_ranges);
+    // the formula dl-4 counted: 3 + 9 ranges a slot, 75 at eight slots, 147 at sixteen (the 64-entry list dropped the surplus without a word)
+    try std.testing.expectEqual(@as(usize, 147), keep_ahead_ranges);
+    // the add never drops: the list has no length check to fall silent on
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, code, "if (n.* < list.len)"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, code, "if (n < list.len)"));
+}
+
+test "after a transport's or a decode ring's failure no round delivers tokens: checkTransport says so, and rank 0's verify and drafter pass ask it before they send a frame and again before they read what the GPU computed" {
+    var m: Model = undefined;
+    m.two = null;
+    m.two_b = null;
     m.two_c = null;
     m.partner_rc = null;
     m.ring = null;
@@ -6145,6 +6412,7 @@ test "TF_DS_ENGRAM_PARTNER and TF_DS_ENGRAM_KEEP_AHEAD: a failed precondition fa
     const refuse = std.mem.indexOf(u8, body[v..], ".refuse => {").?;
     const refused = std.mem.indexOf(u8, body[v..], "return error.PartnerRefused;").?;
     const warn = std.mem.indexOf(u8, body[v..], "std.log.warn(\"TF_DS_ENGRAM_PARTNER: off:").?;
+    const cleared = std.mem.indexOf(u8, body[v..], "prompt2d.engram_partner_asked = false;").?;
     try std.testing.expect(refuse < refused and refused < warn and warn < cleared);
     try std.testing.expect(std.mem.indexOf(u8, body, "openLane(").? > v + cleared);
     // keep-ahead: the shared reader pool refuses only a switch the operator set
@@ -6173,6 +6441,7 @@ test "TF_DS_ROCI_STAGGER: a failed precondition falls back with one warning when
     const refuse = std.mem.indexOf(u8, body[v..], ".refuse => {").?;
     const refused = std.mem.indexOf(u8, body[v..], "return error.StaggerRefused;").?;
     const warn = std.mem.indexOf(u8, body[v..], "std.log.warn(\"TF_DS_ROCI_STAGGER: off:").?;
+    const off = std.mem.indexOf(u8, body[v..], "prompt2d.roci_stagger_asked = false;").?;
     try std.testing.expect(refuse < refused and refused < warn and warn < off); // the refusal is the operator's branch, the fallback the other
     // the fallback names what it costs and runs before any allocation of the second pass
     try std.testing.expect(std.mem.indexOf(u8, body[v..], "speed_defaults.costOf(\"TF_DS_ROCI_STAGGER\")") != null);

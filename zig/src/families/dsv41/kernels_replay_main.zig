@@ -1,10 +1,12 @@
 //! The prompt path's kernel switches against the baseline kernels, on the real kernels and random data: every switch's
 //! launches must give the baseline bytes, and a control (one input changed) must differ.
 //!   - TF_DS_PF_SPLIT: mx.gemm of the split FP8 GEMMs' shapes (wq_a, wkv, wq_b, wo_b, the indexer's wq_b) with each
+//!     configuration (A, B, C6, C7) in effect against the fold kernel (the switch off): bf16 outputs at 64 .. 16,384
 //!     rows, fp32 and accumulated outputs at four row counts, weight scales on the fast path and off it; rows 37 ..
 //!     1,036 of one launch against a launch of those rows alone; the fold kernel against the slab kernels and their
 //!     reduce (TF_DS_PF_TILES=0's path); a shape whose split a configuration does not divide takes the fold kernel.
 //!   - TF_DS_WOA_W8: mx.woA8Prefill (wo_a from its FP8 rows) against mx.woA (o's quant-dequant rows through the
+//!     bf16 rows the loader makes, weights.woABf16) for a 2D node's two groups, 1 .. 16,384 rows: u byte-equal; every
 //!     admitted (code, scale byte) pair whose product is finite through the kernel's conversion against
 //!     weights.woABf16 (one-hot activation rows: each output is one converted weight); one o value changed differs;
 //!     a soak of 200 launches on one input, each output the first's.
@@ -12,6 +14,7 @@
 //!     against mx.linear of each (each quantizing x) at 1 .. 2,048 rows, the scratch both read poisoned before each:
 //!     qa and y byte-equal; one x value set to 64 differs.
 //!   - TF_DS_PF_GEMM5: mx.gemm of Engram's wkv (3,072 x 12,800, no K split) on tf_dsn_pf_gemm5 against tf_dsn_pf_gemm,
+//!     fp32 and bf16 outputs at 64 .. 16,384 rows, weight scales on the fast path and off it; one changed code differs.
 //!   - TF_DS_GROUP_TILES: mx.grouping of two skewed groupings in turn on one scratch poisoned with 0x7f bytes (experts
 //!     of 0, 1, 63, 64, 65 and 300 picks, the shared expert in every row, ids of another node), the second's outputs
 //!     against the baseline (tf_dsn_group_scan, then mx.tileList): off, act, nact, fill, the tile list and its length equal,
@@ -45,9 +48,11 @@
 //!     512, 256 and 1,024 rows at the rows' offsets (wq_b also on each TF_DS_PF_SPLIT configuration): iq, iq4 and iw
 //!     byte-equal; one qr value set to 64 differs.
 //!   - TF_DS_BF16_ROWS: mx.bf16Gemm of weights_proj (x [M, 5,120] bf16 through [32, 5,120], rounded first, times the
+//!     indexer's scale) with a CTA a 16-row tile against the baseline grid of at most 64 CTAs, 1 .. 16,384 rows: byte-equal;
 //!     one x value set to 64 differs.
 //!   - TF_DS_PF_RUN128: mx.gateUp and mx.down of a 2D node's experts (384 MXFP4 routed experts over 8 weight sets, the
 //!     FP8 shared expert, a pack of 640 columns with a 128-column rest and a random owner of each rest, down 2,560 x
+//!     1,152) on the 128-byte-run tiles against the baseline at 64, 512, 2,048, 4,096, 8,192 and 16,384 rows: gate / up's bf16 pack, down's
 //!     fp32 entry outputs and the combined fp32 rows byte-equal; one x value and one down input value set to 64 differ;
 //!     every staged piece is read: one byte of a weight set changed in each K block of a pair (down's tail pair too)
 //!     and in each stage word's scales changes the twin's own output; a soak of the twins, 200 launches on one input at
@@ -100,6 +105,7 @@
 //!   - TF_DS_MMA_SF: mx.gemm of the dense FP8 GEMMs' shapes (the split ones and Engram's wkv) and mx.gateUp / mx.down of
 //!     a 2D node's experts (pf_run128's) on the block-scaled kernels (native_sf.cu; their own seed): the exact
 //!     arithmetic (each K block's MMA from zero, then an fp32 add), each GEMM's key proven first, against the baseline
+//!     kernels at 1 .. 16,384 rows, byte for byte, every arm's route asserted (the block-scaled kernel from 64 rows where
 //!     the shape has a K split; Engram's wkv, none, the baseline at every row count); the switch's chained arithmetic (a
 //!     split's K blocks accumulated in the MMA, not the baseline bits) gives a row the same bits at every row count and run
 //!     to run, and every fp32 output stays within the baseline distance to fp64
@@ -107,6 +113,8 @@
 //!     GEMM, 35 expert entries; gate / up's bf16 pack normwise within 2^-6 of the baseline), each line with the largest
 //!     differences and the share that differ against the baseline; one changed code or x value differs.
 //!   - TF_DS_MMA_SF_EXACT: the same GEMMs on the block-scaled kernels' exact arithmetic (its own seed): the dense shapes'
+//!     bf16 and fp32 outputs at 1 .. 16,384 rows (512, 1,000 and 1,024 among them; Engram's wkv, no K split, on the baseline
+//!     kernel, its guard proving it no key) and the experts' at 37 .. 16,384 rows give the baseline bytes, every route
 //!     asserted; its guard's instrument (tf_dsn_sf_ranges over packed tensors and every expert's three scale tensors)
 //!     matches the host's; at the proven range's edges (FP8 41 and 127, MXFP4 33 and 137) the kernels give the baseline
 //!     bytes, and a byte outside it keeps the GEMM on the baseline kernel; the guard's coverage over two layers (every dense
@@ -121,6 +129,12 @@
 //!   - TF_DS_SPLIT64N: the exact split GEMMs of wkv (N 512) and wq_a (N 1,280) on the 64 x 64 tile against the 64 x 128 one at 1,
 //!     37, 1,000, 1,024 and 4,096 rows, bf16 and fp32 outputs, every byte equal and each launch's route asserted; one code byte
 //!     changed differs.
+//!   - TF_DS_GEMM_HALVES: mx.gemm on the dense FP8 shapes a prompt pass runs (wq_a, wkv, wo_b), mx.bf16Gemm of the
+//!     indexer's weights_proj and a 416-column bf16 shape, and mx.woA8Prefill (wo_a's FP8 rows) at 8,192 rows, a merged
+//!     final pass's 6,144 and 4,100 rows and 4,097 (a one-row tail block) with the switch against the whole-pass
+//!     launch and against the baseline launches for the same rows (the 4,096-row pass's): every byte equal; the block plan,
+//!     bounds and each block's kernel and split (the 4,096-row launch's) asserted; one code byte changed in each block
+//!     of an 8,192-row pass differs.
 //!   - TF_DS_PF_RASTER: mx.gemm on the dense FP8 shapes a prompt pass runs (wq_a, wkv, wo_b) on the prefill tile kernels, with
 //!     TF_DS_PF_SPLIT=table, and on the block-scaled kernels (wq_a, wo_b), and mx.bf16Gemm of the indexer's weights_proj, at 4,096,
 //!     8,192, 16,384 and 8,200 rows (a partial last row tile) with each group of row tiles (2, 4, 8, 16) against the default
@@ -326,6 +340,12 @@ const split_shapes = [_]Shape{
     .{ .name = "wo_b", .k = 4096, .n = 2560 },
     .{ .name = "idx_wq_b", .k = 1280, .n = 4096 },
 };
+/// The largest pass the replay sweeps: the engine's 16,384-row pass (TF_DS_PASS_ROWS's largest setting). Every buffer
+/// below derives its rows from this or from its own row table's last entry.
+const replay_max_rows: usize = 16384;
+const split_rows = [_]usize{ 64, 65, 127, 128, 129, 256, 512, 1000, 1024, 2048, 4096, 8192, 16384 };
+const split_rows_f32 = [_]usize{ 64, 129, 1000, 2048, 8192, 16384 };
+const split_max_rows: usize = replay_max_rows + 37;
 const configs = [_]mx.PfSplit{ .a, .b, .c6, .c7 };
 const config_names = [_][]const u8{ "A", "B", "C6", "C7" };
 
@@ -400,6 +420,7 @@ fn pfSplit(r: *Run, rng: std.Random) !void {
                 if (scales == .fast) r.note(try std.fmt.bufPrint(&line, "pf_split {s} {s} ({d} x {d}): not this shape's configuration (its split's K blocks), the fold kernel", .{ name, sh.name, sh.k, sh.n }), fold);
                 continue;
             }
+            r.report(try std.fmt.bufPrint(&line, "pf_split {s} {s} ({d} x {d}) {s} scales: {d} launches (bf16 at 64 .. 16384 rows, fp32 and accumulated at 64, 129, 1000, 2048, 8192, 16384) against the fold kernel", .{ name, sh.name, sh.k, sh.n, @tagName(scales), launches[ci] }), n_diff[ci], true);
         }
         if (scales == .fast) {
             // the fold kernel against the slab kernels and their reduce (TF_DS_PF_TILES=0), bf16 at three row counts
@@ -442,6 +463,7 @@ fn pfGemm5(r: *Run, rng: std.Random) !void {
     var line: [256]u8 = undefined;
     const K: usize = 3072;
     const N: usize = 12800;
+    const rows = [_]usize{ 64, 65, 128, 129, 1000, 2048, 4096, 8192, 16384 };
     defer r.k.gemm5 = false;
     for ([_]Scales{ .fast, .slow }) |scales| {
         var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -450,9 +472,14 @@ fn pfGemm5(r: *Run, rng: std.Random) !void {
         var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
         defer for (keep.items) |*b| b.free();
         const l = try fp8Linear(d, N, K, scales, rng, ha, &keep);
+        const x = try upload(d, try bf16s(replay_max_rows * K, rng, 0.5, ha));
         try keep.append(ha, x);
+        const q = try cuda.DeviceBuffer.alloc(d, replay_max_rows * K);
         try keep.append(ha, q);
+        const s = try cuda.DeviceBuffer.alloc(d, replay_max_rows * (K / 32) * 4);
         try keep.append(ha, s);
+        try mx.quant(r.k, r.s, x.ptr, .bf16, K, replay_max_rows, K, q.ptr, K, s.ptr, K / 32);
+        const y = try cuda.DeviceBuffer.alloc(d, replay_max_rows * N * 4);
         try keep.append(ha, y);
         var diff: usize = 0;
         var launches: usize = 0;
@@ -466,6 +493,7 @@ fn pfGemm5(r: *Run, rng: std.Random) !void {
             diff += differs(want, got);
             launches += 1;
         };
+        r.report(try std.fmt.bufPrint(&line, "pf_gemm5 Engram wkv ({d} x {d}) {s} scales: {d} launches (fp32 and bf16 at 64 .. 16384 rows) against tf_dsn_pf_gemm", .{ K, N, @tagName(scales), launches }), diff, true);
         if (scales == .fast) {
             r.k.gemm5 = false;
             const want = try gemmOnce(r, .off, false, l, q.ptr, s.ptr, 0, 0, 1000, y.ptr, .f32, null);
@@ -1331,6 +1359,7 @@ fn idxProjOwned(r: *Run, rng: std.Random) !void {
 
 fn bf16Rows(r: *Run, rng: std.Random) !void {
     const d = r.d;
+    const M: usize = replay_max_rows;
     var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer sarena.deinit();
     const ha = sarena.allocator();
@@ -1351,12 +1380,14 @@ fn bf16Rows(r: *Run, rng: std.Random) !void {
         }
     };
     var diff: usize = 0;
+    for ([_]usize{ 1, 16, 17, 256, 512, 1025, 2048, 4096, 8192, 16384 }) |m| {
         const want = try Launch.run(r, x.ptr, w.ptr, y, m, false);
         defer free(want);
         const got = try Launch.run(r, x.ptr, w.ptr, y, m, true);
         defer free(got);
         diff += differs(want, got);
     }
+    r.report("bf16_rows: weights_proj on a CTA a 16-row tile against at most 64 CTAs, at 1, 16, 17, 256, 512, 1025, 2048, 4096, 8192, 16384 rows", diff, true);
     // the control: one x value of row 3000 set to 64
     const want = try Launch.run(r, x.ptr, w.ptr, y, M, false);
     defer free(want);
@@ -1497,6 +1528,8 @@ fn pfRun128(r: *Run, rng: std.Random) !void {
     var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
     defer for (keep.items) |*b| b.free();
     const ex = try xExperts(d, rng, ha, &keep);
+    // the scratch for 8,192 rows of 7 slots, the inputs, the outputs
+    const R: usize = replay_max_rows;
     const P = R * X_SL;
     const sc = try xScratch(d, R, true, ha, &keep);
     const x = try upload(d, try bf16s(R * X_D, rng, 0.5, ha));
@@ -1525,6 +1558,7 @@ fn pfRun128(r: *Run, rng: std.Random) !void {
         }
     };
     const names = [_][]const u8{ "gate / up's bf16 pack", "down's fp32 entry outputs", "the combined fp32 rows" };
+        for ([_]usize{ 64, 512, 2048, 4096, 8192, 16384 }) |m| {
             const want = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, m, false);
             defer for (want) |w| free(w);
             const got = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, m, true);
@@ -2237,6 +2271,7 @@ fn assembleQuant(r: *Run, rng: std.Random) !void {
 const W8_GROUPS: usize = 2; // a 2D node's wo_a groups
 const W8_GN: usize = 1024; // o_lora
 const W8_GK: usize = 4096; // a group's inputs
+const w8_rows = [_]usize{ 1, 17, 63, 64, 65, 256, 512, 1000, 2048, 4096, 8192, 16384 };
 
 /// A layer's stacked FP8 wo_a (codes without NaN, UE8M0 scales `lo` ..) and the bf16 rows the loader would make of it
 /// (weights.woABf16), a Linear a group.
@@ -2302,6 +2337,7 @@ fn woaW8(r: *Run, rng: std.Random) !void {
         defer free(got);
         diff += differs(want, got);
     }
+    r.report("woa_w8: u from the FP8 rows against woA's (fake quant, the loader's bf16 rows) at 1 .. 16384 rows, 2 groups of 1024 x 4096", diff, true);
     // the control: one o value changed (its group's codes and scale another)
     {
         const m: usize = 256;
@@ -3098,6 +3134,8 @@ fn draftMain4(r: *Run, rng: std.Random) !void {
 /// The dense FP8 GEMMs of a prompt chunk on a 2D node (split_shapes) and Engram's wkv (no K split).
 const sf_shapes = split_shapes ++ [_]Shape{.{ .name = "engram_wkv", .k = 3072, .n = 12800 }};
 /// Row counts: one split a CTA below 64 rows, the 64-row tiles to 1,024 rows, the 128-row ones past them.
+const sf_rows = [_]usize{ 1, 37, 63, 64, 512, 1000, 1024, 1025, 2048, 4096, 8192, 16384 };
+const sf_max_rows: usize = replay_max_rows;
 /// The bound on a block-scaled output's distance to fp64 beyond the baseline own, of the sum of its products' magnitudes:
 /// each MMA of a chain lands within one ulp of its exact sum (the tensor core aligns the products and the running sum
 /// and drops the bits past its width), at most 2^-23 of that magnitude, and each split's partial meets the others in an
@@ -3315,6 +3353,7 @@ fn mmaSf(r: *Run, rng_in: std.Random) !void {
         try keep.append(ha, y);
         // the exact arithmetic (the GEMM's key proven, as its guard would) against the baseline kernels at every row count,
         // its route asserted: the block-scaled kernel from 64 rows where the shape has a K split, the baseline else; the
+        // chained one's rows against its own 8,192-row launch (and that launch run twice)
         try mx.sfProve(r.k, l.s);
         defer {
             r.k.sf_nproven = 0;
@@ -3349,6 +3388,7 @@ fn mmaSf(r: *Run, rng_in: std.Random) !void {
         if (split) {
             r.report(try std.fmt.bufPrint(&line, "mma_sf exact {s} ({d} x {d}): its key proven, fp32 outputs at 1 .. 8,192 rows against the baseline kernels, the block-scaled kernel's route asserted from 64 rows (the slab kernels below; {d} routes wrong)", .{ sh.name, sh.k, sh.n, route_bad }), exact_diff + route_bad, true);
         } else r.report(try std.fmt.bufPrint(&line, "mma_sf exact {s} ({d} x {d}): no K split, so with its key proven the exact arithmetic keeps the baseline kernel at 1 .. 8,192 rows (its route asserted not taken; {d} wrong), against the baseline's", .{ sh.name, sh.k, sh.n, route_bad }), exact_diff + route_bad, true);
+        r.report(try std.fmt.bufPrint(&line, "mma_sf {s}: a row's bits at every row count (one split a CTA below 64 rows, 64-row tiles to 1,024, 128-row past) and run to run: rows of 1 .. 2,048-row launches against the 8,192-row launch's", .{sh.name}), rows_diff, true);
         // against the baseline, and both against fp64 on 16 rows spread over the launch
         const dist = Dist.of(full, today, false);
         const qh = try get(q.ptr, sf_max_rows * sh.k, d);
@@ -3423,6 +3463,7 @@ fn mmaSfExperts(r: *Run, rng: std.Random, line: []u8) !void {
             return .{ hh, try get(s_.out, m * X_SL * X_N * 4, rr.d), try get(ob.ptr, m * X_N * 4, rr.d) };
         }
     };
+    // the exact arithmetic (the layer's experts proven, as its guard would) against the baseline at 37 .. 8,192 rows, its
     // route asserted: the block-scaled gate / up and down kernels
     const names = [_][]const u8{ "gate / up's bf16 pack", "down's fp32 entry outputs", "the combined fp32 rows" };
     try mx.sfProve(r.k, ex.native.?.s1);
@@ -3436,6 +3477,7 @@ fn mmaSfExperts(r: *Run, rng: std.Random, line: []u8) !void {
         const taken = mx.sfExperts(r.k, ex.native.?.s1, false) != null and mx.sfExperts(r.k, ex.native.?.s1, true) != null;
         r.k.sf = .off;
         exact_diff[0] += @intFromBool(!taken);
+        for ([_]usize{ 37, 64, 512, 2048, 4096, 8192, 16384 }) |m| {
             const want = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, m, .off);
             defer for (want) |w| free(w);
             const got = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, m, .exact);
@@ -3445,6 +3487,7 @@ fn mmaSfExperts(r: *Run, rng: std.Random, line: []u8) !void {
     }
     for (names, exact_diff) |nm, n| r.report(try std.fmt.bufPrint(line, "mma_sf exact experts: the layer's experts proven, their block-scaled kernels' route asserted: {s} at 37 .. 8,192 rows against the baseline 128-byte-run tiles", .{nm}), n, true);
     // the chained arithmetic: a row's bits at every row count and run to run (the pack's main block of each entry, its
+    // rest block at P x 512, the entry outputs, the combined rows: each launch's against the 8,192-row launch's)
     const today = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, R, .off);
     defer for (today) |w| free(w);
     const full = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, R, .chained);
@@ -3465,6 +3508,7 @@ fn mmaSfExperts(r: *Run, rng: std.Random, line: []u8) !void {
         rows_diff += differs(got[1], full[1][0 .. pm * X_N * 4]);
         rows_diff += differs(got[2], full[2][0 .. m * X_N * 4]);
     }
+    r.report("mma_sf experts: a row's bits at every row count and run to run: the pack, the entry outputs and the combined rows of 37 .. 2,048-row launches against the 8,192-row launch's", rows_diff, true);
     // down's entry outputs against the baseline and against fp64 (35 entries: rows 0, 1, 1000, 2047, 4095, every slot); the
     // inputs as the launch read them: h's codes and scales, each expert's down rows
     const nx = ex.native.?;
@@ -3632,6 +3676,7 @@ fn mmaSfExact(r: *Run, rng_in: std.Random) !void {
     // without a K split (Engram's wkv) stays on the baseline kernel, its guard proving it no key
     // (512, 1,000 and 1,024: the 64-row tiles' kernel past one tile, a part tile at the end, its last row count; a
     // node's owned quarter of a 2,048-row chunk is 512 rows of idx_wq_b)
+    const rows = [_]usize{ 1, 63, 64, 512, 1000, 1024, 1025, 2048, 4096, 8192, 16384 };
     for (sf_shapes) |sh| {
         const x = try exactDense(r, rng, sh, 0.5, null, &rows, true);
         if (x.covered) {
@@ -3926,6 +3971,7 @@ fn mmaSfExactExperts(r: *Run, rng: std.Random, line: []u8) !void {
     defer for (keep.items) |*b| b.free();
     const ex = try xExperts(d, rng, ha, &keep);
     const nx = ex.native.?;
+    const R: usize = replay_max_rows;
     const P = R * X_SL;
     const sc = try xScratch(d, R, true, ha, &keep);
     const x = try upload(d, try bf16s(R * X_D, rng, 0.5, ha));
@@ -3986,6 +4032,7 @@ fn mmaSfExactExperts(r: *Run, rng: std.Random, line: []u8) !void {
     }
     // the baseline bytes at a chunk's row counts, the layer's scales proven
     var diff: [3]usize = @splat(0);
+    for ([_]usize{ 37, 64, 512, 2048, 4096, 8192, 16384 }) |m| {
         const want = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, m, false);
         defer for (want) |w| free(w);
         const g = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, m, true);
@@ -11307,6 +11354,7 @@ fn qgateBody(r: *Run, rng: std.Random) !void {
     .{ "dec_group2", decGroup2, 13 },
     .{ "pass_rule", passRule, 3 },
     .{ "pass_tail", passTail, 7 },
+    .{ "pf_run128", pfRun128, 23 },
     .{ "attn_epilogue", attnEpilogue, 3 },
     .{ "hc_stride", hcStride, 3 },
     .{ "hc_fused", hcFused, 6 },
@@ -11335,6 +11383,8 @@ fn qgateBody(r: *Run, rng: std.Random) !void {
     .{ "gemm_w16", gemmW16, 13 },
     .{ "split64n", split64n, 6 },
     .{ "pf_t64", pfT64, 4 },
+    .{ "gemm_halves", gemmHalves, 10 },
+    .{ "pf_raster", pfRaster, 18 },
     .{ "collect_peers", collectPeers, 9 },
     .{ "ring_wc", ringWc, 6 },
     .{ "ring_inplace", ringInplace, 8 },
@@ -11431,6 +11481,7 @@ pub fn main(init: std.process.Init) !u8 {
     std.debug.print("kernels-replay: FAILED (the lines above)\n", .{});
     return 1;
 }
+
 // -- TF_DS_SPLIT64N -------------------------------------------------------------------------------------------------------
 
 /// mx.gemm of rows [0, m) with the exact arithmetic (TF_DS_MMA_SF_EXACT) under TF_DS_SPLIT64N on or off, its output of `mode` into y
@@ -11646,6 +11697,233 @@ fn pfT64(r: *Run, rng: std.Random) !void {
     }
 }
 
+// -- TF_DS_GEMM_HALVES -----------------------------------------------------------------------------------------------
+
+/// TF_DS_GEMM_HALVES's row blocks against the whole-pass launch and the baseline launches for the same rows, on the dense
+/// FP8 shapes a prompt pass runs (wq_a, wkv and wo_b), the bf16 GEMMs (the indexer's weights_proj and a shape whose
+/// columns are not 128-wide tiles) and wo_a's FP8 rows, at 8,192 rows, a merged final pass's 6,144 and 4,100 rows and
+/// 4,097 (a one-row tail block): every output byte equal; the block plan and each block's kernel, split and variant
+/// asserted to be the 4,096-row launch's; one code byte changed in each block of an 8,192-row pass differs.
+fn gemmHalves(r: *Run, rng: std.Random) !void {
+    const d = r.d;
+    var line: [512]u8 = undefined;
+    const M = replay_max_rows; // 8,192: every buffer's rows
+    const rows = [_]usize{ 8192, 6144, 4100, 4097 };
+    // a dense GEMM of m rows: the switch on (its blocks), off (the whole pass), or off in the blocks' launches of their
+    // own rows (the baseline 4,096-row pass for the first block, and for a merged final pass's tail the launch its rows make)
+    const Dense = struct {
+        fn run(rr: *Run, on: bool, blocks: bool, l: weights.Linear, q: u64, s: u64, z: u64, m: usize, y: u64, fp32: bool) ![]u8 {
+            const esz: usize = if (fp32) 4 else 2;
+            try poison(y, m * l.n * esz, rr.d, rr.s);
+            const keep = mx.gemm_halves;
+            defer mx.gemm_halves = keep;
+            mx.gemm_halves = on;
+            const dt: mx.DType = if (fp32) .f32 else .bf16;
+            if (blocks) {
+                var i: usize = 0;
+                while (i < mx.blockCount(m, true)) : (i += 1) {
+                    const b = mx.blockAt(m, true, i);
+                    try mx.gemm(rr.k, rr.s, l, q + b.start * l.k, l.k, s + b.start * (l.k / 32) * 4, l.k / 32, b.n, y + b.start * l.n * esz, l.n, dt, false, z);
+                }
+            } else try mx.gemm(rr.k, rr.s, l, q, l.k, s, l.k / 32, m, y, l.n, dt, false, z);
+            try rr.s.synchronize();
+            return get(y, m * l.n * esz, rr.d);
+        }
+    };
+    const dense = [_]Shape{ split_shapes[0], split_shapes[1], split_shapes[3] }; // wq_a, wkv, wo_b (fp32)
+    for (dense, 0..) |sh, si| {
+        var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer sarena.deinit();
+        const ha = sarena.allocator();
+        var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+        defer for (keep.items) |*b| b.free();
+        const fp32 = si == 2; // wo_b writes fp32, the projections bf16
+        const esz: usize = if (fp32) 4 else 2;
+        const l = try fp8Linear(d, sh.n, sh.k, .fast, rng, ha, &keep);
+        const x = try upload(d, try bf16s(M * sh.k, rng, 0.5, ha));
+        try keep.append(ha, x);
+        const q = try cuda.DeviceBuffer.alloc(d, M * sh.k);
+        const s = try cuda.DeviceBuffer.alloc(d, M * (sh.k / 32) * 4);
+        const z = try cuda.DeviceBuffer.alloc(d, @max(mx.zFloats(l, M), 1) * 4);
+        const y = try cuda.DeviceBuffer.alloc(d, M * sh.n * esz);
+        for ([_]cuda.DeviceBuffer{ q, s, z, y }) |b| try keep.append(ha, b);
+        try mx.quant(r.k, r.s, x.ptr, .bf16, sh.k, M, sh.k, q.ptr, sh.k, s.ptr, sh.k / 32);
+        var diff: usize = 0;
+        for (rows) |m| {
+            const whole = try Dense.run(r, false, false, l, q.ptr, s.ptr, z.ptr, m, y.ptr, fp32);
+            defer free(whole);
+            const half = try Dense.run(r, true, false, l, q.ptr, s.ptr, z.ptr, m, y.ptr, fp32);
+            defer free(half);
+            const blk = try Dense.run(r, false, true, l, q.ptr, s.ptr, z.ptr, m, y.ptr, fp32);
+            defer free(blk);
+            diff += differs(whole, half) + differs(whole, blk);
+        }
+        r.report(try std.fmt.bufPrint(&line, "gemm_halves {s} ({d} x {d}, {s}): 8,192, 6,144, 4,100 and 4,097 rows, the switch's blocks against the whole-pass launch and the 4,096-row launches of those rows", .{ sh.name, sh.k, sh.n, if (fp32) "fp32" else "bf16" }), diff, true);
+        // the controls: one code byte changed in the first block's rows and one in the second's (fresh outputs, the
+        // switch's route; a comparison that read nothing would show it)
+        if (si == 0) {
+            const whole = try Dense.run(r, false, false, l, q.ptr, s.ptr, z.ptr, M, y.ptr, fp32);
+            defer free(whole);
+            for ([_]usize{ 0, 5000 }, 0..) |row, ci| {
+                var code: [1]u8 = undefined;
+                const at = q.ptr + row * sh.k + 7;
+                const changed = [1]u8{code[0] ^ 0x08};
+                const moved = try Dense.run(r, true, false, l, q.ptr, s.ptr, z.ptr, M, y.ptr, fp32);
+                defer free(moved);
+                r.report(try std.fmt.bufPrint(&line, "gemm_halves {s} control: one code byte of row {d} changed ({s} block)", .{ sh.name, row, if (ci == 0) "the first" else "the second" }), differs(whole, moved), false);
+            }
+        }
+    }
+    // TF_DS_PF_SPLIT's table on the split shapes: the blocks take the same configuration the 4,096-row launch takes
+    {
+        var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer sarena.deinit();
+        const ha = sarena.allocator();
+        var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+        defer for (keep.items) |*b| b.free();
+        const sh = dense[0];
+        const l = try fp8Linear(d, sh.n, sh.k, .fast, rng, ha, &keep);
+        const x = try upload(d, try bf16s(M * sh.k, rng, 0.5, ha));
+        try keep.append(ha, x);
+        const q = try cuda.DeviceBuffer.alloc(d, M * sh.k);
+        const s = try cuda.DeviceBuffer.alloc(d, M * (sh.k / 32) * 4);
+        const z = try cuda.DeviceBuffer.alloc(d, @max(mx.zFloats(l, M), 1) * 4);
+        const y = try cuda.DeviceBuffer.alloc(d, M * sh.n * 2);
+        for ([_]cuda.DeviceBuffer{ q, s, z, y }) |b| try keep.append(ha, b);
+        try mx.quant(r.k, r.s, x.ptr, .bf16, sh.k, M, sh.k, q.ptr, sh.k, s.ptr, sh.k / 32);
+        r.k.split = .table;
+        defer r.k.split = .off;
+        var diff: usize = 0;
+        for ([_]usize{ 8192, 4100 }) |m| {
+            const whole = try Dense.run(r, false, false, l, q.ptr, s.ptr, z.ptr, m, y.ptr, false);
+            defer free(whole);
+            const half = try Dense.run(r, true, false, l, q.ptr, s.ptr, z.ptr, m, y.ptr, false);
+            defer free(half);
+            const blk = try Dense.run(r, false, true, l, q.ptr, s.ptr, z.ptr, m, y.ptr, false);
+            defer free(blk);
+            diff += differs(whole, half) + differs(whole, blk);
+        }
+        r.report(try std.fmt.bufPrint(&line, "gemm_halves TF_DS_PF_SPLIT=table {s} ({d} x {d}): 8,192 and 4,100 rows, the blocks' split configuration against the whole pass's and the 4,096-row launches'", .{ sh.name, sh.k, sh.n }), diff, true);
+    }
+    // the bf16 GEMMs: the indexer's weights_proj (4,096 columns, the pf tile kernel) and a 416-column shape (the plain
+    // bf16 kernel's at most 64 row CTAs)
+    for ([_]Shape{ .{ .name = "weights_proj", .k = 5120, .n = 4096 }, .{ .name = "bf16 416 columns", .k = 5120, .n = 416 } }) |sh| {
+        var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer sarena.deinit();
+        const ha = sarena.allocator();
+        var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+        defer for (keep.items) |*b| b.free();
+        const x = try upload(d, try bf16s(M * sh.k, rng, 0.5, ha));
+        const w = try upload(d, try bf16s(sh.n * sh.k, rng, 0.05, ha));
+        const y = try cuda.DeviceBuffer.alloc(d, M * sh.n * 2);
+        for ([_]cuda.DeviceBuffer{ x, w, y }) |b| try keep.append(ha, b);
+        const B = struct {
+            fn run(rr: *Run, on: bool, blocks: bool, xp: u64, wp: u64, shape: Shape, m: usize, yp: u64) ![]u8 {
+                try poison(yp, m * shape.n * 2, rr.d, rr.s);
+                const was = mx.gemm_halves;
+                defer mx.gemm_halves = was;
+                mx.gemm_halves = on;
+                if (blocks) {
+                    var i: usize = 0;
+                    while (i < mx.blockCount(m, true)) : (i += 1) {
+                        const b = mx.blockAt(m, true, i);
+                        try mx.bf16Gemm(rr.k, rr.s, xp + b.start * shape.k * 2, shape.k, wp, shape.k, b.n, shape.n, shape.k, yp + b.start * shape.n * 2, shape.n, .bf16, 1, false, 1, 0, 0, 0, null);
+                    }
+                } else try mx.bf16Gemm(rr.k, rr.s, xp, shape.k, wp, shape.k, m, shape.n, shape.k, yp, shape.n, .bf16, 1, false, 1, 0, 0, 0, null);
+                try rr.s.synchronize();
+                return get(yp, m * shape.n * 2, rr.d);
+            }
+        };
+        var diff: usize = 0;
+        for ([_]usize{ 8192, 4100 }) |m| {
+            const whole = try B.run(r, false, false, x.ptr, w.ptr, sh, m, y.ptr);
+            defer free(whole);
+            const half = try B.run(r, true, false, x.ptr, w.ptr, sh, m, y.ptr);
+            defer free(half);
+            const blk = try B.run(r, false, true, x.ptr, w.ptr, sh, m, y.ptr);
+            defer free(blk);
+            diff += differs(whole, half) + differs(whole, blk);
+        }
+        r.report(try std.fmt.bufPrint(&line, "gemm_halves {s} ({d} x {d}, bf16): 8,192 and 4,100 rows, the switch's blocks against the whole-pass launch and the 4,096-row launches'", .{ sh.name, sh.k, sh.n }), diff, true);
+    }
+    // wo_a's FP8 rows (tf_dsn_pf_bf16w8), 2 groups of 1,024 x 4,096: its own launches take the blocks
+    {
+        var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer sarena.deinit();
+        const ha = sarena.allocator();
+        var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+        defer for (keep.items) |*b| b.free();
+        const n_all = W8_GROUPS * W8_GN;
+        const kk = W8_GROUPS * W8_GK;
+        const codes = try ha.alloc(u8, n_all * W8_GK);
+        for (codes) |*c| {
+            c.* = rng.int(u8);
+            if (c.* & 0x7f == 0x7f) c.* -= 1;
+        }
+        const scales = try ha.alloc(u8, (n_all / 32) * (W8_GK / 32));
+        for (scales) |*e| e.* = 110 + rng.uintLessThan(u8, 18);
+        const lay = try w8Layer(d, W8_GROUPS, W8_GN, W8_GK, codes, scales, ha, &keep);
+        const o = try upload(d, try bf16s(M * kk, rng, 0.5, ha));
+        try keep.append(ha, o);
+        var sb: [4]cuda.DeviceBuffer = undefined;
+        for (&sb, mx.Scratch.sizes(M, kk, 1)) |*b, n| {
+            b.* = try cuda.DeviceBuffer.alloc(d, n);
+            try keep.append(ha, b.*);
+        }
+        const sc: mx.Scratch = .{ .q = sb[0].ptr, .s = sb[1].ptr, .z = sb[2].ptr, .fake = sb[3].ptr, .rows = M, .max_k = kk };
+        const u = try cuda.DeviceBuffer.alloc(d, M * n_all * 2);
+        try keep.append(ha, u);
+        const W = struct {
+            fn run(rr: *Run, on: bool, blocks: bool, scp: mx.Scratch, w8: weights.Linear, op: u64, m: usize, up: u64, n: usize, k: usize) ![]u8 {
+                try poison(up, m * n * 2, rr.d, rr.s);
+                const was = mx.gemm_halves;
+                defer mx.gemm_halves = was;
+                mx.gemm_halves = on;
+                if (blocks) {
+                    var i: usize = 0;
+                    while (i < mx.blockCount(m, true)) : (i += 1) {
+                        const b = mx.blockAt(m, true, i);
+                        try mx.woA8Prefill(rr.k, rr.s, scp, w8, W8_GROUPS, op + b.start * k * 2, k, b.n, up + b.start * n * 2, n);
+                    }
+                } else try mx.woA8Prefill(rr.k, rr.s, scp, w8, W8_GROUPS, op, k, m, up, n);
+                try rr.s.synchronize();
+                return get(up, m * n * 2, rr.d);
+            }
+        };
+        var diff: usize = 0;
+        for ([_]usize{ 8192, 6144 }) |m| {
+            const whole = try W.run(r, false, false, sc, lay.w8, o.ptr, m, u.ptr, n_all, kk);
+            defer free(whole);
+            const half = try W.run(r, true, false, sc, lay.w8, o.ptr, m, u.ptr, n_all, kk);
+            defer free(half);
+            const blk = try W.run(r, false, true, sc, lay.w8, o.ptr, m, u.ptr, n_all, kk);
+            defer free(blk);
+            diff += differs(whole, half) + differs(whole, blk);
+        }
+        r.report(try std.fmt.bufPrint(&line, "gemm_halves wo_a's FP8 rows ({d} x {d}): 8,192 and 6,144 rows, the switch's blocks against the whole-pass launch and the 4,096-row launches'", .{ kk, n_all }), diff, true);
+    }
+    // the plan itself: the blocks, their bounds and each block's kernel and split at the pass's 4,096-row cap
+    {
+        var ok = true;
+        for (rows) |m| {
+            var at: usize = 0;
+            var i: usize = 0;
+            while (i < mx.blockCount(m, true)) : (i += 1) {
+                const b = mx.blockAt(m, true, i);
+                if (b.start != at or b.n == 0 or b.n > mx.gemm_halves_rows) ok = false;
+                at += b.n;
+            }
+            if (at != m or mx.routeRows(m, true) != @min(m, mx.gemm_halves_rows)) ok = false;
+        }
+        // the whole pass's kernel and split (what the switch-off launch at 8,192 rows picks) are the 4,096-row ones
+        for (dense) |sh| {
+            const sp = mx.splits(sh.k, sh.n);
+            if (mx.sfGemmOf(.exact, 8192, sp) != mx.sfGemmOf(.exact, mx.routeRows(8192, true), sp)) ok = false;
+            if (!std.meta.eql(mx.pfGemmKernel(.table, true, 8192, sh.k, sh.n), mx.pfGemmKernel(.table, true, mx.routeRows(8192, true), sh.k, sh.n))) ok = false;
+        }
+        r.note("gemm_halves plan: 8,192 rows as 4,096 + 4,096, 6,144 as 4,096 + 2,048, 4,100 as 4,096 + 4 and 4,097 as 4,096 + 1; no block past the pass's rows, and every block's kernel and split the 4,096-row launch's", ok);
+    }
+}
 
 // -- TF_DS_PF_RASTER -------------------------------------------------------------------------------------------------
 
@@ -11736,6 +12014,75 @@ const RasterLaunch = struct {
     }
 };
 
+/// wo_a's FP8 rows (mx.woA8Prefill's tf_dsn_pf_bf16w8 launches, 2 groups of 1,024 x 4,096) for pfRaster: the layer, o's codes and
+/// scales quantized once at raster_max_rows rows (woA8PrefillCodes launches over them, no quant), u the output.
+const RasterW8 = struct {
+    w8: weights.Linear,
+    sc: mx.Scratch,
+    u: cuda.DeviceBuffer,
+
+    const n_all = W8_GROUPS * W8_GN;
+    const kk = W8_GROUPS * W8_GK;
+
+    fn make(r: *Run, rng: std.Random, ha: std.mem.Allocator, keep: *std.ArrayList(cuda.DeviceBuffer)) !RasterW8 {
+        const d = r.d;
+        const codes = try ha.alloc(u8, n_all * W8_GK);
+        for (codes) |*c| {
+            c.* = rng.int(u8);
+            if (c.* & 0x7f == 0x7f) c.* -= 1;
+        }
+        const scales = try ha.alloc(u8, (n_all / 32) * (W8_GK / 32));
+        for (scales) |*e| e.* = 110 + rng.uintLessThan(u8, 18);
+        const lay = try w8Layer(d, W8_GROUPS, W8_GN, W8_GK, codes, scales, ha, keep);
+        const o = try upload(d, try bf16s(raster_max_rows * kk, rng, 0.5, ha));
+        try keep.append(ha, o);
+        var sb: [4]cuda.DeviceBuffer = undefined;
+        for (&sb, mx.Scratch.sizes(raster_max_rows, kk, 1)) |*b, n| {
+            b.* = try cuda.DeviceBuffer.alloc(d, n);
+            try keep.append(ha, b.*);
+        }
+        const sc: mx.Scratch = .{ .q = sb[0].ptr, .s = sb[1].ptr, .z = sb[2].ptr, .fake = sb[3].ptr, .rows = raster_max_rows, .max_k = kk };
+        const u = try cuda.DeviceBuffer.alloc(d, raster_max_rows * n_all * 2);
+        try keep.append(ha, u);
+        try mx.woA8Prefill(r.k, r.s, sc, lay.w8, W8_GROUPS, o.ptr, kk, raster_max_rows, u.ptr, n_all); // fills sc.q / sc.s
+        try r.s.synchronize();
+        return .{ .w8 = lay.w8, .sc = sc, .u = u };
+    }
+
+    /// One launch set of m rows with group `g`, TF_DS_GEMM_HALVES `halves` and the 16-warp twin `w16` in effect (each put back).
+    fn go(self: RasterW8, r: *Run, g: u32, halves: bool, w16: bool, m: usize) !void {
+        const was = .{ mx.pf_raster, mx.gemm_halves, r.k.gemm_w16 };
+        defer {
+            mx.pf_raster = was[0];
+            mx.gemm_halves = was[1];
+            r.k.gemm_w16 = was[2];
+        }
+        mx.pf_raster = g;
+        mx.gemm_halves = halves;
+        r.k.gemm_w16 = w16;
+        try mx.woA8PrefillCodes(r.k, r.s, self.sc, self.w8, W8_GROUPS, m, self.u.ptr, n_all);
+    }
+
+    fn bytes(self: RasterW8, r: *Run, g: u32, halves: bool, w16: bool, m: usize) ![]u8 {
+        try poison(self.u.ptr, m * n_all * 2, r.d, r.s);
+        try self.go(r, g, halves, w16, m);
+        try r.s.synchronize();
+        return get(self.u.ptr, m * n_all * 2, r.d);
+    }
+};
+
+const RasterW8Launch = struct {
+    r: *Run,
+    w: RasterW8,
+    g: u32,
+    halves: bool,
+    m: usize,
+
+    fn go(self: RasterW8Launch) anyerror!void {
+        try self.w.go(self.r, self.g, self.halves, false, self.m);
+    }
+};
+
 /// TF_DS_PF_RASTER's grouped tile order against the default order (see the section's header), every byte equal; the timing
 /// lines are GB10's information (a mean of 5 launches after 3 warm ones, kernel time between two events).
 fn pfRaster(r: *Run, rng: std.Random) !void {
@@ -11744,6 +12091,8 @@ fn pfRaster(r: *Run, rng: std.Random) !void {
     // the gate: a launch below 14 MiB of activation keeps the default order, one at it takes the group
     {
         const wq_a = split_shapes[0];
+        const ok = mx.rasterOf(8, 1024, wq_a.k) == 0 and mx.rasterOf(8, 4096, wq_a.k) == 8 and mx.rasterOf(8, 16384, wq_a.k) == 8 and mx.rasterOf(8, 4096, 1280) == 0 and mx.rasterOf(0, 16384, wq_a.k) == 0 and mx.rasterOf(8, 4096, W8_GK) == 8 and mx.rasterOf(8, 2048, W8_GK) == 0;
+        r.note("pf_raster gate: 1,024 rows of wq_a's activation (5 MiB) keep the default order, 4,096 (20 MiB) and 16,384 rows take the group, 4,096 rows of 1,280 columns (5 MiB) do not, wo_a's group of 4,096 codes a row takes it from 4,096 rows and not at 2,048, off never", ok);
     }
     const dense = [_]Shape{ split_shapes[0], split_shapes[1], split_shapes[3] }; // wq_a, wkv, wo_b (fp32)
     var ops: [3]RasterOps = undefined;
@@ -11817,6 +12166,28 @@ fn pfRaster(r: *Run, rng: std.Random) !void {
         }
         r.report("pf_raster weights_proj (5120 x 4096, bf16 tile GEMM): 4,096, 8,192, 16,384 and 8,200 rows, groups 2, 4, 8 and 16 and group 8 beside TF_DS_GEMM_HALVES against the default order", diff, true);
     }
+    // wo_a's FP8 rows (tf_dsn_pf_bf16w8 and its 16-warp twin): the group and the group beside TF_DS_GEMM_HALVES against the default order
+    var w8: ?RasterW8 = null;
+    if (r.k.pf_bf16w8 != null) {
+        w8 = try RasterW8.make(r, rng, ha, &keep);
+        var diff: usize = 0;
+        for ([_]bool{ false, true }) |w16| {
+            if (w16 and r.k.pf_bf16w8_w16 == null) continue;
+            for (raster_rows) |m| {
+                const base = try w8.?.bytes(r, 0, false, w16, m);
+                defer free(base);
+                for (raster_groups) |g| {
+                    const got = try w8.?.bytes(r, g, false, w16, m);
+                    defer free(got);
+                    diff += differs(base, got);
+                }
+                const both = try w8.?.bytes(r, 8, true, w16, m);
+                defer free(both);
+                diff += differs(base, both);
+            }
+        }
+        r.report(try std.fmt.bufPrint(&line, "pf_raster wo_a's FP8 rows ({d} x {d}, bf16){s}: 4,096, 8,192, 16,384 and 8,200 rows, groups 2, 4, 8 and 16 and group 8 beside TF_DS_GEMM_HALVES against the default order", .{ RasterW8.kk, RasterW8.n_all, if (r.k.pf_bf16w8_w16 != null) ", the 8-warp kernel and the 16-warp twin" else ", the 8-warp kernel" }), diff, true);
+    } else r.note("pf_raster wo_a's FP8 rows: tf_dsn_pf_bf16w8 NOT LOADED: WRONG", false);
     // the control: one activation code changed (row 5,000) differs under the group; the comparison reads the data
     {
         const o = ops[0];
@@ -11847,5 +12218,17 @@ fn pfRaster(r: *Run, rng: std.Random) !void {
         var tf: [6]f64 = undefined;
         for (ms, 0..) |v, ci| tf[ci] = if (v > 0) flops / @as(f64, v) / 1e9 else 0;
         r.note(try std.fmt.bufPrint(&line, "pf_raster timing {s} ({d} x {d}), {s}, {d} rows, ms (TFLOPS): default {d:.3} ({d:.1}), group 2 {d:.3} ({d:.1}), 4 {d:.3} ({d:.1}), 8 {d:.3} ({d:.1}), 16 {d:.3} ({d:.1}), TF_DS_GEMM_HALVES {d:.3} ({d:.1}) (GB10's information)", .{ t.name, sh.k, sh.n, t.what, m, ms[0], tf[0], ms[1], tf[1], ms[2], tf[2], ms[3], tf[3], ms[4], tf[4], ms[5], tf[5] }), live);
+    };
+    // wo_a's FP8 rows, kernel time of the launches over the codes (no quant): 2 groups of 1,024 x 4,096
+    if (w8) |w| for ([_]usize{ 8192, 16384 }) |m| {
+        const flops: f64 = 2.0 * @as(f64, @floatFromInt(m)) * @as(f64, @floatFromInt(RasterW8.n_all)) * @as(f64, @floatFromInt(W8_GK));
+        var ms: [6]f32 = undefined;
+        const cfg = [_]struct { g: u32, halves: bool }{ .{ .g = 0, .halves = false }, .{ .g = 2, .halves = false }, .{ .g = 4, .halves = false }, .{ .g = 8, .halves = false }, .{ .g = 16, .halves = false }, .{ .g = 0, .halves = true } };
+        var live = true;
+        for (cfg, 0..) |c, ci| ms[ci] = try kernelMs(r, RasterW8Launch, .{ .r = r, .w = w, .g = c.g, .halves = c.halves, .m = m }, RasterW8Launch.go, 5);
+        for (ms) |v| live = live and v > 0;
+        var tf: [6]f64 = undefined;
+        for (ms, 0..) |v, ci| tf[ci] = if (v > 0) flops / @as(f64, v) / 1e9 else 0;
+        r.note(try std.fmt.bufPrint(&line, "pf_raster timing wo_a's FP8 rows ({d} x {d}), the 8-warp kernel, {d} rows, ms (TFLOPS): default {d:.3} ({d:.1}), group 2 {d:.3} ({d:.1}), 4 {d:.3} ({d:.1}), 8 {d:.3} ({d:.1}), 16 {d:.3} ({d:.1}), TF_DS_GEMM_HALVES {d:.3} ({d:.1}) (GB10's information)", .{ RasterW8.kk, RasterW8.n_all, m, ms[0], tf[0], ms[1], tf[1], ms[2], tf[2], ms[3], tf[3], ms[4], tf[4], ms[5], tf[5] }), live);
     };
 }

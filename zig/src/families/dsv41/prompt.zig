@@ -376,7 +376,8 @@ pub const Chunk = struct {
     max_comp: usize = 0,
     key_cap: usize = key_elems, // the most keys a row block holds: keyCapFor(max_comp)
     // the candidate pool past candidate_blocks blocks (model.py _candidates, apply_candidates): the chunk's block mask
-    // (u8 [cap, pool_ms]), a row block's block maxima (fp32) and their top blocks (int64 [rows, candidate_blocks]), a
+    // (u8 [dec_rows, pool_ms]), a row block's block maxima (fp32) and their top blocks (int64 [dec_rows,
+    // candidate_blocks]): the candidate source and the layers after it run on the decoder half's rows alone; a
     // row's every_vis (no mask); the layers before the candidate source's pruned selection (tpos, cand: up to
     // pruned_rows rows)
     pool: u64 = 0,
@@ -457,7 +458,8 @@ pub const Chunk = struct {
     n_counters: usize = 0,
     ktop: u64 = 0, // int64 [cap, index_topk]: torch's top-k values for _topk_finish
     // the DSpark taps and the head
-    taps: u64 = 0, // bf16 [taps, cap, D]: each tap layer's mean of the streams (Model.forward's taps)
+    taps: u64 = 0, // bf16 [taps, dec_rows, D]: each tap layer's mean of the streams (Model.forward's taps)
+    dec_rows: usize = 0, // the rows the decoder half reads at most (decoderRows): the taps', the pool's and its picks
     head_x: u64 = 0, // bf16 [1, D]: collapse_norm of the last row
     head_l: u64 = 0, // fp32 [1, this rank's vocabulary columns]: its logits
     head_g: u64 = 0, // fp32 [world, 1, columns]: their gather (the prompt's logits, rank after rank)
@@ -493,6 +495,7 @@ pub const Chunk = struct {
         ch.img_rows = 0;
         ch.cap = cap;
         ch.rows_max = cap;
+        ch.dec_rows = decoderRows(cap, c.window);
         ch.n = 0;
         ch.start = 0;
         ch.pending = false;
@@ -600,10 +603,9 @@ pub const Chunk = struct {
             const cb = c.candidate_block;
             ch.pool_ms = (ch.max_comp + cb - 1) / cb;
             if (ch.pool_ms > c.candidate_blocks) {
-                ch.pool = try a.take(cap * ch.pool_ms);
-                ch.bmax = try a.take(@max(16 * ch.pool_ms, key_elems / cb + cap) * 4);
-                ch.pidx = try a.take(cap * c.candidate_blocks * 8);
+                ch.pool = try a.take(ch.dec_rows * ch.pool_ms);
                 ch.bmax = try a.take(@max(16 * ch.pool_ms, ch.key_cap / cb + cap) * 4);
+                ch.pidx = try a.take(ch.dec_rows * c.candidate_blocks * 8);
             }
             ch.every = try a.take(cap * 8);
             {
@@ -622,6 +624,7 @@ pub const Chunk = struct {
             const en = if (e.two) |t| t.engramWidth() else ew.n; // the summed projection's width (2D: both pairs')
             ch.eb = try a.take(cap * ew.k * 2);
             ch.ek = if (rc) |r| r.addr(.ek) else try a.take(cap * ew.n * 4);
+            ch.ekg = try a.take(ekgBytes(cap, e.world, en, if (e.two) |t| .{ .ew = t.ew, .p = t.p, .world = e.comm.world } else null));
             ch.kv = try a.take(cap * en * 2);
             break;
         }
@@ -652,10 +655,11 @@ pub const Chunk = struct {
             if (e.two) |t| try t.clearRest(e); // parity: the rest launches' grouping starts empty
         }
         ch.gl = try a.take(16 * (d / 256) * c.experts * 4);
-        // prefill.Workspace: the largest prompt GEMM's rotated input and W_q (fp16) over every layer, and the Hadamard
+        // prefill.Workspace: the largest prompt GEMM's rotated input and W_q (fp16) over every layer, and the Hadamard;
+        // none on Format.native (mmRows takes mx.linear: no EXL3 GEMM runs)
         var max_xk: usize = 0;
         var max_kn: usize = 0;
-        for (e.w.layers) |lay| {
+        if (e.mx == null) for (e.w.layers) |lay| {
             var ls: [16]?weights.Linear = @splat(null);
             ls[0] = lay.wq_a;
             ls[1] = lay.wkv;
@@ -672,8 +676,8 @@ pub const Chunk = struct {
                 max_xk = @max(max_xk, l.k);
                 max_kn = @max(max_kn, @as(usize, l.k) * l.n);
             }
-        }
-        ch.ws = .{ .xh = try a.take(cap * max_xk * 2), .w = try a.take(max_kn * 2), .h = try a.take(128 * 128 * 2) };
+        };
+        ch.ws = if (e.mx == null) .{ .xh = try a.take(cap * max_xk * 2), .w = try a.take(max_kn * 2), .h = try a.take(128 * 128 * 2) } else .{ .xh = 0, .w = 0, .h = 0 };
         ch.blas_ws = try a.take(cublas.Blas.workspace_bytes);
         // grouped linears: every layer's counters (int32 [8 N / 128], zeros, left zero by each launch), the largest
         // group's rotated rows and partials at 128 rows
@@ -714,9 +718,11 @@ pub const Chunk = struct {
             try fill32(e, xs.members, 0xffffffff, sz[8] / 4);
         }
         try fill(e, ch.neg, 0xff, cap * 8);
-        var had: [128 * 128]u16 = undefined;
-        exl3_prefill.hadamard(&had);
-        try upload(e, ch.ws.h, &had, had.len * 2);
+        if (e.mx == null) {
+            var had: [128 * 128]u16 = undefined;
+            exl3_prefill.hadamard(&had);
+            try upload(e, ch.ws.h, &had, had.len * 2);
+        }
         return ch;
     }
 };
@@ -725,6 +731,39 @@ pub const Chunk = struct {
 /// a pass under the resume rows: the resume rows, so n < cap and the unsharded path runs, as at the grid's own chunks).
 pub fn viewRows(n: usize, resume_rows: usize) usize {
     return @max(n, resume_rows);
+}
+
+/// The rows a chunk's decoder half reads at most (the DSpark taps, the candidate pool and its picks): the window
+/// (replayCut keeps the rows from the prompt's length less the window), or the chunk's own rows when fewer.
+pub fn decoderRows(cap: usize, window: usize) usize {
+    return @min(cap, window);
+}
+
+/// The most rows a prompt pass runs (TF_DS_PASS_ROWS=16384: eight resume units). Declared here so this module's host row tables
+/// size without importing model (which imports this); model asserts they agree. What bounds it: the host row tables on the stack
+/// (three of this many i64 in a layer), the Engram worker's ring (twice the units, engram_rows.max_wk), and the memory a pass takes
+/// (the start check names the shortfall); a larger pass raises this one constant and the replay tables.
+pub const max_pass_rows = 16384;
+
+/// A host row table for a pass's `n` rows over stack storage for the engine's largest pass (`max_pass_rows`): the
+/// chunk's view and the storage both cap it. The table is filled to n only; the storage is the ceiling, not the count.
+pub fn hostRows(ch: *const Chunk, store: []i64, n: usize) ![]i64 {
+    if (n > ch.cap or n > store.len) return error.ChunkTooLong;
+    return store[0..n];
+}
+
+/// A 2D split's Engram widths for ekgBytes: this node's pair's and the other's columns, its pair, the nodes.
+pub const EkgSplit = struct { ew: [2]usize, p: usize, world: usize };
+
+/// Engram's gather buffer (Chunk.ekg) for chunks of `cap` rows: on a 2D split the largest of engramSum's n (6 ew[p]
+/// + 2 ew[1 - p]) bytes, the quarters' [2, n, ew0 + ew1] fp32 under 64 rows (add2Bf16 reads them after) and the owner
+/// sums' stage at the owned rows; else the `tp` ranks' projections [tp, cap, en] fp32 (the all-gather).
+pub fn ekgBytes(cap: usize, tp: usize, en: usize, two: ?EkgSplit) usize {
+    const t = two orelse return tp * cap * en * 4;
+    const small: usize = @min(cap, 63); // (typed: @min with a comptime bound narrows)
+    var b = @max(cap * (6 * t.ew[t.p] + 2 * t.ew[1 - t.p]), 2 * small * en * 4);
+    if (t.world != 0 and cap % t.world == 0) b = @max(b, prompt2d.OwnStage.bytes(cap / t.world, t.ew[t.p]));
+    return b;
 }
 
 /// Format.native's scratch for chunks of `cap` rows (and rounds and drafter passes, fewer): the widest K any native
@@ -926,6 +965,38 @@ pub const Caches = struct {
     cap: usize = 0, // positions
     slots: usize = 1, // the positional stores' slots
 
+    /// The device bytes of one layer's caches for a pool of `cap` positions and `slots` streams (zero where the layer keeps none):
+    /// the sizes init takes.
+    pub const LayerBytes = struct { comp_codes: usize = 0, comp_scales: usize = 0, idx_codes: usize = 0, idx_scales: usize = 0, raw_kv: usize = 0, raw_score: usize = 0 };
+
+    pub fn layerBytes(c: *const Config, lay: weights.Layer, cap: usize, slots: usize) LayerBytes {
+        var b: LayerBytes = .{};
+        if (lay.comp_wkv == null) return b;
+        const r: usize = lay.ratio;
+        const rows = cap / r + 2;
+        b.comp_codes = rows * c.head_dim / 2;
+        b.comp_scales = rows * c.head_dim / 16;
+        if (lay.idx_wk != null) {
+            b.idx_codes = rows * c.index_head_dim / 2;
+            b.idx_scales = rows * c.index_head_dim / 32;
+        }
+        if (r > 1) {
+            b.raw_kv = slots * raw_rows * c.head_dim * 4;
+            b.raw_score = slots * raw_rows * c.head_dim * 4;
+        }
+        return b;
+    }
+
+    /// The device bytes of the whole pool's caches (what init takes, before the arena's 256-byte alignment): the KV pool a Spark holds.
+    pub fn poolBytes(c: *const Config, layers: []const weights.Layer, cap: usize, slots: usize) usize {
+        var total: usize = 0;
+        for (layers) |lay| {
+            const b = layerBytes(c, lay, cap, slots);
+            total += b.comp_codes + b.comp_scales + b.idx_codes + b.idx_scales + b.raw_kv + b.raw_score;
+        }
+        return total;
+    }
+
     pub fn init(e: *const Engine, a: *Arena, cap: usize, slots: usize) !Caches {
         const Src = struct {
             a: *Arena,
@@ -1023,23 +1094,16 @@ pub const Caches = struct {
         const c = e.c;
         var cs: Caches = .{ .cap = cap, .slots = slots };
         for (e.w.layers, 0..) |lay, i| {
-            if (lay.comp_wkv == null) continue;
-            const r: usize = lay.ratio;
-            const rows = cap / r + 2;
-            cs.comp_codes[i] = try a.take(rows * c.head_dim / 2);
-            cs.comp_scales[i] = try a.take(rows * c.head_dim / 16);
-            if (lay.idx_wk != null) {
-                cs.idx_codes[i] = try a.take(rows * c.index_head_dim / 2);
-                cs.idx_scales[i] = try a.take(rows * c.index_head_dim / 32);
+            const b = layerBytes(c, lay, cap, slots);
+            if (b.comp_codes == 0) continue;
             const m = layerBytes(c, lay, cap_max, slots);
             cs.comp_codes[i] = try src.take(b.comp_codes, m.comp_codes);
             cs.comp_scales[i] = try src.take(b.comp_scales, m.comp_scales);
+            if (b.idx_codes != 0) {
                 cs.idx_codes[i] = try src.take(b.idx_codes, m.idx_codes);
                 cs.idx_scales[i] = try src.take(b.idx_scales, m.idx_scales);
             }
-            if (r > 1) {
-                cs.raw_kv[i] = try a.take(slots * raw_rows * c.head_dim * 4);
-                cs.raw_score[i] = try a.take(slots * raw_rows * c.head_dim * 4);
+            if (b.raw_kv != 0) {
                 cs.raw_kv[i] = try src.take(b.raw_kv, m.raw_kv);
                 cs.raw_score[i] = try src.take(b.raw_score, m.raw_score);
             }
@@ -1582,10 +1646,10 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         const src = sh.kv_layer orelse return error.NoKvSource;
         const n_comp_end = (start + n) / r;
         // vis = (pos + 1) // ratio: the compressed entries row i may see (host-made: the same integers)
-        var vis_host: [max_pass_rows]i64 = undefined;
-        if (n > vis_host.len) return error.ChunkTooLong;
-        for (0..n) |i| vis_host[i] = @intCast((start + i + 1) / r);
-        try upload(e, ch.vis, &vis_host, n * 8);
+        var vis_store: [max_pass_rows]i64 = undefined;
+        const vis_host = try hostRows(ch, &vis_store, n);
+        for (vis_host, 0..) |*p, i| p.* = @intCast((start + i + 1) / r);
+        try upload(e, ch.vis, vis_host.ptr, n * 8);
         if (lay.idx_wq_b) |wqb| try indexer(e, ch, cs, sh, li, wqb, src, n_comp_end, rope);
         const kk = sh.kk orelse return error.NoIndexerSelection;
         comp = .{ .fp4 = .{ .codes = cs.comp_codes[src], .scales = cs.comp_scales[src] } };
@@ -1851,15 +1915,16 @@ pub fn kvSourceAt(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
     }
     sh.kv_layer = li;
     // groups first // r .. and their positions group * r (the rotations _rot reads)
-    var g_host: [max_pass_rows]i64 = undefined;
-    var p_host: [max_pass_rows]i64 = undefined;
-    if (full > g_host.len) return error.ChunkTooLong;
-    for (0..full) |j| {
-        g_host[j] = @intCast(start / r + j);
-        p_host[j] = @intCast((start / r + j) * r);
+    var g_store: [max_pass_rows]i64 = undefined;
+    var p_store: [max_pass_rows]i64 = undefined;
+    const g_host = try hostRows(ch, &g_store, full);
+    const p_host = try hostRows(ch, &p_store, full);
+    for (g_host, p_host, 0..) |*g, *p, j| {
+        g.* = @intCast(start / r + j);
+        p.* = @intCast((start / r + j) * r);
     }
-    try upload(e, ch.groups, &g_host, full * 8);
-    try upload(e, ch.gpos, &p_host, full * 8);
+    try upload(e, ch.groups, g_host.ptr, full * 8);
+    try upload(e, ch.gpos, p_host.ptr, full * 8);
     const rot = e.compressed;
     if (lay.idx_wk) |iwk| {
         const id = c.index_head_dim;
@@ -2056,7 +2121,7 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     const cb = c.candidate_block;
     const nbk = (n_comp_end + cb - 1) / cb;
     const pooled = !keyed and nbk > c.candidate_blocks;
-    if (pooled and (ch.pool == 0 or nbk > ch.pool_ms)) return error.ChunkTooLong;
+    if (pooled and (ch.pool == 0 or nbk > ch.pool_ms or n > ch.dec_rows)) return error.ChunkTooLong;
     const pk = @min(c.candidate_blocks, nbk);
     dump(e, li, "iq", ch.iq, n * ih * id * 2);
     dump(e, li, "iq4", ch.iq4, n * ih * id * 2);
@@ -2577,6 +2642,7 @@ pub fn ffnCodesOffAt(gpa: std.mem.Allocator, finds: anytype, native: bool, layer
 pub const PinSlots = struct {
     live: [2][engram_rows.max_wk]bool = @splat(@splat(false)),
     used: [2][engram_rows.max_wk]usize = @splat(@splat(0)),
+    ring: usize = 2, // the worker's chunk slots (engram_rows.workerSlots): the pending copies a layer at most
     next: [2]usize = .{ 0, 0 }, // the ring position of the next arm, by layer
 
     /// The ring position the next arm of layer j takes, or null when both are pending (the caller waits for the oldest).
@@ -2666,6 +2732,7 @@ pub const EngramHost = struct {
     // in wk_rows[i % 2][j], chunk i ready once wk_done[j] > i, its slot free again once wk_used[j] > i (the rows
     // uploaded), so the worker runs up to a chunk ahead of the layers: a chunk's table reads overlap the chunk before
     wk_rows: [engram_rows.max_wk][2][]u16 = @splat(.{ &.{}, &.{} }),
+    // the chunk slots in use (engram_rows.workerSlots: a pass's resume units, or twice them for two passes in flight, at least 2)
     wk_slots: usize = 2,
     // the worker's row ids by chunk parity: a pass-major read leaves one chunk's layer-1 rows to read after the next
     // chunk's layer 0 has hashed its ids, so each slot keeps its own (the chunk-major order read them back to back)
@@ -2719,10 +2786,17 @@ pub const EngramHost = struct {
     wk_pass_rows: usize = 0, // the pass rule's pass_rows cap (Model.pass_rows)
     // engramApply's rows when the worker read them: the pass's resume units in order (use_n of them, use_unit rows each
     // but the last), or their records instead with packed shards (engramWorkerStage)
+    use_rows: [engram_rows.max_units]?[]u16 = @splat(null),
+    use_stage: [engram_rows.max_units]?*engram_rows.Stage = @splat(null),
     use_n: usize = 0,
     use_unit: usize = 0,
 
-    pub fn init(gpa: std.mem.Allocator, c: *const Config, hasher: engram.Hasher, tables: *const engram_io.Tables, pool: *engram_io.Pool, rank: usize, world: usize, cap: usize) !EngramHost {
+    pub fn init(gpa: std.mem.Allocator, c: *const Config, hasher: engram.Hasher, tables: *const engram_io.Tables, pool: *engram_io.Pool, rank: usize, world: usize, cap: usize, unit: usize, wk_slots: usize) !EngramHost {
+        var why: [320]u8 = undefined;
+        if (engram_rows.slotsRefusal(&why, wk_slots, @max(1, cap / unit))) |w| {
+            std.log.err("{s}", .{w});
+            return error.BadSlots;
+        }
         const cols = hasher.cols();
         const lo = rank * cols / world;
         const hi = (rank + 1) * cols / world;
@@ -2733,6 +2807,7 @@ pub const EngramHost = struct {
         var max_s: usize = 0;
         for (0..@min(2, c.engram_layers.slice().len)) |j| {
             const tj = tables.layers.get(@intCast(c.engram_layers.slice()[j])) orelse return error.MissingEngramTable;
+            for (0..wk_slots) |slot| wr[slot][j] = try gpa.alloc(u16, unit * k * tj.row_w);
             max_w = @max(max_w, tj.row_w);
             max_s = @max(max_s, tj.row_s);
         }
@@ -2752,8 +2827,12 @@ pub const EngramHost = struct {
             .wk_slots = wk_slots,
             .wk_hashes = blk: {
                 var h: [engram_rows.max_wk][]i64 = @splat(&.{});
+                for (0..wk_slots) |i| h[i] = try gpa.alloc(i64, unit * hasher.layers * cols);
                 break :blk h;
             },
+            .wk_flat = try gpa.alloc(i64, unit * k),
+            .wk_w = try gpa.alloc(u8, unit * k * max_w),
+            .wk_s = try gpa.alloc(u8, unit * k * max_s),
             .ahead_w = aw,
             .ahead_s = as,
             .ahead_rows = ar,
@@ -3005,12 +3084,16 @@ pub fn engramWorker(eh: *EngramHost, c: *const Config, seq: []const i32, start: 
     if (chunk == 0) return;
     if (std.c.getenv("TF_DS_ROCI_PAIR_LOG") != null) std.log.info("the Engram worker of this fill is thread {d} (core {d})", .{ std.os.linux.gettid(), threadProbe().core });
     const chunks = if (seq.len > start) (seq.len - start + chunk - 1) / chunk else 0;
+    // The ring and its per-slot hash buffers hold wk_slots chunks of one resume unit (engram_rows.workerSlots: a pass's
+    // units at the least, twice them with two passes in flight); the guard below keeps the worker wk_slots chunks ahead of
+    // the layers' uploads.
     var order: WorkerOrder = .{
         .start = start,
         .chunks = chunks,
         .chunk = chunk,
         .layers = nl,
         .pass_from = eh.wk_pass_from,
+        .pass_rows = if (eh.wk_ahead) @min(eh.wk_pass_rows, max_pass_rows) else chunk,
         .filling_pass = prompt2d.pass_filling_asked,
         .group = eh.wk_group,
     };
@@ -3521,6 +3604,7 @@ pub fn tap(e: *const Engine, ch: *Chunk, j: usize, li: usize) !void {
     // rows' tap output, which the gather below overwrites with every rank's own correct rows next) -- no row-shard
     // needed for the mean itself, only for what already needed it above (hcPost) and for making ch.taps globally
     // correct afterward, since DSpark drafting reads every row of it on every node.
+    if (ch.n > ch.dec_rows) return error.ChunkTooLong;
     return tapOwned(e, ch, j, r orelse return error.NoOwnedRows);
 }
 
@@ -4017,6 +4101,21 @@ test "the boundary's in-place gathers put every rank's owned groups of the four 
     };
 }
 
+test "Engram's gather buffer holds engramSum's parts, a small chunk's quarters and the owner sums' stage" {
+    const s: EkgSplit = .{ .ew = .{ 12800, 12800 }, .p = 0, .world = 4 };
+    // a 2D node at 2,048 rows: engramSum's 2,048 x (6 + 2) x 12,800 bytes, half the baseline [2, 2,048, 25,600] fp32
+    try std.testing.expectEqual(@as(usize, 209_715_200), ekgBytes(2048, 2, 25600, s));
+    // under 64 rows the quarters' [2, 63, 25,600] fp32 decide
+    try std.testing.expectEqual(@as(usize, 2 * 63 * 25600 * 4), ekgBytes(64, 2, 25600, s));
+    // unequal pairs: this node's own share of the six and the two
+    try std.testing.expectEqual(@as(usize, 2048 * (6 * 12928 + 2 * 12672)), ekgBytes(2048, 2, 25600, .{ .ew = .{ 12928, 12672 }, .p = 0, .world = 4 }));
+    try std.testing.expectEqual(@as(usize, 2048 * (6 * 12672 + 2 * 12928)), ekgBytes(2048, 2, 25600, .{ .ew = .{ 12928, 12672 }, .p = 1, .world = 4 }));
+    // the owner sums' stage fits: 512 owned rows of 12,800 at 14 bytes
+    try std.testing.expect(prompt2d.OwnStage.bytes(512, 12800) <= ekgBytes(2048, 2, 25600, s));
+    // TP2: both ranks' projections, as in the baseline
+    try std.testing.expectEqual(@as(usize, 2 * 2048 * 12800 * 4), ekgBytes(2048, 2, 12800, null));
+}
+
 test "the indexer's key bound follows the context: 1M is the baseline's, 2M passes where 1M refuses" {
     // served 1M context: max_comp 1,048,576 -> exactly key_elems, the same buffers and the same refusals as before
     try std.testing.expectEqual(key_elems, keyCapFor(1_048_576));
@@ -4033,6 +4132,12 @@ test "the indexer's key bound follows the context: 1M is the baseline's, 2M pass
     const n: usize = 600_000;
     const rb = @max(floor, (@as(usize, 1) << 26) / (4 * n) / 16 * 16);
     try std.testing.expect(!keysRefused(rb, n, keyCapFor(1_048_576)));
+}
+
+test "a chunk's decoder half reads the window's rows at most" {
+    try std.testing.expectEqual(@as(usize, 128), decoderRows(2048, 128));
+    try std.testing.expectEqual(@as(usize, 128), decoderRows(4096, 128));
+    try std.testing.expectEqual(@as(usize, 64), decoderRows(64, 128));
 }
 
 test "a chunk's view of a pass stays within the rows its buffers hold" {
@@ -4058,6 +4163,17 @@ test "a pass's view: its own rows when whole, the resume rows under them" {
     try std.testing.expectEqual(@as(usize, 4096), viewRows(4096, 2048));
     try std.testing.expectEqual(@as(usize, 2048), viewRows(2047, 2048));
     try std.testing.expectEqual(@as(usize, 2048), viewRows(1, 2048));
+}
+
+test "a prompt chunk's host row tables take an 8,192-row pass: no 4,096-row stack caps a pass" {
+    const src = @embedFile("prompt.zig");
+    // the needle split so this test's own text does not match
+    const cap: []const u8 = "[4096]i64";
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, src, "var vis_host: " ++ cap));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, src, "var g_host: " ++ cap));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, src, "var p_host: " ++ cap));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, src, "[" ++ "max_pass_rows]i64 = undefined"));
+    try std.testing.expect(std.mem.indexOf(u8, src, "hostRows(ch,") != null);
 }
 
 test "TF_DS_ATTN_U moves a prompt chunk's sparse attention only: its call asks for the twin, a round's and a pass's never" {
@@ -4159,6 +4275,30 @@ test "TF_DS_PASS_FROM=8192, TF_DS_PASS_ROWS=8192: 8,192-row passes read four chu
         .{ .chunk = 8, .layer = 1 },  .{ .chunk = 9, .layer = 1 },
         .{ .chunk = 10, .layer = 1 }, .{ .chunk = 11, .layer = 1 },
     });
+}
+
+test "TF_DS_PASS_ROWS at every size: a pass of u resume units reads its u chunks a layer at a time, layer 0's then layer 1's, pass after pass" {
+    for (1..engram_rows.max_units + 1) |u| {
+        var order: WorkerOrder = .{ .start = 0, .chunks = 3 * u, .chunk = 2048, .layers = 2, .pass_from = 0, .pass_rows = u * 2048 };
+        for (0..3) |pass| for (0..2) |layer| for (0..u) |k| {
+            const step = order.next() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(pass * u + k, step.chunk);
+            try std.testing.expectEqual(layer, step.layer);
+        };
+        try std.testing.expect(order.next() == null);
+    }
+}
+
+test "TF_DS_ROCI_STAGGER at every size: the pair's group is both passes' 2u chunks, layer 0's then layer 1's, pair after pair" {
+    for (1..engram_rows.max_units + 1) |u| {
+        var order: WorkerOrder = .{ .start = 0, .chunks = 4 * u, .chunk = 2048, .layers = 2, .pass_from = 0, .pass_rows = u * 2048, .group = 2 * u };
+        for (0..2) |pair| for (0..2) |layer| for (0..2 * u) |k| {
+            const step = order.next() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(pair * 2 * u + k, step.chunk);
+            try std.testing.expectEqual(layer, step.layer);
+        };
+        try std.testing.expect(order.next() == null);
+    }
 }
 
 test "TF_DS_PASS_FILLING: two fills alternating 4,096-row passes read each pass two chunks a layer, its own slots" {
@@ -4277,6 +4417,64 @@ test "TF_DS_ROCI_WORKER_PAIR_MAJOR: a group of four chunks reads layer 0 of all 
         .{ .chunk = 0, .layer = 0 }, .{ .chunk = 0, .layer = 1 }, .{ .chunk = 1, .layer = 0 }, .{ .chunk = 1, .layer = 1 },
         .{ .chunk = 2, .layer = 0 }, .{ .chunk = 2, .layer = 1 }, .{ .chunk = 3, .layer = 0 }, .{ .chunk = 3, .layer = 1 },
     });
+}
+
+/// The worker's order (groups of `per` passes of `units` resume units, layer by layer) against the engine's uploads on a ring of
+/// `slots` chunk slots, as engramWorker's guard and engramApply's releases run them: a pass's layer-j units are uploaded together
+/// (wk_used[j] = the pass's end) once the worker has read them all. True when the worker and the uploads both reach the end;
+/// false when neither can move (the worker waits for a slot the uploads have not freed, the uploads for rows the worker has not read).
+fn ringRuns(units: usize, per: usize, slots: usize, groups: usize) bool {
+    const chunk = 2048;
+    var order: WorkerOrder = .{ .start = 0, .chunks = groups * per * units, .chunk = chunk, .layers = 2, .pass_from = 0, .pass_rows = units * chunk, .group = per * units };
+    var done = [2]usize{ 0, 0 };
+    var used = [2]usize{ 0, 0 };
+    var next = order.next();
+    var g: usize = 0; // the group the uploads are at, its layer and its pass
+    var j: usize = 0;
+    var q: usize = 0;
+    while (g < groups or next != null) {
+        var moved = false;
+        if (next) |st| if (st.chunk < used[st.layer] + slots) {
+            done[st.layer] = st.chunk + 1;
+            next = order.next();
+            moved = true;
+        };
+        if (g < groups) {
+            const end = g * per * units + (q + 1) * units;
+            if (done[j] >= end) {
+                used[j] = end;
+                q += 1;
+                if (q == per) {
+                    q = 0;
+                    j += 1;
+                    if (j == 2) {
+                        j = 0;
+                        g += 1;
+                    }
+                }
+                moved = true;
+            }
+        }
+        if (!moved) return false;
+    }
+    return true;
+}
+
+test "the worker's ring: a pass's units are the fewest slots that do not hang it, twice them serve two passes in flight, at every pass size from 2,048 to 16,384 rows" {
+    for ([_]usize{ 1, 2, 3, 4, 5, 6, 7, 8 }) |units| {
+        for ([_]usize{ 1, 2 }) |per| {
+            // fewer slots than a pass's units never lets a pass finish (a silent hang in the engine)
+            for (1..units) |slots| try std.testing.expect(!ringRuns(units, per, slots, 3));
+            // a pass's units and more, up to the largest ring, run
+            for (units..engram_rows.max_wk + 1) |slots| try std.testing.expect(ringRuns(units, per, slots, 3));
+        }
+        // the slots the engine boots: without the stagger and with it
+        try std.testing.expect(ringRuns(units, 1, engram_rows.workerSlots(units, false), 3));
+        try std.testing.expect(ringRuns(units, 2, engram_rows.workerSlots(units, true), 3));
+        var why: [320]u8 = undefined;
+        try std.testing.expectEqual(@as(?[]const u8, null), engram_rows.slotsRefusal(&why, engram_rows.workerSlots(units, true), units));
+        try std.testing.expectEqual(@as(?[]const u8, null), engram_rows.slotsRefusal(&why, engram_rows.workerSlots(units, false), units));
+    }
 }
 
 test "TF_DS_ROCI_STAGGER_LANES=3: a group of three passes' 3u chunks, layer 0's then layer 1's, and any ring of a pass's units or more runs it against the uploads (no deadlock); the booted ring is three passes' units" {

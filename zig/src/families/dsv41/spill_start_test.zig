@@ -180,6 +180,7 @@ test "the math text names TF_DS_ROCI, TF_DS_ROCI_COLLECT, TF_DS_IDX_V, TF_DS_GEM
     off.attn_epi_fused = false;
     off.hc_2s = false;
     off.gemm_r2 = false;
+    off.gemm_halves = false;
     off.qgate_canary = 0;
     off.pf_raster = 0;
     const text = try start.mathText(&buf, off);

@@ -256,3 +256,50 @@ test "T-KSET, the decoder half on owned rows: any_check.decoderOff finds every l
     const w = (try any_check.decoderOff(gpa, arena.allocator(), no_post, cfg, &lays)).?;
     try std.testing.expect(std.mem.indexOf(u8, w, "_hc_post_2b") != null);
 }
+
+/// The kit's variants for every launch of a pass of `pass_rows` rows (a quarter of them a slab, `widest` rows): the base set's for the
+/// encoder half, the extra set's two-block readers of the pass's one full slab, and the whole any-row-count check the owned path runs at start.
+fn ksetAtPassRows(pass_rows: usize, widest_want: usize) !void {
+    const gpa = std.testing.allocator;
+    var man = try kitManifest(gpa);
+    defer man.deinit();
+    var why: config_mod.Why = .{};
+    const cfg = try config_mod.parse(gpa, config_mod.test_config, &why);
+    var lays: [40]weights.Layer = undefined;
+    layers(&lays, cfg);
+    var looked: usize = 0;
+    const finds: ManifestFinds = .{ .m = &man, .looked = &looked };
+    const enc = try distinctSlabs(gpa, pass_rows);
+    defer gpa.free(enc);
+    var miss: std.ArrayList(Miss) = .empty;
+    defer miss.deinit(gpa);
+    try sweep(gpa, finds, cfg, &lays, 20, true, enc, &miss);
+    var widest: usize = 0;
+    for (enc) |r| widest = @max(widest, r.n);
+    std.debug.print("T-KSET {d}: {d} distinct encoder slab row counts (the widest {d} rows), {d} launches looked up in the kit's {d} base variants\n", .{ pass_rows, enc.len, widest, looked, man.parsed.value.kernels.len });
+    try std.testing.expectEqual(widest_want, widest);
+    report("encoder half of a pass (layers 0-19)", miss.items);
+    try std.testing.expectEqual(@as(usize, 0), miss.items.len);
+    // the readers (TF_DS_ROCI's start check looks up the pass's one full slab: the pass rows / 4)
+    const dir = std.c.getenv("TF_KSET_EXTRA_DIR") orelse return;
+    var extra = aot.Manifest.read(gpa, std.testing.io, std.mem.span(dir)) catch return;
+    defer extra.deinit();
+    const reason = try prompt.rociReadersOff(gpa, ManifestFinds{ .m = &extra }, &[_]usize{pass_rows / 4}, cfg.hidden, 12800, cfg.eps, cfg.hc_eps, cfg.hc_iters);
+    if (reason) |r| std.debug.print("T-KSET {d} two-block readers: {s}\n", .{ pass_rows, r });
+    try std.testing.expectEqual(@as(?[]const u8, null), reason);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const kit: KitFinds = .{ .base = .{ .m = &man }, .extra = &extra };
+    any_check.layers(&lays, cfg);
+    const any = try any_check.anyOwnedOff(gpa, arena.allocator(), kit, cfg, &lays, 20, true, pass_rows);
+    if (any) |r| std.debug.print("T-KSET {d} any_check: {s}\n", .{ pass_rows, r });
+    try std.testing.expectEqual(@as(?[]const u8, null), any);
+}
+
+test "T-KSET at 8,192 rows: the kit's base set has every launch of every slab of 1..8,192 encoder rows (slabs to 2,048), and the extra set the two-block readers of the 2,048-row slab" {
+    try ksetAtPassRows(8192, 2048);
+}
+
+test "T-KSET at 16,384 rows: the kit's base set has every launch of every slab of 1..16,384 encoder rows (slabs to 4,096), and the extra set the two-block readers of the 4,096-row slab" {
+    try ksetAtPassRows(16384, 4096);
+}

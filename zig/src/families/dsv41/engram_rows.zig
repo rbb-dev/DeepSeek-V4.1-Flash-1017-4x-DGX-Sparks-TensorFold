@@ -129,12 +129,31 @@ pub const Stage = struct {
     }
 };
 
+/// The resume units (2,048 rows) in the largest pass (TF_DS_PASS_ROWS=16384).
+pub const max_units = 8;
+
+/// The most chunk slots the worker holds: two passes of the largest pass's units.
+pub const max_wk = 2 * max_units;
+
+/// The chunk slots the worker's ring holds for passes of `units` resume units: a pass reads all its units before the
+/// layers give the first back, so the ring needs `units` at the least (fewer hangs the worker, silently); two passes in
+/// flight (`pair`) need a whole pass more for the worker to read ahead into the next, so twice the units. Never fewer
+/// than two, the ring before passes of more than one unit existed.
+pub fn workerSlots(units: usize, pair: bool) usize {
     return workerSlotsN(units, if (pair) 2 else 1);
 }
 
 /// `workerSlots` for `lanes` passes in flight (TF_DS_ROCI_STAGGER_LANES: 3 takes three times the units, up to max_wk).
 pub fn workerSlotsN(units: usize, lanes: usize) usize {
     return @max(2, if (lanes >= 2) lanes * units else units);
+}
+
+/// Why a ring of `slots` cannot serve passes of `units` resume units (null: it can): the name of the setting and the
+/// slots it needs.
+pub fn slotsRefusal(buf: []u8, slots: usize, units: usize) ?[]const u8 {
+    if (slots >= units and slots <= max_wk) return null;
+    return std.fmt.bufPrint(buf, "the Engram worker's ring has {d} chunk slots and a pass of {d} resume units ({d} rows, TF_DS_PASS_ROWS) needs {d} to {d}: a ring with fewer slots than a pass's units never lets the worker finish a pass", .{ slots, units, units * 2048, units, max_wk }) catch "the Engram worker's ring does not hold a pass's units";
+}
 
 pub const Options = struct {
     dir: []const u8, // the packed shards
@@ -156,6 +175,8 @@ pub const Options = struct {
     chunk_dev: u64, // of a chunk (chunk_rows * slots * record bytes)
     chunk_dev_b: u64 = 0, // the second lane's pass: its own (0: one pass at a time)
     chunk_dev_c: u64 = 0, // the third lane's pass (TF_DS_ROCI_STAGGER_LANES=3; 0: two at most)
+    wk_slots: usize = 2, // the worker's chunk slots (workerSlots): 2 to max_wk
+    unit_rows: usize = 0, // the rows one worker slot holds: a resume unit (0: chunk_rows)
 };
 
 pub const Rows = struct {
@@ -231,10 +252,13 @@ pub const Rows = struct {
         errdefer ahead0.deinit(gpa);
         var ahead1 = try Stage.init(gpa, null, 1, o.chunk_rows * sl, rec);
         errdefer ahead1.deinit(gpa);
+        if (o.wk_slots < 2 or o.wk_slots > max_wk) return error.EngramShape;
+        const unit_rows = if (o.unit_rows == 0) o.chunk_rows else o.unit_rows;
         var wk: [max_wk][2]Stage = @splat(@splat(Stage.empty));
         var made: usize = 0;
         errdefer for (0..made) |i| wk[i / 2][i % 2].deinit(gpa);
         for (0..2 * o.wk_slots) |i| {
+            wk[i / 2][i % 2] = try Stage.init(gpa, if (o.pinned) d else null, i % 2, unit_rows * sl, rec);
             made += 1;
         }
         var caches: [2]?engram_cache.Cache = .{ null, null };
@@ -564,4 +588,31 @@ test "TF_DS_ENGRAM_PREFAULT: the row caches are faulted in at the open, each lay
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, model, "const prefault = engram_rows.envOn(\"TF_DS_ENGRAM_PREFAULT\");"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, model, ".prefault = prefault,"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, model, "if (prefault) logPrefault(m.erows.?, mib, huge0, hugeKiB(io));"));
+}
+
+test "the worker's ring: a pass's resume units, twice them with two passes in flight, never fewer than two; a ring under a pass's units is refused naming the setting and the slots" {
+    try std.testing.expectEqual(@as(usize, 8), max_units); // 16,384 rows
+    try std.testing.expectEqual(@as(usize, 2), workerSlots(1, false)); // 2,048-row passes
+    try std.testing.expectEqual(@as(usize, 2), workerSlots(2, false)); // 4,096
+    try std.testing.expectEqual(@as(usize, 4), workerSlots(4, false)); // 8,192
+    try std.testing.expectEqual(@as(usize, 8), workerSlots(8, false)); // 16,384
+    try std.testing.expectEqual(@as(usize, 2), workerSlots(1, true));
+    try std.testing.expectEqual(@as(usize, 4), workerSlots(2, true));
+    try std.testing.expectEqual(@as(usize, 8), workerSlots(4, true));
+    try std.testing.expectEqual(@as(usize, 16), workerSlots(8, true));
+    try std.testing.expectEqual(max_wk, workerSlots(max_units, true));
+    var buf: [320]u8 = undefined;
+    for (1..max_units + 1) |units| {
+        try std.testing.expectEqual(@as(?[]const u8, null), slotsRefusal(&buf, workerSlots(units, false), units));
+        try std.testing.expectEqual(@as(?[]const u8, null), slotsRefusal(&buf, workerSlots(units, true), units));
+        // one slot short of a pass's units hangs the worker: refused, whatever the size
+        if (units > 2) try std.testing.expect(slotsRefusal(&buf, units - 1, units) != null);
+    }
+    const w = slotsRefusal(&buf, 2, 4).?;
+    try std.testing.expect(std.mem.indexOf(u8, w, "2 chunk slots") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w, "4 resume units (8192 rows, TF_DS_PASS_ROWS)") != null);
+    const w8 = slotsRefusal(&buf, 4, 8).?;
+    try std.testing.expect(std.mem.indexOf(u8, w8, "8 resume units (16384 rows, TF_DS_PASS_ROWS) needs 8 to 16") != null);
+    try std.testing.expect(slotsRefusal(&buf, 1, 2) != null);
+    try std.testing.expect(slotsRefusal(&buf, max_wk + 1, 1) != null);
 }

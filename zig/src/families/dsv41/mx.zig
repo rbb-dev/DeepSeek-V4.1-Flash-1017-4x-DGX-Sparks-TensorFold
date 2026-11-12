@@ -155,6 +155,7 @@ pub const W8Args = extern struct {
     y_dtype: c_int = 0,
     y: u64 = 0,
     ldy: i64 = 0,
+    raster: c_int = 0, // as MxArgs.raster, for tf_dsn_pf_bf16w8_kernel and its 16-warp twin
     gq: i64 = 0, // TF_DS_WOA_MERGE: group z's operands are the base ones + z times these byte strides (woaGroupStrides); 0: a one-group launch
     gs: i64 = 0,
     gw: i64 = 0,
@@ -644,6 +645,36 @@ pub fn bf16ToF16(k: *const Kernels, s: cuda.Stream, in: u64, out: u64, n: usize)
 /// The rows a GEMM launch takes at most (larger row counts run as launches of this many, each its own rows' bits):
 /// it bounds the split partials' buffer.
 pub const slab_rows = 1024;
+
+/// TF_DS_GEMM_HALVES in effect (Model.open): a pass of more than `gemm_halves_rows` rows runs its dense FP8, bf16 and
+/// pf GEMMs as row blocks of that many rows at most, each block the launch a pass of that many rows makes for its
+/// rows; the experts keep the whole pass. Rows are independent in these GEMMs (a row's bits at every row count), so
+/// every output byte is the whole-pass launch's.
+pub var gemm_halves: bool = false;
+pub const gemm_halves_rows: usize = 4096;
+
+/// A row block of a GEMM launch's `m` rows: [start, start + n).
+pub const Block = struct { start: usize, n: usize };
+
+/// The row blocks TF_DS_GEMM_HALVES gives a GEMM of `m` rows (`on`: the switch in effect): blocks of gemm_halves_rows
+/// rows from row 0, the last one the remainder; a launch of that many rows or fewer is one block, as is every launch
+/// with the switch off.
+pub fn blockCount(m: usize, on: bool) usize {
+    return if (on and m > gemm_halves_rows) cdiv(m, gemm_halves_rows) else 1;
+}
+
+/// Block `i` of blockCount(m, on): its rows, never crossing the launch's m (i past the count: no rows).
+pub fn blockAt(m: usize, on: bool, i: usize) Block {
+    const bs = if (on and m > gemm_halves_rows) gemm_halves_rows else m;
+    if (bs == 0 or i * bs >= m) return .{ .start = m, .n = 0 };
+    return .{ .start = i * bs, .n = @min(bs, m - i * bs) };
+}
+
+/// The rows a GEMM launch picks its kernel, split and variant at under TF_DS_GEMM_HALVES: its first block's (the block
+/// rows at more, 4,096 at the served setting), so every block takes the launch a 4,096-row pass takes for its rows.
+pub fn routeRows(m: usize, on: bool) usize {
+    return if (on and m > gemm_halves_rows) gemm_halves_rows else m;
+}
 
 /// TF_DS_PF_RASTER in effect (Model.open): the group of row tiles G (2, 4, 8 or 16) the prompt tile GEMMs walk their grid
 /// in (native.cu pf_tile_of: G row tiles across all the column tiles, then the next G), or 0: row tiles fastest. It
@@ -1648,18 +1679,40 @@ pub fn fake(k: *const Kernels, s: cuda.Stream, x: u64, x_dtype: DType, ldx: usiz
 }
 
 /// The MX GEMM of a quantized activation (q, sc: row strides ldq, lds) with a native FP8 / FP4 linear: y [m, n]
+/// (row stride ldy, dtype; accumulate: fp32 y +=), split as splits(K, N), slabs of slab_rows rows. With
+/// TF_DS_GEMM_HALVES a launch of more than gemm_halves_rows rows runs as row blocks of them, each block's kernel and
+/// split chosen at the block rows (routeRows) and its grid over its own rows: a row's bits are the same at every row
+/// count, so the blocks give the whole launch's bytes.
 pub fn gemm(k: *const Kernels, s: cuda.Stream, l: weights.Linear, q: u64, ldq: usize, sc: u64, lds: usize, m: usize, y: u64, ldy: usize, y_dtype: DType, accumulate: bool, z: u64) !void {
     if (l.fmt != .fp8 and l.fmt != .fp4) return error.NotAnMxLinear;
+    const sel = routeRows(m, gemm_halves);
+    if (blockCount(m, gemm_halves) == 1) return gemmBlock(k, s, l, q, ldq, sc, lds, m, y, ldy, y_dtype, accumulate, z, sel);
+    const esz: usize = switch (y_dtype) {
+        .f32 => 4,
+        else => 2,
+    };
+    var i: usize = 0;
+    while (i < blockCount(m, gemm_halves)) : (i += 1) {
+        const b = blockAt(m, gemm_halves, i);
+        try gemmBlock(k, s, l, q + b.start * ldq, ldq, sc + b.start * lds * 4, lds, b.n, y + b.start * ldy * esz, ldy, y_dtype, accumulate, z, sel);
+    }
+}
+
+/// gemm's launch of `m` rows (one of its row blocks): its kernel, split and variant chosen at `sel` rows (routeRows).
+fn gemmBlock(k: *const Kernels, s: cuda.Stream, l: weights.Linear, q: u64, ldq: usize, sc: u64, lds: usize, m: usize, y: u64, ldy: usize, y_dtype: DType, accumulate: bool, z: u64, sel: usize) !void {
     const sp = splits(l.k, l.n);
     const esz: usize = switch (y_dtype) {
         .f32 => 4,
         else => 2,
     };
+    if (sfRoute(k, l, q, ldq, sc, lds, y, ldy, accumulate, sel)) |kind| return sfGemm(k, s, kind, l, q, ldq, sc, lds, m, y, ldy, y_dtype, accumulate, z);
+    if (pfDense(k, l, q, ldq, sc, lds, sel, y, ldy, accumulate)) {
         // the prefill tile GEMM: every row at once, a split folded in the CTA (the tile kernel's and reduce's bits)
         const a: MxArgs = .{ .q = q, .s = sc, .ldq = @intCast(ldq), .lds = @intCast(lds), .w = l.w, .ws = l.s, .ldw = l.k, .ldws = l.k / 32, .fmt = 0, .M = @intCast(m), .N = @intCast(l.n), .K = @intCast(l.k), .splits = @intCast(sp), .kblocks = @intCast(cdiv(l.k / 32, sp)), .y = y, .ldy = @intCast(ldy), .y_dtype = @backingInt(y_dtype), .accumulate = @intFromBool(accumulate), .raster = rasterOf(pf_raster, m, l.k) };
         var args: cuda.Args = .{};
         args.add(a);
         const stage = stagedY(k, y, ldy, y_dtype, accumulate);
+        return switch (pfGemmKernel(k.split, k.gemm5, sel, l.k, l.n)) {
             .gemm => launchShared(if (stage) k.st_gemm.? else k.pf_gemm, s, .{ cdiv(m, 128), l.n / 128, 1 }, pf_gemm_smem, &args),
             .gemm5 => launchShared((if (stage) k.st_gemm5 else k.pf_gemm5) orelse return error.NoGemm5Kernel, s, .{ cdiv(m, 128), l.n / 128, 1 }, pf_gemm5_smem, &args),
             .fold => launchShared(if (stage) k.st_fold.? else k.pf_gemm_fold, s, .{ cdiv(m, 64), l.n / 128, 1 }, pf_gemm_smem, &args),
@@ -1761,8 +1814,21 @@ pub fn gemv(k: *const Kernels, s: cuda.Stream, l: weights.Linear, q: u64, ldq: u
 /// `scale` (round_first: of the bf16-rounded sum, as a bf16 Linear's output times a constant), `groups` block-diagonal
 /// groups (x + g gx, w + g gw, y + g gy elements).
 /// With `z` (a decode launch: one group, its rows within z) K is split as bfSplits(kdim, n), the partials summed in
+/// split order; without it the K loop runs whole (prompt chunks). With TF_DS_GEMM_HALVES a launch of more than
+/// gemm_halves_rows rows runs as row blocks of them, each block's kernel chosen at the pass's block cap (routeRows)
+/// and its grid over its own rows.
 pub fn bf16Gemm(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: u64, ldw: usize, m: usize, n: usize, kdim: usize, y: u64, ldy: usize, y_dtype: DType, scale: f32, round_first: bool, groups: usize, gx: usize, gw: usize, gy: usize, z: ?Z) !void {
     if (n % 32 != 0 or kdim % 16 != 0) return error.UnsupportedShape;
+    const sel = routeRows(m, gemm_halves);
+    if (blockCount(m, gemm_halves) == 1) return bf16Block(k, s, x, ldx, w, ldw, m, n, kdim, y, ldy, y_dtype, scale, round_first, groups, gx, gw, gy, z, sel);
+    const ysz: usize = if (y_dtype == .f32) 4 else 2;
+    var i: usize = 0;
+    while (i < blockCount(m, gemm_halves)) : (i += 1) {
+        const b = blockAt(m, gemm_halves, i);
+        try bf16Block(k, s, x + b.start * ldx * 2, ldx, w, ldw, b.n, n, kdim, y + b.start * ldy * ysz, ldy, y_dtype, scale, round_first, groups, gx, gw, gy, z, sel);
+    }
+}
+
 /// The launch of a prompt chunk's bf16 GEMM under TF_DS_PF_T64 (`on`): the 64 x 64 tile for the router's 384 columns of a single group,
 /// else null (the 128 x 128 tile). Its grid is (cdiv(m, 64), n / 64, 1) at 128 threads.
 pub fn pfT64Of(k: *const Kernels, on: bool, n: usize, groups: usize) ?cuda.Function {
@@ -1770,12 +1836,15 @@ pub fn pfT64Of(k: *const Kernels, on: bool, n: usize, groups: usize) ?cuda.Funct
     return k.pf_bf16_t64;
 }
 
+/// bf16Gemm's launch of `m` rows (one of its row blocks): its kernel chosen at `sel` rows (routeRows).
+fn bf16Block(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: u64, ldw: usize, m: usize, n: usize, kdim: usize, y: u64, ldy: usize, y_dtype: DType, scale: f32, round_first: bool, groups: usize, gx: usize, gw: usize, gy: usize, z: ?Z, sel: usize) !void {
     if (z != null and groups == 1 and m > decode_rows) {
         // a decode launch past decode_rows rows (the drafter's router at 13+ streams): slabs of decode_rows rows, each
         // as a launch of its own rows (the split partials are sized for decode_rows rows; a row's bits are its own)
         const ysz: usize = if (y_dtype == .f32) 4 else 2;
         var r0: usize = 0;
         while (r0 < m) : (r0 += decode_rows)
+            try bf16Block(k, s, x + r0 * ldx * 2, ldx, w, ldw, @min(decode_rows, m - r0), n, kdim, y + r0 * ldy * ysz, ldy, y_dtype, scale, round_first, 1, gx, gw, gy, z, sel);
         return;
     }
     if (z != null and groups == 1 and decTakes(k, 2, n, kdim)) return decDense(k, s, 2, .{
@@ -1806,6 +1875,7 @@ pub fn pfT64Of(k: *const Kernels, on: bool, n: usize, groups: usize) ?cuda.Funct
     }
     var args: cuda.Args = .{};
     args.add(a);
+    if (sp == 1 and !k.pf_off and sel >= pf_min_rows and n % 128 == 0 and kdim % 32 == 0 and aligned(x, 16) and ldx % 8 == 0 and
         gx % 8 == 0 and aligned(w, 16) and ldw % 8 == 0 and gw % 8 == 0)
     {
         // the prefill bf16 GEMM: the same MMA chain (the tile kernel's bits), staged tiles
@@ -1974,6 +2044,8 @@ fn woAGemm(k: *const Kernels, s: cuda.Stream, sc: Scratch, wo: []const weights.L
 /// (act_quant: the codes and scales whose quant-dequant values woA's fake rows hold), then each group's columns through
 /// tf_dsn_pf_bf16w8 into u's column block (row stride ldu, bf16). The kernel multiplies the values woA multiplies (each
 /// code times its scale rounded to bf16; each weight's E4M3 value times its block scale cut to bf16, the loader's rows)
+/// on pf_bf16's MMA chain, at every row count: woA's bits. With TF_DS_GEMM_HALVES a launch of more than
+/// gemm_halves_rows rows runs as row blocks of them, each block its own launch over its rows.
 pub fn woA8Prefill(k: *const Kernels, s: cuda.Stream, sc: Scratch, w8: weights.Linear, groups: usize, o: u64, ldo: usize, m: usize, u: u64, ldu: usize) !void {
     const gk: usize = w8.k;
     const kk = gk * groups;
@@ -2028,19 +2100,30 @@ fn woA8Groups(k: *const Kernels, s: cuda.Stream, sc: Scratch, w8: weights.Linear
     const kk = gk * groups;
     const gn = w8.n / groups;
     const st = woaGroupStrides(gk, gn);
+    // TF_DS_GEMM_HALVES: row blocks of gemm_halves_rows at most, each block its own launch (the kernel's bits are a
+    // row's own), the codes and scales read at the block's rows. TF_DS_PF_RASTER: each launch's slab is its rows of one
+    // group's codes (b.n * gk bytes), the group applying from raster_slab_bytes
+    var i: usize = 0;
+    while (i < blockCount(m, gemm_halves)) : (i += 1) {
+        const b = blockAt(m, gemm_halves, i);
         const merged = woa_merge and groups > 1;
         for (0..if (merged) 1 else groups) |g| {
             const a: W8Args = .{
+                .q = sc.q + b.start * kk + g * gk,
+                .s = sc.s + b.start * (kk / 32) * 4 + g * (gk / 32) * 4,
                 .ldq = @intCast(kk),
                 .lds = @intCast(kk / 32),
                 .w = w8.w + g * gn * gk,
                 .ws = w8.s + g * (gn / 32) * (gk / 32),
                 .ldw = @intCast(gk),
                 .ldws = @intCast(gk / 32),
+                .M = @intCast(b.n),
                 .N = @intCast(gn),
                 .K = @intCast(gk),
                 .y_dtype = @backingInt(DType.bf16),
+                .y = u + b.start * ldu * 2 + g * gn * 2,
                 .ldy = @intCast(ldu),
+                .raster = rasterOf(pf_raster, b.n, gk),
                 .gq = if (merged) st.gq else 0,
                 .gs = if (merged) st.gs else 0,
                 .gw = if (merged) st.gw else 0,
@@ -2050,6 +2133,7 @@ fn woA8Groups(k: *const Kernels, s: cuda.Stream, sc: Scratch, w8: weights.Linear
             var args: cuda.Args = .{};
             args.add(a);
             try launchSharedT(f, s, .{ cdiv(b.n, 128), gn / 128, if (merged) groups else 1 }, pf_w8_smem, if (w16 != null) 512 else 256, &args);
+        }
     }
 }
 
@@ -2966,6 +3050,7 @@ test "TF_DS_BF16_ROWS: a prompt launch of the bf16 GEMM takes a CTA a 16-row til
 
 test "the bf16 GEMM's plain launch takes its rows' grid from bfGridRows" {
     const src = @embedFile("mx.zig");
+    const at = std.mem.indexOf(u8, src, "fn bf16Block(").?;
     const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n}\n").?];
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "try launch(k.bf16, s, .{ cdiv(n / 32, 4), bfGridRows(k.bf16_rows, z == null, m), if (sp > 1) sp else groups }, 128, &args);"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "launch(k.bf16,"));
@@ -3365,7 +3450,10 @@ test "the door, two-base and down-on-the-parts kernels follow the block-scaled a
 test "gemm, gate / up and down take TF_DS_MMA_SF's kernels before the baseline's, on the baseline grids and the twins' shared memory" {
     const src = @embedFile("mx.zig");
     const code = src[0..std.mem.indexOf(u8, src, "\ntest \"").?];
+    const gat = std.mem.indexOf(u8, code, "fn gemmBlock(").?;
     const gemm_body = code[gat .. gat + std.mem.indexOf(u8, code[gat..], "\n}\n").?];
+    const sfl = std.mem.indexOf(u8, gemm_body, "if (sfRoute(k, l, q, ldq, sc, lds, y, ldy, accumulate, sel)) |kind| return sfGemm(k, s, kind, l, q, ldq, sc, lds, m, y, ldy, y_dtype, accumulate, z);") orelse return error.TestUnexpectedResult;
+    const pfl = std.mem.indexOf(u8, gemm_body, "if (pfDense(k, l, q, ldq, sc, lds, sel, y, ldy, accumulate)) {").?;
     try std.testing.expect(sfl < pfl);
     const fns = [_][]const u8{ "fn gateUpOf(", "fn downOf(" };
     const sfs = [_][]const u8{
@@ -3499,7 +3587,13 @@ test "TF_DS_MMA_SF_EXACT's route: sfDense takes a dense shape only with a K spli
     for ([_]usize{ 1025, 4096 }) |m| try std.testing.expectEqual(@as(?SfGemm, .split128), sfRoute(&k, l, 0x2000, 5120, 0x3000, 160, 0, 0, false, m));
     // mx.gemm takes the route sfRoute names
     const src = @embedFile("mx.zig");
+    // (TF_DS_GEMM_HALVES off: routeRows gives the launch's own m, so this is still mx.gemm's kernel at m rows)
+    for ([_]usize{ 1, 64, 1025, 4096, 8192 }) |m| try std.testing.expectEqual(m, routeRows(m, false));
+    const gat = std.mem.indexOf(u8, src, "const sel = routeRows(m, gemm_halves);") orelse return error.TestUnexpectedResult;
+    const at = std.mem.indexOf(u8, src, "fn gemmBlock(k: *const Kernels") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(gat < at);
     const body = src[at .. at + (std.mem.indexOf(u8, src[at..], "\n}\n") orelse return error.TestUnexpectedResult)];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "if (sfRoute(k, l, q, ldq, sc, lds, y, ldy, accumulate, sel)) |kind| return sfGemm(k, s, kind, l, q, ldq, sc, lds, m, y, ldy, y_dtype, accumulate, z);"));
 }
 
 test "TF_DS_MMA_SF_EXACT's guard fails closed: a tensor proven only by a real read inside the bounds, or by a length of 0" {
@@ -3608,6 +3702,80 @@ test "TF_DS_ROCI_SENT_FIRST: the kernels' argument structs are the device struct
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(Door));
 }
 
+test "TF_DS_GEMM_HALVES's row blocks: 4,096 rows each at most, never past the launch's m, the last one the remainder" {
+    // off (or at the block rows and fewer): one block of the launch's rows
+    for ([_]usize{ 1, 4096, 4097, 6144, 8192 }) |m| {
+        try std.testing.expectEqual(@as(usize, 1), blockCount(m, false));
+        try std.testing.expectEqual(Block{ .start = 0, .n = m }, blockAt(m, false, 0));
+    }
+    try std.testing.expectEqual(@as(usize, 1), blockCount(4096, true));
+    try std.testing.expectEqual(@as(usize, 2), blockCount(4097, true));
+    try std.testing.expectEqual(@as(usize, 2), blockCount(6144, true));
+    try std.testing.expectEqual(@as(usize, 2), blockCount(8192, true));
+    // on: the blocks start at 0, stay within the launch's rows and cover them; no block crosses the pass's last row
+    for ([_]usize{ 4097, 4100, 6144, 8192 }) |m| {
+        var at: usize = 0;
+        var i: usize = 0;
+        while (i < blockCount(m, true)) : (i += 1) {
+            const b = blockAt(m, true, i);
+            try std.testing.expectEqual(at, b.start);
+            try std.testing.expect(b.n > 0 and b.n <= gemm_halves_rows);
+            at += b.n;
+        }
+        try std.testing.expectEqual(m, at);
+        try std.testing.expectEqual(@as(usize, 0), blockAt(m, true, blockCount(m, true)).n);
+    }
+    try std.testing.expectEqual(Block{ .start = 0, .n = 4096 }, blockAt(8192, true, 0));
+    try std.testing.expectEqual(Block{ .start = 4096, .n = 4096 }, blockAt(8192, true, 1));
+    try std.testing.expectEqual(Block{ .start = 4096, .n = 2048 }, blockAt(6144, true, 1));
+    try std.testing.expectEqual(Block{ .start = 4096, .n = 4 }, blockAt(4100, true, 1)); // a merged final pass's tail
+    try std.testing.expectEqual(Block{ .start = 4096, .n = 1 }, blockAt(4097, true, 1));
+    // routeRows: the pass's block cap past it, the launch's own rows otherwise
+    try std.testing.expectEqual(@as(usize, 4096), routeRows(8192, true));
+    try std.testing.expectEqual(@as(usize, 4096), routeRows(4097, true));
+    try std.testing.expectEqual(@as(usize, 4096), routeRows(4096, true));
+    try std.testing.expectEqual(@as(usize, 4096), routeRows(4096, false));
+    try std.testing.expectEqual(@as(usize, 8192), routeRows(8192, false));
+    // every block of an 8,192-row pass picks the kernel, split and variant the 4,096-row pass picks (the pass's block
+    // cap), though a shorter block's own rows would pick another (2,048 rows: a 64-row-tile split past 1,024; 512: a
+    // 64-row-tile split; 4 rows: the fold kernel, or the baseline kernels below 64)
+    for ([_]usize{ 5120, 3072, 1280 }) |kdim| for ([_]usize{ 1280, 512, 8192 }) |n| {
+        if (n % 128 != 0 or kdim % 64 != 0) continue;
+        for ([_]PfSplit{ .off, .table, .a, .b, .c6, .c7 }) |sw| try std.testing.expect(std.meta.eql(pfGemmKernel(sw, true, 4096, kdim, n), pfGemmKernel(sw, true, routeRows(8192, true), kdim, n)));
+        for ([_]MmaSf{ .chained, .exact }) |sw| try std.testing.expectEqual(sfGemmOf(sw, 4096, splits(kdim, n)), sfGemmOf(sw, routeRows(8192, true), splits(kdim, n)));
+    };
+    try std.testing.expectEqual(SfGemm.split128, sfGemmOf(.exact, 4096, 16).?);
+    try std.testing.expectEqual(SfGemm.split64, sfGemmOf(.exact, 512, 16).?); // where a tail block's own rows would go
+    try std.testing.expect(std.meta.eql(PfGemm.fold, pfGemmOf(.table, 512, 5120, 1280)));
+    try std.testing.expect(std.meta.eql(PfGemm{ .split = .a }, pfGemmOf(.table, 4096, 5120, 1280)));
+}
+
+test "TF_DS_GEMM_HALVES's launches: gemm, bf16Gemm and woA8Prefill run the row blocks; the experts keep the pass" {
+    const src = @embedFile("mx.zig");
+    // one block loop in each launch (the experts' gateUp / down launch no dense GEMM: they keep the pass)
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, src, "\n        const b = blockAt(m, gemm_halves, i);"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, src, "\n    while (i < blockCount(m, gemm_halves))"));
+    // gemm and bf16Gemm choose their kernel, split and variant at the pass's block cap (sel), and read their rows at
+    // the block's offsets: the codes, the scales and the output alike
+    for ([_][]const u8{
+        "const sel = routeRows(m, gemm_halves);",
+        "q + b.start * ldq, ldq, sc + b.start * lds * 4, lds, b.n, y + b.start * ldy * esz",
+        "sfRoute(k, l, q, ldq, sc, lds, y, ldy, accumulate, sel)",
+        "pfDense(k, l, q, ldq, sc, lds, sel, y, ldy, accumulate)",
+        "pfGemmKernel(k.split, k.gemm5, sel, l.k, l.n)",
+        "x + b.start * ldx * 2, ldx, w, ldw, b.n, n, kdim, y + b.start * ldy * ysz",
+        "sel >= pf_min_rows",
+        "q = sc.q + b.start * kk + g * gk,",
+        "y = u + b.start * ldu * 2 + g * gn * 2,",
+    }) |line| try std.testing.expect(std.mem.indexOf(u8, src, line) != null);
+    // the experts' launches take the whole pass (their scratch and tiles are the pass's)
+    for ([_][]const u8{ "pub fn gateUp(", "pub fn down(" }) |sig| {
+        const at = std.mem.indexOf(u8, src, sig) orelse return error.TestUnexpectedResult;
+        const body = src[at .. at + (std.mem.indexOf(u8, src[at..], "\n}\n") orelse return error.TestUnexpectedResult)];
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, body, "gemm_halves"));
+    }
+}
+
 test "TF_DS_PF_RASTER's tile order: every (row tile, column tile) is visited exactly once, group by group, for odd grids too" {
     const a = std.testing.allocator;
     for ([_]u32{ 0, 2, 4, 8, 16 }) |g| for ([_][2]u32{ .{ 1, 1 }, .{ 1, 9 }, .{ 3, 5 }, .{ 7, 1 }, .{ 16, 10 }, .{ 17, 3 }, .{ 33, 7 }, .{ 64, 10 }, .{ 65, 20 }, .{ 129, 9 } }) |grid| {
@@ -3642,6 +3810,11 @@ test "TF_DS_PF_RASTER's gate: the group applies from an activation slab of 14 Mi
     try std.testing.expectEqual(@as(c_int, 0), rasterOf(8, 2867, 5120)); // 14,679,040 B: one row short of 14 MiB
     try std.testing.expectEqual(@as(c_int, 4), rasterOf(4, 2868, 5120));
     try std.testing.expectEqual(@as(c_int, 0), rasterOf(0, 16384, 5120));
+    // wo_a's FP8 rows: a group's codes are gk = 4,096 bytes a row (woA8Prefill's slab per launch, a block's rows under halves)
+    try std.testing.expectEqual(@as(c_int, 8), rasterOf(8, 4096, 4096)); // 16 MiB
+    try std.testing.expectEqual(@as(c_int, 8), rasterOf(8, 3584, 4096)); // exactly 14 MiB
+    try std.testing.expectEqual(@as(c_int, 0), rasterOf(8, 3583, 4096));
+    try std.testing.expectEqual(@as(c_int, 0), rasterOf(8, 2048, 4096)); // 8 MiB
     try std.testing.expectEqual(@as(usize, 14 << 20), raster_slab_bytes);
 }
 
@@ -3652,9 +3825,14 @@ test "TF_DS_PF_RASTER's launches: the tile GEMMs get the group, the argument str
     // (each count includes the literal in this test)
     try std.testing.expectEqual(@as(usize, 2 + 1), std.mem.count(u8, src, ".raster = rasterOf(pf_raster, m, l.k) }"));
     try std.testing.expectEqual(@as(usize, 1 + 1), std.mem.count(u8, src, ".raster = rasterOf(pf_raster, m, kdim * 2) }"));
+    // wo_a's FP8 rows (woA8Prefill: one tf_dsn_pf_bf16w8 launch a group and row block, the slab a group's codes) take it too,
+    // so TF_DS_GEMM_HALVES splits no prompt launch the group leaves in the default order
+    try std.testing.expectEqual(@as(usize, 1 + 1), std.mem.count(u8, src, ".raster = rasterOf(pf_raster, b.n, gk),"));
+    try std.testing.expectEqual(@as(usize, 96), @offsetOf(W8Args, "raster"));
     try std.testing.expectEqual(@as(usize, 144), @sizeOf(W8Args));
     try std.testing.expectEqual(@as(usize, 104), @offsetOf(W8Args, "gq"));
     try std.testing.expectEqual(@as(usize, 136), @offsetOf(W8Args, "gy"));
+    // the argument structs end in the field, in step with the device structs (native.cu MxArgs / BfArgs / W8Args)
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(MxArgs, "raster") % 4);
     try std.testing.expectEqual(@offsetOf(MxArgs, "accumulate") + 4, @offsetOf(MxArgs, "raster"));
     try std.testing.expectEqual(@offsetOf(BfArgs, "z") + 8, @offsetOf(BfArgs, "raster"));

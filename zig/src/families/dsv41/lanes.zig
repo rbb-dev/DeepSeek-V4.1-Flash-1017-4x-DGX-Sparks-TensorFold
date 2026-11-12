@@ -629,6 +629,37 @@ test "the pass rule keeps every row in the grid's own chunk: a decoder row's pas
     try std.testing.expectEqual(@as(usize, 2), (try checkPasses(r + 129, 0, 2 * r, 0, &.{@intCast(2 * r)}, &.{}, false)).len);
     try std.testing.expectEqual(@as(usize, 1), (try checkPasses(2 * r, 0, 2 * r, 0, &.{@intCast(2 * r)}, &.{}, true)).len);
     try std.testing.expectEqual(@as(usize, 2), (try checkPasses(2 * r, 0, 2 * r, 0, &.{@intCast(2 * r)}, &.{}, false)).len);
+    // the third setting, 8,192 rows: a quiet 16-unit prompt (and its 128 decoder rows) from position 0 runs four passes
+    // of 8,192, then the decoder rows' chunk; from pass_from 8,192 its four 2,048-row passes first, then three of 8,192
+    const p8 = try checkPasses(16 * r + 128, 0, 4 * r, 0, &.{@intCast(4 * r)}, &.{}, false);
+    try std.testing.expectEqual(@as(usize, 5), p8.len);
+    try std.testing.expectEqual(@as(usize, 4), p8.long);
+    const p8f = try checkPasses(16 * r + 128, 0, 4 * r, 4 * r, &.{@intCast(4 * r)}, &.{}, false);
+    try std.testing.expectEqual(@as(usize, 8), p8f.len);
+    try std.testing.expectEqual(@as(usize, 3), p8f.long);
+}
+
+test "the pass rule at every pass size from 2,048 to 16,384 rows keeps every row in the grid's own chunk, and a quiet prompt runs whole passes of the setting" {
+    const r = model.chunk_rows;
+    var prng = std.Random.DefaultPrng.init(0x16384);
+    const rng = prng.random();
+    var u: usize = 1;
+    while (u <= 8) : (u += 1) {
+        const pr = u * r;
+        // every length to 20 resume units and 300 rows past, from position 0 and from 8,192, with and without the merged final pass,
+        // the cap at the pass rows, then any whole number of units up to them at random from step to step
+        var len: usize = 1;
+        while (len <= 20 * r + 300) : (len += 37) for ([_]usize{ 0, 4 * r }) |from| for ([_]bool{ false, true }) |tail| {
+            _ = try checkPasses(len, 0, pr, from, &.{@intCast(pr)}, &.{}, tail);
+            var caps: [16]u32 = undefined;
+            for (&caps) |*c| c.* = @intCast((1 + rng.uintLessThan(usize, u)) * r);
+            _ = try checkPasses(len, 0, pr, from, &caps, &.{}, tail);
+        };
+        // a quiet 24-unit prompt and its 128 decoder rows from position 0: ceil(24 / u) passes of the setting, then the decoder rows' chunk
+        const quiet = try checkPasses(24 * r + 128, 0, pr, 0, &.{@intCast(pr)}, &.{}, false);
+        try std.testing.expectEqual((24 + u - 1) / u + 1, quiet.len);
+        try std.testing.expectEqual(if (u == 1) @as(usize, 0) else (24 + u - 1) / u, quiet.long);
+    }
 }
 
 test "the pass counts of the served rule, D1 and the merged final pass at the design's lengths" {

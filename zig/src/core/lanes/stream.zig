@@ -796,6 +796,7 @@ test "wholePass: the facts of a pass at the booted rows, from pass_from on, with
     try std.testing.expect(!wholePass(f, 16384, 8192, true, 4096));
     // the rule's cut at every pass size (2,048 included, where the rows are the same cut or whole): wholePass is the rule's whole
     // pass with nothing decoding, for pass rows above the resume rows, over every combination of facts
+    for ([_]u32{ 4096, 6144, 8192, 10240, 12288, 14336, 16384 }) |p| for ([_]bool{ false, true }) |decoding| for ([_]bool{ false, true }) |filling| for ([_]bool{ false, true }) |waiting| for ([_]bool{ false, true }) |fp| for ([_]usize{ 0, 4096, 8192, 16384 }) |start| for ([_]u32{ 2048, 4096, 8192, std.math.maxInt(u32) }) |step_rows| {
         const g: Facts = .{ .decoding = decoding, .filling = filling, .waiting = waiting, .step_rows = step_rows };
         const rule_whole = passRows(g, start, 8192, p, 2048, fp) == p;
         try std.testing.expectEqual(rule_whole and !decoding, wholePass(g, start, 8192, fp, p));
@@ -834,6 +835,7 @@ test "a stream asks its host's hook for the facts and the plan, and has neither 
 
 test "a step beside a decoding stream is the host's step rows in whole resume units, at most the pass rows, at least one unit" {
     const quiet: Facts = .{ .decoding = false, .filling = false, .waiting = false, .step_rows = std.math.maxInt(u32) };
+    for ([_]u32{ 2048, 4096, 6144, 8192, 12288, 16384 }) |pass| for ([_]u32{ 2048, 4096, 6144, 8192, 16384, 20480 }) |beside| {
         var f = quiet;
         f.decoding = true;
         f.step_rows = beside;
