@@ -28,6 +28,7 @@ const exl3_experts2d = @import("exl3_experts2d.zig");
 const engram = @import("engram.zig");
 const exact = @import("exact.zig");
 const ops_mod = @import("ops.zig");
+const graph_cache = @import("graph_cache.zig");
 
 const Engine = prompt.Engine;
 const Chunk = prompt.Chunk;
@@ -979,32 +980,35 @@ const Carry = struct {
 /// The rounds' stretches as CUDA graphs (the served graph.py: one capture a rows and context bucket, the round cut
 /// before each Engram layer, whose rows the host reads between the stretches): a stretch is captured the first time
 /// its (rows, bucket, stretch) comes up and replayed after, with what it leaves. The same launches with the same
-/// arguments as the eager round, so the same bytes.
+/// arguments as the eager round, so the same bytes. At most `cap` stretches are kept (TF_DS_GRAPH_CAP, the followers'
+/// --graph-cap; 0: all): past it the least recently replayed one is destroyed and captured again when it next comes
+/// up. Uncapped, the keys (rows x buckets x stretches) add up over days of growing conversations, each graph holding
+/// device and host memory until the process ends. Every rank sees the same keys in the same order, so with the same
 pub const Graphs = struct {
     gpa: std.mem.Allocator,
-    map: std.AutoHashMapUnmanaged(Key, Entry) = .empty,
+    lru: graph_cache.Lru(Key, Entry),
 
     pub const Key = struct { rows: u32, bucket: u64, stretch: u32 };
     const Entry = struct { exec: cuda.graph.Exec, start: Carry, end: Carry };
 
-    pub fn init(gpa: std.mem.Allocator) Graphs {
-        return .{ .gpa = gpa };
+    pub fn init(gpa: std.mem.Allocator, cap: usize) Graphs {
+        return .{ .gpa = gpa, .lru = .init(cap) };
     }
 
     pub fn deinit(g: *Graphs) void {
-        var it = g.map.valueIterator();
-        while (it.next()) |en| en.exec.deinit();
-        g.map.deinit(g.gpa);
+        var it = g.lru.valueIterator();
+        g.lru.deinit(g.gpa);
         g.* = undefined;
     }
 
     /// The captured stretches.
     pub fn count(g: *const Graphs) usize {
-        return g.map.count();
+        return g.lru.count();
     }
 
     fn run(g: *Graphs, key: Key, e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, rings: []const u64, cy: *Carry, li: usize, end: usize) !void {
         if (g.map.getPtr(key)) |en| {
+        if (g.lru.get(key)) |en| {
             if (!std.meta.eql(en.start, cy.*)) return error.GraphStateMismatch;
             try en.exec.launchOn(e.s);
             cy.* = en.end;
@@ -1016,6 +1020,13 @@ pub const Graphs = struct {
         // G0.3 (docs/UNIFIED-DECODE-IMPROVEMENTS.md): a capture or instantiate that fails on one rank only (Hector saw
         // cuGraphInstantiateWithFlags fail with 800 after hours) left that rank out of the stretch's exchanges and the
     }
+                var x = old.exec;
+                x.deinit();
+                if (std.math.isPowerOfTwo(g.lru.evicted)) std.log.info("dsv41: CUDA graphs: {d} kept (the cap), {d} destroyed for newer ones so far; a count that keeps rising means TF_DS_GRAPH_CAP is below the working set", .{ g.lru.count(), g.lru.evicted });
+            } else if (std.math.isPowerOfTwo(g.lru.count()) and g.lru.count() >= 64) std.log.info("dsv41: CUDA graphs: {d} kept", .{g.lru.count()});
+        }
+    };
+
 };
 
 /// A round of these rows through every layer and the head: rd.logits [R, vocab] and rd.taps. The caches (ring, the
