@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Stop the server that ./start.sh started and remove its containers on every Spark, freeing their GPU memory: here
-# (rank 0) and on every configured worker (WORKER, WORKER2, WORKER3).
-# The ranks get STOP_TIMEOUT seconds (default 30) to shut down; requests still running are cut off (it does not drain
-# them), so stop.sh says when there are any. Each rank's log is saved first (docker rm deletes it), gzipped, in LOG_DIR
+# (rank 0) and on every configured worker (WORKER1, WORKER2, WORKER3).
+# The ranks get STOP_TIMEOUT seconds (default 30) to shut down. With DRAIN_TIMEOUT (scripts/config.sh) it first waits
+# that long for the requests running or waiting to finish; any left are cut off, and stop.sh says how many. Each rank's log is saved first (docker rm deletes it), gzipped, in LOG_DIR
 # here (~/.cache/dsv41-tensorfold/logs) and ~/.cache/dsv41-tensorfold/logs on each worker; the newest LOG_KEEP (10) of
 # each rank stay.
-# From MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold's stop.sh (Mia's AI Lab).
-# Usage: ./stop.sh      Env: CONTAINER_NAME, PORT, WORKER, WORKER2 (see scripts/config.sh), STOP_TIMEOUT,
+# From MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold's stop.sh (MiaAI-Lab).
+# Usage: ./stop.sh      Env: CONTAINER_NAME, PORT, WORKER1 .. WORKER3 (see scripts/config.sh), STOP_TIMEOUT,
 #                       LOG_DIR, LOG_KEEP
 #   DRY_RUN=1 ./stop.sh   says what it would stop, and on which Spark, and stops nothing
 # Exits 1 when a rank could not be stopped or a Spark's containers could not be listed (its rank may still run), so
@@ -15,6 +15,9 @@ set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh
 source ./scripts/nodes.sh
+# under ./setup.sh its lines go to the setup's log file (warnings stay on the screen)
+[[ -z "${SETUP_TAG:-}" || -z "${SETUP_LOG:-}" ]] || log() { detail "$@"; }
+[[ "$DRAIN_TIMEOUT" =~ ^[0-9]+$ ]] || die "DRAIN_TIMEOUT is seconds, not $DRAIN_TIMEOUT"
 
 # Where the containers are: here (rank 0) and on the workers (rank i on worker i). A Spark whose containers could
 # not be listed (ssh or docker ps failed) may still run its rank: unknown=1, and stop.sh fails (exit 1).
@@ -30,7 +33,7 @@ workers=$(configured_workers)
 nw=$(wc -w <<<"$workers")
 declare -a there=()
 any=0
-[[ -n "$workers" ]] || warn "WORKER is not set (scripts/local.sh): rank 1 was left alone"
+[[ -n "$workers" ]] || warn "WORKER1 is not set (scripts/local.sh): rank 1 was left alone"
 for i in $workers; do
   there[i]=0
   if ! worker "$i" true 2>/dev/null; then
@@ -57,12 +60,27 @@ else
   where=$(paste -sd, <<<"$where" | sed 's/,/, /g')
 fi
 
+# the requests rank 0 holds: running + waiting, from /metrics (its key header when the API has keys); empty when it
+# does not answer. Always status 0: a rank 0 that runs with no API (a start that failed after it launched) makes curl
+# fail, and under set -e + pipefail that ended stop.sh in silence with the container still running.
+busy_now() {
+  local -a auth=() ; local hdr
+  hdr=$(api_header_file 2>/dev/null) && [[ -n "$hdr" ]] && auth=(-H "@$hdr")
+  { curl -s --max-time 3 "${auth[@]}" "http://$api_host:$PORT/metrics" 2>/dev/null |
+    awk '/^tensorfold:requests_(running|waiting) / {s += $2; n++} END {if (n) print s}'; } || true
+}
 if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; then
   api_host="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && api_host=127.0.0.1
   [[ "$api_host" == *:* ]] && api_host="[$api_host]"
-  busy=$(curl -s --max-time 3 "http://$api_host:$PORT/health" 2>/dev/null |
-         python3 -c 'import json,sys; print(json.load(sys.stdin).get("requests_running", 0))' 2>/dev/null || echo 0)
-  (( busy == 0 )) || warn "$busy request(s) still running will be cut off"
+  busy=$(busy_now)
+  if [[ -z "$busy" ]]; then warn "rank 0 is running but its API does not answer ($api_host:$PORT/metrics): stopping it without draining"; busy=0; fi
+  if (( busy > 0 && DRAIN_TIMEOUT > 0 )) && [[ "${DRY_RUN:-0}" != 1 ]]; then
+    log "Draining: $busy request(s) running or waiting; up to ${DRAIN_TIMEOUT}s for them to finish (DRAIN_TIMEOUT)"
+    t0=$SECONDS
+    while (( busy > 0 && SECONDS - t0 < DRAIN_TIMEOUT )); do sleep 1; busy=$(busy_now); busy=${busy:-0}; done
+    (( busy > 0 )) || log "Drained in $((SECONDS - t0))s"
+  fi
+  (( busy == 0 )) || warn "$busy request(s) running or waiting will be cut off"
 fi
 if [[ "${DRY_RUN:-0}" == 1 ]]; then
   log "DRY_RUN=1: would stop and remove $CONTAINER_NAME $where (up to ${STOP_TIMEOUT:-30}s); nothing is stopped"
@@ -73,6 +91,9 @@ if [[ "${DRY_RUN:-0}" == 1 ]]; then
   (( unknown == 0 )) || exit 1                           # a warning above said which Spark could not be listed
   exit 0
 fi
+# the containers are the truth: stop.sh keeps no state of its own, so a rank a failed start left behind is found and stopped
+state_here=absent; if (( here )); then state_here=$(docker inspect -f '{{if .State.Running}}running{{else}}{{.State.Status}}{{end}}' "$CONTAINER_NAME" 2>/dev/null || echo unknown); fi
+log "Found $CONTAINER_NAME $where (rank 0 here: $state_here)"
 log "Stopping $CONTAINER_NAME $where (up to ${STOP_TIMEOUT:-30}s)"
 
 # each rank: stop, save its log (with the shutdown lines), then remove the container
