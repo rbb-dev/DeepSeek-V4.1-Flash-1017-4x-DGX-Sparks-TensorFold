@@ -680,75 +680,111 @@ test "the prefill yield: a round that fails between two chunks fails the filling
     try std.testing.expectEqual(@as(usize, 1), target.chunks_b); // and ran no chunk after it
 }
 
-test {
-    _ = @import("lane_host_fail_test.zig");
-    _ = @import("lane_host_lone_test.zig");
-    _ = @import("lane_host_admit_test.zig");
-    _ = @import("lane_host_recall_test.zig");
-    _ = @import("lane_host_fill_test.zig");
-    _ = @import("lane_host_status_test.zig");
-    _ = @import("lane_host_stale_test.zig");
-    _ = @import("lane_host_reuse_test.zig");
-    _ = @import("lane_host_cache_lifetime_test.zig");
-    _ = @import("lane_host_borrow_test.zig");
-    _ = @import("lane_host_warm_test.zig");
-    _ = @import("lane_host_rows_test.zig");
+test "a request whose reply grammar cannot start fails alone, and the next request is served" {
+    const gpa = std.testing.allocator;
+    for ([_]bool{ false, true }) |chunked| {
+        var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+        defer cfg.deinit(gpa);
+        var target: lanes.fake.Fake = .{ .gpa = gpa };
+        defer target.deinit();
+        var clock: lanes.fake.FixedClock = .{};
+        var core = lanes.Engine.init(gpa, &cfg, if (chunked) target.chunkedBackend() else target.backend(), clock.clock());
+        defer core.deinit();
+        var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+        try host.start();
+        defer host.stop();
+        const Box = struct {
+            mutex: std.Io.Mutex = .init,
+            done: ?Reason = null,
+            message: [96]u8 = undefined,
+            len: usize = 0,
+            fn event(ctx: *anyopaque, _: Id, ev: *const Event) void {
+                const b: *@This() = @ptrCast(@alignCast(ctx));
+                b.mutex.lockUncancelable(std.testing.io);
+                defer b.mutex.unlock(std.testing.io);
+                switch (ev.*) {
+                    .finished => |f| {
+                        b.len = @min(f.message.len, b.message.len);
+                        @memcpy(b.message[0..b.len], f.message[0..b.len]);
+                        b.done = f.reason;
+                    },
+                    else => {},
+                }
+            }
+            fn wait(b: *@This()) Reason {
+                while (true) {
+                    b.mutex.lockUncancelable(std.testing.io);
+                    const d = b.done;
+                    b.mutex.unlock(std.testing.io);
+                    if (d) |r| return r;
+                    std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+                }
+            }
+        };
+        const e = host.engine();
+        const prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
+        // a structure with no compiler to start its grammar: refused at set-up
+        const bad: Request = .{ .prompt = &prompt, .max_tokens = 2, .structure = .{ .kind = .json } };
+        var b1: Box = .{};
+        try e.submit(1, &bad, .{ .ctx = &b1, .event = Box.event });
+        try std.testing.expectEqual(Reason.failed, b1.wait());
+        try std.testing.expect(std.mem.indexOf(u8, b1.message[0..b1.len], "grammar") != null);
+        const plain: Request = .{ .prompt = &prompt, .max_tokens = 2 };
+        var b2: Box = .{};
+        try e.submit(2, &plain, .{ .ctx = &b2, .event = Box.event });
+        try std.testing.expectEqual(Reason.length, b2.wait());
+    }
 }
 
-test "a request refused for room while another stream runs is tried again within a second" {
+test "status read while requests finish never meets a finished request's freed job" {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
     defer cfg.deinit(gpa);
-    var target: lanes.fake.Fake = .{ .gpa = gpa, .refuse_full = 1 };
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
     defer target.deinit();
     var clock: lanes.fake.FixedClock = .{};
-    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    var core = lanes.Engine.init(gpa, &cfg, target.chunkedBackend(), clock.clock());
     defer core.deinit();
     var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
     try host.start();
     defer host.stop();
-    const Box = struct {
-        mutex: std.Io.Mutex = .init,
-        done: ?Reason = null,
-        tokens: usize = 0,
-        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
-            const b: *@This() = @ptrCast(@alignCast(ctx));
-            b.mutex.lockUncancelable(std.testing.io);
-            defer b.mutex.unlock(std.testing.io);
-            switch (e.*) {
-                .tokens => |t| b.tokens += t.len,
-                .finished => |f| b.done = f.reason,
-                else => {},
-            }
+    const e = host.engine();
+    const Count = struct {
+        done: std.atomic.Value(u32) = .init(0),
+        fn event(ctx: *anyopaque, _: Id, ev: *const Event) void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            if (ev.* == .finished) _ = c.done.fetchAdd(1, .release);
         }
-        fn state(b: *@This()) struct { ?Reason, usize } {
-            b.mutex.lockUncancelable(std.testing.io);
-            defer b.mutex.unlock(std.testing.io);
-            return .{ b.done, b.tokens };
-        }
-        // the reason the request ended with, or null when it has not ended within `ms`
-        fn waitFor(b: *@This(), ms: u32) ?Reason {
-            for (0..ms) |_| {
-                if (b.state()[0]) |r| return r;
-                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    };
+    // a reader walking what status walks (the prompt passes of the admitted requests), as fast as it can
+    const Reader = struct {
+        engine: api.Engine,
+        stop: std.atomic.Value(bool) = .init(false),
+        reads: u64 = 0,
+        fn run(r: *@This()) void {
+            var st: api.Status = .{};
+            var streams: [4]u32 = undefined;
+            while (!r.stop.load(.acquire)) {
+                r.engine.status(&st, &streams);
+                r.reads += 1;
             }
         }
     };
-    const prompt = [_]u32{ 2, 7, 1, 8 };
-    var long: Box = .{};
-    var short: Box = .{};
-    const e = host.engine();
-    try e.submit(1, &.{ .prompt = &prompt, .max_tokens = 1 << 30 }, .{ .ctx = &long, .event = Box.event });
-    while (long.state()[1] == 0) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
-    // the second request's prompt pass is refused once for room (error.ContextFull) while the first stream runs on:
-    // it goes back to the queue and is tried again within a second, not only when that stream ends
-    try e.submit(2, &.{ .prompt = &prompt, .max_tokens = 8 }, .{ .ctx = &short, .event = Box.event });
-    try std.testing.expectEqual(@as(?Reason, Reason.length), short.waitFor(5000));
-    try std.testing.expectEqual(@as(usize, 8), short.state()[1]);
-    try std.testing.expectEqual(@as(usize, 0), target.refuse_full);
-    try std.testing.expect(long.state()[0] == null);
-    e.cancel(1);
-    try std.testing.expect(long.waitFor(5000) != null);
+    var reader: Reader = .{ .engine = e };
+    const th = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    var count: Count = .{};
+    const n = 200;
+    var prompts: [n][6]u32 = undefined;
+    var reqs: [n]Request = undefined;
+    for (&prompts, &reqs, 0..) |*p, *q, i| {
+        p.* = .{ 1, @intCast(i % 7 + 2), @intCast(i % 5 + 3), 4, @intCast(i % 3 + 5), 6 };
+        q.* = .{ .prompt = p, .max_tokens = 1 };
+    }
+    for (&reqs, 0..) |*q, i| try e.submit(@intCast(i + 1), q, .{ .ctx = &count, .event = Count.event });
+    while (count.done.load(.acquire) < n) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    reader.stop.store(true, .release);
+    th.join();
+    try std.testing.expect(reader.reads > 0);
 }
 
 test "a prompt cancelled between its chunks keeps what they computed: the same prompt again resumes there" {

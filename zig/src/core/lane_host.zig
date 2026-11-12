@@ -596,6 +596,7 @@ pub const LaneHost = struct {
                 i += 1;
                 continue;
             }
+            if (!h.deliver(other)) i += 1;
         }
         h.commitDecoded();
     }
@@ -724,8 +725,8 @@ pub const LaneHost = struct {
         }
     }
 
-    /// Sends a stream's new tokens; true once it has finished and left the lists a status read walks.
-    pub fn deliver(h: *LaneHost, job: *Job) bool {
+    /// Sends a stream's new tokens; true once it has finished: out of `admitted` (where status reads it), then freed.
+    fn deliver(h: *LaneHost, job: *Job) bool {
         if (!job.started or job.prefilled == null) return false;
         h.send(job);
         if (!job.stream.finished) return false;
@@ -735,6 +736,7 @@ pub const LaneHost = struct {
             .@"error" => .failed,
             else => .stop,
         };
+        h.remove(job);
         h.finish(job, reason, job.stream.problem);
         return true;
     }
@@ -945,6 +947,7 @@ pub const LaneHost = struct {
             h.finish_until = now + finish_ns;
             h.unlock();
         }
+        _ = h.deliver(job);
         return true;
     }
 
@@ -994,8 +997,8 @@ pub const LaneHost = struct {
             .lane_images = r.lane_images,
             .grammar = if (r.structure) |st| h.constraint(st) catch |e| {
                 job.proposer.deinit();
-                recalls.release(job);
-                return h.drop(job, if (e == error.OutOfMemory) "out of memory" else "the reply's grammar could not start (xgrammar)");
+                _ = h.drop(job, if (e == error.OutOfMemory) "out of memory" else "the reply's grammar could not start (xgrammar)");
+                return false;
             } else null,
         }) catch {
             job.proposer.deinit();
@@ -1061,6 +1064,7 @@ pub const LaneHost = struct {
         if (done) {
             h.passEnd(job, true);
             h.prefilled(job, job.began);
+            _ = h.deliver(job);
         }
     }
 
@@ -1237,11 +1241,22 @@ pub const LaneHost = struct {
                 return host.queued.items.len > 0 or host.cancels.items.len > 0 or host.closing or host.waitingCount() > 0;
             }
         };
-        h.prefilled(job, began);
-        if (h.cache) |store| _ = if (!job.request.untaught and store.rules.lookahead == 0 and keyed(job.request)) store.keepBorn(job.request.cacheKey(), job.request.bornLen(), @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request)) else false;
-        be.release(&job.stream);
-        h.remove(job);
-        h.finish(job, .length, "");
+        job.began = began;
+        const paused = lone.run(lone.ctx, &job.stream, .{ .ctx = h, .committed = Hooks.committed, .yield = Hooks.yield });
+        h.lone_job = null;
+        const handed = paused catch |e| {
+            if (!job.prefill_sent) emit(job, .{ .prefilled = 0 });
+            h.remove(job);
+            h.finish(job, if (e == error.Cancelled) .cancelled else .failed, if (e == error.Cancelled) "" else h.words(e));
+            return true;
+        };
+        if (!job.prefill_sent) h.prefilled(job, began);
+        if (handed) {
+            h.core.adopt(&job.stream) catch |e| return h.drop(job, @errorName(e));
+            h.send(job);
+            return true;
+        }
+        _ = h.deliver(job);
         return true;
     }
 
@@ -1532,6 +1547,8 @@ pub const LaneHost = struct {
                     i += 1;
                     continue;
                 }
+                if (!h.deliver(job)) i += 1;
+            }
             h.commitDecoded();
         }
     }
