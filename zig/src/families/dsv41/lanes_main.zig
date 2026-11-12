@@ -72,6 +72,7 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("{s}", .{usage});
         return 2;
     }
+        dsv41.model.cfg_settings.bootstrap(a, io, init.environ_map, init.environ_map.get("TF_ENGINE_CFG"), Say, true, &problem) catch {
         dsv41.model.speed_defaults.applyFamily(); // before the CUDA context reads them
     var o: dsv41.model.Options = .{
         .model_dir = args[1],
@@ -90,6 +91,13 @@ pub fn main(init: std.process.Init) !u8 {
         if (std.c.getenv("TF_DS_STREAMS")) |v| o.streams = try std.fmt.parseInt(usize, std.mem.span(v), 10);
         if (std.c.getenv("TF_DS_ROUND_ROWS")) |v| o.round_rows = try std.fmt.parseInt(usize, std.mem.span(v), 10);
         if (std.c.getenv("TF_DS_GRAPH_CAP")) |v| o.graph_cap = try std.fmt.parseInt(usize, std.mem.span(v), 10);
+        // the free target and the growth are every rank's (the vote refuses a rank that was given other values)
+        if (std.c.getenv("TF_DS_KV_FREE_TARGET_GIB")) |v| o.kv_target_bytes = try dsv41.model.kv_pool.parseTargetGib(std.mem.span(v));
+        if (std.c.getenv("TF_DS_KV_VMM")) |v| o.kv_vmm = !std.mem.eql(u8, std.mem.span(v), "0");
+        if (std.c.getenv("TF_DS_KV_GROWTH_MIB")) |v| {
+            o.kv_growth_bytes = try dsv41.model.kv_pool.parseGrowthMib(std.mem.span(v));
+            o.kv_growth_set = true;
+        }
     }
     var requests_file: ?[]const u8 = null;
     var parallel: ?usize = null; // default: every stream of the pool
@@ -117,6 +125,11 @@ pub fn main(init: std.process.Init) !u8 {
             o.streams = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--pool")) {
             o.pool = try std.fmt.parseInt(usize, val, 10);
+        } else if (std.mem.eql(u8, key, "--kv-free-target-gib")) {
+            o.kv_target_bytes = try dsv41.model.kv_pool.parseTargetGib(val);
+        } else if (std.mem.eql(u8, key, "--kv-growth-mib")) {
+            o.kv_growth_bytes = try dsv41.model.kv_pool.parseGrowthMib(val);
+            o.kv_growth_set = true;
         } else if (std.mem.eql(u8, key, "--context")) {
             o.context = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--drafts")) {
@@ -154,6 +167,8 @@ pub fn main(init: std.process.Init) !u8 {
             dsv41.lanes.logits_sha = dsv41.lanes.logitsSha(val) orelse return error.BadLogitsSha;
         } else return error.BadArgument;
     }
+    // with a free target the vote sizes the pool: a follower without --pool starts from the context, not the options' default
+    o.pool = dsv41.model.kv_pool.startPool(o.pool, o.context, o.kv_target_bytes);
     const par = parallel orelse o.streams;
     if (par == 0 or par > o.streams or o.streams > dsv41.model.max_streams) return error.BadArgument;
     o.arena_bytes = (arena_gib orelse 0) << 30; // (0: the arena grows as the buffers ask)
@@ -169,7 +184,7 @@ pub fn main(init: std.process.Init) !u8 {
     const t0 = std.Io.Timestamp.now(io, .awake);
     const m = try dsv41.model.Model.open(gpa, io, &ctx, o);
     defer m.close();
-    try w.print("{{\"rank\": {d}, \"loaded_s\": {d:.1}, \"pool\": {d}, \"drafts\": {}, \"arena_used\": {d}, \"arena_reserved\": {d}}}\n", .{ o.rank, seconds(t0, io), o.pool, m.drafting(), m.arena.used, m.arena.reserved });
+    try w.print("{{\"rank\": {d}, \"loaded_s\": {d:.1}, \"pool\": {d}, \"drafts\": {}, \"arena_used\": {d}, \"arena_reserved\": {d}}}\n", .{ o.rank, seconds(t0, io), m.pool_cap, m.drafting(), m.arena.used, m.arena.reserved });
     try w.flush();
 
     if (o.rank != 0) {

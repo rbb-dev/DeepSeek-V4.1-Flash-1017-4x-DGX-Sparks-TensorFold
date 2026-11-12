@@ -494,6 +494,42 @@ test "TF_DS_ROUNDS_BESIDE's text: whole numbers from 1; unset is none; anything 
     for ([_][]const u8{ "", "0", "-1", "+2", "2.0", "1.5", " 2", "2 ", "two", "4294967296", "1_0", "0x10" }) |t| try std.testing.expectEqual(@as(?u32, null), roundsText(t));
 }
 
+test "the host takes a live rounds-beside at its next turn, falls back to the start's on unset, and refuses a count beside a share" {
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.chunkedBackend(), clock.clock());
+    defer core.deinit();
+    var host = api.LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2, .resume_rows = 4, .rounds_beside = 3 });
+    const live = api.live_config;
+    var blk: live.Block = .{};
+    host.live = &blk;
+    host.liveTurn();
+    try std.testing.expectEqual(@as(u32, 3), host.share.rounds); // nothing published: the start's value stays
+    blk.publish(.rounds_beside, 6, 1);
+    host.share.due = 4;
+    host.liveTurn();
+    try std.testing.expectEqual(@as(u32, 6), host.share.rounds);
+    try std.testing.expectEqual(@as(u32, 0), host.share.due); // what was owed at the old count is forgiven
+    try std.testing.expectEqual(@as(u64, 1), blk.active_version.load(.acquire));
+    blk.publish(.rounds_beside, live.unset, 2);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(u32, 3), host.share.rounds); // unset: the start's own
+    // a count beside a share below 1 is two controls: the host keeps what it had, and the version is still taken (the API refused it first)
+    host.share.p = 0.5;
+    host.share.rounds = 0;
+    blk.publish(.rounds_beside, 4, 3);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(u32, 0), host.share.rounds);
+    // a value no count can be (above a u32) is not applied
+    host.share.p = 1;
+    blk.publish(.rounds_beside, 1 << 40, 4);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(u32, 0), host.share.rounds);
+}
+
 var cfg_seen: [8]api.live_config.CfgItem = undefined;
 var cfg_versions: [8]u64 = undefined;
 var cfg_count: usize = 0;

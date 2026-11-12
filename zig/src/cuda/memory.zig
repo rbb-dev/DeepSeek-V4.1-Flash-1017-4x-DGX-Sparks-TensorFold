@@ -49,6 +49,14 @@ fn lockCounts() void {
     while (!counts_mutex.tryLock()) std.Thread.yield() catch {};
 }
 
+/// Device bytes held outside a DeviceBuffer (the KV pool's virtual-memory mappings) enter and leave the same counts.
+pub fn noteDeviceHeld(n: usize) void {
+    held(&device_bytes, n);
+}
+pub fn noteDeviceFreed(n: usize) void {
+    freed(&device_bytes, n);
+}
+
 pub const DeviceBuffer = struct {
     d: *const Driver,
     ptr: abi.DevicePtr,

@@ -29,6 +29,28 @@ pub const stream_wait_value_geq: c_uint = 0;
 pub const stream_mem_op_wait_value_64: c_uint = 4;
 pub const stream_mem_op_write_value_64: c_uint = 5;
 
+/// CUmemGenericAllocationHandle: one physical allocation made by cuMemCreate (virtual memory management).
+pub const MemHandle = u64;
+pub const mem_location_device: c_int = 1; // CU_MEM_LOCATION_TYPE_DEVICE
+pub const mem_allocation_pinned: c_int = 1; // CU_MEM_ALLOCATION_TYPE_PINNED
+pub const mem_access_read_write: c_int = 3; // CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+pub const mem_granularity_minimum: c_int = 0; // CU_MEM_ALLOC_GRANULARITY_MINIMUM
+pub const mem_granularity_recommended: c_int = 1; // CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
+
+/// CUmemLocation and CUmemAllocationProp (cuda.h, 13.0): the device's own pinned memory takes type 1, location device `id`.
+pub const MemLocation = extern struct { type: c_int, id: c_int };
+pub const MemAllocationProp = extern struct {
+    type: c_int,
+    requested_handle_types: c_int = 0,
+    location: MemLocation,
+    win32_handle_meta_data: ?*anyopaque = null,
+    compression_type: u8 = 0,
+    gpu_direct_rdma_capable: u8 = 0,
+    usage: u16 = 0,
+    reserved: [4]u8 = .{ 0, 0, 0, 0 },
+};
+pub const MemAccessDesc = extern struct { location: MemLocation, flags: c_int };
+
 /// One CUstreamBatchMemOpParams (a 48-byte union): the wait or write of one 64-bit word.
 pub const BatchMemOp = extern struct {
     operation: c_uint,
@@ -197,6 +219,14 @@ pub const Api = struct {
     cuMemGetInfo_v2: *const fn (*usize, *usize) callconv(.c) R,
     cuMemAlloc_v2: *const fn (*DevicePtr, usize) callconv(.c) R,
     cuMemFree_v2: *const fn (DevicePtr) callconv(.c) R,
+    cuMemAddressReserve: *const fn (*DevicePtr, usize, usize, DevicePtr, u64) callconv(.c) R,
+    cuMemAddressFree: *const fn (DevicePtr, usize) callconv(.c) R,
+    cuMemCreate: *const fn (*MemHandle, usize, *const MemAllocationProp, u64) callconv(.c) R,
+    cuMemRelease: *const fn (MemHandle) callconv(.c) R,
+    cuMemMap: *const fn (DevicePtr, usize, usize, MemHandle, u64) callconv(.c) R,
+    cuMemUnmap: *const fn (DevicePtr, usize) callconv(.c) R,
+    cuMemSetAccess: *const fn (DevicePtr, usize, [*]const MemAccessDesc, usize) callconv(.c) R,
+    cuMemGetAllocationGranularity: *const fn (*usize, *const MemAllocationProp, c_int) callconv(.c) R,
     cuMemHostAlloc: *const fn (*Ptr, usize, c_uint) callconv(.c) R,
     cuMemHostGetDevicePointer_v2: *const fn (*DevicePtr, Ptr, c_uint) callconv(.c) R,
     cuMemFreeHost: *const fn (Ptr) callconv(.c) R,
@@ -267,5 +297,6 @@ comptime {
     std.debug.assert(@sizeOf(LaunchConfig) == 56 and @offsetOf(LaunchConfig, "stream") == 32);
     std.debug.assert(@sizeOf(KernelNodeParams) == 72 and @offsetOf(KernelNodeParams, "params") == 40);
     std.debug.assert(@sizeOf(ExecUpdateResultInfo) == 24);
+    std.debug.assert(@sizeOf(MemAllocationProp) == 32 and @offsetOf(MemAllocationProp, "location") == 8 and @offsetOf(MemAllocationProp, "win32_handle_meta_data") == 16 and @sizeOf(MemAccessDesc) == 12);
     std.debug.assert(@sizeOf(BatchMemOp) == 48 and @offsetOf(BatchMemOp, "address") == 8 and @offsetOf(BatchMemOp, "value64") == 16 and @offsetOf(BatchMemOp, "flags") == 24 and @offsetOf(BatchMemOp, "alias") == 32);
 }

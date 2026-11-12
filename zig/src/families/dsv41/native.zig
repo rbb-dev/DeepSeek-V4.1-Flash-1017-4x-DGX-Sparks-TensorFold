@@ -457,6 +457,12 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const arena_gib = if (getenv("TF_DS_ARENA_GIB")) |t| std.fmt.parseInt(usize, t, 10) catch return error.BadArena else 0;
     const window = if (getenv("TF_DS_WINDOW")) |t| std.fmt.parseInt(usize, t, 10) catch return error.BadWindow else o.context;
     if (window < o.context) return error.BadWindow;
+    // the free target (TF_DS_KV_FREE_TARGET_GIB) sizes the pool from the memory the ranks have free; a pool named too is two
+    // answers to one question: refused, never one clamped to the other
+    const kv_target: u64 = if (getenv("TF_DS_KV_FREE_TARGET_GIB")) |t| api.kv_pool.parseTargetGib(t) catch return error.BadKvTarget else 0;
+    const kv_growth_text = getenv("TF_DS_KV_GROWTH_MIB");
+    const kv_growth: u64 = if (kv_growth_text) |t| api.kv_pool.parseGrowthMib(t) catch return error.BadKvGrowth else 0;
+    if (kv_target != 0 and getenv("TF_DS_WINDOW") != null) return error.KvTargetAndWindow;
     const st = try gpa.create(State);
     errdefer gpa.destroy(st);
     st.* = .{ .gpa = gpa, .m = undefined, .lanes = undefined };
@@ -504,6 +510,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .prefetch = if (getenv("TF_DS_L2_PREFETCH")) |v| !std.mem.eql(u8, v, "0") else false,
         .engram_aio = if (getenv("TF_DS_ENGRAM_AIO")) |v| !std.mem.eql(u8, v, "0") else false,
         .pool = window,
+        .kv_target_bytes = kv_target,
+        .kv_growth_bytes = kv_growth,
+        .kv_growth_set = kv_growth_text != null,
+        .kv_vmm = if (getenv("TF_DS_KV_VMM")) |v| !std.mem.eql(u8, v, "0") else false,
         .context = o.context,
         .drafts = o.drafts,
         .arena_bytes = arena_gib << 30,
@@ -574,6 +584,7 @@ pub fn tierMath(two: ?*const prompt2d.Two, k: ?*const mx.Kernels) spill_start.Ma
         .engram_owner_sum = two != null,
         .boundary_owned = two != null,
         .cat_codes = two != null,
+        .pf_split = mx.PfSplit.name(@backingInt(if (k) |x| x.split else .off)).?,
         .woa_w8 = weights.woa_w8,
         .quant_once = prompt.quant_once,
         .pf_gemm5 = if (k) |x| x.gemm5 else false,
@@ -674,6 +685,7 @@ fn tierStartInner(st: *State, io: std.Io, ctx: *const cuda.Context, dir: []const
     };
     // the store opened on its own thread; the start waits at most TF_DS_SPILL_OPEN_MS for it
     const oc = gpa.create(OpenCtx) catch |e| return st.off("{s}", .{@errorName(e)});
+    m.pool_ceiling = @min(m.pool_ceiling, m.pool_cap); // (the tier's tables are sized by the pool: a live resize may not take it beyond)
     oc.* = .{ .gpa = gpa, .io = io, .m = m, .layout = layout, .settings = s, .compat = spill_tier.storeCompat(name, &layout), .max_tokens = @intCast(@min(m.pool_cap, std.math.maxInt(u32))), .staging = @alignCast(st.staging.?.bytes), .events = st.events };
     const compat = oc.compat;
     const opener = spill_open.Opener(lanes_mod.SpillTier.S).start(gpa, io, oc, OpenCtx.open, OpenCtx.close) catch |e| {
@@ -814,6 +826,7 @@ fn openFollowerStore(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Contex
     };
     const compat = spill_tier.storeCompat(name, &layout);
     const oc = try gpa.create(OpenCtx);
+    m.pool_ceiling = @min(m.pool_ceiling, m.pool_cap); // (the tier's tables are sized by the pool: a live resize may not take it beyond)
     oc.* = .{ .gpa = gpa, .io = io, .m = m, .layout = layout, .settings = s, .compat = compat, .max_tokens = @intCast(@min(m.pool_cap, std.math.maxInt(u32))), .staging = @alignCast(staging.bytes), .events = events, .rank = m.rank };
     const opener = try spill_open.Opener(lanes_mod.SpillTier.S).start(gpa, io, oc, OpenCtx.open, OpenCtx.close);
     const side = switch (opener.wait(@as(u64, sp.open_ms) * std.time.ns_per_ms)) {
@@ -927,6 +940,11 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.BadFill => "TF_FILL_CHUNKS, TF_FILL_FIRST and TF_FILL_ROUNDS: whole numbers (a prompt piece's chunks of 2,048 tokens, the first piece's, the other streams' rounds between two pieces)",
         error.BadWindow => "TF_DS_WINDOW: the streams' shared positions, at least --context",
         error.SettingsDiffer => "a follower rank runs other settings than this server (the line above says which): give every rank the same TF_DS_STREAMS (the followers: --streams), TF_DS_ROUND_ROWS (--round-rows), RDMA devices, drafter, TF_DS_REPLAY_FLOOR and TF_DS_IDX_SPLIT, and every follower a --pool of at least the window (--context, or TF_DS_WINDOW)",
+        error.BadKvTarget => "TF_DS_KV_FREE_TARGET_GIB: the free memory to keep on each Spark, a number of GiB above 0 and at most 1024 (unset: the pool is TF_DS_WINDOW's, or the context)",
+        error.BadKvGrowth => "TF_DS_KV_GROWTH_MIB: the memory left for what the engine takes after the pool, a whole number of MiB (unset: 6144)",
+        error.KvTargetAndWindow => "TF_DS_KV_FREE_TARGET_GIB sizes the pool from the free memory; TF_DS_WINDOW (the recipe's POOL) names a fixed one: set one of them",
+        error.NoHostLinks => "the ranks' host links (the star the start's votes and digests go over) are not open: every rank must join rank 0 at TF_TP_MASTER before the weights load",
+        error.PoolRefused => "the KV pool does not fit the free memory the ranks have: the line above names the shortfall, the rank and what its start has taken (lower TF_DS_KV_FREE_TARGET_GIB, or free memory), or a rank was given other KV pool settings than rank 0",
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
         error.CanariesDiffer => "TF_DS_QGATE_CANARY: the ranks asked different canaries (the lines above say which): set the same on every rank (a quality gate's runs, never a serving setting)",
@@ -1161,10 +1179,12 @@ test "the tier's math keeps the values the shipped settings gave the switches th
     try std.testing.expect(std.mem.indexOf(u8, text, " roci=1") != null and std.mem.indexOf(u8, text, "roci_collect") == null);
 }
 
-test "passRows takes multiples of the resume grid up to the pass rows" {
-    try std.testing.expectEqual(@as(usize, model.resume_rows), try passRows("2048"));
-    try std.testing.expectEqual(@as(usize, model.chunk_rows), try passRows("4096"));
-    try std.testing.expectError(error.BadPassRows, passRows("0"));
-    try std.testing.expectError(error.BadPassRows, passRows("3000"));
-    try std.testing.expectError(error.BadPassRows, passRows("8192"));
+test "every start error of the pool, the follower settings and the engine.cfg has its sentence, and the window and the free target are told apart" {
+    inline for (.{ error.BadKvTarget, error.BadKvGrowth, error.KvTargetAndWindow, error.PoolRefused, error.NoHostLinks }) |e| {
+        const words = explain(null, e) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(words.len > 20);
+    }
+    const both = explain(null, error.KvTargetAndWindow).?;
+    try std.testing.expect(std.mem.indexOf(u8, both, "TF_DS_KV_FREE_TARGET_GIB sizes the pool from the free memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, both, "TF_DS_WINDOW (the recipe's POOL) names a fixed one: set one of them") != null);
 }

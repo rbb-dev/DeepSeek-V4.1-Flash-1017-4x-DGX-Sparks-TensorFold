@@ -26,6 +26,49 @@
    "first_use": "families/dsv41/prompt.zig:readWaitEnv",
    "secret": false
   },
+  {
+   "group": "memory",
+   "tab": "Passes & memory",
+   "unit": "GiB",
+   "min": 0.5,
+   "max": 1024,
+   "default": "",
+   "default_check": "none",
+   "apply": "A",
+   "who": [
+    "admin"
+   ],
+   "values": [],
+   "seed": "name",
+   "secret": false,
+   "id": 505,
+   "name": "tf_ds_kv_free_target_gib",
+   "env": "TF_DS_KV_FREE_TARGET_GIB",
+   "kind": "float",
+   "first_use": "families/dsv41/native.zig:480",
+   "doc": "Sizes the KV pool automatically: the pool is the most positions that fit on all four nodes while each keeps this many GiB free. It is never smaller than the context. A start that cannot fit the context with this much free is refused and names the shortfall. Cannot be combined with the pool size setting; every node must use the same value. With TF_DS_KV_VMM=1 a change while the engine runs resizes the pool live on every Spark: it grows or gives back its tail so each Spark keeps this much free (the ranks take the smallest fit, never below the context, never under an extent a stream or a kept conversation holds: a shrink stops there and says so); without TF_DS_KV_VMM it applies at the next start."
+  },
+  {
+   "group": "memory",
+   "tab": "Passes & memory",
+   "unit": "MiB",
+   "min": 0,
+   "max": 1048576,
+   "default": "",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "values": [],
+   "seed": "name",
+   "secret": false,
+   "id": 506,
+   "name": "tf_ds_kv_growth_mib",
+   "env": "TF_DS_KV_GROWTH_MIB",
+   "kind": "int",
+   "first_use": "families/dsv41/native.zig:481",
+  },
    "name": "tf_ds_bf16_rows",
    "env": "TF_DS_BF16_ROWS",
    "unit": "rows",
@@ -96,6 +139,30 @@
    "values": [],
    "seed": "name",
    "first_use": "families/dsv41/model.zig:1864",
+   "secret": false
+  },
+  },
+  {
+   "id": 930,
+   "name": "tf_ds_kv_vmm",
+   "env": "TF_DS_KV_VMM",
+   "group": "memory",
+   "tab": "Passes & memory",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "0",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "KV pool in virtual memory",
+   "doc": "Places the KV pool's cache planes in a CUDA virtual-memory reservation instead of ordinary device allocations: each plane has a fixed stretch of address space sized for the largest pool the Spark could hold, and only the front of it is backed by memory. Same pool size, same bytes, same layout of planes; the planes' addresses never change, which is what lets a later live resize keep every captured graph. Costs up to one allocation granule (2 MiB) of rounding per plane. On when set to anything but 0, on every rank (a follower: the environment).",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/native.zig:487",
    "secret": false
   },
   {

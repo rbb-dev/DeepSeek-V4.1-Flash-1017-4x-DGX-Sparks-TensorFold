@@ -1047,6 +1047,15 @@ pub const recall_store = lanes.recall_store;
 /// The idle keepalive's ticker and target contract.
 pub const keepalive = @import("keepalive.zig");
 
+/// Rewriting engine.cfg for a persisted change (cfg_write.zig).
+pub const cfg_write = @import("cfg_write.zig");
+
+/// The settings of class H that rank 0's host takes at its next loop turn (live_config.zig).
+pub const live_config = @import("live_config.zig");
+
+/// The KV pool sized from the free memory the operator leaves, and the ledger of a start (kv_pool.zig).
+pub const kv_pool = @import("kv_pool.zig");
+
 /// A model folder's original files kept before --slide first teaches it, its hold and its rollback (originals.zig).
 pub const originals = @import("originals.zig");
 
@@ -1062,6 +1071,12 @@ test {
     _ = @import("spill_settings_test.zig");
     _ = @import("prompt_imprint.zig");
     _ = @import("keepalive.zig");
+    _ = @import("kv_pool.zig");
+    _ = @import("kv_pool_test.zig");
+    _ = @import("cfg_write.zig");
+    _ = @import("cfg_write_test.zig");
+    _ = @import("live_config.zig");
+    _ = @import("live_config_test.zig");
     _ = @import("originals_test.zig");
 }
 

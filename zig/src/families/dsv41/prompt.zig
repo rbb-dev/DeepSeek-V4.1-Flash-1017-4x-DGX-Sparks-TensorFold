@@ -927,6 +927,99 @@ pub const Caches = struct {
     slots: usize = 1, // the positional stores' slots
 
     pub fn init(e: *const Engine, a: *Arena, cap: usize, slots: usize) !Caches {
+        const Src = struct {
+            a: *Arena,
+            fn take(s: @This(), bytes: usize, _: usize) !u64 {
+                return s.a.take(bytes);
+            }
+        };
+        return initFrom(e, Src{ .a = a }, cap, cap, slots);
+    }
+
+    /// The pool in virtual memory (TF_DS_KV_VMM=1, kv_vmm.zig): each plane takes a stretch of `vp`'s reservation sized for
+    /// `cap_max` positions and has its first `cap` positions' bytes backed. Same planes, same order, same bytes as `init`.
+    pub fn initVmm(e: *const Engine, vp: anytype, cap: usize, cap_max: usize, slots: usize) !Caches {
+        const Src = struct {
+            vp: @TypeOf(vp),
+            fn take(s: @This(), bytes: usize, max: usize) !u64 {
+                return s.vp.addPlane(max, bytes);
+            }
+        };
+        return initFrom(e, Src{ .vp = vp }, cap, cap_max, slots);
+    }
+
+    /// The address space a pool of up to `cap_max` positions takes in a reservation of granularity `gran`: each plane's stretch.
+    pub fn vaBytes(c: *const Config, layers: []const weights.Layer, cap_max: usize, slots: usize, gran: usize) usize {
+        var total: usize = 0;
+        for (layers) |lay| {
+            const b = layerBytes(c, lay, cap_max, slots);
+            inline for (.{ b.comp_codes, b.comp_scales, b.idx_codes, b.idx_scales, b.raw_kv, b.raw_score }) |n| {
+                if (n != 0) total += std.mem.alignForward(usize, n, gran);
+            }
+        }
+        return total;
+    }
+
+    pub const PlaneKind = enum { comp_codes, comp_scales, idx_codes, idx_scales, raw_kv, raw_score };
+    pub const Plane = struct { kind: PlaneKind, bytes: usize };
+    /// The most planes a pool has: six a layer.
+    pub const max_planes = 64 * 6;
+
+    /// Each plane's bytes for a pool of `cap` positions, in the order init takes them (the VMM pool's plane numbers); how many.
+    pub fn planeSizes(c: *const Config, layers: []const weights.Layer, cap: usize, slots: usize, out: *[max_planes]Plane) usize {
+        var n: usize = 0;
+        for (layers) |lay| {
+            const b = layerBytes(c, lay, cap, slots);
+            if (b.comp_codes == 0) continue;
+            inline for (.{ .{ PlaneKind.comp_codes, b.comp_codes }, .{ PlaneKind.comp_scales, b.comp_scales }, .{ PlaneKind.idx_codes, b.idx_codes }, .{ PlaneKind.idx_scales, b.idx_scales }, .{ PlaneKind.raw_kv, b.raw_kv }, .{ PlaneKind.raw_score, b.raw_score } }) |pl| {
+                if (pl[1] != 0) {
+                    out[n] = .{ .kind = pl[0], .bytes = pl[1] };
+                    n += 1;
+                }
+            }
+        }
+        return n;
+    }
+
+    /// The device bytes a VMM pool of `cap` positions has mapped: each plane's bytes rounded up to the granularity.
+    pub fn vmmBytes(c: *const Config, layers: []const weights.Layer, cap: usize, slots: usize, gran: usize) usize {
+        var pl: [max_planes]Plane = undefined;
+        const n = planeSizes(c, layers, cap, slots, &pl);
+        var total: usize = 0;
+        for (pl[0..n]) |x| total += std.mem.alignForward(usize, x.bytes, gran);
+        return total;
+    }
+
+    /// The VMM pool moves to `new_cap` positions: every plane grows or shrinks at its tail, its address unchanged. A grow clears the
+    /// rows it adds (zeros, the index keys' scales 127: a new pool's contents) and, failing part way, gives back what it took and
+    /// leaves the pool as it was. A shrink gives back whole tail segments and keeps the rest mapped (the pool's size is then `new_cap`
+    /// all the same). The device must be idle: the caller synchronised.
+    pub fn resizeVmm(cs: *Caches, e: *const Engine, vp: anytype, new_cap: usize) !void {
+        var old: [max_planes]Plane = undefined;
+        var neu: [max_planes]Plane = undefined;
+        const n = planeSizes(e.c, e.w.layers, cs.cap, cs.slots, &old);
+        if (n != planeSizes(e.c, e.w.layers, new_cap, cs.slots, &neu) or n != vp.planes.items.len) return error.BadPool;
+        if (new_cap > cs.cap) {
+            var done: usize = 0;
+            errdefer for (0..done) |i| {
+                _ = vp.shrink(@intCast(i), old[i].bytes) catch 0;
+            };
+            for (0..n) |i| {
+                try vp.grow(@intCast(i), neu[i].bytes);
+                done = i + 1;
+            }
+            for (0..n) |i| if (neu[i].bytes > old[i].bytes) {
+                const value: u8 = if (neu[i].kind == .idx_scales) 127 else 0;
+                try fill(e, vp.addressOf(@intCast(i)) + old[i].bytes, value, neu[i].bytes - old[i].bytes);
+            };
+        } else {
+            for (0..n) |i| _ = try vp.shrink(@intCast(i), neu[i].bytes);
+        }
+        cs.cap = new_cap;
+    }
+
+    /// `src.take(bytes, max_bytes)` gives one plane: `bytes` now, room for `max_bytes` (the planes at `cap_max` positions).
+    fn initFrom(e: *const Engine, src: anytype, cap: usize, cap_max: usize, slots: usize) !Caches {
         const c = e.c;
         var cs: Caches = .{ .cap = cap, .slots = slots };
         for (e.w.layers, 0..) |lay, i| {
@@ -938,10 +1031,17 @@ pub const Caches = struct {
             if (lay.idx_wk != null) {
                 cs.idx_codes[i] = try a.take(rows * c.index_head_dim / 2);
                 cs.idx_scales[i] = try a.take(rows * c.index_head_dim / 32);
+            const m = layerBytes(c, lay, cap_max, slots);
+            cs.comp_codes[i] = try src.take(b.comp_codes, m.comp_codes);
+            cs.comp_scales[i] = try src.take(b.comp_scales, m.comp_scales);
+                cs.idx_codes[i] = try src.take(b.idx_codes, m.idx_codes);
+                cs.idx_scales[i] = try src.take(b.idx_scales, m.idx_scales);
             }
             if (r > 1) {
                 cs.raw_kv[i] = try a.take(slots * raw_rows * c.head_dim * 4);
                 cs.raw_score[i] = try a.take(slots * raw_rows * c.head_dim * 4);
+                cs.raw_kv[i] = try src.take(b.raw_kv, m.raw_kv);
+                cs.raw_score[i] = try src.take(b.raw_score, m.raw_score);
             }
         }
         try cs.clear(e);

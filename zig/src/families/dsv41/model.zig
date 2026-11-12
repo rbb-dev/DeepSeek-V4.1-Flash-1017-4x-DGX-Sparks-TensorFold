@@ -31,6 +31,7 @@ const ProcessEnv = struct {
 
 const weights = @import("weights.zig");
 const prompt = @import("prompt.zig");
+const kv_vmm = @import("kv_vmm.zig");
 const land = @import("land.zig");
 const prompt2d = @import("prompt2d.zig");
 const spill_sync = @import("spill_sync.zig");
@@ -93,6 +94,8 @@ pub fn readWorkerEnv() void {
     prompt.readAheadPassEnv(); // TF_DS_ENGRAM_AHEAD_PASS (its start line printed here, once)
     prompt.readWaitEnv(); // TF_DS_ENGRAM_WAIT_US
 }
+/// The KV pool's vote and ledger (core/kv_pool.zig), where the followers' flags parse their numbers.
+pub const kv_pool = engine_api.kv_pool;
 pub const live_config = engine_api.live_config;
 /// The pool's streams (--parallel 4).
 pub const max_streams = draft.max_streams;
@@ -130,6 +133,10 @@ pub const Options = struct {
     streams: usize = draft.default_streams, // the pool's streams (--parallel; the four-node lane's 16)
     round_ms: ?[]const f64 = null, // the lane core's round costs by rows (TF_DS_ROUND_MS; null: the served ROUND_MS)
     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
+    kv_target_bytes: u64 = 0, // TF_DS_KV_FREE_TARGET_GIB (--kv-free-target-gib): the free memory to keep; 0: the pool is `pool`'s, as ever
+    kv_growth_bytes: u64 = 0, // TF_DS_KV_GROWTH_MIB (--kv-growth-mib): left for what the engine takes after the pool, when kv_growth_set
+    kv_growth_set: bool = false, // the operator gave it: else the role's measured default (kv_pool.defaultGrowth)
+    kv_vmm: bool = false, // TF_DS_KV_VMM=1 (--kv-vmm): the pool's planes in a virtual-memory reservation (kv_vmm.zig)
 };
 
 /// TF_DS_2D_GU=parity (the served switch): the 2D split's experts with half the gate / up blocks a pair and the ninth by
@@ -187,84 +194,8 @@ const KitFinds = struct {
 /// guard below; a box with less than this much (CUDA's total) keeps 2,048-row passes. The default only: a setting is the operator's.
 const pass_rows_default_floor: usize = 96 << 30;
 
-        m.arena = try prompt.Arena.init(d, o.arena_bytes);
-        errdefer m.arena.deinit();
-        // world 4 (layer_main's setup): the 2D exchanges' buffers, and with rdma_devices their rings (whose infos go
-        // round over NCCL world 4)
-        errdefer if (m.neighbor_gather) |*ng| ng.close(gpa);
-        errdefer if (m.rdma_rings) |*x| x.close(gpa);
-        if (sp.pair != null) {
-            m.two = try prompt2d.Two.init(c, &m.w, &m.arena, sp, chunk_rows);
-            if (neighbor_rdma) {
-                m.rdma_mod = try cuda.Module.load(d, cuda.kernels.dsv41_rdma);
-                m.neighbor_gather = try neighbor.Gather.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), o.rank, &m.comm, m.stream, neighbor_gid);
-                m.two.?.neighbor_gather = &m.neighbor_gather.?;
-            }
-            if (o.rdma_devices) |devs| {
-                const image: []const u8 = if (o.rdma_kernels) |path|
-                    try std.Io.Dir.cwd().readFileAllocOptions(io, path, a, .limited(1 << 26), .@"16", null)
-                else if (cuda.kernels.available) cuda.kernels.dsv41_rdma else return error.NoRdmaKernels;
-                m.rdma_mod = try cuda.Module.load(d, image);
-                var devices: std.ArrayList([]const u8) = .empty;
-                var dit = std.mem.splitScalar(u8, devs, ',');
-                while (dit.next()) |x| try devices.append(a, x);
-                m.rdma_rings = try ring2d.Rings.open(gpa, io, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, .{ .max_bytes = ring_bytes, .gid_index = rdma.rdmaGid() }, &m.comm, m.stream);
-                m.two.?.rings = &m.rdma_rings.?;
-            }
-        }
-        m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
-        m.eng.round_rows = o.round_rows;
-        if (m.par) |*x| m.eng.par = x;
-        m.ch = try prompt.Chunk.init(&m.eng, &m.arena, if (m.waves) wave_rows else chunk_rows, m.ctx_cap); // a stream's keys at most
-        if (m.waves) m.ch2 = try prompt.Chunk.init(&m.eng, &m.arena, wave_rows, m.ctx_cap);
-        m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, m.streams);
-        m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
-        errdefer m.blas.close();
-        m.eng.blas = &m.blas;
-        if (m.waves) {
-            if (2 * wave_rows != chunk_rows) return error.WavesNeedTwoWaveRowsAPass;
-            const t = if (m.two) |*x| x else return error.WavesNeedThe2DSplit;
-            if (t.ow[0] != t.ow[1]) return error.WavesNeedEqualWidths; // the gathers on cs never take t.pad
-            m.cs = try cuda.Stream.init(d, true);
-            // the compute stream's exchanges stay in the parts' lower half (a wave's rows at most), cs's in the upper
-            m.two_c = t.*;
-            m.two_c.part_bytes = t.part_bytes / 2;
-            m.two_c.parts = t.parts + 2 * t.part_bytes;
-            m.two_c.rings = null;
-            // the bf16-sum gathers (TF_DS_2D_YX) exchange through a pad of cs's own
-            m.two_c.pad = try m.arena.take(m.two_c.part_bytes);
-            m.ec = m.eng;
-            m.ec.s = m.cs.?;
-            m.ec.t.stream = m.cs.?;
-            m.ec.comm = &m.comm2.?;
-            m.ec.two = &m.two_c;
-            m.ec.ring = null;
-            for (&m.wev) |*w| for (w) |*ev| {
-                ev.* = try cuda.Event.init(d, false);
-            };
-        }
-        m.rings = try a.alloc(u64, c.layers);
-        m.ring_view = try a.alloc(u64, c.layers);
-        for (m.rings) |*r| {
-            r.* = try m.arena.take(m.streams * m.eng.ringBytes());
-            try d.check(d.api.cuMemsetD8Async(r.*, 0, m.streams * m.eng.ringBytes(), m.stream.handle), "cuMemsetD8Async");
-        }
-        m.rd = try round.Round.init(&m.eng, &m.arena, a, m.ctx_cap); // a round's deepest bucket: a stream's context
-        m.amax = try m.arena.take(round.max_rows * 4);
-        if (o.graphs) m.graphs = round.Graphs.init(gpa);
-        if (o.side) try m.rd.useSide(&m.eng);
-        if (o.prefetch) try m.rd.usePrefetch(&m.eng);
-        if (m.two) |t| if (t.ir != 0 and o.side and m.par == null) try m.rd.usePar(&m.eng); // parity in two launches: the rest beside the main gate / up
-        if (o.drafts) {
-            m.dpool = try draft.Pool.init(&m.eng, &m.arena, m.streams);
-            m.dr = try draft.Drafter.init(&m.eng, &m.arena, sp);
-            if (o.graphs) {
-                m.pgraphs = draft.PassGraphs.init(gpa);
-                m.dr.?.graphs = &m.pgraphs.?;
-            }
-        }
-        try m.synchronize();
-        try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize"); // the setup's legacy-stream copies too
+/// Why the defaulted 4,096-row passes do not apply on this box (null: they do, or the operator set the rows).
+pub fn passRowsFallback(text: ?[]const u8, is_default: bool, total_bytes: usize) ?[]const u8 {
     if (!is_default or text == null or !std.mem.eql(u8, text.?, "4096")) return null;
     if (total_bytes >= pass_rows_default_floor) return null;
     return "this box's memory is under 96 GiB, too little for the larger pass's buffers";
@@ -1425,6 +1356,128 @@ pub fn lanesChoice(want: usize, set: bool, fits_all: bool) LanesChoice {
     return .{ .lanes = 2, .warn = true };
 }
 
+/// The device memory free now (the driver's count; 0 when it cannot say): the ledger's measure of what an allocation took.
+fn freeNow(ctx: *const cuda.Context) u64 {
+    const i = ctx.memInfo() catch return 0;
+    return i.free;
+}
+
+/// The KV pool's bytes at a number of positions, for the vote's fit (prompt.Caches.poolBytes over this rank's layers).
+const PoolBytes = struct {
+    m: *const Model,
+    c: *const Config,
+
+    pub fn bytes(s: PoolBytes, positions: usize) usize {
+        return prompt.Caches.poolBytes(s.c, s.m.w.layers, positions, s.m.streams);
+    }
+};
+
+/// TF_DS_KV_VMM=1: the pool's planes in virtual memory. The reservation is sized for the most positions the device could ever
+/// hold (every plane's stretch at that many), the first `pool` positions of each plane are backed, and the start line says what
+/// was reserved and mapped. The bytes, the order and the layout of the planes are the arena's (Caches.init): only where they live differs.
+fn openVmmCaches(m: *Model, ctx: *const cuda.Context, c: *const Config, pool: usize) !prompt.Caches {
+    const info = try ctx.memInfo();
+    var be: kv_vmm.CudaBackend = .{ .d = ctx.d, .device = ctx.device };
+    const gran: u64 = try be.granularity();
+    const most = @max(pool, kv_vmm.maxPositions(PoolBytes{ .m = m, .c = c }, info.total, engine_api.kv_pool.pool_step));
+    const va = prompt.Caches.vaBytes(c, m.w.layers, most, m.streams, @intCast(gran));
+    m.kv_vmm = try kv_vmm.Driver.open(m.gpa, be, gran, kv_vmm.seg_default, va);
+    errdefer {
+        m.kv_vmm.?.deinit();
+        m.kv_vmm = null;
+    }
+    const cs = try prompt.Caches.initVmm(&m.eng, &m.kv_vmm.?, pool, most, m.streams);
+    m.vmm_most = most;
+    const v = &m.kv_vmm.?;
+    std.log.info("TF_DS_KV_VMM=1: rank {d}: the KV pool's {d} planes are in a virtual-memory reservation of {d:.2} GiB (room for {d} positions, the device's total), {d:.2} GiB mapped in segments of {d} MiB (granularity {d} KiB; the planes' bytes {d:.2} GiB, rounded up per plane to the granularity); the planes' addresses never change, so the graphs' stay valid", .{ m.rank, v.planes.items.len, @as(f64, @floatFromInt(v.va_bytes)) / (1 << 30), most, @as(f64, @floatFromInt(v.mapped)) / (1 << 30), kv_vmm.seg_default >> 20, gran >> 10, @as(f64, @floatFromInt(v.asked)) / (1 << 30) });
+    return cs;
+}
+
+/// The pool this rank allocates, from the ranks' vote (kv_pool.zig): every rank offers the device memory it has free now, its
+/// free target and growth, the positions that fits and the ledger of what its start has taken, over the host star; every rank reads
+/// the same table and decides the same. With no free target (TF_DS_KV_FREE_TARGET_GIB) each rank keeps its own pool, as before the
+/// vote; with one the pool is the smallest any rank fits, never below the context, and a start that cannot hold the context ends on
+/// every rank alike, naming the shortfall and the ledger's largest lines.
+fn votePool(m: *Model, o: Options, c: *const Config) !usize {
+    const kv = engine_api.kv_pool;
+    const info = try m.ctx.memInfo();
+    const lin: PoolBytes = .{ .m = m, .c = c };
+    const floor: usize = if (o.context != 0) o.context else o.pool;
+    var mine = kv.Part.init(m.rank);
+    mine.free_bytes = info.free;
+    mine.total_bytes = info.total;
+    mine.target_bytes = o.kv_target_bytes;
+    const growth = kv.growthForPass(m.rank, o.kv_growth_set, o.kv_growth_bytes, m.pass_rows); // larger passes: the pool pays (D98)
+    mine.growth_bytes = growth;
+    mine.growth_set = @intFromBool(o.kv_growth_set);
+    mine.floor = floor;
+    mine.asked = o.pool;
+    mine.fit = if (o.kv_target_bytes != 0) kv.fit(info.free, o.kv_target_bytes, growth, lin) else 0;
+    mine.floor_bytes = lin.bytes(floor);
+    mine.b_lo = lin.bytes(kv.pool_step);
+    mine.b_hi = lin.bytes(17 * kv.pool_step);
+    mine.bytes_per_token = (mine.b_hi - mine.b_lo) / (16 * kv.pool_step);
+    var snap = m.ledger; // (a copy: the remainder this adds is the vote's, the running ledger closes at the end)
+    snap.close(@src(), info.total -| info.free);
+    snap.fill(&mine);
+    var table: [4]kv.Part = undefined;
+    const world: usize = m.world;
+    const star = m.comm.host.star orelse return error.NoHostLinks;
+    try star.allGather(std.mem.asBytes(&mine), std.mem.sliceAsBytes(table[0..world]));
+    const d = kv.decide(table[0..world]);
+    kv.report.world = m.world;
+    kv.report.table = table;
+    kv.report.decision = d;
+    if (d.verdict == .refused) {
+        var buf: [1600]u8 = undefined;
+        std.log.err("rank {d}: {s}", .{ m.rank, kv.refusalText(&buf, table[0..world], d) });
+        return error.PoolRefused;
+    }
+    const pool: usize = if (d.verdict == .auto) d.pool else o.pool;
+    kv.report.pool_active = pool;
+    kv.report.streams = @intCast(m.streams);
+    var fits: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&fits);
+    for (table[0..world], 0..) |p, i| w.print("{s}{d}", .{ if (i > 0) ", " else "", p.fit }) catch {};
+    if (d.verdict == .auto) {
+        std.log.info("KV pool: rank {d}: {d} positions, the smallest any rank fits (rank {d}); the ranks fit {s} with {d:.2} GiB kept free (TF_DS_KV_FREE_TARGET_GIB) and {d:.2} GiB left for what follows the pool (TF_DS_KV_GROWTH_MIB: {s}); this rank has {d:.2} GiB free before the pool", .{ m.rank, pool, d.limiting_rank, w.buffered(), @as(f64, @floatFromInt(o.kv_target_bytes)) / (1 << 30), @as(f64, @floatFromInt(growth)) / (1 << 30), if (o.kv_growth_set) "the operator's number" else kv.growth_measured, @as(f64, @floatFromInt(info.free)) / (1 << 30) });
+    } else {
+        std.log.info("KV pool: rank {d}: {d} positions, the pool the settings name (no TF_DS_KV_FREE_TARGET_GIB); this rank has {d:.2} GiB free before the pool and the pool takes about {d:.2} GiB", .{ m.rank, pool, @as(f64, @floatFromInt(info.free)) / (1 << 30), @as(f64, @floatFromInt(lin.bytes(pool))) / (1 << 30) });
+    }
+    return pool;
+}
+
+/// What the pool took, measured, beside what its layout says it takes.
+fn logPoolTaken(m: *const Model, c: *const Config, taken: u64) void {
+    const predicted = (PoolBytes{ .m = m, .c = c }).bytes(m.pool_cap);
+    engine_api.kv_pool.report.pool_taken = taken;
+    engine_api.kv_pool.report.pool_predicted = predicted;
+    std.log.info("KV pool: rank {d}: {d} positions took {d:.2} GiB of device memory (MEASURED by the driver's free count), the caches' layout takes {d:.2} GiB (the arena rounds up to its blocks)", .{ m.rank, m.pool_cap, @as(f64, @floatFromInt(taken)) / (1 << 30), @as(f64, @floatFromInt(predicted)) / (1 << 30) });
+}
+
+/// At the start's end: every rank's whole ledger to every rank over the host star, the remainder (the CUDA context, the kernels,
+/// the graphs) named, and the start's own line saying what it took after the pool: the growth TF_DS_KV_GROWTH_MIB is to cover.
+fn gatherLedger(m: *Model, free_after_pool: u64) !void {
+    const kv = engine_api.kv_pool;
+    const info = try m.ctx.memInfo();
+    m.ledger.close(@src(), info.total -| info.free);
+    var mine = kv.Part.init(m.rank);
+    mine.free_bytes = info.free;
+    mine.total_bytes = info.total;
+    m.ledger.fill(&mine);
+    var table: [4]kv.Part = undefined;
+    const world: usize = m.world;
+    const star = m.comm.host.star orelse return error.NoHostLinks;
+    try star.allGather(std.mem.asBytes(&mine), std.mem.sliceAsBytes(table[0..world]));
+    kv.report.final = table;
+    kv.report.have_final = true;
+    kv.report.mine = m.ledger;
+    kv.report.after_taken = free_after_pool -| info.free;
+    kv.report.free_ready = info.free;
+    kv.ready.store(true, .release);
+    std.log.info("KV pool: rank {d}: the start took {d:.2} GiB after the pool (MEASURED: TF_DS_KV_GROWTH_MIB is the room kept for this, and for what serving grows by); {d:.2} GiB of {d:.2} GiB are free at its end", .{ m.rank, @as(f64, @floatFromInt(kv.report.after_taken)) / (1 << 30), @as(f64, @floatFromInt(info.free)) / (1 << 30), @as(f64, @floatFromInt(info.total)) / (1 << 30) });
+}
+
 fn pairShortText(buf: []u8, free: u64, pass_rows: usize, lane_arena: u64, v: PoolView, lanes: usize) ![]const u8 {
     const what = if (lanes >= 3) "the second and third passes (TF_DS_ROCI_STAGGER_LANES=3)" else "the second pass";
     return memoryRefusal(buf, what, true, pass_rows, (lanes - 1) * pairEstimate(pass_rows, lane_arena) + pair_guard_bytes, free, v);
@@ -1680,6 +1733,8 @@ pub const Model = struct {
     streams: usize, // the pool's streams (Options.streams)
     round_ms: []const f64, // the lane core's round costs by rows (Options.round_ms, else draft.round_ms)
     pool_cap: usize,
+    ledger: engine_api.kv_pool.Ledger, // what this start has taken, line by line (kv_pool.zig)
+    ctx_cap: usize, // a stream's extent at most (Options.context, else the pool)
     pass_rows: usize = chunk_rows, // a pass's rows at most (TF_DS_PASS_ROWS, every rank alike): the chunk's allocation
     cache_dir: std.Io.Dir,
     cache_file: std.Io.File,
@@ -1703,6 +1758,22 @@ pub const Model = struct {
     mxk: ?mx.Kernels = null, // Format.native: DeepSeek's own FP8 / MXFP4 checkpoint's kernels (mx.zig)
     rope_buf: cuda.DeviceBuffer,
     arena: prompt.Arena,
+    vmm_most: usize = 0, // the positions the VMM reservation has room for
+    kv_vmm: ?kv_vmm.Driver = null, // the pool's reservation (TF_DS_KV_VMM=1); the caches' planes live in it
+    pool_start: usize = 0, // the pool the start took (a live free target of 0 returns to it)
+    pool_ceiling: usize = 0, // the most positions a live resize may take: the reservation's, or the start's when the SSD tier's tables are sized by it
+    kv_start_target_mib: u32 = 0, // the start's free target (a live `unset` returns to it; 0: the start had none)
+    kv_live_loading: u32 = 0, // rank 0, with it: the disk restores still loading into the pool
+    kv_live_floor: usize = 0, // rank 0, set by the lane host before a cfg frame: the end of the highest extent a stream or a kept state holds
+    eng: prompt.Engine,
+    ch: prompt.Chunk,
+    caches: prompt.Caches,
+    blas: cublas.Blas,
+    rings: []u64, // each layer's window rings, max_streams slots
+    ring_view: []u64, // a filling stream's slot of them
+    rd: round.Round,
+    graphs: ?round.Graphs = null,
+    pgraphs: ?draft.PassGraphs = null, // the drafter pass as CUDA graphs (with graphs)
     graph_fallbacks: std.atomic.Value(u64) = .init(0), // either kind's work run eagerly after a failed capture (/metrics)
     vocab_stats: api.DraftVocabCounters = .{}, // TF_DS_DRAFT_VOCAB: its passes and guard on rank 0 (/metrics)
     dpool: ?draft.Pool = null,
@@ -1981,6 +2052,8 @@ pub const Model = struct {
         if (ops_mod.l2_chunk_bytes != 8192) std.log.info("TF_DS_L2_CHUNK_KIB={d}: the L2 prefetch's waves are {d} KiB chunks x 128 every {d} ns (the served: 8 KiB, same rate, same bytes)", .{ ops_mod.l2_chunk_bytes / 1024, ops_mod.l2_chunk_bytes / 1024, ops_mod.waveNs(ops_mod.l2_rate_gbps, ops_mod.l2_chunk_bytes) });
         m.round_ms = o.round_ms orelse &draft.round_ms;
         if (m.round_ms.len == 0) return error.BadRoundMs;
+        m.ledger = .{};
+        m.ctx_cap = if (o.context != 0) @min(o.context, o.pool) else o.pool;
         m.pass_rows = prompt2d.pass_rows_asked; // (every rank alike: the start-up exchange refuses a follower that differs)
         if (prompt2d.pass_tail_asked) std.log.info("TF_DS_PASS_TAIL=1: a prompt's final pass runs up to {d} rows, the remainder after whole {d}-row units merged into it; every other pass stays whole units on the grid", .{ m.pass_rows, chunk_rows });
         m.fill_slot = 0;
@@ -2149,6 +2222,8 @@ pub const Model = struct {
         if (prompt2d.draft_main_4way_asked) {
             if (draftMainFourWayOff(c, sp, o.drafts, mx.decOnEnv())) |why| std.log.info("TF_DS_DRAFT_MAIN_4WAY=1: off on rank {d}: {s}", .{ o.rank, why }) else weights.draft_main_4way = true;
         }
+        const free_before_weights = freeNow(ctx);
+        m.ledger.record(@src(), .weights, free_before_weights -| freeNow(ctx), 0);
         // the ranks' links (rank 0 takes its followers in order; a follower retries its connect for TF_DS_CONNECT_S)
 
         try m.fan.join(io, o.master, o.port, o.rank, o.world, prompt2d.connectSeconds());
@@ -2297,6 +2372,17 @@ pub const Model = struct {
         const rope: prompt.Rope = .{ .cos = m.rope_buf.ptr, .sin = m.rope_buf.ptr + tbl };
         const rope_c: prompt.Rope = .{ .cos = m.rope_buf.ptr + 2 * tbl, .sin = m.rope_buf.ptr + 3 * tbl };
 
+        const free_before_transport = freeNow(ctx);
+        m.kv_vmm = null; // (TF_DS_KV_VMM=1 opens it with the caches)
+        m.vmm_most = 0;
+        m.pool_start = 0;
+        m.pool_ceiling = 0;
+        m.kv_start_target_mib = @intCast(@min(o.kv_target_bytes >> 20, std.math.maxInt(u32) - 1));
+        m.kv_live_floor = 0;
+        m.kv_live_loading = 0;
+        m.arena = try prompt.Arena.init(d, o.arena_bytes);
+        errdefer m.arena.deinit();
+        // world 4 (layer_main's setup): the 2D exchanges' buffers, and with rdma_devices their rings (whose infos go
         // round over the host links)
         errdefer if (m.rdma_rings) |*x| x.close(gpa);
         // the first lane's proxy threads (Roci.openLane, below) run from its start: a later failure stops them before the arena and the
@@ -2437,15 +2523,43 @@ pub const Model = struct {
         m.eng.round_rows = o.round_rows;
         if (m.par) |*x| m.eng.par = x;
         if (m.mxk) |*x| m.eng.mx = x;
+        m.ledger.record(@src(), .transport, free_before_transport -| freeNow(ctx), 0); // the arena's first block, the exchanges' buffers and rings
+        const free_before_chunk = freeNow(ctx);
         try agreeQgateCanary(d, &m.comm, m.stream, prompt2d.qgate_canary_asked);
         if (prompt.qgate_body != .off) try m.mxk.?.useQgateBody();
         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, m.pass_rows, m.ctx_cap); // a stream's keys at most
+        m.ledger.record(@src(), .chunk, free_before_chunk -| freeNow(ctx), 0);
+        // the pool: the ranks' vote on the free memory they have now (kv_pool.zig), before the caches are taken
+        const pool = try votePool(m, o, c);
+        m.pool_cap = pool;
+        const free_before_pool = freeNow(ctx);
+        m.caches = if (o.kv_vmm) try openVmmCaches(m, ctx, c, pool) else try prompt.Caches.init(&m.eng, &m.arena, pool, m.streams);
+        errdefer if (m.kv_vmm) |*v| v.deinit();
+        m.pool_start = pool;
+        m.pool_ceiling = if (m.kv_vmm != null) @min(m.vmm_most, engine_api.kv_pool.max_pool_positions) else pool;
+        const free_after_pool = freeNow(ctx);
+        m.ledger.record(@src(), .kv_pool, free_before_pool -| free_after_pool, 0);
+        logPoolTaken(m, c, free_before_pool -| free_after_pool);
+        m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
+        errdefer m.blas.close();
+        m.eng.blas = &m.blas;
+        m.rings = try a.alloc(u64, c.layers);
+        m.ring_view = try a.alloc(u64, c.layers);
+        const free_before_rings = freeNow(ctx);
+        for (m.rings) |*r| {
+            r.* = try m.arena.take(m.streams * m.eng.ringBytes());
+            try d.check(d.api.cuMemsetD8Async(r.*, 0, m.streams * m.eng.ringBytes(), m.stream.handle), "cuMemsetD8Async");
+        }
+        m.ledger.record(@src(), .window_rings, free_before_rings -| freeNow(ctx), 0);
+        const free_before_round = freeNow(ctx);
+        m.rd = try round.Round.init(&m.eng, &m.arena, a, m.ctx_cap); // a round's deepest bucket: a stream's context
         errdefer m.rd.dropPar();
         errdefer m.rd.dropPrefetch();
         errdefer m.rd.dropSide(&m.eng);
         m.amax = try m.arena.take(round.max_rows * 4);
         m.cand = try m.arena.take(round.max_rows * (sampling.max_candidates * 12 + 4));
         m.eng.agree_flag = try m.arena.take(64); // G0.3: the graph captures' agreement bytes (agreeAll, agreeCapture)
+        m.ledger.record(@src(), .round_buffers, free_before_round -| freeNow(ctx), 0);
         errdefer if (m.dr) |*dr| dr.deinit();
         errdefer if (m.pgraphs) |*g| g.deinit();
         errdefer if (m.graphs) |*g| g.deinit();
@@ -2460,6 +2574,12 @@ pub const Model = struct {
         try useHeadCand(m, a, d, prompt2d.head_cand_asked);
         try useHeadKey(m, a, d, prompt2d.head_key_asked);
         if (o.drafts) {
+            const free_before_drafter = freeNow(ctx);
+            m.dpool = try draft.Pool.init(&m.eng, &m.arena, m.streams);
+            m.dr = try draft.Drafter.init(&m.eng, &m.arena, sp);
+            m.ledger.record(@src(), .drafter, free_before_drafter -| freeNow(ctx), 0);
+            if (o.graphs) {
+                m.pgraphs = draft.PassGraphs.init(gpa);
                 m.pgraphs.?.lazy.fallbacks = &m.graph_fallbacks;
                 m.dr.?.graphs = &m.pgraphs.?;
             }
@@ -2570,6 +2690,9 @@ pub const Model = struct {
         m.keep_ahead_start = m.keep_ahead;
         m.keep_ahead_able = m.keep_ahead or m.keepAheadAble();
         live_config.setAble(.keep_ahead, m.keep_ahead_able);
+        live_config.setAble(.kv_free_target, m.kv_vmm != null); // (a live free target resizes the pool only where it is in virtual memory)
+
+        // a vision checkpoint's image routing bias (without it a prompt with images is refused; text runs as ever)
         if (c.vision and c.format == .exl3) { // (Format.native: the checkpoint's own gate.bias_vl, loaded with the weights)
             const path = o.vision_bias orelse try std.fs.path.join(a, &.{ o.kit_dir, "vision", "gate_bias_vl.safetensors" });
             m.loadVisionBias(path) catch |err| if (o.vision_bias != null or err != error.FileNotFound) return err;
@@ -2580,6 +2703,10 @@ pub const Model = struct {
         m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
         m.logits = try a.alloc(f32, round.max_rows * m.vocab);
         if (prompt2d.engram_partner_asked) try openPartner(m, gpa, d, o, sp);
+        try gatherLedger(m, free_after_pool);
+        return m;
+    }
+
         return engram_rows.workerSlotsN(m.pass_rows / chunk_rows, if (prompt2d.roci_stagger_asked) prompt2d.roci_stagger_lanes else 1);
     /// A pair's second pass: its lane before the first's (it borrows the first's arena), then its events, handle and stream.
     fn closePair(m: *Model) void {
@@ -2652,6 +2779,10 @@ pub const Model = struct {
         if (m.tables) |*t| t.close();
         if (m.rdma_rings) |*r| r.close(m.gpa);
         m.blas.close();
+        if (m.kv_vmm) |*v| v.deinit();
+        m.arena.deinit();
+        m.rope_buf.free();
+        if (m.par) |*x| x.unload();
         if (m.mxk) |*x| x.unload();
         m.ex.unload();
         m.ops.unload();
@@ -3193,6 +3324,7 @@ pub const Model = struct {
     pub fn cfgStart(m: *const Model, slot: u8) u32 {
         return switch (slot) {
             @backingInt(live_config.Slot.keep_ahead) => @intFromBool(m.keep_ahead_start),
+            @backingInt(live_config.Slot.kv_free_target) => m.kv_start_target_mib,
             else => live_config.cfg_unset,
         };
     }
@@ -3211,10 +3343,136 @@ pub const Model = struct {
                 m.keep_ahead = want;
                 std.log.info("TF_DS_ENGRAM_KEEP_AHEAD is now {d} on rank {d} (cfg version {d})", .{ @intFromBool(want), m.rank, version });
             },
+            @backingInt(live_config.Slot.kv_free_target) => try m.resizePool(version, it.value),
             else => std.log.warn("a cfg frame names slot {d}, which this build does not know (rank {d})", .{ it.slot, m.rank }),
         };
     }
 
+    /// Every stream that can read or write the KV pool's planes: the model's stream, the pairs' second and third pass streams, and
+    /// the round's side, prefetch and parity streams. The SSD tier's copies run on the model's stream (SpillDev). The test below
+    /// holds this list to the Stream fields of Model and Round.
+    pub const pool_stream_models = [_][]const u8{ "stream", "stream_b", "stream_c" };
+    pub const pool_stream_round = [_][]const u8{ "side", "pf", "par" };
+
+    fn poolStreams(m: *Model, out: *[16]cuda.Stream) usize {
+        var n: usize = 0;
+        out[n] = m.stream;
+        n += 1;
+        for ([_]?cuda.Stream{ m.stream_b, m.stream_c, m.rd.side, m.rd.pf, m.rd.par }) |x| if (x) |st| {
+            out[n] = st;
+            n += 1;
+        };
+        return n;
+    }
+
+    /// The device idle for a resize: the context, then each stream of `poolStreams` by itself.
+    fn syncPoolStreams(m: *Model) !void {
+        try m.ctx.synchronize();
+        var st: [16]cuda.Stream = undefined;
+        const n = m.poolStreams(&st);
+        for (st[0..n]) |x| try x.synchronize();
+    }
+
+    /// The KV pool's bytes at a number of positions as the VMM pool maps them (each plane rounded up to the granularity).
+    const VmmBytes = struct {
+        m: *const Model,
+        gran: usize,
+
+        pub fn bytes(s: VmmBytes, positions: usize) usize {
+            return prompt.Caches.vmmBytes(s.m.eng.c, s.m.w.layers, positions, s.m.streams, s.gran);
+        }
+    };
+
+    /// TF_DS_KV_FREE_TARGET_GIB written live (class A, only with TF_DS_KV_VMM=1): every rank, at the same cfg frame, offers the
+    /// positions its memory holds with `target_mib` kept free (the pool's mapped bytes plus what is free now, less the target), the ranks'
+    /// parts go round the host star, and every rank reads the same table and takes the same decision (kv_pool.decideResize: the smallest
+    /// fit, within every ceiling, never under the context and never under the extents rank 0 reports in use). The planes then grow or give
+    /// back their tails with their addresses unchanged, so the graphs stay valid. A rank that cannot map what the decision asks makes
+    /// every rank undo it (a second ballot). A target of 0 (an unset change with no start target) asks for the start's pool.
+    fn resizePool(m: *Model, version: u64, target_mib: u32) !void {
+        const kv = engine_api.kv_pool;
+        // (a rank without the virtual-memory pool takes part all the same, so no rank waits for it: the decision names it)
+        const vp: ?*kv_vmm.Driver = if (m.kv_vmm) |*v| v else null;
+        if (vp == null) std.log.warn("TF_DS_KV_FREE_TARGET_GIB: rank {d} has no virtual-memory pool (TF_DS_KV_VMM=1 on every rank): nothing moves (cfg version {d})", .{ m.rank, version });
+        const star = m.comm.host.star orelse return error.NoHostLinks;
+        const target: u64 = if (target_mib == live_config.cfg_unset) @as(u64, m.kv_start_target_mib) << 20 else @as(u64, target_mib) << 20;
+        try m.syncPoolStreams();
+        const before = try m.ctx.memInfo();
+        const gran: usize = if (vp) |v| @intCast(v.gran) else 1;
+        const mapped: u64 = if (vp) |v| v.mapped else 0;
+        const fit_pos: usize = if (vp == null) 0 else if (target == 0) m.pool_start else blk: {
+            const have = before.free + mapped;
+            break :blk if (have <= target) 0 else kv.fitIn(have - target, VmmBytes{ .m = m, .gran = gran });
+        };
+        var mine: kv.ResizePart = std.mem.zeroes(kv.ResizePart);
+        mine.magic = kv.ResizePart.tag;
+        mine.rank = m.rank;
+        mine.vmm = @intFromBool(vp != null);
+        mine.cur = m.pool_cap;
+        mine.fit = fit_pos;
+        mine.ceiling = m.pool_ceiling;
+        mine.in_use = if (m.rank == 0) m.kv_live_floor else 0;
+        mine.restoring = if (m.rank == 0) m.kv_live_loading else 0;
+        mine.free_bytes = before.free;
+        mine.mapped_bytes = mapped;
+        mine.target_bytes = target;
+        var table: [4]kv.ResizePart = undefined;
+        const world: usize = @min(m.comm.world, 4);
+        try star.allGather(std.mem.asBytes(&mine), std.mem.sliceAsBytes(table[0..world]));
+        const d = kv.decideResize(table[0..world], m.ctx_cap);
+        const from = m.pool_cap;
+        const gib_f: f64 = 1 << 30;
+        var failed: u8 = kv.ballot_ok;
+        if (d.positions != from) {
+            m.caches.resizeVmm(&m.eng, vp.?, d.positions) catch |e| {
+                std.log.err("TF_DS_KV_FREE_TARGET_GIB: rank {d} could not move the pool from {d} to {d} positions ({s}); every rank undoes it (cfg version {d})", .{ m.rank, from, d.positions, @errorName(e), version });
+                failed = if (e == error.OutOfDeviceMemory or e == error.OutOfMemory) kv.ballot_memory else kv.ballot_error;
+            };
+        }
+        // every rank's result, by rank: the outcome names the rank that ran out of memory
+        var ballots: [4]u8 = undefined;
+        try star.allGather(&[1]u8{failed}, ballots[0..world]);
+        const out = kv.resizeOutcome(d, ballots[0..world]);
+        const after_free = if (m.ctx.memInfo()) |i| i.free else |_| 0;
+        if (out.verdict == .refused_memory or out.verdict == .refused_error) {
+            // some rank failed: the ones that moved go back (a grow's undo, a shrink's regrow of what it gave back: shrinks cannot fail)
+            if (failed == kv.ballot_ok and d.positions != from) m.caches.resizeVmm(&m.eng, vp.?, from) catch {};
+            kv.report.resize_version = version;
+            kv.report.resize_verdict = out.verdict;
+            kv.report.resize_rank = out.rank;
+            kv.report.resize_from = from;
+            kv.report.resize_wanted = d.wanted;
+            std.log.warn("TF_DS_KV_FREE_TARGET_GIB: the pool stays at {d} positions on rank {d}: REFUSED, rank {d} {s} mapping the change (cfg version {d}); every rank undid it", .{ from, m.rank, out.rank, if (out.verdict == .refused_memory) "ran out of memory" else "failed", version });
+            return;
+        }
+        try m.syncPoolStreams();
+        m.pool_cap = d.positions;
+        kv.report.pool_active = d.positions;
+        kv.report.resize_version = version;
+        kv.report.resize_verdict = d.verdict;
+        kv.report.resize_rank = out.rank;
+        kv.report.resize_from = from;
+        kv.report.resize_wanted = d.wanted;
+        std.log.info("TF_DS_KV_FREE_TARGET_GIB is now {d:.2} GiB on rank {d} (cfg version {d}): {s}; the pool was {d} positions and is {d} ({d:.2} GiB mapped, {d:.2} GiB free before and {d:.2} GiB after on this Spark; the ranks fit {d} positions, the smallest by rank {d}; rank 0 reports extents in use to {d})", .{
+            @as(f64, @floatFromInt(target)) / gib_f,      m.rank,                                      version,
+            switch (d.verdict) {
+                .same => "no change: the ranks' memory holds the pool as it is",
+                .grow => "the pool grew",
+                .shrink => "the pool gave back its tail",
+                .shrink_partial => "the pool shrank as far as it is free: a stream or a kept conversation holds an extent above the memory's size, so the target is not reached",
+                .blocked_by_use => "NOT shrunk: a stream or a kept conversation holds an extent to the pool's end, or a disk restore is still loading into the pool",
+                .refused_context => "REFUSED: fewer positions fit than the context (the context is never lowered)",
+                .refused_disagree => "REFUSED: the ranks' offers do not describe one pool and one target",
+                .refused_memory, .refused_error => unreachable, // (returned above)
+                .refused_no_vmm => "REFUSED: a rank's pool is not in virtual memory (give TF_DS_KV_VMM=1 to every rank)",
+            },
+            from,                                         d.positions,                                 @as(f64, @floatFromInt(if (vp) |v| v.mapped else 0)) / gib_f,
+            @as(f64, @floatFromInt(before.free)) / gib_f, @as(f64, @floatFromInt(after_free)) / gib_f, d.wanted,
+            d.limiting_rank,                              table[0].in_use,
+        });
+    }
+
+    pub fn fillBegin(m: *Model, slot: usize, base: usize) !void {
         try m.pairJoin();
         m.fill_t0 = m.now();
         m.pair_in_fill = 0;
@@ -5291,44 +5549,204 @@ test "TF_DS_ROCI_STAGGER_LANES: a group of three is issued by groupSchedule, eac
     try std.testing.expect(std.mem.indexOf(u8, code, "m.ch_c.?.lane = 2;") != null);
 }
 
+test "TF_DS_KV_VMM: the reservation holds every plane of the pool at the most positions, and the planes' backed bytes are the layout's rounded up per plane" {
+    const config_mod = @import("config.zig");
+    const gpa = std.testing.allocator;
+    var why: config_mod.Why = .{};
+    const cfg = try config_mod.parse(gpa, config_mod.test_config, &why);
+    var lays: [40]weights.Layer = undefined;
+    const layers = poolTestLayers(&lays, cfg);
+    const pool: usize = 1 << 20;
+    const most: usize = 4 * pool;
+    const gran: usize = 2 << 20;
+    const va = prompt.Caches.vaBytes(&cfg, layers, most, 16, gran);
+    var vp = try kv_vmm.Pool(kv_vmm.Fake).open(gpa, .{ .gpa = gpa }, gran, kv_vmm.seg_default, va);
+    defer vp.b.live.deinit(gpa);
+    defer vp.deinit();
+    // the planes as initFrom takes them: each layer's, in its order, `pool` positions now and room for `most`
+    var planes: usize = 0;
+    var rounded: usize = 0;
+    for (layers) |lay| {
+        const b = prompt.Caches.layerBytes(&cfg, lay, pool, 16);
+        const m = prompt.Caches.layerBytes(&cfg, lay, most, 16);
+        inline for (.{ "comp_codes", "comp_scales", "idx_codes", "idx_scales", "raw_kv", "raw_score" }) |f| {
+            if (@field(b, f) != 0) {
+                _ = try vp.addPlane(@field(m, f), @field(b, f));
+                planes += 1;
+                rounded += std.mem.alignForward(usize, @field(b, f), gran);
             }
         }
-        const t1 = m.now();
-        if (m.dr) |*dr| {
-            const wins = rows.windows orelse return error.BadRound;
-            var items: [max_streams]draft.Item = undefined;
-            var n: usize = 0;
-            for (wins, absorb) |win, yes| {
-                if (!yes) continue;
-                items[n] = .{ .slot = @intCast(rows.slots.?[win.row]), .taps = m.rd.taps + win.row * dr.taps_w * 2, .n = win.n, .start = @intCast(rows.pos[win.row]) };
-                n += 1;
-            }
-            if (n > 0) try dr.absorbMany(e, &m.ch, &m.dpool.?, items[0..n]);
+    }
+    try std.testing.expect(planes > 0);
+    try std.testing.expectEqual(planes, vp.planes.items.len);
+    try std.testing.expectEqual(@as(u64, va), vp.carved); // the reservation is exactly the planes' stretches
+    try std.testing.expectEqual(@as(u64, rounded), vp.mapped);
+    const layout = prompt.Caches.poolBytes(&cfg, layers, pool, 16);
+    try std.testing.expect(vp.mapped >= layout and vp.mapped < layout + planes * gran); // under one granule of rounding a plane
+    // a pool of the most positions fits the stretches: every plane grows to its full size
+    for (0..planes) |i| try vp.grow(@intCast(i), vp.planes.items[i].max);
+    try std.testing.expect(vp.mapped >= prompt.Caches.poolBytes(&cfg, layers, most, 16));
+}
+
+test "TF_DS_KV_FREE_TARGET_GIB live: the planes grow and shrink at their tails in the plane order, addresses fixed, and the mapped bytes follow vmmBytes" {
+    const config_mod = @import("config.zig");
+    const gpa = std.testing.allocator;
+    var why: config_mod.Why = .{};
+    const cfg = try config_mod.parse(gpa, config_mod.test_config, &why);
+    var lays: [40]weights.Layer = undefined;
+    const layers = poolTestLayers(&lays, cfg);
+    const small: usize = 1 << 20;
+    const big: usize = 4 << 20;
+    const gran: usize = 2 << 20;
+    const va = prompt.Caches.vaBytes(&cfg, layers, big, 16, gran);
+    var vp = try kv_vmm.Pool(kv_vmm.Fake).open(gpa, .{ .gpa = gpa }, gran, kv_vmm.seg_default, va);
+    defer vp.b.live.deinit(gpa);
+    defer vp.deinit();
+    var a: [prompt.Caches.max_planes]prompt.Caches.Plane = undefined;
+    var b: [prompt.Caches.max_planes]prompt.Caches.Plane = undefined;
+    const n = prompt.Caches.planeSizes(&cfg, layers, small, 16, &a);
+    try std.testing.expectEqual(n, prompt.Caches.planeSizes(&cfg, layers, big, 16, &b));
+    var at: [prompt.Caches.max_planes]u64 = undefined;
+    for (0..n) |i| at[i] = try vp.addPlane(b[i].bytes, a[i].bytes);
+    try std.testing.expectEqual(@as(u64, prompt.Caches.vmmBytes(&cfg, layers, small, 16, gran)), vp.mapped);
+    for (0..n) |i| try vp.grow(@intCast(i), b[i].bytes); // the pool grows to `big`
+    try std.testing.expectEqual(@as(u64, prompt.Caches.vmmBytes(&cfg, layers, big, 16, gran)), vp.mapped);
+    for (0..n) |i| try std.testing.expectEqual(at[i], vp.addressOf(@intCast(i))); // nothing moved
+    for (0..n) |i| _ = try vp.shrink(@intCast(i), a[i].bytes); // and back to `small`
+    const want = prompt.Caches.vmmBytes(&cfg, layers, small, 16, gran);
+    try std.testing.expect(vp.mapped >= want and vp.mapped < want + n * kv_vmm.seg_default); // whole segments: under one a plane over
+    try std.testing.expectEqual(vp.mapped, vp.b.total());
+    // the kinds the grow clears: the index keys' scales are 127, every other plane 0 (a new pool's contents)
+    var idx: usize = 0;
+    for (a[0..n]) |x| {
+        if (x.kind == .idx_scales) idx += 1;
+    }
+    try std.testing.expect(idx > 0);
+}
+
+test "TF_DS_KV_FREE_TARGET_GIB live: a graph holds only plane bases, and every position below the pool stays backed through grows and shrinks" {
+    // What the round graphs bake (round.zig: cs.<plane>[layer], the whole pool's Caches): each plane's BASE, plus counts that do not depend
+    // on the pool (cs.slots, raw_rows). Which rows a kernel touches comes from device buffers (keys, targets) the lanes fill from positions
+    // below pool_cap. So a graph is safe across a resize exactly when (1) the bases never move and (2) every row below the pool is backed.
+    const config_mod = @import("config.zig");
+    const gpa = std.testing.allocator;
+    var why: config_mod.Why = .{};
+    const cfg = try config_mod.parse(gpa, config_mod.test_config, &why);
+    var lays: [40]weights.Layer = undefined;
+    const layers = poolTestLayers(&lays, cfg);
+    const gran: usize = 2 << 20;
+    const caps = [_]usize{ 1 << 20, 3 << 20, 1 << 20, 5 << 20, 2 << 20 }; // the pool's sizes, in turn (start, grow, shrink, grow past, shrink)
+    const most: usize = 5 << 20;
+    var vp = try kv_vmm.Pool(kv_vmm.Fake).open(gpa, .{ .gpa = gpa }, gran, kv_vmm.seg_default, prompt.Caches.vaBytes(&cfg, layers, most, 16, gran));
+    defer vp.b.live.deinit(gpa);
+    defer vp.deinit();
+    var now: [prompt.Caches.max_planes]prompt.Caches.Plane = undefined;
+    var big: [prompt.Caches.max_planes]prompt.Caches.Plane = undefined;
+    const n = prompt.Caches.planeSizes(&cfg, layers, caps[0], 16, &now);
+    _ = prompt.Caches.planeSizes(&cfg, layers, most, 16, &big);
+    var bases: [prompt.Caches.max_planes]u64 = undefined;
+    for (0..n) |i| bases[i] = try vp.addPlane(big[i].bytes, now[i].bytes);
+    // the graph, captured at the first size: it holds the bases, and (the negative control) one address past the plane's first size
+    var past: [prompt.Caches.max_planes]u64 = undefined;
+    for (0..n) |i| past[i] = bases[i] + now[i].bytes;
+    var cap = caps[0];
+    for (caps[1..]) |next| {
+        var want: [prompt.Caches.max_planes]prompt.Caches.Plane = undefined;
+        _ = prompt.Caches.planeSizes(&cfg, layers, next, 16, &want);
+        for (0..n) |i| {
+            if (next > cap) try vp.grow(@intCast(i), want[i].bytes) else _ = try vp.shrink(@intCast(i), want[i].bytes);
+        }
+        cap = next;
+        for (0..n) |i| {
+            try std.testing.expectEqual(bases[i], vp.addressOf(@intCast(i))); // (1) the baked bases did not move
+            try std.testing.expect(vp.b.isMapped(bases[i], want[i].bytes)); // (2) every row of the pool is backed
         }
     }
-
-    /// The rounds' GPU clocks (a profile): the forward's start and each stretch's ends, for its gaps.
-    pub fn useClock(m: *Model, marks: u8) !void {
-        m.rd.clk_marks = marks == 1 or marks == 3;
-        // TF_DS_CLOCK_RATIO: the compress ratio whose layers mode 3 times (2 unless set)
-        const r: u8 = if (std.c.getenv("TF_DS_CLOCK_RATIO")) |v| std.fmt.parseInt(u8, std.mem.span(v), 10) catch 2 else 2;
-        m.rd.clk_ratio = if (marks == 3) r else null;
-        m.rd.clk_layers = marks == 2 or marks == 3;
-        if (m.rd.clk == 0) m.rd.clk = try m.arena.take((1 + 2 * round.Round.max_clocks) * 8);
+    // the checker can fail: after the last shrink an address a graph captured at the biggest size past the new end is unbacked, and the
+    // gap between planes' stretches is never backed
+    var found_unbacked = false;
+    for (0..n) |i| {
+        var at_max: [prompt.Caches.max_planes]prompt.Caches.Plane = undefined;
+        _ = prompt.Caches.planeSizes(&cfg, layers, most, 16, &at_max);
+        if (!vp.b.isMapped(bases[i] + at_max[i].bytes - 1, 1)) found_unbacked = true;
     }
+    try std.testing.expect(found_unbacked);
+    try std.testing.expect(!vp.b.isMapped(past[0], vp.stride(big[0].bytes))); // a pointer past the old end, over the whole stretch
+}
 
-    /// The rounds' GPU time by phase (eager rounds; --profile 2): a timer on the round.
-    pub fn usePhaseTimer(m: *Model) !void {
-        if (m.timer != null) return;
-        const t = try m.gpa.create(round.PhaseTimer);
-        errdefer m.gpa.destroy(t);
-        t.* = try round.PhaseTimer.init(m.gpa, m.ctx.d);
-        m.timer = t;
-        const pt = try m.gpa.create(round.PhaseTimer);
-        errdefer m.gpa.destroy(pt);
-        pt.* = try round.PhaseTimer.init(m.gpa, m.ctx.d);
-        m.ptimer = pt;
-        m.rd.timer = t;
+test "the round's graphs take plane bases of the whole pool: no pointer arithmetic on a cache plane, no pool end" {
+    // (the source half of the argument above: a captured address is cs.<plane>[li] itself, never cs.<plane>[li] + something or cs.cap)
+    const src = @embedFile("round.zig");
+    const planes = [_][]const u8{ "cs.comp_codes[", "cs.comp_scales[", "cs.idx_codes[", "cs.idx_scales[", "cs.raw_kv[", "cs.raw_score[" };
+    var uses: usize = 0;
+    for (planes) |w| {
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, src, from, w)) |at| {
+            from = at + w.len;
+            const close = std.mem.indexOfScalarPos(u8, src, from, ']').?;
+            const after = std.mem.trimStart(u8, src[close + 1 ..][0..4], " ");
+            try std.testing.expect(after.len == 0 or after[0] == ',' or after[0] == ')' or after[0] == ' ' or after[0] == '}'); // not "+ ..." or "* ..."
+            uses += 1;
+        }
+    }
+    try std.testing.expect(uses >= 8);
+    try std.testing.expect(std.mem.indexOf(u8, src, "cs.cap") == null); // the round never reads the pool's size
+}
+
+test "TF_DS_KV_FREE_TARGET_GIB live: a rank without a virtual-memory pool leaves the pool and says the change applies at the next start; the decision order is fixed" {
+    const src = @embedFile("model.zig");
+    const f = std.mem.indexOf(u8, src, "    fn resizePool(m: *Model").?;
+    const body = src[f .. f + std.mem.indexOf(u8, src[f..], "\n    }\n").?];
+    const novmm = std.mem.indexOf(u8, body, "has no virtual-memory pool").?;
+    try std.testing.expect(std.mem.indexOf(u8, body, "return;") == null or std.mem.indexOf(u8, body, "return;").? > std.mem.indexOf(u8, body, "try star.allGather(").?); // a rank without the pool never leaves before the gather
+    const sync = std.mem.indexOf(u8, body, "try m.syncPoolStreams();").?;
+    const gather = std.mem.indexOf(u8, body, "try star.allGather(").?;
+    const decide = std.mem.indexOf(u8, body, "kv.decideResize(").?;
+    const move = std.mem.indexOf(u8, body, "m.caches.resizeVmm(").?;
+    const ballot = std.mem.indexOf(u8, body, "try star.allGather(&[1]u8{failed}, ballots[0..world]);").?;
+    const commit = std.mem.indexOf(u8, body, "m.pool_cap = d.positions;").?;
+    // idle first, then every rank's offer, one decision, the move, the ranks' ballot on it, and only then the new size
+    try std.testing.expect(novmm < sync and sync < gather and gather < decide and decide < move and move < ballot and ballot < commit);
+    try std.testing.expect(std.mem.indexOf(u8, body, "m.kv_live_floor") != null); // rank 0's extents in use bound a shrink
+    try std.testing.expect(std.mem.indexOf(u8, src, "@backingInt(live_config.Slot.kv_free_target) => try m.resizePool(version, it.value),") != null);
+    // lanes sets the floor from the extents in use just before the frame is applied
+    const lsrc = @embedFile("lanes.zig");
+    const lf = std.mem.indexOf(u8, lsrc, "fn liveCfg(").?;
+    const lb = lsrc[lf .. lf + std.mem.indexOf(u8, lsrc[lf..], "\n    }\n").?];
+    try std.testing.expect(std.mem.indexOf(u8, lb, "m.kv_live_floor = held.end;").? < std.mem.indexOf(u8, lb, "try m.applyCfg(version").?);
+}
+
+test "TF_DS_KV_FREE_TARGET_GIB live: Model.open makes the free target live exactly when the pool is in virtual memory" {
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    const caches = std.mem.indexOf(u8, body, "m.caches = if (o.kv_vmm)").?;
+    const able = std.mem.indexOf(u8, body, "live_config.setAble(.kv_free_target, m.kv_vmm != null);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(able > caches); // once the pool exists, so the bit says what the pool is
+}
+
+test "TF_DS_KV_FREE_TARGET_GIB live: the streams a resize waits for are every Stream field of the model and the round" {
+    const S = struct {
+        // the Stream fields of T (a Stream or an optional one), as names
+        fn names(comptime T: type) []const []const u8 {
+            comptime var out: []const []const u8 = &.{};
+            const info = @typeInfo(T).@"struct";
+            inline for (info.field_names, info.field_types) |name, FT| {
+                const is = FT == cuda.Stream or FT == ?cuda.Stream or FT == [2]cuda.Stream;
+                if (is) out = out ++ &[_][]const u8{name};
+            }
+            return out;
+        }
+        fn same(comptime want: []const []const u8, comptime got: []const []const u8) !void {
+            try std.testing.expectEqual(want.len, got.len);
+            inline for (want, got) |w, g| try std.testing.expectEqualStrings(w, g);
+        }
+    };
+    // a stream added to either struct fails here until poolStreams waits for it (or says why it cannot touch the pool)
+    try S.same(&Model.pool_stream_models, S.names(Model));
+    try S.same(&Model.pool_stream_round, S.names(round.Round));
+}
+
     try std.testing.expect(std.mem.indexOf(u8, code, "return memoryRefusal(buf, what, true, pass_rows, (lanes - 1) * pairEstimate(pass_rows, lane_arena) + pair_guard_bytes, free, v);") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "const what = if (lanes >= 3) \"the second and third passes (TF_DS_ROCI_STAGGER_LANES=3)\" else \"the second pass\";") != null);
     }
@@ -5436,11 +5854,24 @@ test "the start-up settings carry this rank's options and the math switches it r
     try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), startSettings(o).idx_rb);
 }
 
-    pub fn roundLogits(m: *Model, R: usize) ![]const f32 {
-        const d = m.ctx.d;
-        try m.synchronize();
-        try d.check(d.api.cuMemcpyDtoH_v2(m.logits.ptr, m.rd.logits, R * m.vocab * 4), "cuMemcpyDtoH");
-        return m.logits[0 .. R * m.vocab];
+test "the KV pool is the ranks' vote: decided after the chunk and before the caches, from the vote only in the free-target mode, and every rank's ledger is gathered at the start's end" {
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    const chunk = std.mem.indexOf(u8, body, "m.ch = try prompt.Chunk.init(").?;
+    const vote = std.mem.indexOf(u8, body, "const pool = try votePool(m, o, c);").?;
+    const caches = std.mem.indexOf(u8, body, "m.caches = if (o.kv_vmm) try openVmmCaches(m, ctx, c, pool) else try prompt.Caches.init(&m.eng, &m.arena, pool, m.streams);").?;
+    try std.testing.expect(chunk < vote and vote < caches);
+    try std.testing.expect(std.mem.indexOf(u8, body, "prompt.Caches.init(&m.eng, &m.arena, o.pool") == null); // no other way to size the pool
+    try std.testing.expect(std.mem.indexOf(u8, body, "m.pool_cap = pool;").? > vote);
+    const gather = std.mem.indexOf(u8, body, "try gatherLedger(m, free_after_pool);").?;
+    try std.testing.expect(gather > caches and gather < std.mem.indexOf(u8, body, "        return m;").?);
+    // without a free target each rank keeps its own pool (the recipe's rule: a follower's may be larger), as before the vote
+    const f = std.mem.indexOf(u8, src, "fn votePool(").?;
+    const vbody = src[f .. f + std.mem.indexOf(u8, src[f..], "\n}\n").?];
+    try std.testing.expect(std.mem.indexOf(u8, vbody, "if (d.verdict == .auto) d.pool else o.pool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vbody, "m.comm.host.star") != null); // the host star, never the device communicator
+}
 
 test "a cfg frame's keep-ahead: on only where the start verified it can run, off always, unset is the start's; the other ranks' rule is the same function" {
     var m: Model = undefined;
@@ -5709,11 +6140,13 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
 test "TF_DS_ENGRAM_PARTNER and TF_DS_ENGRAM_KEEP_AHEAD: a failed precondition falls back with one warning when it is the default and refuses by name when the operator set it" {
     const src = @embedFile("model.zig");
     // the partner split: the refusal is the operator's branch, the warning and the cleared flag the default's, and no lane is opened before either
+    const at = std.mem.indexOf(u8, src, "fn openPartner(").?;
     const v = std.mem.indexOf(u8, body, "speed_defaults.verdict(why orelse").?;
     const refuse = std.mem.indexOf(u8, body[v..], ".refuse => {").?;
     const refused = std.mem.indexOf(u8, body[v..], "return error.PartnerRefused;").?;
     const warn = std.mem.indexOf(u8, body[v..], "std.log.warn(\"TF_DS_ENGRAM_PARTNER: off:").?;
     try std.testing.expect(refuse < refused and refused < warn and warn < cleared);
+    try std.testing.expect(std.mem.indexOf(u8, body, "openLane(").? > v + cleared);
     // keep-ahead: the shared reader pool refuses only a switch the operator set
     const ka = std.mem.indexOf(u8, src, "fn useKeepAhead(").?;
     const kv = std.mem.indexOf(u8, kb, "speed_defaults.verdict(why, speed_defaults.defaulted(\"TF_DS_ENGRAM_KEEP_AHEAD\")) == .fallback").?;
@@ -5735,6 +6168,7 @@ test "TF_DS_ENGRAM_PARTNER and TF_DS_ENGRAM_KEEP_AHEAD: a failed precondition fa
 
 test "TF_DS_ROCI_STAGGER: a failed precondition falls back with one warning when it is the default and refuses by name when the operator set it" {
     const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "fn openPair(").?;
     const v = std.mem.indexOf(u8, body, "speed_defaults.verdict(why orelse").?;
     const refuse = std.mem.indexOf(u8, body[v..], ".refuse => {").?;
     const refused = std.mem.indexOf(u8, body[v..], "return error.StaggerRefused;").?;
@@ -5742,6 +6176,7 @@ test "TF_DS_ROCI_STAGGER: a failed precondition falls back with one warning when
     try std.testing.expect(refuse < refused and refused < warn and warn < off); // the refusal is the operator's branch, the fallback the other
     // the fallback names what it costs and runs before any allocation of the second pass
     try std.testing.expect(std.mem.indexOf(u8, body[v..], "speed_defaults.costOf(\"TF_DS_ROCI_STAGGER\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "m.two_b = try prompt2d.Two.init").? > std.mem.indexOf(u8, body, "prompt2d.roci_stagger_asked = false;").?);
     try std.testing.expect(std.mem.indexOf(u8, body, "needs passes of two resume units (TF_DS_PASS_ROWS=4096)") != null);
 }
 

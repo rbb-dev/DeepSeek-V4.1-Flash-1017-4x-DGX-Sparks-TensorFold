@@ -11,6 +11,7 @@ const lanes = @import("lanes");
 const api = @import("engine_api.zig");
 const pc = @import("prompt_cache.zig");
 const share_mod = @import("lane_host_share.zig");
+const live_config = @import("live_config.zig");
 const Allocator = std.mem.Allocator;
 const Id = api.Id;
 const Request = api.Request;
@@ -75,6 +76,10 @@ pub const LaneHost = struct {
     /// TF_DS_PROMPT_TRACE=1: one log line per prompt step the host serves or holds back, with the order's reading of every
     /// admitted prompt, so a prompt that waited can be read off the engine log. Off: nothing is read or written.
     trace_fill: bool = false,
+    /// The block of live settings this host takes from once a loop turn (null: none), the version it has taken, and the rounds beside
+    /// the start gave (what `unset` returns to).
+    live: ?*live_config.Block = null,
+    live_seen: u64 = 0,
     /// What every rank was last told for each slot of class A (`unset`: nothing yet, the start's): a cfg frame goes out only when a
     /// slot's published value differs.
     live_sent: [live_config.slot_count]u64 = @splat(live_config.unset),
@@ -336,6 +341,7 @@ pub const LaneHost = struct {
         enforced.loop_guard = true;
         var share = share_mod.Share.fromEnv();
         share.rounds = info_.rounds_beside;
+        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced, .share = share, .live = &live_config.block, .trace_fill = std.c.getenv("TF_DS_PROMPT_TRACE") != null };
     }
 
     pub fn start(h: *LaneHost) !void {
@@ -1159,6 +1165,14 @@ pub const LaneHost = struct {
         };
         if (tele) |t| h.tele = t;
         if (h.spill_asked) h.spill = spill;
+    pub fn liveTurn(h: *LaneHost) void {
+        const blk = h.live orelse return;
+            var next = h.share;
+            next.rounds = want;
+                h.share.rounds = want;
+                h.share.due = 0;
+                std.log.info("TF_DS_ROUNDS_BESIDE is now {d} (taken live at version {d})", .{ want, h.live_seen });
+            }
         // the slots of class A: one cfg frame to every rank when one changed
         h.sendCfg(snap.vals);
     }
@@ -1185,11 +1199,14 @@ pub const LaneHost = struct {
             return;
         };
         if (!sent) std.log.warn("a live change of class A was published and this backend has no frame for it: it applies at the next start", .{});
+
     fn run(h: *LaneHost) void {
         while (true) {
             ends.takeCancels(h);
             rows_host.answer(h);
             learn.refuse(h);
+            h.liveTurn();
+            h.takeCancels();
             while (h.admitOne()) {}
             // restores, staged writes and deferred retries, between rounds, between prompt chunks and at idle (only with
             // work in flight)

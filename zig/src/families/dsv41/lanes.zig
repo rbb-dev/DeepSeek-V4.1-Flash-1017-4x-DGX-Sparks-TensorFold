@@ -1686,6 +1686,7 @@ pub const Lanes = struct {
         // a pass runs block rows a stream through the decode window's linears (prompt.grouped: 128 rows at most), so more
         // streams than 128 / block (25 at the 5-row block) draft in passes of that many, each its own wire message
         // (TensorFold ba03026c; the followers are unchanged)
+        const per = @max(1, draft_pass_rows / block);
         var g0: usize = 0;
         while (g0 < n) : (g0 += per) {
             const g1 = @min(n, g0 + per);
@@ -1981,12 +1982,28 @@ pub const Lanes = struct {
         const self = of(ptr);
         const m = self.m;
         if (items.len > live_config.CfgFrame.max_items) return error.CfgTooLong;
+        const held = self.poolHeld();
+        m.kv_live_floor = held.end;
+        m.kv_live_loading = held.loading; // (a live resize of the KV pool never goes under what a stream or a kept state holds)
         var resolved: [live_config.CfgFrame.max_items]live_config.CfgItem = undefined;
         if (try self.begin(.cfg)) {
             var body: [live_config.CfgFrame.head_len + 5 * live_config.CfgFrame.max_items]u8 = undefined;
             try self.wire.buf.appendSlice(self.gpa, try live_config.CfgFrame.encode(&body, version, flags, resolved[0..items.len]));
             try self.flush();
         }
+    }
+
+    /// The end of the highest extent a stream or a kept state holds in the pool (a stale state's room is free).
+    const PoolHeld = struct { end: usize, loading: u32 };
+    fn poolHeld(self: *Lanes) PoolHeld {
+        var h: PoolHeld = .{ .end = 0, .loading = 0 };
+        var it = self.streams.valueIterator();
+        while (it.next()) |l| h.end = @max(h.end, l.end);
+        for (self.snaps.items) |sn| if (!sn.stale) {
+            h.end = @max(h.end, sn.end);
+            if (sn.loading) h.loading += 1; // a disk restore whose unpack has not been installed
+        };
+        return h;
     }
 
     /// One snap_sync frame to the other ranks: the bytes after the frame header are a sub-op and its fields (spill_wire).
@@ -2350,6 +2367,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model, mirror: ?*FollowMirror) !void {
     where.head_probe = headProbe;
     defer where.head_probe = null;
     // (with a store of its own: a keep's frame also carries the kept ids and, with pictures, the raw ids)
+    const buf = try gpa.alloc(u8, (@max(m.pool_cap, m.pool_ceiling) + 1) * (if (mirror != null) @as(usize, 8) else 4) + (1 << 16)); // (a live resize may take the pool up to its ceiling)
     defer gpa.free(buf);
     var seqs: [max_streams]std.ArrayList(i32) = @splat(.empty);
     defer for (&seqs) |*q| q.deinit(gpa);
@@ -2917,6 +2935,31 @@ test "a restore's destination is held back from placement, never a victim and ne
     loading.restored = true;
     try std.testing.expect(ln.usable(&loading, 8 * c));
     try std.testing.expect(ln.spill == null);
+}
+
+test "a live KV resize sees a restore loading and the end of every extent held: a stale state's room is free" {
+    const c = model.chunk_rows;
+    var m: Model = undefined;
+    m.watch = .{};
+    m.pmem = .{};
+    m.pool_cap = 16 * c;
+    const gpa = std.testing.allocator;
+    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = null };
+    defer ln.snaps.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), ln.poolHeld().end);
+    var loading: Snap = .{ .id = 1, .at = 4 * c, .base = 0, .end = 4 * c, .buf = undefined, .loading = true };
+    var kept: Snap = .{ .id = 2, .at = 4 * c, .base = 4 * c, .end = 9 * c, .buf = undefined };
+    try ln.snaps.append(gpa, &loading);
+    try ln.snaps.append(gpa, &kept);
+    var h = ln.poolHeld();
+    try std.testing.expectEqual(@as(usize, 9 * c), h.end);
+    try std.testing.expectEqual(@as(u32, 1), h.loading);
+    kept.stale = true; // its room is free again
+    h = ln.poolHeld();
+    try std.testing.expectEqual(@as(usize, 4 * c), h.end);
+    try std.testing.expectEqual(@as(u32, 1), h.loading);
+    loading.loading = false; // installed on every rank
+    try std.testing.expectEqual(@as(u32, 0), ln.poolHeld().loading);
 }
 
 test "a restore's destination holds the waiting prompt's room past its rows while that fits clear of the others" {

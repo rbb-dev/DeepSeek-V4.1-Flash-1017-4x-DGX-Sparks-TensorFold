@@ -73,6 +73,8 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("usage: tensorfold-native capabilities --json | models | info MODEL | pull REPO[@REVISION] | slide rollback FOLDER | serve MODEL [flags] | benchmark MODEL [flags]\n", .{});
         return 2;
     }
+        api.settings.bootstrap(a, io, init.environ_map, init.environ_map.get("TF_ENGINE_CFG"), log, true, &cfg_problem) catch return fail(cfg_problem);
+            @import("admin_state.zig").release = @import("build_options").version;
     const started = std.Io.Clock.awake.now(io).toNanoseconds();
     var u: cli.Usage = .{};
     var args = cli.parse(a, argv[2..], &u) catch |e| switch (e) {
