@@ -1,6 +1,8 @@
 name: Zig format
 
 on:
+  push:
+    branches: [deepseek-v41-zig-tp4]
   pull_request:
     types: [opened, synchronize, reopened]
 

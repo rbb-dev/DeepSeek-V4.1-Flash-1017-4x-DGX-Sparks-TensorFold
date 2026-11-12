@@ -1,6 +1,8 @@
 name: No GPU
 
 on:
+  push:
+    branches: [deepseek-v41-zig-tp4]
   pull_request:
     types: [opened, synchronize, reopened]
 
@@ -30,8 +32,10 @@ jobs:
       # Cortheon's readers of untrusted web bytes under the fuzz harness: seeds, 100,000 edits, linear time.
       - name: zig build fuzz-cortheon
         run: zig build fuzz-cortheon
-      # The lean rule (600-line files, one-line comments within 120 columns): no problem the base branch lacks.
+      # The lean rule (600-line files, one-line comments within 120 columns): no problem the base branch lacks. A pull
+      # request only: a push has no base branch to compare with.
       - name: lean check
+        if: github.event_name == 'pull_request'
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
@@ -41,3 +45,19 @@ jobs:
           (cd ../lean-base && python3 tools/zig/lean_check.py > ../lean-base.txt || true)
           python3 tools/zig/lean_check.py > ../lean-head.txt || true
           python3 tools/zig/lean_new.py ../lean-base.txt ../lean-head.txt
+
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # The scripts', the setup's and the tools' tests: no GPU and no Sparks (stand-ins for ssh, docker, sudo and the GPU).
+      - name: python tests
+        run: python3 -m unittest discover -s tests
+      # Every environment name the engine reads has a schema row, and the generated settings table matches the schema.
+      - name: settings schema
+        run: python3 tools/schema/check_env_schema.py
+      # The RDMA copy's own tests, on its loopback backend (no RDMA hardware or headers).
+      - name: fabric-xfer tests
+        run: make -C tools/fabric-xfer test
