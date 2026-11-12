@@ -630,12 +630,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "H",
    "who": [
     "admin"
    ],
    "label": "Whole passes when prompts fill together",
+   "doc": "When several prompts are being processed at once, each keeps whole-size passes and they take turns, instead of 2,048-row passes. Measured 16% more throughput with two or three cold 147,000-token prompts and 14% faster first tokens, replies equal. A decode stream or waiting request still cuts a pass short. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/prompt2d.zig:927",
@@ -651,12 +653,14 @@
    "unit": "tokens",
    "min": 0,
    "max": null,
+   "default": "0",
    "default_check": "none",
    "apply": "H",
    "who": [
     "admin"
    ],
    "label": "Where larger prompt passes start",
+   "doc": "Where a fresh prompt's larger passes may begin: 0 starts them at its first row (fresh 4,000 to 19,000-token prompts reached the first token 8 to 9% sooner, replies equal), 8192 is the built-in default where the first four 2,048-row units stay small. On by default: it is a measured win, so an engine started with nothing set runs it; set it to the previous value 8192 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/model.zig:245",
@@ -672,12 +676,14 @@
    "unit": "rows",
    "min": 2048,
    "max": null,
+   "default": "4096",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Largest prompt pass",
+   "doc": "The most rows a prompt pass runs when nothing is decoding, filling or waiting: 2048 (default) or 4096. 4096 made a cold 147,000-token prompt 13.7% faster alone and about 0.3% beside decoders, with identical replies. Changing it makes cached conversations on the SSD recompute once. On by default: it is a measured win, so an engine started with nothing set runs it; set it to the previous value 2048 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/model.zig:187",
@@ -768,12 +774,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Expert tiles read 128-byte weight rows",
+   "doc": "Prompt expert kernels stage each weight row 128 bytes at a time instead of 64. Same arithmetic; measured about 0.6 to 0.7% faster. Every node must agree. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/model.zig:1686",
@@ -789,12 +797,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Prompt split-GEMM loop",
+   "doc": "Runs a prompt chunk's split FP8 matrix multiplies on a restructured loop in one of four tile layouts (A, B, C6, C7, or 1 for the per-shape table). Outputs are identical; about 1% faster with the table. Every node must agree. On by default: it is a measured win, so an engine started with nothing set runs it; set it to the previous value 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [
     "0",
     "1",
@@ -840,12 +850,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "H",
    "who": [
     "admin"
    ],
    "label": "Decode rounds between prompt chunks",
+   "doc": "While a long prompt is processed in chunks, live streams get a decode round between chunks and queued requests may be admitted too. Unset runs the whole prompt first. It keeps other users' replies flowing at some cost to the long prompt. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/lanes.zig:1018",
@@ -1028,12 +1040,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Candidates before the drafter's absorb",
+   "doc": "On a decode round, reads the first candidate tokens back to the host while the drafter is still absorbing the verified rows, so the GPU is not left idle waiting for the host to draw the next round. Same kernels and same replies; a small speed gain for single streams. Applies on the first server process. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/model.zig:1828",
@@ -1072,12 +1086,14 @@
    "unit": "",
    "min": 4,
    "max": 64,
+   "default": "16",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Matching tokens a copy needs",
+   "doc": "How many tokens of the current text must match earlier text before the engine drafts a copied continuation (4 to 64; built-in 8). A higher number copies less often, which helped slightly on prose where copies rarely pay and made no difference on copy-heavy edits. On by default: it is a measured win, so an engine started with nothing set runs it; set it to the previous value 8 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/lanes.zig:3143",
@@ -1093,12 +1109,14 @@
    "unit": "rows",
    "min": 0,
    "max": 17,
+   "default": "17",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Longest copied continuation",
+   "doc": "Lets a single stream verify a copied continuation of up to this many rows in one round (7 to 17; 0 or unset keeps the normal short windows). Long copies make edits that repeat existing text much faster; it changes speed only, not replies. On by default: it is a measured win, so an engine started with nothing set runs it; set it to the previous value 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/lanes_main.zig:234",
@@ -1229,12 +1247,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "fp4",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Drafter output head precision",
+   "doc": "Chooses how the drafter's output head is stored: fp8 (default), fp4 (a quarter of the bf16 bytes; measured 1 to 2% faster for one stream), or bf16 (full size). A smaller head changes only what the drafter proposes, not what the model accepts. On by default: it is a measured win, so an engine started with nothing set runs it; set it to the previous value fp8 to turn it off (the engine says at the start when it cannot run).",
    "values": [
     "fp8",
     "fp4",
@@ -1396,12 +1416,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Candidates from each node's head columns",
+   "doc": "For sampled decode rounds, each node ranks its own quarter of the output head and rank 0 merges the results, so whole rows of logits are not exchanged. Measured 0.6 to 0.7% faster on sampled text, replies byte-identical. Every node must agree. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/model.zig:1713",
@@ -1417,12 +1439,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Greedy tokens from head columns",
+   "doc": "Same idea as the candidate setting but for greedy rounds: each node finds the best token in its own head columns and rank 0 picks the winner, avoiding the whole-row exchange. Measured about 1.4% faster on code at 16 streams, replies identical. Every node must agree. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/model.zig:1714",
@@ -1508,12 +1532,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "H",
    "who": [
     "admin"
    ],
    "label": "GPU candidate sampling",
+   "doc": "For sampled (non-greedy) decode rounds, picks the top candidates on the GPU instead of copying the whole logits row to the host. Set to 1 to turn on; any other value uses whole logits. Speed only. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/lanes.zig:702",
@@ -1851,12 +1877,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Collect from every peer at once",
+   "doc": "In the decode exchanges the copy-out reads every peer's data at once instead of peer by peer, so the network reads overlap. Measured about 0.5% faster for one stream; replies unchanged. Every node must agree. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/model.zig:2629",
@@ -2037,12 +2065,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "RDMA proxies nap instead of polling",
+   "doc": "Each RDMA proxy with nothing in flight naps on its doorbell with an Arm wait instruction instead of polling at 100% of a core. Measured 94 to 99% napping, small-core zones 3 to 7 C cooler, speed and replies unchanged. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/rdma.zig:2408",
@@ -2738,12 +2768,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "A",
    "who": [
     "admin"
    ],
    "label": "Engram rows read pass by pass",
+   "doc": "The Engram reader works through a whole prompt pass a layer at a time instead of one chunk's layers at a time. With 4,096-row passes this stops two nodes stalling 100 to 350 ms before layers whose rows are not cached, and the first prompt after a start does not run about 21% slower. Replies equal. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/prompt.zig:2926",
@@ -2759,12 +2791,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Engram reads by asynchronous disk I/O",
+   "doc": "Reads each decode round's Engram rows with Linux asynchronous direct I/O, so many reads are in flight at once. Needed by the keep-ahead option. Disk-read behaviour only; replies are unchanged. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "name",
    "first_use": "families/dsv41/native.zig:527",
@@ -3104,12 +3138,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Engram rows in pinned memory",
+   "doc": "The Engram reader stages its rows in pinned host memory, so uploading them to the GPU does not make the host wait. A speed option for prompt processing. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "name",
    "first_use": "families/dsv41/model.zig:83",
@@ -3125,12 +3161,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Pre-fault Engram row cache",
+   "doc": "Touches the whole Engram row cache at start in 2 MiB pages, so the first prompt after a start does not pay for page faults (the first cold prompt was about 2.75% slower). Costs about 45 ms per node at start; replies equal. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/model.zig:2395",
@@ -4409,12 +4447,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Prompt attention from packed latents",
+   "doc": "A prompt chunk's sparse attention reads the packed FP4 latents directly (unpacked in hardware) instead of rebuilding their values first. Measured about 1.1% faster alone and 1.4% beside decoding. It is part of the SSD cache's identity, so changing it makes cached conversations recompute. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/model.zig:1705",
@@ -4430,12 +4470,14 @@
    "unit": "rows",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Plain bf16 GEMMs by 16-row tile",
+   "doc": "A prompt chunk's plain bf16 matrix multiplies (the indexer's weights projection) give each GPU block a 16-row tile instead of at most 64 blocks sharing the rows. Each tile computes identically, so outputs keep their bits. Every node must agree. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/model.zig:1685",
@@ -4521,12 +4563,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Skip idle expert rows early",
+   "doc": "Decode expert kernels' blocks beyond the experts active in the round return at once instead of running idle. A speed option for decoding. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/mx.zig:367",
@@ -4611,12 +4655,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Expert tile list built once",
+   "doc": "A prompt chunk's expert grouping builds the tile list in one launch instead of a scan plus two list builds. Off by default; every node must agree. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/model.zig:1682",
@@ -4724,12 +4770,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Indexer projections on owned rows",
+   "doc": "With the indexer sharded, each node computes the indexer's query and weight projections only for the quarter of rows its scorer reads instead of all 2,048. Each row's arithmetic is unchanged, so the rows read hold identical bytes. Four-node split only; every node must agree. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/model.zig:1684",
@@ -4745,12 +4793,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "2",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Indexer kernel row block",
+   "doc": "Chooses the indexer's kernel variant: 1 is the built-in default, 2 uses the kernel kit's alternative that dequantizes each key tile once per two rows. Part of the computation's identity for the SSD cache. On by default: it is a measured win, so an engine started with nothing set runs it; set it to the previous value 1 to turn it off (the engine says at the start when it cannot run).",
    "values": [
     "1",
     "2"
@@ -4769,12 +4819,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Shard the indexer across nodes",
+   "doc": "In a full four-node prompt chunk, each node scores only its own quarter of the rows for the indexer layers before the candidate source, instead of every node scoring all rows. A speed option for long prompts; every node must agree. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/prompt2d.zig:1620",
@@ -4790,12 +4842,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Indexer scores from packed keys",
+   "doc": "A prompt chunk's indexer scores read the packed FP4 keys directly with hardware unpacking instead of rebuilding them first. Same bits, measured about 1.6% faster alone and 1.7% beside decoding. Part of the SSD cache's identity. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/model.zig:1707",
@@ -4834,12 +4888,14 @@
    "unit": "layers",
    "min": 0,
    "max": 31,
+   "default": "4",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Prompt issue lead",
+   "doc": "Limits how many layers ahead of the GPU the host may issue a prompt pass (1 to 31; 0 or unset is no limit). Without a limit the host can run a whole pass ahead and fill the launch queue, which can stall the engine thread. On by default: it is a measured win, so an engine started with nothing set runs it; set it to the previous value 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "name",
    "first_use": "families/dsv41/model.zig:1838",
@@ -5111,12 +5167,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Block-scaled MMA, exact arithmetic",
+   "doc": "Selects the exact form of the block-scaled kernels: each K block's multiply from zero then the same float add as the standard kernel, so replies are byte-identical. Measured 2.2% faster alone and 2.1% beside decoding. A multiply whose weight scales leave the proven range stays on the standard kernel. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/model.zig:1699",
@@ -5225,12 +5283,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Quantize attention input once",
+   "doc": "Attention's front quantizes its input once for both the wq_a and wkv projections instead of once for each, saving a launch. Same results; every node must agree. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/model.zig:1680",
@@ -5246,12 +5306,14 @@
    "unit": "",
    "min": null,
    "max": null,
+   "default": "1",
    "default_check": "none",
    "apply": "R",
    "who": [
     "admin"
    ],
    "label": "Indexer top-k in one launch",
+   "doc": "The indexer's pruned top-k for prompt rows past 4,096 keys runs as one launch per row block instead of a chain of steps. Picks match the exact result. Every node must agree. On by default: it is a measured win, so an engine started with nothing set runs it; set it to 0 to turn it off (the engine says at the start when it cannot run).",
    "values": [],
    "seed": "params",
    "first_use": "families/dsv41/model.zig:1683",

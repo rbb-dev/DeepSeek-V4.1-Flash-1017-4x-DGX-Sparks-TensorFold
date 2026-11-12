@@ -1051,6 +1051,12 @@ pub const keepalive = @import("keepalive.zig");
 /// Every setting the engine reads, and the engine.cfg reader (settings.zig).
 pub const settings = @import("settings.zig");
 
+/// The speed settings that are on when the operator sets nothing (speed_defaults.zig).
+pub const speed_defaults = @import("speed_defaults.zig");
+
+/// Which essential speed features run and why not (speed_report.zig): the start-up block and /status.
+pub const speed_report = @import("speed_report.zig");
+
 /// engine.history.jsonl: the record of every change to the settings (settings_history.zig).
 pub const settings_history = @import("settings_history.zig");
 
@@ -1089,6 +1095,8 @@ test {
     _ = @import("settings.zig");
     _ = @import("settings_test.zig");
     _ = @import("settings_history.zig");
+    _ = @import("speed_defaults.zig");
+    _ = @import("speed_report.zig");
     _ = @import("settings_history_test.zig");
     _ = @import("kv_pool.zig");
     _ = @import("peer_mem.zig");

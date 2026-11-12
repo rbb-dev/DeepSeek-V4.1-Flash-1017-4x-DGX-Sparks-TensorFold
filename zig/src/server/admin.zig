@@ -531,6 +531,7 @@ pub fn statusValue(srv: *Server, a: Allocator, who: Who) !Value {
     try cv.put(a, "pending", .{ .array = pend });
     try root.put(a, "config", .{ .object = cv });
     try putPoolStatus(a, root);
+    try putSpeedFeatures(a, root);
     // the build's release (empty where the server's main set none) and each rank's memory NOW: rank 0's MemAvailable read on this
     // request, each follower's last report (they send one every 2 s over a link of their own: families/dsv41/peer_mem.zig) with its
     // age. A rank that has not reported is a row without figures, never zeros.
@@ -946,6 +947,25 @@ pub fn ledger(a: Allocator) !Value {
 
 /// status.kv_pool and status.memory: the pool as the start sized it and each Spark's memory at the start. Both are left out
 /// until a start has recorded them: a group with no source is never zero-filled.
+/// `speed_features`: every essential speed feature with whether it runs, whether the operator chose it off (`asked`), the reason in
+/// plain words and what it costs without it (core/speed_report.zig; the same list the start printed as one block).
+fn putSpeedFeatures(a: Allocator, root: *json.Object) !void {
+    const r = try a.create(api.speed_report.Report);
+    api.speed_report.current(r);
+    const rows = try a.alloc(Value, r.n);
+    for (r.items[0..r.n], rows) |f, *slot| {
+        const o = try json.newObject(a);
+        try o.put(a, "name", str(f.name));
+        try o.put(a, "env", str(f.env));
+        try o.put(a, "on", .{ .bool = f.on });
+        try o.put(a, "asked", .{ .bool = f.asked });
+        try o.put(a, "reason", str(try a.dupe(u8, f.reason)));
+        try o.put(a, "cost", str(f.cost));
+        slot.* = .{ .object = o };
+    }
+    try root.put(a, "speed_features", .{ .array = rows });
+}
+
 fn putPoolStatus(a: Allocator, root: *json.Object) !void {
     if (!kv_pool.ready.load(.acquire)) return;
     const rep = &kv_pool.report;

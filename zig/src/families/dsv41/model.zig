@@ -111,6 +111,8 @@ pub fn readWorkerEnv() void {
 }
 /// The settings table and the engine.cfg reader, which every rank runs (the followers call it from lanes_main).
 pub const cfg_settings = engine_api.settings;
+/// The speed settings that are on when nothing is set (core/speed_defaults.zig), applied by the follower binary as rank 0 applies them.
+pub const speed_defaults = engine_api.speed_defaults;
 /// The speed report (core/speed_report.zig): the start report the quality gate's log keeps beside it (lanes_main).
 pub const speed_report = engine_api.speed_report;
 /// The KV pool's vote and ledger (core/kv_pool.zig), where the followers' flags parse their numbers.

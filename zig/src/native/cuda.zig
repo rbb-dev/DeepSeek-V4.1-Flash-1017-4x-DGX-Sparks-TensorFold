@@ -464,6 +464,14 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     };
     // what /health and the start-up line show: the family's own off reason from its start too (h holds the text)
     const shown_spill = startInfo(spill_info, if (h.spill_start) |*st| st else null);
+    // the speed report, once, now that the cache and the tier are decided (a family with no tier has none to report)
+    if (@hasField(@TypeOf(loaded), "spill_info")) api.speed_report.emit(.{
+        .cache_bytes = if (h.cache != null) cache_want else 0,
+        .spill_asked = if (shown_spill) |si| si.settings.asked else false,
+        .spill_on = if (shown_spill) |si| si.settings.asked and si.settings.off == null and si.settings.dir != null and si.settings.gib > 0 else false,
+        .spill_off = if (shown_spill) |si| si.settings.off else null,
+        .spill_gib = if (shown_spill) |si| si.settings.gib else 0,
+    });
     if (@hasField(@TypeOf(loaded), "quiet")) h.quiet = loaded.quiet;
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
     const vision: ?api.LaneVision = if (@hasField(@TypeOf(loaded), "lane_vision")) loaded.lane_vision else null;

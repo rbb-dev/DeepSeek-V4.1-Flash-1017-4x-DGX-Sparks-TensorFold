@@ -983,6 +983,20 @@ test "/requests shows a request still in flight with the tokens its reply holds 
     try std.testing.expect(std.mem.indexOf(u8, gone.body, "\"in_flight\": []") != null);
 }
 
+test "/status lists the speed features: each with its name, whether it is on, the reason and what it costs" {
+    api.speed_report.reset();
+    api.speed_report.noteLine("TF_DS_IDX_U=1: off: the kit's extra set (aot-extra/) did not load (none)");
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open(null, admin_keys_file);
+    defer rig.close();
+    const st = try request(rig.srv, "GET", base("status"), bearer);
+    defer st.free();
+    try std.testing.expectEqual(@as(u16, 200), st.status);
+    try std.testing.expect(std.mem.indexOf(u8, st.body, "\"speed_features\": [") != null);
+    for ([_][]const u8{ "\"name\": \"SSD prompt cache\"", "\"on\": false", "\"reason\":", "\"cost\":", "\"asked\": false", "kit's extra set" }) |want|
+        try std.testing.expect(std.mem.indexOf(u8, st.body, want) != null);
+}
+
 test "/status says whether the server is idle, from its own record" {
     var rig: Rig = .{ .arena = undefined, .tmp = undefined };
     try rig.open(null, admin_keys_file);
@@ -2654,6 +2668,8 @@ test "set: the share, the step rows, the tier's timings and the prompt-step orde
     const rc = try Run.go(&rig, a, "{\"set\": {\"tf_ds_rounds_beside\": 4}, \"wait_ms\": 0}");
     defer rc.free();
     try std.testing.expectEqual(@as(u16, 422), rc.status);
+    // the step rows: a whole number of 2,048-row units within the booted pass rows (4,096 unless TF_DS_PASS_ROWS says another)
+    for ([_][]const u8{ "{\"set\": {\"tf_ds_pass_beside\": 3000}}", "{\"set\": {\"tf_ds_pass_beside\": 8192}}" }, [_][]const u8{ "invalid_value", "above_booted_pass_rows" }) |body, code| {
         const bad = try Run.go(&rig, a, body);
         defer bad.free();
         try std.testing.expectEqual(@as(u16, 422), bad.status);

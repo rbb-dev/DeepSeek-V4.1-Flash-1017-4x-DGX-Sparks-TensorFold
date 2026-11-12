@@ -774,7 +774,9 @@ function speedBox() {
   return {
     el: b.el,
     update(st) {
+      const fs = st.speed_features;
       b.el.hidden = !Array.isArray(fs);
+      if (!Array.isArray(fs)) return;
       const label = (f) => { const o = S.byEnv && S.byEnv.get(f.env); return (o && o.label) || f.name; };
       const grp = (f) => { const o = S.byEnv && S.byEnv.get(f.env); return GROUP_NAMES[o && o.group] || 'Other'; };
       const next = fs.map((f) => f.env + '|' + grp(f)).join(',');
@@ -807,6 +809,7 @@ function speedBox() {
         setTip(r.el, `${f.env}\n${f.reason}${f.on ? '' : '\nWithout it: ' + f.cost}`);
       });
     },
+  };
 }
 
 function kvBox() {

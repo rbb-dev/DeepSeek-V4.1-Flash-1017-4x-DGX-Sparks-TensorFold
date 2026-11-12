@@ -118,6 +118,8 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("tf-dsv41-lanes: {s}\n", .{problem});
             return 1;
         };
+        // the same defaults rank 0 applies, so every rank runs alike (speed_defaults.zig)
+        _ = dsv41.model.speed_defaults.apply(a, init.environ_map, true);
         dsv41.model.speed_defaults.applyFamily(); // before the CUDA context reads them
     }
     var o: dsv41.model.Options = .{
@@ -329,6 +331,7 @@ pub fn main(init: std.process.Init) !u8 {
             .qkv_plain = dsv41.round.qkv_plain,
         });
         // the settings beside the log: the start report as this rank 0 process has it, and its hash in the header
+        var settings_buf: [64 * 1024]u8 = undefined;
         const settings_text = settingsText(&settings_buf);
         {
             const sp = try std.fmt.allocPrint(gpa, "{s}.settings", .{p});

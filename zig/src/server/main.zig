@@ -36,7 +36,16 @@ const not_lanes = "--recall drafts from a record in the lane engine's rounds, " 
 /// The flags past the common ones this binary's backend serves; cli.zig reads them from the root.
 pub const serves = engines.serves;
 
-pub const std_options = engines.std_options;
+/// The log goes where it always went; a switch line ("TF_NAME=1: off: why") is also noted for the speed report.
+pub const std_options: std.Options = .{ .logFn = speedLog };
+
+fn speedLog(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+    if (comptime api.speed_report.watches(format)) {
+        var b: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&b, format, args)) |m| api.speed_report.noteLine(m) else |_| {}
+    }
+    std.log.defaultLog(level, scope, format, args);
+}
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
@@ -78,6 +87,8 @@ pub fn main(init: std.process.Init) !u8 {
         // without the variable nothing is read, logged or changed
         var cfg_problem: []const u8 = "";
         api.settings.bootstrap(a, io, init.environ_map, init.environ_map.get("TF_ENGINE_CFG"), log, true, &cfg_problem) catch return fail(cfg_problem);
+        // the measured speed settings the operator left unset (speed_defaults.zig): after engine.cfg, before anything reads the environment
+        _ = api.speed_defaults.apply(a, init.environ_map, true);
         // a hand edit made while the engine was stopped is recorded as an `imported` row of engine.history.jsonl; a history
         // that cannot be written is told and the start goes on
         if (init.environ_map.get("TF_ENGINE_CFG")) |cfg_path| {
