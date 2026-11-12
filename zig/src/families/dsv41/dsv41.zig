@@ -200,9 +200,11 @@ test {
     _ = @import("spill_state_native_test.zig");
     refAll(@import("land.zig"));
     _ = @import("land_test.zig");
+    _ = @import("no_nccl_test.zig");
     _ = @import("ring_hotpath_test.zig");
     _ = @import("kv_vote_test.zig");
     refAll(@import("kv_vmm.zig"));
+    _ = @import("retired_test.zig");
     _ = @import("readback.zig");
     _ = @import("hybrid_wait.zig");
     refAll(@import("spill_identity.zig"));
