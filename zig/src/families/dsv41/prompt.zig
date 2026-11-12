@@ -186,8 +186,9 @@ pub const Chunk = struct {
     n: usize = 0,
     start: usize = 0,
     ids: u64, // int64 [cap]
-    pos: u64, // int64 [n]: start .. start + n (pos0; a replay cut uploads pos[first:] there)
-    pos0: u64, // int64 [cap]: the chunk's positions (begin() writes them, a replay cut its rows')
+    pos: u64, // int64 [n]: start .. start + n (after a replay cut a view into pos0, pos[first:])
+    pos0: u64, // int64 [cap]: the chunk's positions as begin() wrote them
+    pos1: u64 = 0, // int64 [cap]: a replay cut's positions moved to a 16-byte boundary (replayCut)
     h: u64, // bf16 [cap, hc, D]: the streams
     h_alt: u64, // their second buffer (hc_pre_pf writes the posted streams there)
     x: u64, // bf16 [cap, D]: a block's input rows
@@ -317,6 +318,7 @@ pub const Chunk = struct {
         ch.y_neg = false;
         ch.ids = try a.take(cap * 8);
         ch.pos0 = try a.take(cap * 8);
+        ch.pos1 = try a.take(cap * 8);
         ch.pos = ch.pos0;
         ch.h = try a.take(cap * hc * d * 2);
         ch.h_alt = try a.take(cap * hc * d * 2);
@@ -1647,6 +1649,18 @@ pub fn engramWorkerRows(eh: *EngramHost, j: usize, start: usize, chunk: usize) !
     const ci = (start - eh.wk_start) / chunk;
 }
 
+    // pos[first:]: a view, first * 8 bytes in (its alignment is the one the served kernels were specialized for). An odd
+    // `first` leaves it off a 16-byte boundary, and the kit has no variant for some launches with such a view (a short
+    // chunk's split attention: _sparse_attn_part with SPLITS > 1 and no row bases); the same positions copied, in the
+    // stream's order, to a 16-byte boundary then: the kernels read the same values from an address they were captured for.
+    if ((first * 8) % 16 != 0) {
+        try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(ch.pos1, ch.pos + first * 8, n * 8, e.s.handle), "cuMemcpyDtoDAsync");
+        ch.pos = ch.pos1;
+    } else ch.pos += first * 8;
+}
+
+/// DSpark tap j (_forward_k at a tap layer): a pending MoE gather posted into the streams first (hc_post, not fused),
+/// then h.to(fp32).mean(1).to(bf16) into tap j's rows.
 }
 
 /// The head on the chunk's last row (_forward_k without all_logits): the pending MoE post, collapse_norm of the row with
