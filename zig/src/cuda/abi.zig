@@ -20,6 +20,7 @@ pub const error_not_ready: Result = 600;
 
 pub const stream_non_blocking: c_uint = 1;
 pub const event_disable_timing: c_uint = 2;
+pub const event_blocking_sync: c_uint = 1; // CU_EVENT_BLOCKING_SYNC: a cuEventSynchronize on it blocks instead of busy-waiting
 pub const host_alloc_portable: c_uint = 1;
 pub const host_alloc_devicemap: c_uint = 2;
 pub const host_alloc_writecombined: c_uint = 4;

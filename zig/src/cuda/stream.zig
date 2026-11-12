@@ -4,6 +4,7 @@ const std = @import("std");
 const abi = @import("abi.zig");
 const Driver = @import("driver.zig").Driver;
 const Error = @import("driver.zig").Error;
+const context = @import("context.zig");
 
 pub const Stream = struct {
     d: *const Driver,
@@ -89,7 +90,12 @@ pub const Event = struct {
     /// Timing events cost a little more to record; ordering-only events skip the timestamp.
     pub fn init(d: *const Driver, timing: bool) Error!Event {
         var e: abi.Event = null;
-        try d.check(d.api.cuEventCreate(&e, if (timing) 0 else abi.event_disable_timing), "cuEventCreate");
+        // TF_DS_CUDA_EVENTS=blocking adds CU_EVENT_BLOCKING_SYNC (context.event_flags): a wait on the event sleeps
+        const base: c_uint = if (timing) 0 else abi.event_disable_timing;
+        try d.check(d.api.cuEventCreate(&e, base | context.event_flags), "cuEventCreate");
+        return .{ .d = d, .handle = e };
+    }
+
         return .{ .d = d, .handle = e };
     }
 
@@ -121,3 +127,31 @@ pub const Event = struct {
         return ms;
     }
 };
+
+test "TF_DS_CUDA_EVENTS: every event is made with the flags Context.init read, timing or not" {
+    const Fake = struct {
+        var flags: c_uint = 0xff;
+        fn create(e: *abi.Event, f: c_uint) callconv(.c) abi.Result {
+            e.* = null;
+            flags = f;
+            return abi.success;
+        }
+    };
+    var driver: Driver = undefined;
+    driver.api = undefined; // (only cuEventCreate is read)
+    driver.api.cuEventCreate = &Fake.create;
+    const saved = context.event_flags;
+    defer context.event_flags = saved;
+
+    context.event_flags = 0;
+    _ = try Event.init(&driver, false);
+    try std.testing.expectEqual(abi.event_disable_timing, Fake.flags);
+    _ = try Event.init(&driver, true);
+    try std.testing.expectEqual(@as(c_uint, 0), Fake.flags);
+
+    context.event_flags = abi.event_blocking_sync;
+    _ = try Event.init(&driver, false);
+    try std.testing.expectEqual(abi.event_disable_timing | abi.event_blocking_sync, Fake.flags);
+    _ = try Event.init(&driver, true);
+    try std.testing.expectEqual(abi.event_blocking_sync, Fake.flags);
+}

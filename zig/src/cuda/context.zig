@@ -19,6 +19,30 @@ fn schedName(flags: c_uint) []const u8 {
     };
 }
 
+/// TF_DS_CUDA_EVENTS: how a wait on one of the engine's events waits. Unset, empty or white space: the driver's default
+/// (cuda.h: a cuEventSynchronize on an event made without CU_EVENT_BLOCKING_SYNC busy-waits, whatever the context's
+/// scheduling flags). `blocking`, surrounding white space ignored: every event Context.init's process makes afterwards
+/// carries CU_EVENT_BLOCKING_SYNC, so a thread that waits on one sleeps until the GPU completes it. Any other text is
+/// not taken: the rank says so and keeps the default (how a wait waits changes no result).
+pub fn eventFlags(text: ?[]const u8) error{Invalid}!c_uint {
+    const v = std.mem.trim(u8, text orelse return 0, " \t\r\n");
+    if (v.len == 0) return 0;
+    if (std.mem.eql(u8, v, "blocking")) return abi.event_blocking_sync;
+    return error.Invalid;
+}
+
+/// Reads TF_DS_CUDA_EVENTS into the flags Event.init adds; the start line when it is on, a warning when it is not taken.
+fn eventsApply(text: ?[]const u8) c_uint {
+    const f = eventFlags(text) catch {
+        std.log.warn("TF_DS_CUDA_EVENTS={s}: blocking or unset; the engine's events keep the driver's default wait", .{text.?});
+        return 0;
+    };
+    if (f != 0) std.log.info("TF_DS_CUDA_EVENTS={s}: a wait on the engine's events sleeps until the GPU completes them (CU_EVENT_BLOCKING_SYNC)", .{std.mem.trim(u8, text.?, " \t\r\n")});
+    return f;
+}
+
+/// The flags every Event.init adds to its own (TF_DS_CUDA_EVENTS as Context.init read it).
+pub var event_flags: c_uint = 0;
 
 pub const Context = struct {
     d: *const Driver,
@@ -28,6 +52,7 @@ pub const Context = struct {
     pub fn init(d: *const Driver, ordinal: c_int) Error!Context {
         var dev: abi.Device = 0;
         try d.check(d.api.cuDeviceGet(&dev, ordinal), "cuDeviceGet");
+        event_flags = eventsApply(if (std.c.getenv("TF_DS_CUDA_EVENTS")) |v| std.mem.span(v) else null);
         var ctx: abi.Context = null;
         try d.check(d.api.cuDevicePrimaryCtxRetain(&ctx, dev), "cuDevicePrimaryCtxRetain");
         errdefer _ = d.api.cuDevicePrimaryCtxRelease_v2(dev);
@@ -87,4 +112,15 @@ pub const Context = struct {
     try std.testing.expectEqual(@as(?c_uint, abi.ctx_sched_blocking_sync), try schedFlags("blocking"));
     try std.testing.expectError(error.Invalid, schedFlags("block"));
     try std.testing.expectError(error.Invalid, schedFlags("4"));
+}
+
+test "TF_DS_CUDA_EVENTS: unset or white space adds nothing, blocking adds CU_EVENT_BLOCKING_SYNC, anything else refused" {
+    try std.testing.expectEqual(@as(c_uint, 0), try eventFlags(null));
+    try std.testing.expectEqual(@as(c_uint, 0), try eventFlags(""));
+    try std.testing.expectEqual(@as(c_uint, 0), try eventFlags(" \t\r\n"));
+    try std.testing.expectEqual(abi.event_blocking_sync, try eventFlags("blocking"));
+    try std.testing.expectEqual(abi.event_blocking_sync, try eventFlags(" blocking\n"));
+    try std.testing.expectError(error.Invalid, eventFlags("block"));
+    try std.testing.expectError(error.Invalid, eventFlags("spin"));
+    try std.testing.expectError(error.Invalid, eventFlags("1"));
 }
