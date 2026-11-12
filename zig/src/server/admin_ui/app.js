@@ -450,6 +450,7 @@ function chart(label, tip, color, unit, name) {
   return {
     el: s.el, name,
     setNow(v) { setText(s.now, `${fmt(v)} ${unit}`); },
+    draw(body, atMs, goal) {
       const pts = body.points.map((p) => (p == null ? null : Number(p)));
       const peaks = (body.peaks || []).map((p) => (p == null ? null : Number(p)));
       const n = pts.length;
@@ -471,6 +472,7 @@ function chart(label, tip, color, unit, name) {
       line.setAttribute('d', d);
       area.setAttribute('d', a);
       const gy = goal ? plotY(goal / top).toFixed(1) : '-10';
+      goalLine.setAttribute('y1', gy); goalLine.setAttribute('y2', gy);
       setText(s.g[0], whole.format(top)); setText(s.g[1], whole.format(top / 2));
       xlabels(s.xlab, state.t0, body.step_s * 1000, n);
       s.plot.setAttribute('aria-label', `${label}, last ${Math.round(n * body.step_s / 60)} minutes, ${real.length ? 'highest ' + whole.format(Math.max(...real)) + ' ' + unit : 'no readings yet'}`);
@@ -673,6 +675,8 @@ function tileGrid(specs, cls) {
   return {
     el,
     set(key, value, unit, sub, tip) { const x = t[key]; setText(x.v, value); setText(x.u, unit ? ' ' + unit : ''); setText(x.q, sub || ''); setTip(x.cell, tip); },
+  };
+}
 const quantile = (arr, p) => { if (!arr.length) return null; const a = arr.slice().sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.floor(p * a.length))]; };
 
 function linesBox() {

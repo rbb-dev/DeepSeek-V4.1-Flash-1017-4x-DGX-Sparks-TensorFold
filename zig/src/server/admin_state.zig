@@ -69,6 +69,10 @@ pub fn record(o: *const settings.Option, live: ?[]const u8, file: ?[]const u8, w
 fn taken(o: *const settings.Option, r: Row) bool {
     if (r.live_text == null) return false;
     if (live_config.slotOf(o.id)) |slot| {
+        switch (slot) {
+            .log_polls, .goal_mode, .goal_decode, .goal_prefill, .goal_n_cap => return true,
+            else => {},
+        } // a flag or a goal read on the server's own threads: taken at once
     } else if (!live_config.isFillRow(o.id)) return false;
     return live_config.block.active_version.load(.acquire) >= r.live_version;
 }

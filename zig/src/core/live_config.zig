@@ -31,6 +31,10 @@ pub const Slot = enum(u8) {
     spill_poll_ms,
     keep_ahead,
     graph_cap,
+    goal_mode,
+    goal_decode,
+    goal_prefill,
+    goal_n_cap,
     kv_free_target,
 };
 pub const slot_count = std.enums.values(Slot).len;
@@ -59,6 +63,11 @@ pub const wired = [_]Wired{
     .{ .id = 412, .slot = .keep_ahead },
     // 105 tf_ds_graph_cap (class A): the CUDA graphs kept at most, 0 all; lowering destroys the excess on every rank at the frame
     .{ .id = 105, .slot = .graph_cap },
+    // rows 926-929 tf_goal_*: the goals controller's mode and goals, read on the sampler's thread (never the engine's)
+    .{ .id = 926, .slot = .goal_mode },
+    .{ .id = 927, .slot = .goal_decode },
+    .{ .id = 928, .slot = .goal_prefill },
+    .{ .id = 929, .slot = .goal_n_cap },
     // 505 tf_ds_kv_free_target_gib (class A, with TF_DS_KV_VMM=1): MiB the pool leaves free; every rank resizes it at the frame (0: the start's pool)
     .{ .id = 505, .slot = .kv_free_target },
 };

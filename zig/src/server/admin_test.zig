@@ -207,6 +207,7 @@ const bearer_agent = "Authorization: Bearer " ++ key_agent ++ "\r\n";
 const bearer_other = "Authorization: Bearer " ++ key_other ++ "\r\n";
 const json_head = "Content-Type: application/json\r\n";
 
+const get_routes = [_][]const u8{ "routes", "schema", "config", "status", "ledger", "requests", "series?name=decode_tps", "goals", "logs", "keys", "history", "leases", "policy" };
 
 fn base(comptime name: []const u8) *const [admin.prefix.len + 1 + name.len]u8 {
     return admin.prefix ++ "/" ++ name;
@@ -331,6 +332,7 @@ test "every route answers the same 404 to a /v1 key, no key and the wrong method
         defer post.free();
         try std.testing.expectEqual(@as(u16, 404), post.status);
     }
+    for ([_][]const u8{ "apply/cancel", "leases/revoke", "leases/approve" }) |name| {
         var buf: [64]u8 = undefined;
         const p = try std.fmt.bufPrint(&buf, "/admin/api/v1/{s}", .{name});
         const r = try exchange(rig.srv, "POST", p, bearer ++ json_head, "{}");
@@ -2700,6 +2702,7 @@ test "set: the share, the step rows, the tier's timings and the prompt-step orde
     for ((try json.parse(a, sc.body)).ok.get("options").?.array) |o| if (o.get("live").?.bool) {
         live_rows += 1;
     };
+    try std.testing.expectEqual(@as(usize, 15 + 4), live_rows); // the 15 of the host and the four goal rows (926-929)
 }
 
 test "set: keep-ahead (class A) is live only where the engine can take it, then it is published for the host to send to every rank" {
@@ -2930,4 +2933,87 @@ test "set: the KV free target (class A) is live only with a virtual-memory pool,
     try std.testing.expectEqual(@as(u16, 200), un.status);
     try std.testing.expect(live.block.turn(&seen, &vals));
     try std.testing.expectEqual(live.unset, vals[@backingInt(live.Slot.kv_free_target)]);
+}
+
+
+test "goals: off by default; a mode and a goal set through set are what /goals judges, from the sampler's seconds; nothing is changed" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open(null, admin_keys_file);
+    defer rig.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = try Writable.open(&rig, "# a release's settings\nschema 1\n");
+    defer w.restore();
+    const sampler = try admin_series.Sampler.create(std.testing.allocator);
+    defer sampler.destroy();
+    rig.srv.series = sampler;
+    defer rig.srv.series = null;
+    // a fake plant at N=5 with one user and a prompt filling: ~15 tok/s a user, ~5,000 tok/s of prompt
+    var i: u32 = 0;
+    while (i < 10) : (i += 1) sampler.sample(std.testing.io, 5_000 + i * 1000, .{ .running = 2, .decode_tokens_per_second = 15.2, .prefill_tokens_per_second = 5000, .prompt_pass = .{ .computed = 1, .total = 2, .resumed = 0, .seconds = 1 } }, null);
+    const off = try request(rig.srv, "GET", base("goals"), bearer_read);
+    defer off.free();
+    try std.testing.expectEqual(@as(u16, 200), off.status);
+    const od = (try json.parse(a, off.body)).ok;
+    try std.testing.expectEqualStrings("off", od.get("mode").?.string);
+    try std.testing.expectEqualStrings("off", od.get("state").?.string);
+    try std.testing.expect(od.get("alert_only").?.bool);
+    // the mode and a goal the plant meets
+    const set = try setBody(&rig, "{\"set\": {\"tf_goal_mode\": \"decode_first\", \"tf_goal_decode_tps\": 14}, \"wait_ms\": 0}");
+    defer set.free();
+    try std.testing.expectEqual(@as(u16, 200), set.status);
+    const met = try request(rig.srv, "GET", base("goals"), bearer_read);
+    defer met.free();
+    const md = (try json.parse(a, met.body)).ok;
+    try std.testing.expectEqualStrings("decode_first", md.get("mode").?.string);
+    try std.testing.expectEqualStrings("meeting", md.get("state").?.string);
+    try std.testing.expectEqual(@as(usize, 1), md.get("goals").?.array.len);
+    try std.testing.expectEqual(@as(f64, 14), md.get("goals").?.array[0].get("target").?.float);
+    // a goal the plant does not meet: short, with the N that would, and the engine's rounds untouched
+    const more = try setBody(&rig, "{\"set\": {\"tf_goal_decode_tps\": 40}, \"wait_ms\": 0}");
+    defer more.free();
+    try std.testing.expectEqual(@as(u16, 200), more.status);
+    const short = try request(rig.srv, "GET", base("goals"), bearer_read);
+    defer short.free();
+    const sd = (try json.parse(a, short.body)).ok;
+    try std.testing.expectEqualStrings("short", sd.get("state").?.string);
+    try std.testing.expectEqualStrings("below_goal_now", sd.get("reason").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, sd.get("reachability").?.string, "alert only") != null);
+    const wanted = try std.fmt.parseInt(u32, sd.get("n_wanted").?.int, 10);
+    try std.testing.expect(wanted >= 24 and wanted <= 30);
+    // one unreachable: 100 tok/s a user
+    const gone = try setBody(&rig, "{\"set\": {\"tf_goal_decode_tps\": 100}, \"wait_ms\": 0}");
+    defer gone.free();
+    const unr = try request(rig.srv, "GET", base("goals"), bearer_read);
+    defer unr.free();
+    const ud = (try json.parse(a, unr.body)).ok;
+    try std.testing.expectEqualStrings("unreachable", ud.get("state").?.string);
+    // the status carries the short form
+    const st = try request(rig.srv, "GET", base("status"), bearer_read);
+    defer st.free();
+    const std_doc = (try json.parse(a, st.body)).ok;
+    try std.testing.expectEqualStrings("unreachable", std_doc.get("goals").?.get("state").?.string);
+    // the controller changed nothing: the only live slot written for the host is the goals' own, rounds beside is still unset
+    var seen: u64 = 0;
+    var vals: [live.slot_count]u64 = undefined;
+    try std.testing.expect(live.block.turn(&seen, &vals));
+    try std.testing.expectEqual(live.unset, vals[@backingInt(live.Slot.rounds_beside)]);
+    // a reader may not set a goal
+    const denied = try exchange(rig.srv, "POST", base("set"), bearer_read ++ json_head, "{\"set\": {\"tf_goal_mode\": \"off\"}}");
+    defer denied.free();
+    try std.testing.expectEqual(@as(u16, 403), denied.status);
+}
+
+test "goals: a value outside the schema's bounds is refused like any row's" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open(null, admin_keys_file);
+    defer rig.close();
+    const w = try Writable.open(&rig, "# a release's settings\nschema 1\n");
+    defer w.restore();
+    for ([_][]const u8{ "{\"set\": {\"tf_goal_mode\": \"closed_loop\"}}", "{\"set\": {\"tf_goal_decode_tps\": 0}}", "{\"set\": {\"tf_goal_n_cap\": 5000}}" }) |body| {
+        const r = try setBody(&rig, body);
+        defer r.free();
+        try std.testing.expect(r.status >= 400 or std.mem.indexOf(u8, r.body, "refused") != null);
+    }
 }

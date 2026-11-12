@@ -4,7 +4,10 @@
 const std = @import("std");
 const api = @import("engine_api");
 const json = @import("json");
+const goals = api.goals;
+const admin_goals = @import("admin_goals.zig");
 const admin_requests = @import("admin_requests.zig");
+const log = @import("log.zig");
 const Allocator = std.mem.Allocator;
 const Value = json.Value;
 
@@ -35,6 +38,9 @@ pub const Sampler = struct {
     last_ms: i64 = 0,
     stop_flag: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
+    /// The goals controller's window of the same samples (alert-only; read under `mutex`).
+    goals: goals.Controller = .{},
+    last_goal_state: goals.State = .off,
     /// The requests table the seats' KV share is read from (null: the seat series stay empty).
     requests: ?*admin_requests.Registry = null,
     /// The seats' KV tokens for the next `sample` (set by the sampler thread just before it; NaN = not tracked).
@@ -72,6 +78,7 @@ pub const Sampler = struct {
         s.ring[4][at] = @floatFromInt(st.generation_tokens);
         s.ring[5][at] = if (mem) |m| @floatFromInt(m.active) else std.math.nan(f32);
         for (0..seat_rows) |k| s.ring[base_names.len + k][at] = s.seat_kv[k];
+        s.goals.observe(.{ .decode_tps = st.decode_tokens_per_second, .prefill_tps = st.prefill_tokens_per_second, .running = st.running, .filling = st.prompt_pass != null });
         if (s.taken == 0) s.since_ms = now_ms;
         s.last_ms = now_ms;
         s.taken += 1;
@@ -89,9 +96,26 @@ pub const Sampler = struct {
             const mem = engine.memory(false);
             if (s.requests) |r| r.seatKv(io, &s.seat_kv);
             s.sample(io, @intCast(@divTrunc(std.Io.Clock.real.now(io).toNanoseconds(), std.time.ns_per_ms)), st, mem);
+            s.logGoalChange(io);
             var waited: u32 = 0;
             while (waited < 10 and !s.stop_flag.load(.acquire)) : (waited += 1) std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
         }
+    }
+
+    /// The goals controller's report over its window for `cfg` (alert-only).
+    pub fn goalsReport(s: *Sampler, io: std.Io, cfg: goals.Config, n_now: ?u32) goals.Report {
+        s.mutex.lockUncancelable(io);
+        defer s.mutex.unlock(io);
+        return s.goals.report(cfg, n_now);
+    }
+
+    /// One line when the goal's state changes, never one a second (the sampler's thread, a few microseconds).
+    fn logGoalChange(s: *Sampler, io: std.Io) void {
+        const cfg = admin_goals.config();
+        const r = s.goalsReport(io, cfg, admin_goals.nNow());
+        if (r.state == s.last_goal_state) return;
+        log.line("goals: {s} -> {s} (mode {s}; alert only, nothing is changed)", .{ @tagName(s.last_goal_state), @tagName(r.state), @tagName(cfg.mode) });
+        s.last_goal_state = r.state;
     }
 
     pub fn stop(s: *Sampler) void {

@@ -27,6 +27,11 @@
    "about": "Serving, keys and limits."
   },
   {
+   "name": "Goals",
+   "title": "Goals",
+   "about": "What the engine is asked to keep: decode speed for each user, prompt speed. Alert-only: it measures and reports, it changes nothing."
+  },
+  {
    "name": "Advanced",
    "title": "Advanced",
    "about": "Everything else, for people who know the engine."
@@ -6490,6 +6495,103 @@
    "secret": false,
    "hidden": true
   },
+  {
+   "id": 926,
+   "name": "tf_goal_mode",
+   "env": "TF_GOAL_MODE",
+   "group": "goals",
+   "tab": "Goals",
+   "kind": "enum",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "off",
+   "default_check": "none",
+   "apply": "H",
+   "who": [
+    "admin"
+   ],
+   "doc": "Which goal the controller watches. Off watches nothing. Decode first keeps each decoding user at the decode goal and lets the prompt have the rest above its floor. Prefill first keeps the prompt at the prefill goal and lets decoders have the rest above theirs. Alert only: the controller measures and reports, it never changes the rounds after a prompt step.",
+   "values": [
+    "off",
+    "decode_first",
+    "prefill_first"
+   ],
+   "seed": "name",
+   "first_use": "server/admin_goals.zig:1",
+   "secret": false,
+   "label": "Goal mode"
+  },
+  {
+   "id": 927,
+   "name": "tf_goal_decode_tps",
+   "env": "TF_GOAL_DECODE_TPS",
+   "group": "goals",
+   "tab": "Goals",
+   "kind": "int",
+   "unit": "tok/s",
+   "min": 1,
+   "max": 1000,
+   "default": "",
+   "default_check": "none",
+   "apply": "H",
+   "who": [
+    "admin"
+   ],
+   "doc": "Tokens a second each decoding user should see, drafts included. One stream alone makes about 64 on prose (measured), so 100 on prose is unreachable and the report says so.",
+   "values": [],
+   "seed": "name",
+   "first_use": "server/admin_goals.zig:1",
+   "secret": false,
+   "label": "Decode goal per user",
+   "default_text": "No decode goal"
+  },
+  {
+   "id": 928,
+   "name": "tf_goal_prefill_tps",
+   "env": "TF_GOAL_PREFILL_TPS",
+   "group": "goals",
+   "tab": "Goals",
+   "kind": "int",
+   "unit": "tok/s",
+   "min": 1,
+   "max": 20000,
+   "default": "",
+   "default_check": "none",
+   "apply": "H",
+   "who": [
+    "admin"
+   ],
+   "doc": "Prompt tokens a second over all prompts filling. One 4,096-row step alone does about 6,500 (measured), so more than that is unreachable.",
+   "values": [],
+   "seed": "name",
+   "first_use": "server/admin_goals.zig:1",
+   "secret": false,
+   "label": "Prefill goal",
+   "default_text": "No prefill goal"
+  },
+  {
+   "id": 929,
+   "name": "tf_goal_n_cap",
+   "env": "TF_GOAL_N_CAP",
+   "group": "goals",
+   "tab": "Goals",
+   "kind": "int",
+   "unit": "rounds",
+   "min": 1,
+   "max": 4096,
+   "default": "256",
+   "default_check": "none",
+   "apply": "H",
+   "who": [
+    "admin"
+   ],
+   "doc": "The most rounds after a prompt step the controller will ever want: a decode goal that needs more is reported short.",
+   "values": [],
+   "seed": "name",
+   "first_use": "server/admin_goals.zig:1",
+   "secret": false,
+   "label": "Most rounds a goal may ask for"
   },
   {
    "id": 930,

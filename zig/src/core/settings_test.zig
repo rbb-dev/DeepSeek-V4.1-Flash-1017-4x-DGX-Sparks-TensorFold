@@ -312,6 +312,7 @@ test "the schema's new fields: the environment overrides only the debug and benc
     try std.testing.expect(!settings.byId(504).?.now_ok); // the KV pool
     try std.testing.expect(!settings.byId(502).?.now_ok); // the arena
     try std.testing.expect(settings.byId(122).?.now_ok);
+    try std.testing.expect(settings.tabs.len == 7);
     // every row's tab is a tab the schema lists
     for (&settings.options) |*o| {
         var found = false;

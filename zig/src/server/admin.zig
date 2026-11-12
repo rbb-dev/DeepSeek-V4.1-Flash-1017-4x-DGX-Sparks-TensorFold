@@ -22,6 +22,7 @@ const settings_history = api.settings_history;
 const kv_pool = api.kv_pool;
 const live_config = api.live_config;
 const fill_order = api.fill_order;
+const goals_mod = api.goals;
 const cfg_write = api.cfg_write;
 const admin_state = @import("admin_state.zig");
 const json = @import("json");
@@ -34,6 +35,7 @@ const routes = @import("routes.zig");
 const status_routes = @import("status_routes.zig");
 const prepare_gate = @import("prepare_gate.zig");
 const admin_series = @import("admin_series.zig");
+const admin_goals = @import("admin_goals.zig");
 const Server = @import("server.zig").Server;
 const Conn = http_conn.Conn;
 const Allocator = std.mem.Allocator;
@@ -68,6 +70,7 @@ pub const table = [_]Route{
     .{ .name = "ledger", .method = .get, .need = .read, .step = 4 },
     .{ .name = "requests", .method = .get, .need = .read, .step = 2 },
     .{ .name = "series", .method = .get, .need = .read, .step = 2 },
+    .{ .name = "goals", .method = .get, .need = .read, .step = 6 },
     .{ .name = "logs", .method = .get, .need = .admin, .step = 2 },
     .{ .name = "keys", .method = .get, .need = .admin, .step = 2 },
     .{ .name = "history", .method = .get, .need = .read, .step = 3 },
@@ -150,6 +153,7 @@ pub fn handle(srv: *Server, conn: *Conn, a: Allocator, discard: *const fn (*Conn
     if (std.mem.eql(u8, name, "ledger")) return reply(ctx, ledger(a));
     if (std.mem.eql(u8, name, "requests")) return reply(ctx, requestsValue(srv, a));
     if (std.mem.eql(u8, name, "series")) return seriesReply(ctx);
+    if (std.mem.eql(u8, name, "goals")) return reply(ctx, goalsValue(srv, a));
     if (std.mem.eql(u8, name, "logs")) return logsReply(ctx);
     if (std.mem.eql(u8, name, "keys")) return reply(ctx, keysValue(srv, a));
     if (std.mem.eql(u8, name, "history")) return historyReply(ctx);
@@ -496,6 +500,11 @@ pub fn statusValue(srv: *Server, a: Allocator, who: Who) !Value {
     try idle.put(a, "basis", str("server"));
     try root.put(a, "idle", .{ .object = idle });
     try root.put(a, "health", try status_routes.healthValue(srv, a, false));
+    {
+        const gcfg = admin_goals.config();
+        const gr: api.goals.Report = if (srv.series) |sm| sm.goalsReport(srv.io, gcfg, admin_goals.nNow()) else .{ .state = if (gcfg.mode == .off) .off else .idle };
+        try root.put(a, "goals", try admin_goals.statusBlock(a, gcfg, gr));
+    }
     const version_now = settings_history.version.load(.acquire);
     const version = try json.intValue(a, version_now);
     const cv = try json.newObject(a);
@@ -1060,6 +1069,13 @@ fn queryValue(a: Allocator, raw_path: []const u8, name: []const u8) ?[]const u8 
 fn queryNumber(ctx: Ctx, name: []const u8, default: u64, max: u64) ?u64 {
     const t = queryValue(ctx.a, ctx.conn.path, name) orelse return default;
     return @min(std.fmt.parseInt(u64, t, 10) catch return null, max);
+}
+
+/// GET /goals: the controller's state over its window (empty while the sampler is not running). Alert-only: nothing is changed.
+fn goalsValue(srv: *Server, a: Allocator) !Value {
+    const cfg = admin_goals.config();
+    const r: api.goals.Report = if (srv.series) |s| s.goalsReport(srv.io, cfg, admin_goals.nNow()) else .{ .state = if (cfg.mode == .off) .off else .idle, .n_now = admin_goals.nNow() };
+    return admin_goals.value(a, cfg, r);
 }
 
 /// GET /series?name=&seconds=&step=: the sampler's ring (empty while the sampler is not running).
@@ -1799,6 +1815,7 @@ fn publishLive(srv: *Server, c: Change, version: u64) void {
     const slot = live_config.slotOf(c.o.id) orelse return;
     const n: u64 = if (unset) live_config.unset else switch (slot) {
         .log_polls => @intFromBool(std.mem.eql(u8, c.text, "1")),
+        .goal_mode => @backingInt(goals_mod.modeOf(c.text)),
         .prefill_share => @as(u64, @bitCast(std.fmt.parseFloat(f64, c.text) catch return)),
         .kv_free_target => blk: { // GiB (a decimal) as whole MiB: what a cfg item's u32 carries
             const g = std.fmt.parseFloat(f64, c.text) catch return;

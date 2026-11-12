@@ -1059,6 +1059,8 @@ pub const cfg_write = @import("cfg_write.zig");
 
 /// The settings of class H that rank 0's host takes at its next loop turn (live_config.zig).
 pub const live_config = @import("live_config.zig");
+/// The goals controller (alert-only): what the sampled status says about a decode or prefill goal.
+pub const goals = @import("goals.zig");
 
 /// The KV pool sized from the free memory the operator leaves, and the ledger of a start (kv_pool.zig).
 pub const kv_pool = @import("kv_pool.zig");
@@ -1095,6 +1097,7 @@ test {
     _ = @import("cfg_write_test.zig");
     _ = @import("live_config.zig");
     _ = @import("live_config_test.zig");
+    _ = @import("goals.zig");
     _ = @import("originals_test.zig");
 }
 

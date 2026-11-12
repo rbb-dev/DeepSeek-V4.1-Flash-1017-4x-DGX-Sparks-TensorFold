@@ -23,6 +23,8 @@ test "a wired row is named by its id, and no other row is" {
     try std.testing.expectEqual(live.Slot.rounds_beside, live.slotOf(122).?);
     try std.testing.expectEqual(live.Slot.log_polls, live.slotOf(4).?);
     try std.testing.expect(live.slotOf(110) == null);
+    try std.testing.expectEqual(live.Slot.goal_mode, live.slotOf(926).?);
+    try std.testing.expectEqual(live.Slot.goal_n_cap, live.slotOf(929).?);
     try std.testing.expect(live.slotOf(504) == null);
     const settings = @import("settings.zig");
     try std.testing.expectEqual(live.Slot.keep_ahead, live.slotOf(412).?);
