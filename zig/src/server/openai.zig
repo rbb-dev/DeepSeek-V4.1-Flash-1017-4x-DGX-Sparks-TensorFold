@@ -140,7 +140,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     var input: chat.Input = .{ .fields = undefined };
     // a lane-vision engine takes image parts as the served lane renders them: their placeholders in the text, their
     // bytes in input.lane_images (an engine with upstream's vision gets them as parts: normalizeWith)
-    var images: messages.Images = .{ .placeholder = if (srv.info.lane_vision) |v| v.placeholder else "" };
+    var images: messages.Images = .{ .placeholder = if (srv.info.lane_vision) |v| v.placeholder else "", .io = srv.io };
     const take: ?*messages.Images = if (srv.info.lane_vision != null) &images else null;
     if (is_chat) {
         input.messages = if (take) |lane| try messages.normalizeImages(cx, body.get("messages"), "system", srv.needs_user_after_tool, lane) else try messages.normalizeWith(cx, body.get("messages"), "system", srv.needs_user_after_tool, .of(srv.info.vision));
