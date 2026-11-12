@@ -9,6 +9,9 @@ const aot = cuda.aot;
 /// concurrent round's row bound while round.forward runs one (kernels.round_rows(), Engine.round_rows).
 pub var decode_rows: usize = 16;
 
+/// Launches a twin's call site sent to its base function: the extra set had no variant of the twin for them.
+pub var twin_misses: std.atomic.Value(u64) = .init(0);
+
 pub const Tri = struct {
     set: ?*const aot.Set = null,
     stream: cuda.Stream = undefined,
@@ -18,6 +21,12 @@ pub const Tri = struct {
 
     pub fn run(t: Tri, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !void {
         if (t.log) |l| return l.add(name, grid, args, consts);
+    /// run of `twin`, the extra set's twin of base function `name` (taking the same arguments and constexprs), where
+    /// the extra set holds its variant of this launch; else run of `name` itself, counted in twin_misses (a kit
+    /// without the twin: the baseline kernel, the baseline bytes).
+    pub fn runTwin(t: Tri, twin: []const u8, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !void {
+        if (t.extra) |set| if (set.lookup(twin, args, consts)) |v| return aot.Set.launchVariant(v, t.stream, grid, args);
+        _ = twin_misses.fetchAdd(1, .monotonic);
         try t.set.?.run(t.stream, name, grid, args, consts);
     }
 
@@ -218,4 +227,29 @@ pub fn conform(fn_name: []const u8, call: *const fn (Tri, Case) anyerror!void) !
 fn folded(args: []const aot.Arg, name: []const u8) bool {
     for (args) |a| if (std.mem.eql(u8, a.name, name)) return a.value == .i32 and a.value.i32 == 1;
     return false;
+}
+
+test "a function's variants and the twins compiled the same way" {
+    const base =
+        \\{"kernels": [
+        \\ {"fn": "f", "hash": "a1", "name": "f", "num_warps": 4, "params": [{"name": "X", "type": "*bf16", "div16": true, "nospec": false}], "consts": {"K": {"int": 1}}},
+        \\ {"fn": "f", "hash": "a2", "name": "f", "num_warps": 4, "params": [{"name": "X", "type": "*bf16", "div16": false, "nospec": false}], "consts": {"K": {"int": 1}}},
+        \\ {"fn": "f", "hash": "a3", "name": "f", "num_warps": 8, "params": [{"name": "X", "type": "*bf16", "div16": true, "nospec": false}], "consts": {"K": {"int": 2}}},
+        \\ {"fn": "g", "hash": "a4", "name": "g", "num_warps": 4, "params": [], "consts": {}}]}
+    ;
+    const extra =
+        \\{"kernels": [
+        \\ {"fn": "f_u", "hash": "b1", "name": "f_u", "num_warps": 4, "params": [{"name": "X", "type": "*bf16", "div16": true, "nospec": false}], "consts": {"K": {"int": 1}}},
+        \\ {"fn": "f_u", "hash": "b2", "name": "f_u", "num_warps": 4, "params": [{"name": "X", "type": "*bf16", "div16": true, "nospec": false}], "consts": {"K": {"int": 2}}},
+        \\ {"fn": "f", "hash": "b3", "name": "f", "num_warps": 4, "params": [{"name": "X", "type": "*bf16", "div16": false, "nospec": false}], "consts": {"K": {"int": 1}}},
+        \\ {"fn": "f_u", "hash": "b4", "name": "f_u", "num_warps": 4, "params": [{"name": "X", "type": "*bf16", "div16": false, "nospec": false}], "consts": {"K": {"int": 1}, "T": {"int": 2}}}]}
+    ;
+    var m = try aot.Manifest.parse(std.testing.allocator, base);
+    defer m.deinit();
+    var x = try aot.Manifest.parse(std.testing.allocator, extra);
+    defer x.deinit();
+    // a1 has its twin (b1); a2's specialization differs from b1's, and b4 has a constexpr more; a3's warps and
+    // constexpr (b2 is another build); b3 is f itself, no twin
+    try std.testing.expectEqual([2]usize{ 3, 1 }, m.twinCoverage(&x, "f", "f_u"));
+    try std.testing.expectEqual([2]usize{ 1, 0 }, m.twinCoverage(&x, "g", "g_u"));
 }

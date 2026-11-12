@@ -349,6 +349,9 @@ pub const kern_topk_tiles: u32 = 1 << 4;
 pub const kern_idx_proj_owned: u32 = 1 << 5;
 pub const kern_bf16_rows: u32 = 1 << 6;
 pub const kern_pf_run128: u32 = 1 << 7;
+pub const kern_attn_u: u32 = 1 << 12;
+pub const kern_idx_u: u32 = 1 << 13;
+pub const kern_attn_u_decode: u32 = 1 << 14;
 pub const kern_assemble_quant: u32 = 1 << 15;
 pub const kern_mma_sf: u32 = 1 << 18;
 pub const kern_mma_sf_exact: u32 = 1 << 22;
@@ -389,6 +392,15 @@ pub var bf16_rows_asked: bool = false;
 
 /// TF_DS_PF_RUN128 as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useRun128).
 pub var pf_run128_asked: bool = false;
+
+/// TF_DS_ATTN_U as Model.open read it (switchAsked), once (Settings.kern, tri_attn.attn_u).
+pub var attn_u_asked: bool = false;
+
+/// TF_DS_IDX_U as Model.open read it (switchAsked), once (Settings.kern, tri_index.idx_u).
+pub var idx_u_asked: bool = false;
+
+/// TF_DS_ATTN_U_DECODE as Model.open read it (switchAsked), once (Settings.kern, tri_attn.attn_u_decode).
+pub var attn_u_decode_asked: bool = false;
 
 /// TF_DS_ASSEMBLE_QUANT as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.assemble_quant).
 pub var assemble_quant_asked: bool = false;
@@ -484,6 +496,9 @@ pub fn kernAsked() u32 {
     if (idx_proj_owned_asked) x |= kern_idx_proj_owned;
     if (bf16_rows_asked) x |= kern_bf16_rows;
     if (pf_run128_asked) x |= kern_pf_run128;
+    if (attn_u_asked) x |= kern_attn_u;
+    if (idx_u_asked) x |= kern_idx_u;
+    if (attn_u_decode_asked) x |= kern_attn_u_decode;
     if (assemble_quant_asked) x |= kern_assemble_quant;
     if (mma_sf_asked) x |= kern_mma_sf;
     if (mma_sf_exact_asked) x |= kern_mma_sf_exact;

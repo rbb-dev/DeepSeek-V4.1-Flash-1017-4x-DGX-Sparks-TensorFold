@@ -24,6 +24,7 @@ pub const cublas = @import("cublas.zig");
 pub const elf = @import("elf.zig");
 pub const exl3_linear = @import("exl3_linear.zig");
 pub const mx = @import("mx.zig");
+pub const idx_spread = @import("idx_spread.zig");
 pub const tri_norm = @import("tri_norm.zig");
 pub const tri_index = @import("tri_index.zig");
 pub const idx_split = @import("idx_split.zig");

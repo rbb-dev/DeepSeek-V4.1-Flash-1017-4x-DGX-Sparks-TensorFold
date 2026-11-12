@@ -19,6 +19,10 @@ pub const topk_fused_max = 4096;
 /// 64-key tile once for 2 rows instead of 1; TF_DS_IDX_RB=2 set once at startup, model.zig), but not at RB=1's
 /// "TREE" constexpr -- the matching capture simply has no TREE entry, so the call below only asks for it at RB=1.
 pub var idx_rb: usize = 1;
+/// TF_DS_IDX_U in effect (Model.open): a prompt chunk's index score asks for the kit's twin _index_score_rows_u (each
+/// packed key code byte's two FP4 values unpacked in hardware: the same scores and keys); a variant without its twin
+/// keeps the baseline kernel (Tri.runTwin).
+pub var idx_u: bool = false;
 /// What topk_select_pruned's `every` holds in each row: a visible count past every tile position.
 pub const every_vis: i64 = 1 << 40;
 
@@ -93,6 +97,8 @@ pub fn indexScore(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, out: u6
         ci("IH", ih),            ci("ID", id),     ci("BN", tile),                        ci("RB", idx_rb),
         cb("PACKED", k == .fp4), cb("KEYS", keys), cb("HAS_TMAX", tmax != null and keys),
     };
+    if (idx_u) return t.runTwin("_index_score_rows_u", "_index_score_rows", grid, args, consts);
+    try t.run("_index_score_rows", grid, args, consts);
 }
 
 /// index_keys: index_score's int64 keys (decode windows), apply_candidates' mask folded in; pruned_k: topk_select_pruned's k.
@@ -240,6 +246,59 @@ test "index_score (prompt chunks) launches _index_score_rows as recorded" {
             try indexScore(t, c.ptr("Q"), caseK(c), c.ptr("Wt"), c.ptr("VIS"), c.dim("OUT", 1), c.ptr("OUT"), null, c.constInt("KEYS") != 0, tmax, false, c.dim("Q", 0), c.dim("Q", 1), c.dim("Q", 2));
         }
     }.call);
+}
+
+test "TF_DS_IDX_U: a prompt chunk's index score launches _index_score_rows' twin with its arguments; decode windows, rowwise and unset as the baseline" {
+    const keep_u = idx_u;
+    defer idx_u = keep_u;
+    const keep_rb = idx_rb;
+    defer idx_rb = keep_rb;
+    for ([_]usize{ 1, 2 }) |rb| for ([_]bool{ true, false }) |keyed| {
+        idx_rb = rb;
+        var today: tri.Log = .{ .gpa = std.testing.allocator };
+        defer today.deinit();
+        idx_u = false;
+        try indexScore(.{ .log = &today }, 0x100, .{ .fp4 = .{ .codes = 0x200, .scales = 0x300 } }, 0x400, 0x500, 40000, 0x600, null, keyed, if (keyed) 0x700 else null, false, 512, 32, 128);
+        var twin: tri.Log = .{ .gpa = std.testing.allocator };
+        defer twin.deinit();
+        idx_u = true;
+        try indexScore(.{ .log = &twin }, 0x100, .{ .fp4 = .{ .codes = 0x200, .scales = 0x300 } }, 0x400, 0x500, 40000, 0x600, null, keyed, if (keyed) 0x700 else null, false, 512, 32, 128);
+        try std.testing.expectEqual(@as(usize, 1), today.items.items.len);
+        try std.testing.expectEqual(@as(usize, 1), twin.items.items.len);
+        const p0 = today.items.items[0];
+        const p1 = twin.items.items[0];
+        try std.testing.expectEqualStrings("_index_score_rows", p0.name);
+        try std.testing.expect(!p0.extra);
+        try std.testing.expectEqualStrings("_index_score_rows_u", p1.name);
+        try std.testing.expect(p1.extra);
+        try std.testing.expectEqual(p0.grid, p1.grid);
+        try std.testing.expectEqual(p0.args.len, p1.args.len);
+        try std.testing.expectEqual(p0.consts.len, p1.consts.len);
+        for (p0.args, p1.args) |q0, q1| try std.testing.expect(std.mem.eql(u8, q0.name, q1.name) and std.meta.eql(q0.value, q1.value));
+        for (p0.consts, p1.consts) |q0, q1| try std.testing.expect(std.mem.eql(u8, q0.name, q1.name) and std.meta.eql(q0.int, q1.int));
+        // (RB 1 asks for the TREE variants)
+        var tree = false;
+        for (p1.consts) |q| tree = tree or (std.mem.eql(u8, q.name, "TREE") and q.int == 1);
+        try std.testing.expectEqual(rb == 1, tree);
+    };
+    // decode windows and rowwise calls: _index_score, the baseline, with or without the switch
+    idx_u = true;
+    for ([_]struct { rows: usize, rowwise: bool }{ .{ .rows = 16, .rowwise = false }, .{ .rows = 512, .rowwise = true } }) |c| {
+        var log: tri.Log = .{ .gpa = std.testing.allocator };
+        defer log.deinit();
+        try indexScore(.{ .log = &log }, 0x100, .{ .fp4 = .{ .codes = 0x200, .scales = 0x300 } }, 0x400, 0x500, 40000, 0x600, null, true, 0x700, c.rowwise, c.rows, 32, 128);
+        try std.testing.expectEqualStrings("_index_score", log.items.items[0].name);
+        try std.testing.expect(!log.items.items[0].extra);
+    }
+}
+
+test "every _index_score_rows variant of the kit has its twin _index_score_rows_u, compiled the same way" {
+    // fixtures/kit-drafter*.json (tools/dsv41-zig/kit/kit_fixture.py): the base set's variants and the extra set's
+    var base = try cuda.aot.Manifest.parse(std.testing.allocator, @embedFile("fixtures/kit-drafter.json"));
+    defer base.deinit();
+    var extra = try cuda.aot.Manifest.parse(std.testing.allocator, @embedFile("fixtures/kit-drafter-extra.json"));
+    defer extra.deinit();
+    try std.testing.expectEqual([2]usize{ 102, 102 }, base.twinCoverage(&extra, "_index_score_rows", "_index_score_rows_u"));
 }
 
 test "index_keys_cand launches _index_score_cand as recorded" {

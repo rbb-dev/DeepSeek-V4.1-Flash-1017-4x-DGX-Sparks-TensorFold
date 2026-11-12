@@ -58,6 +58,7 @@ const pair_nap = @import("rdma_nap.zig");
 const any_check = @import("any_check.zig");
 const rdma = @import("rdma.zig");
 const tri_index = @import("tri_index.zig");
+const tri_attn = @import("tri_attn.zig");
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK), the resume grid: a prompt's passes start at its multiples, and every
 /// kept state, mark and frame of the grid stands on one. A pass runs one unit, or with TF_DS_PASS_ROWS up to
 /// pass_rows_max rows of whole units (lanes.passLen), where the facts allow (lanes.stream.passRows); with
@@ -766,6 +767,97 @@ fn nactWrite(m: *Model, b: cuda.DeviceBuffer) void {
     if (rdma.diagWriteFile("TF_DS_NACT_DIR", file, text)) std.log.info("TF_DS_NACT_LOG: {d} launches written ({s})", .{ n, file });
 }
 
+/// The line a kit-twin switch logs when a rank cannot run it: off on every rank, the ranks named, this rank's reason.
+fn twinOffLine(buf: []u8, name: []const u8, cannot: u32, mine_on: bool) []const u8 {
+    var rb: [64]u8 = undefined;
+    return std.fmt.bufPrint(buf, "{s}=1: off: {s} cannot run it (this rank: {s}); every rank runs the baseline kernel", .{ name, prompt2d.rankList(cannot, &rb), if (mine_on) "can" else "its kit's extra set does not provide it" }) catch buf[0..0];
+}
+
+/// A kit-twin switch (`on`, put into effect by useAttnU / useIdxU / useAttnUDecode from this rank's own extra set) on every
+/// rank or off on every rank, said: one gather of every rank's flag (ranksThatCannot), called by every rank together after
+/// the switch's use, only for a switch asked for (asked is every rank's alike: Settings). The twins give the baseline bytes, so
+/// a mix of ranks would be a mix of kernels (speed, and a replay that cannot tell), never a different reply.
+fn agreeTwin(d: *const cuda.Driver, comm: *const comm_mod.Comm, stream: cuda.Stream, name: []const u8, asked: bool, on: *bool) !void {
+    if (!asked) return;
+    const mine_on = on.*;
+    const cannot = try prompt2d.ranksThatCannot(d, comm, stream, mine_on);
+    if (cannot == 0) return;
+    on.* = false;
+    var buf: [256]u8 = undefined;
+    std.log.info("{s}", .{twinOffLine(&buf, name, cannot, mine_on)});
+}
+
+/// TF_DS_ATTN_U `asked` in effect: a prompt chunk's sparse attention with packed latents from the kit's twin
+/// _sparse_attn_part_u (the hardware unpack, the same keys) when the extra set loaded (`loaded`; else `why` it did
+/// not), one line saying which and how many of the kit's _sparse_attn_part variants have their twin (read from the two
+/// sets' aot.json); a launch of a variant without one takes the baseline kernel (Tri.runTwin).
+fn useAttnU(a: std.mem.Allocator, io: std.Io, asked: bool, loaded: bool, why: ?[]const u8, aot_dir: []const u8, extra_dir: []const u8) void {
+    tri_attn.attn_u = false;
+    if (!asked) return;
+    if (!loaded) return std.log.info("TF_DS_ATTN_U=1: off: the kit's extra set (aot-extra/) did not load ({s})", .{why orelse "none"});
+    tri_attn.attn_u = true;
+    var cov: ?[2]usize = null;
+    if (cuda.aot.Manifest.read(a, io, aot_dir)) |b| {
+        var base = b;
+        defer base.deinit();
+        if (cuda.aot.Manifest.read(a, io, extra_dir)) |x| {
+            var extra = x;
+            defer extra.deinit();
+            cov = base.twinCoverage(&extra, "_sparse_attn_part", "_sparse_attn_part_u");
+        } else |_| {}
+    } else |_| {}
+    if (cov) |n| {
+        if (n[1] < n[0]) std.log.warn("TF_DS_ATTN_U=1: partial twin coverage: only {d} of the kit's {d} _sparse_attn_part variants have their twin; a launch of any other runs the baseline kernel", .{ n[1], n[0] });
+        std.log.info("TF_DS_ATTN_U=1: a prompt chunk's sparse attention with packed latents from _sparse_attn_part_u (the latents unpacked in hardware), {d} of the kit's {d} _sparse_attn_part variants with their twin; another keeps the baseline kernel", .{ n[1], n[0] });
+    } else std.log.info("TF_DS_ATTN_U=1: a prompt chunk's sparse attention with packed latents from _sparse_attn_part_u (the latents unpacked in hardware); a variant without its twin keeps the baseline kernel", .{});
+}
+
+/// TF_DS_IDX_U `asked` in effect: a prompt chunk's index score from the kit's twin _index_score_rows_u (the hardware
+/// unpack of the FP4 keys, the same scores) when the extra set loaded (`loaded`; else `why` it did not), one line saying
+/// which and how many of the kit's _index_score_rows variants have their twin (read from the two sets' aot.json); a
+/// launch of a variant without one takes the baseline kernel (Tri.runTwin).
+fn useIdxU(a: std.mem.Allocator, io: std.Io, asked: bool, loaded: bool, why: ?[]const u8, aot_dir: []const u8, extra_dir: []const u8) void {
+    tri_index.idx_u = false;
+    if (!asked) return;
+    if (!loaded) return std.log.info("TF_DS_IDX_U=1: off: the kit's extra set (aot-extra/) did not load ({s})", .{why orelse "none"});
+    tri_index.idx_u = true;
+    var cov: ?[2]usize = null;
+    if (cuda.aot.Manifest.read(a, io, aot_dir)) |b| {
+        var base = b;
+        defer base.deinit();
+        if (cuda.aot.Manifest.read(a, io, extra_dir)) |x| {
+            var extra = x;
+            defer extra.deinit();
+            cov = base.twinCoverage(&extra, "_index_score_rows", "_index_score_rows_u");
+        } else |_| {}
+    } else |_| {}
+    if (cov) |n| {
+        if (n[1] < n[0]) std.log.warn("TF_DS_IDX_U=1: partial twin coverage: only {d} of the kit's {d} _index_score_rows variants have their twin; a launch of any other runs the baseline kernel", .{ n[1], n[0] });
+        std.log.info("TF_DS_IDX_U=1: a prompt chunk's indexer scores from _index_score_rows_u (the keys unpacked in hardware), {d} of the kit's {d} _index_score_rows variants with their twin; another keeps the baseline kernel", .{ n[1], n[0] });
+    } else std.log.info("TF_DS_IDX_U=1: a prompt chunk's indexer scores from _index_score_rows_u (the keys unpacked in hardware); a variant without its twin keeps the baseline kernel", .{});
+}
+
+fn useAttnUDecode(a: std.mem.Allocator, io: std.Io, asked: bool, loaded: bool, why: ?[]const u8, aot_dir: []const u8, extra_dir: []const u8) void {
+    tri_attn.attn_u_decode = false;
+    if (!asked) return;
+    if (!loaded) return std.log.info("TF_DS_ATTN_U_DECODE=1: off: the kit's extra set (aot-extra/) did not load ({s})", .{why orelse "none"});
+    tri_attn.attn_u_decode = true;
+    var cov: ?[2]usize = null;
+    if (cuda.aot.Manifest.read(a, io, aot_dir)) |b| {
+        var base = b;
+        defer base.deinit();
+        if (cuda.aot.Manifest.read(a, io, extra_dir)) |x| {
+            var extra = x;
+            defer extra.deinit();
+            cov = base.twinCoverage(&extra, "_sparse_attn_part", "_sparse_attn_part_u");
+        } else |_| {}
+    } else |_| {}
+    if (cov) |n| {
+        if (n[1] < n[0]) std.log.warn("TF_DS_ATTN_U_DECODE=1: partial twin coverage: only {d} of the kit's {d} _sparse_attn_part variants have their twin; a launch of any other runs the baseline kernel", .{ n[1], n[0] });
+        std.log.info("TF_DS_ATTN_U_DECODE=1: a decode round's sparse attention with packed latents from _sparse_attn_part_u (the latents unpacked in hardware), {d} of the kit's {d} _sparse_attn_part variants with their twin; another keeps the baseline kernel", .{ n[1], n[0] });
+    } else std.log.info("TF_DS_ATTN_U_DECODE=1: a decode round's sparse attention with packed latents from _sparse_attn_part_u (the latents unpacked in hardware); a variant without its twin keeps the baseline kernel", .{});
+}
+
 /// TF_DS_QGATE_CANARY's canary (prompt2d.qgateAsked); text that is no canary runs none, said once.
 fn readQgate() prompt2d.Qgate {
     const v: ?[]const u8 = if (std.c.getenv("TF_DS_QGATE_CANARY")) |x| std.mem.span(x) else null;
@@ -1135,6 +1227,9 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         prompt2d.gemm_w16_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_GEMM_W16")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.pf_t64_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_PF_T64")) |v| std.mem.span(v) else null); // this rank's launches alone: its bytes are the 128 x 128 tile's
         prompt2d.gemm_r2_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_GEMM_R2")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.attn_u_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ATTN_U")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.idx_u_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_IDX_U")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.attn_u_decode_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ATTN_U_DECODE")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.assemble_quant_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ASSEMBLE_QUANT")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.ring_wc_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_RING_WC")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.ring_inplace_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_RING_INPLACE")) |v| std.mem.span(v) else null); // every rank alike (Settings)
@@ -1310,6 +1405,28 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         m.comm = try m.fan.settingsChecked(o.rank, o.world, mine, rankDigest(), &heard);
         errdefer m.comm.deinit();
         m.comm.host = .{ .star = .{ .links = &m.vfan.links, .rank = o.rank, .world = o.world, .busy = &m.star_busy } };
+        // the kit's extra set (aot-extra/), which only the call sites of TF_DS_DRAFT_4WAY's stages, TF_DS_ATTN_U's prompt
+        const load_why = extra_why;
+        if (weights.draft_4way) if (m.extra) |*x| {
+            extra_why = try draft.fourWayKitOff(gpa, SetLookups{ .set = x }, c, sp.headSpan(c.*)[1]);
+        };
+        useAttnU(a, io, prompt2d.attn_u_asked, m.extra != null, load_why, o.aot_dir orelse try std.fs.path.join(a, &.{ o.kit_dir, "aot" }), try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }));
+        try agreeTwin(d, &m.comm, m.stream, "TF_DS_ATTN_U", prompt2d.attn_u_asked, &tri_attn.attn_u);
+        useIdxU(a, io, prompt2d.idx_u_asked, m.extra != null, load_why, o.aot_dir orelse try std.fs.path.join(a, &.{ o.kit_dir, "aot" }), try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }));
+        try agreeTwin(d, &m.comm, m.stream, "TF_DS_IDX_U", prompt2d.idx_u_asked, &tri_index.idx_u);
+        useAttnUDecode(a, io, prompt2d.attn_u_decode_asked, m.extra != null, load_why, o.aot_dir orelse try std.fs.path.join(a, &.{ o.kit_dir, "aot" }), try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }));
+        try agreeTwin(d, &m.comm, m.stream, "TF_DS_ATTN_U_DECODE", prompt2d.attn_u_decode_asked, &tri_attn.attn_u_decode);
+        m.pf = try exl3_prefill.Kernels.load(d, try readKit(a, io, o.kit_dir, "linear.cubin"));
+        errdefer m.pf.unload();
+        m.lg = try exl3_linear.Kernels.load(d, try readKit(a, io, o.kit_dir, "linear_grouped.cubin"));
+        errdefer m.lg.unload();
+        m.exk = try exl3_experts.Kernels.load(d, try readKit(a, io, o.kit_dir, "experts.cubin"), try readKit(a, io, o.kit_dir, "experts_cb.cubin"), exl3_linear.codebook_mul1);
+        errdefer m.exk.unload();
+        if (!cuda.kernels.available) return error.NoKernelImages;
+        m.ops = try ops_mod.Ops.load(d, cuda.kernels.torch_pointwise, cuda.kernels.torch_movement, cuda.kernels.dsv41_ops);
+        errdefer m.ops.unload();
+        m.ex = try exact.Exact.load(d, cuda.kernels.dsv41_torch);
+        errdefer m.ex.unload();
         m.par = if (sp.parity and parOne() and c.format == .exl3) try exl3_experts2d.ParKernels.load(d, cuda.kernels.dsv41_experts_par) else null;
         errdefer if (m.par) |*x| x.unload();
         m.mxk = if (c.format == .native) try mx.Kernels.load(d, cuda.kernels.dsv41_native) else null;
@@ -2508,6 +2625,21 @@ test "the start-up settings carry TF_DS_PF_SPLIT and the kernel switches as Mode
     prompt2d.pf_run128_asked = true;
     try std.testing.expectEqual(prompt2d.kern_pf_run128, startSettings(o).kern);
     prompt2d.pf_run128_asked = false;
+    const was_au = prompt2d.attn_u_asked;
+    defer prompt2d.attn_u_asked = was_au;
+    prompt2d.attn_u_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_attn_u, startSettings(o).kern);
+    prompt2d.attn_u_asked = false;
+    const was_iu = prompt2d.idx_u_asked;
+    defer prompt2d.idx_u_asked = was_iu;
+    prompt2d.idx_u_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_idx_u, startSettings(o).kern);
+    prompt2d.idx_u_asked = false;
+    const was_aud = prompt2d.attn_u_decode_asked;
+    defer prompt2d.attn_u_decode_asked = was_aud;
+    prompt2d.attn_u_decode_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_attn_u_decode, startSettings(o).kern);
+    prompt2d.attn_u_decode_asked = false;
     const was_sf = prompt2d.mma_sf_asked;
     defer prompt2d.mma_sf_asked = was_sf;
     prompt2d.mma_sf_asked = true;
@@ -2561,6 +2693,68 @@ test "Model.open reads TF_DS_PF_RASTER before the kernels load, refuses text tha
     try std.testing.expect(std.mem.indexOf(u8, body, "TF_DS_PF_RASTER={d}: off: needs the checkpoint's own FP8 / MXFP4 weights") != null);
     // the start-up settings carry the asked group, the SSD tier's math the one in effect
     try std.testing.expect(std.mem.indexOf(u8, src, ".pf_raster = prompt2d.pf_raster_asked,") != null);
+}
+
+test "TF_DS_ATTN_U takes effect with the kit's extra set loaded, else stays off; unset, never" {
+    const keep = tri_attn.attn_u;
+    defer tri_attn.attn_u = keep;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    tri_attn.attn_u = true;
+    useAttnU(a, io, false, true, null, "/nonexistent/aot", "/nonexistent/aot-extra");
+    try std.testing.expect(!tri_attn.attn_u); // not asked
+    useAttnU(a, io, true, false, "FileNotFound", "/nonexistent/aot", "/nonexistent/aot-extra");
+    try std.testing.expect(!tri_attn.attn_u); // no extra set
+    useAttnU(a, io, true, true, null, "/nonexistent/aot", "/nonexistent/aot-extra");
+    try std.testing.expect(tri_attn.attn_u); // (its coverage unread: the line says so)
+}
+
+test "TF_DS_IDX_U takes effect with the kit's extra set loaded, else stays off; unset, never" {
+    const keep = tri_index.idx_u;
+    defer tri_index.idx_u = keep;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    tri_index.idx_u = true;
+    useIdxU(a, io, false, true, null, "/nonexistent/aot", "/nonexistent/aot-extra");
+    try std.testing.expect(!tri_index.idx_u); // not asked
+    useIdxU(a, io, true, false, "FileNotFound", "/nonexistent/aot", "/nonexistent/aot-extra");
+    try std.testing.expect(!tri_index.idx_u); // no extra set
+    useIdxU(a, io, true, true, null, "/nonexistent/aot", "/nonexistent/aot-extra");
+    try std.testing.expect(tri_index.idx_u); // (its coverage unread: the line says so)
+    // Model.open: the switch read, the extra set loaded when it is asked for, then the switch put into effect
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    const read = std.mem.indexOf(u8, body, "prompt2d.idx_u_asked = prompt2d.switchAsked(if (std.c.getenv(\"TF_DS_IDX_U\")) |v| std.mem.span(v) else null);").?;
+    const load = std.mem.indexOf(u8, body, "        if (weights.draft_4way or ").?;
+    const cond = body[load .. load + std.mem.indexOfScalar(u8, body[load..], '{').?];
+    try std.testing.expect(std.mem.indexOf(u8, cond, "prompt2d.idx_u_asked") != null);
+    const use = std.mem.indexOf(u8, body, "useIdxU(a, io, prompt2d.idx_u_asked, m.extra != null, load_why,").?;
+    try std.testing.expect(read < load and load < use);
+}
+
+test "TF_DS_ATTN_U_DECODE takes effect with the kit's extra set loaded, else stays off; unset, never" {
+    const keep = tri_attn.attn_u_decode;
+    defer tri_attn.attn_u_decode = keep;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    tri_attn.attn_u_decode = true;
+    useAttnUDecode(a, io, false, true, null, "/nonexistent/aot", "/nonexistent/aot-extra");
+    try std.testing.expect(!tri_attn.attn_u_decode); // not asked
+    useAttnUDecode(a, io, true, false, "FileNotFound", "/nonexistent/aot", "/nonexistent/aot-extra");
+    try std.testing.expect(!tri_attn.attn_u_decode); // no extra set
+    useAttnUDecode(a, io, true, true, null, "/nonexistent/aot", "/nonexistent/aot-extra");
+    try std.testing.expect(tri_attn.attn_u_decode); // (its coverage unread: the line says so)
+    // Model.open: the switch read, the extra set loaded when it is asked for, then the switch put into effect
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    const read = std.mem.indexOf(u8, body, "prompt2d.attn_u_decode_asked = prompt2d.switchAsked(if (std.c.getenv(\"TF_DS_ATTN_U_DECODE\")) |v| std.mem.span(v) else null);").?;
+    const load = std.mem.indexOf(u8, body, "        if (weights.draft_4way or ").?;
+    const cond = body[load .. load + std.mem.indexOfScalar(u8, body[load..], '{').?];
+    try std.testing.expect(std.mem.indexOf(u8, cond, "prompt2d.attn_u_decode_asked") != null);
+    const use = std.mem.indexOf(u8, body, "useAttnUDecode(a, io, prompt2d.attn_u_decode_asked, m.extra != null, load_why,").?;
+    try std.testing.expect(read < load and load < use);
 }
 
     const keep_b = prompt.qgate_body;
@@ -3170,7 +3364,38 @@ test "TF_DS_RING_WORD_SIGNAL's decision: unset is the atomic where the cards can
     try std.testing.expect(w.roci == .word and !w.refuse and !w.warn);
     try std.testing.expect(Model.ringWordSignalMode("atomics", null) == null);
 }
+
+test "a kit twin's off line names the ranks that cannot run it and this rank's own state" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("TF_DS_ATTN_U=1: off: rank 2 cannot run it (this rank: can); every rank runs the baseline kernel", twinOffLine(&buf, "TF_DS_ATTN_U", 1 << 2, true));
+    try std.testing.expectEqualStrings("TF_DS_IDX_U=1: off: ranks 0 and 3 cannot run it (this rank: its kit's extra set does not provide it); every rank runs the baseline kernel", twinOffLine(&buf, "TF_DS_IDX_U", 0b1001, false));
+}
+
+test "Model.open agrees TF_DS_ATTN_U, TF_DS_IDX_U and TF_DS_ATTN_U_DECODE over the ranks right after each is put into effect" {
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator") orelse return error.TestUnexpectedResult;
+    const body = src[at .. at + (std.mem.indexOf(u8, src[at..], "\n    }\n") orelse return error.TestUnexpectedResult)];
+    const pairs = [_][2][]const u8{
+        .{ "useAttnU(a, io, prompt2d.attn_u_asked", "try agreeTwin(d, &m.comm, m.stream, \"TF_DS_ATTN_U\", prompt2d.attn_u_asked, &tri_attn.attn_u);" },
+        .{ "useIdxU(a, io, prompt2d.idx_u_asked", "try agreeTwin(d, &m.comm, m.stream, \"TF_DS_IDX_U\", prompt2d.idx_u_asked, &tri_index.idx_u);" },
+        .{ "useAttnUDecode(a, io, prompt2d.attn_u_decode_asked", "try agreeTwin(d, &m.comm, m.stream, \"TF_DS_ATTN_U_DECODE\", prompt2d.attn_u_decode_asked, &tri_attn.attn_u_decode);" },
+    };
+    for (pairs) |p| {
+        const use = std.mem.indexOf(u8, body, p[0]) orelse return error.TestUnexpectedResult;
+        const agree = std.mem.indexOf(u8, body, p[1]) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(use < agree);
+        // the agreement follows its own switch's line: no other line between
+        const between = body[use..agree];
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, between, "\n"));
     }
+    // a switch not asked for is never agreed (asked is every rank's alike), and a rank that cannot turns it off
+    const f = std.mem.indexOf(u8, src, "fn agreeTwin(") orelse return error.TestUnexpectedResult;
+    const fb = src[f .. f + (std.mem.indexOf(u8, src[f..], "\n}\n") orelse return error.TestUnexpectedResult)];
+    const skip = std.mem.indexOf(u8, fb, "if (!asked) return;") orelse return error.TestUnexpectedResult;
+    const gather = std.mem.indexOf(u8, fb, "ranksThatCannot(d, comm, stream, mine_on)") orelse return error.TestUnexpectedResult;
+    const off = std.mem.indexOf(u8, fb, "on.* = false;") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(skip < gather and gather < off);
+}
 
     /// The prompt's logits on the host (after a fill's last chunk).
     pub fn promptLogitsHost(m: *Model) ![]const f32 {
@@ -3208,6 +3433,7 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
     const kv = std.mem.indexOf(u8, kb, "speed_defaults.verdict(why, speed_defaults.defaulted(\"TF_DS_ENGRAM_KEEP_AHEAD\")) == .fallback").?;
     const kwarn = std.mem.indexOf(u8, kb[kv..], "std.log.warn(\"TF_DS_ENGRAM_KEEP_AHEAD: rank").?;
     const kerr = std.mem.indexOf(u8, kb[kv..], "return error.KeepAheadSharesReader;").?;
+    try std.testing.expect(kwarn < kerr);
     // both are in the defaults table, so the speed report lists a fallback with its reason
     const gib: usize = 1 << 30;
     try std.testing.expect(passRowsFallback("4096", true, 64 * gib) != null); // a small box, the default: falls back

@@ -13,6 +13,8 @@ test "the math text holds every switch at the widest TF_DS_IDX_RB" {
 
     try std.testing.expectEqualStrings("packed=1 owned=0 instream=0 aio=1", c.engram_switches);
     try std.testing.expectEqualStrings("packed=1 owned=0 instream=0 aio=0", odd.engram_switches);
+    // every field of the math in its text
+    inline for (@typeInfo(start.Math).@"struct".field_names) |f| try std.testing.expect(std.mem.indexOf(u8, c.math, f ++ "=") != null);
     // every switch at its longest value fits the text
     var longest = math;
     longest.idx_rb = std.math.maxInt(usize);

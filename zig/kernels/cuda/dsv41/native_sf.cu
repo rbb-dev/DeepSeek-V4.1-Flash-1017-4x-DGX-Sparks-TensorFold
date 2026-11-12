@@ -1081,3 +1081,70 @@ extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_gu_exact_r2_kerne
 extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_dn_exact_r2_kernel(DnArgs a, const int2* __restrict__ tiles, const int* __restrict__ ntiles) {
     sf::dn_r2<sf::kExact, sf::DnR2Cfg>(a, tiles, ntiles);
 }
+
+#ifdef TF_SF_LOAD_ONLY
+// ---------------------------------------------------------------------------------------------------------------------
+// The scale spreads of the indexer's FP4 dots on real prompts (a test-instruments build; the host's idx_spread.zig launches it beside a chunk's
+// index score). A dot of one query head with one key is the sum over the four 32-value blocks b of an exact block sum times 2^(eq[h][b] +
+// ek[b]) (eq: the E8M0 exponent byte _fp4qd_p2 gives the head's block of the query, ek: the key's stored scale byte), so the dot is
+// exact in the tensor core only while the spread of those four exponents is small. For a sample of rows (every row_step-th) and keys (every
+// key_step-th, visible ones only) it counts, over all 32 heads of the row: the pair's largest head spread S (hist [0, 32)), the key's own
+// spread (hist [32, 64)), the row's largest head spread of eq (hist [64, 96)), the pairs seen (ctr[96]) and those a sufficient test (the row's
+// eq spread + the key's spread <= 7) passes (ctr[97]).
+__device__ __forceinline__ uint32_t spread_qd_scale(float amax) {
+    const float sv = __fdiv_rn(fmaxf(amax, 6.0f * 0x1p-126f), 6.0f);
+    const uint32_t bits = __float_as_uint(sv);
+    return ((bits >> 23) & 0xffu) + ((bits & 0x7fffffu) != 0u);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_dsn_idx_spread_kernel(const uint16_t* __restrict__ iq, const uint8_t* __restrict__ ks,
+                                                                           const int64_t* __restrict__ vis, int rows, int row_step, int n,
+                                                                           int key_step, unsigned* __restrict__ ctr) {
+    __shared__ int eq[32][4];
+    __shared__ int qrow;
+    const int r = blockIdx.x * row_step;
+    if (r >= rows) return;
+    const int t = threadIdx.x, h0 = t >> 2, b0 = t & 3;
+    {
+        const uint4* src = reinterpret_cast<const uint4*>(iq + (size_t(r) * 32 + h0) * 128 + b0 * 32);
+        float amax = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const uint4 u = src[i];
+            const uint32_t w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                amax = fmaxf(amax, fabsf(__uint_as_float((w[j] & 0xffffu) << 16)));
+                amax = fmaxf(amax, fabsf(__uint_as_float(w[j] & 0xffff0000u)));
+            }
+        }
+        eq[h0][b0] = int(spread_qd_scale(amax));
+    }
+    __syncthreads();
+    if (t == 0) {
+        int m = 0;
+        for (int h = 0; h < 32; h++) {
+            int lo = 255, hi = 0;
+            for (int b = 0; b < 4; b++) { lo = min(lo, eq[h][b]); hi = max(hi, eq[h][b]); }
+            m = max(m, hi - lo);
+        }
+        qrow = m;
+        atomicAdd(&ctr[64 + min(m, 31)], 1u);
+    }
+    __syncthreads();
+    const int64_t lim = min(int64_t(n), vis[r]);
+    for (int kk = t; int64_t(kk) * key_step < lim; kk += 128) {
+        const uint32_t w = *reinterpret_cast<const uint32_t*>(ks + size_t(kk) * key_step * 4);
+        const int e0 = w & 0xff, e1 = (w >> 8) & 0xff, e2 = (w >> 16) & 0xff, e3 = w >> 24;
+        const int ksp = max(max(e0, e1), max(e2, e3)) - min(min(e0, e1), min(e2, e3));
+        int smax = 0;
+        for (int h = 0; h < 32; h++) {
+            const int a0 = eq[h][0] + e0, a1 = eq[h][1] + e1, a2 = eq[h][2] + e2, a3 = eq[h][3] + e3;
+            smax = max(smax, max(max(a0, a1), max(a2, a3)) - min(min(a0, a1), min(a2, a3)));
+        }
+        atomicAdd(&ctr[min(smax, 31)], 1u);
+        atomicAdd(&ctr[32 + min(ksp, 31)], 1u);
+        atomicAdd(&ctr[96], 1u);
+        if (qrow + ksp <= 7) atomicAdd(&ctr[97], 1u);
+    }
+}
+#endif

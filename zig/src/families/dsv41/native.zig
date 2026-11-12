@@ -108,6 +108,21 @@
 //!                                               without it 64 bytes, one stage's), the same arithmetic in the same
 //!                                               order (the replies' bits as without); with the checkpoint's own
 //!                                               weights and the tile kernels; every rank the same
+//!   TF_DS_ATTN_U=1                              a prompt chunk's sparse attention with packed latents from the kit's
+//!                                               twin _sparse_attn_part_u (aot-extra/: each code byte's two FP4 values
+//!                                               unpacked in hardware), the same keys and the same arithmetic (the
+//!                                               replies' bits as without); a variant without its twin keeps the baseline
+//!                                               kernel; every rank the same
+//!   TF_DS_IDX_U=1                               a prompt chunk's indexer scores from the kit's twin
+//!                                               _index_score_rows_u (aot-extra/: each packed key code byte's two FP4
+//!                                               values unpacked in hardware), the same scores and keys (the replies'
+//!                                               bits as without); a variant without its twin keeps the baseline kernel;
+//!                                               every rank the same
+//!   TF_DS_ATTN_U_DECODE=1                       a decode round's sparse attention with packed latents from the kit's
+//!                                               twin _sparse_attn_part_u (as TF_DS_ATTN_U's prompt call; the
+//!                                               drafter's passes read bf16 keys and are unchanged), the same keys
+//!                                               and arithmetic; a variant without its twin keeps the baseline kernel;
+//!                                               every rank the same
 //!   TF_DS_MMA_SF=1                              a prompt chunk's FP8 GEMMs (the dense ones the tile kernels take and
 //!                                               the experts' gate / up and down) on the tensor core's block-scaled
 //!                                               MMA (native_sf.cu, built for sm_121a): each K block's sum scaled by
@@ -168,6 +183,7 @@ const round = @import("round.zig");
 const link = @import("link.zig");
 const rank_cache = @import("rank_cache.zig");
 const vision_mod = @import("vision.zig");
+const tri_attn = @import("tri_attn.zig");
 const mx = @import("mx.zig");
 const weights = @import("weights.zig");
 
@@ -373,6 +389,8 @@ pub fn tierMath(two: ?*const prompt2d.Two, k: ?*const mx.Kernels) spill_start.Ma
         .mma_sf_exact = if (k) |x| x.sf == .exact else false,
         .gemm_w16 = if (k) |x| x.gemm_w16 else false,
         .gemm_r2 = if (k) |x| x.gemm_r2 else false,
+        .attn_u = tri_attn.attn_u,
+        .idx_u = tri_index.idx_u,
         .roci = two != null,
         .roci_collect = false,
         .assemble_quant = if (k) |x| x.assemble_quant else false,
@@ -429,8 +447,39 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     };
 }
 
+test "every kernel switch the start-up settings carry and a prompt pass computes with is in the SSD tier's math" {
     @setEvalBranchQuota(20000);
+    // a switch the store's name leaves out lets one setting restore the chunk-end states another wrote; the switches
+    // of decode rounds and the drafter's passes alone compute no state a prompt pass stores
         if (name.len == 0) continue; // a reserved bit: no switch here
+        const field = comptime blk: {
+            var b: [name.len - "TF_DS_".len]u8 = undefined;
+            for (name["TF_DS_".len..], &b) |c, *o| o.* = std.ascii.toLower(c);
+            const f = b;
+            break :blk &f;
+        };
+        const exempt = comptime for (decode_only) |x| {
+            if (std.mem.eql(u8, x, name)) break true;
+        } else false;
+        if (exempt == @hasField(spill_start.Math, field)) {
+            std.debug.print("{s}: {s}\n", .{ name, if (exempt) "decode-only, yet in the tier's math" else "not in the tier's math (spill_start.Math, its text, tierMath)" });
+            return error.TestUnexpectedResult;
+        }
+    }
+    // TF_DS_ATTN_U: the effective switch
+    const keep = tri_attn.attn_u;
+    defer tri_attn.attn_u = keep;
+    tri_attn.attn_u = true;
+    try std.testing.expect(tierMath(null, null).attn_u);
+    tri_attn.attn_u = false;
+    try std.testing.expect(!tierMath(null, null).attn_u);
+    // TF_DS_IDX_U likewise
+    const keep_iu = tri_index.idx_u;
+    defer tri_index.idx_u = keep_iu;
+    tri_index.idx_u = true;
+    try std.testing.expect(tierMath(null, null).idx_u);
+    tri_index.idx_u = false;
+    try std.testing.expect(!tierMath(null, null).idx_u);
     // TF_DS_QGATE_CANARY: the canary in effect, the head's 1, the body's 2 or 3, none 0
     const keep_qb = prompt.qgate_body;
     defer prompt.qgate_body = keep_qb;
@@ -441,6 +490,8 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     try std.testing.expectEqual(@as(u8, 2), tierMath(null, null).qgate_canary);
     prompt.qgate_body = .body_ulp;
     try std.testing.expectEqual(@as(u8, 3), tierMath(null, null).qgate_canary);
+}
+
 test "the tier's math carries TF_DS_QUANT_ONCE in effect" {
     const was = prompt.quant_once;
     defer prompt.quant_once = was;
@@ -524,6 +575,9 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_IDX_PROJ_OWNED") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_BF16_ROWS") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_PF_RUN128") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_ATTN_U") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_IDX_U") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_ATTN_U_DECODE") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_MMA_SF") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_MMA_SF_EXACT") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_GEMM_R2") != null);

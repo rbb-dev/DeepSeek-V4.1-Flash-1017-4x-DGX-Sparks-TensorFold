@@ -216,40 +216,42 @@ fn fits(k: KernelJson, args: []const Arg, consts: []const Const) ?usize {
                     if (x != 1 or got.int == null or got.int.? != 1) return null;
                     held += 1;
                     continue;
+
+    /// `function`'s variants in `m`, and how many of them `twins` holds a variant of under the name `twin` compiled
+    /// the same way: the same parameters (name, type, specialization), constexprs, warps, CTAs and PDL. A launch of a
+    /// covered variant finds the twin's under the same arguments and constexprs.
+    pub fn twinCoverage(m: *const Manifest, twins: *const Manifest, function: []const u8, twin: []const u8) [2]usize {
+        var n: [2]usize = .{ 0, 0 };
+        for (m.parsed.value.kernels) |k| {
+            if (!std.mem.eql(u8, k.@"fn", function)) continue;
+            n[0] += 1;
+            for (twins.parsed.value.kernels) |x| {
+                if (std.mem.eql(u8, x.@"fn", twin) and sameBuild(k, x)) {
+                    n[1] += 1;
+                    break;
                 }
-                const p = param.?;
-                if (!std.mem.eql(u8, p.type, "i32")) return null;
-                const d16 = !p.nospec and x != 1 and @mod(x, 16) == 0;
-                if (p.div16 and !d16) return null;
-                if (p.div16 == d16 and (p.nospec or x != 1)) held += 1;
-            },
-            .ptr => |x| {
-                const p = param orelse return null;
-                if (!std.mem.eql(u8, p.type, x.ty)) return null;
-                const d16 = x.addr % 16 == 0;
-                if (p.div16 and !d16) return null;
-                if (p.div16 == d16) held += 1;
-            },
-            .f32 => {
-                const p = param orelse return null;
-                if (!std.mem.eql(u8, p.type, "fp32")) return null;
-                held += 1;
-            },
-            .u64 => |x| {
-                const p = param orelse return null;
-                if (!std.mem.eql(u8, p.type, "u64")) return null;
-                const d16 = x % 16 == 0;
-                if (p.div16 and !d16) return null;
-                if (p.div16 == d16) held += 1;
-            },
+            }
         }
-        runtime += 1;
+        return n;
     }
     if (runtime != k.params.len) return null;
     return held;
 }
 
-const Fit = enum { exact, general };
+/// Two entries compiled alike: parameters (name, type, specialization), constexprs, warps, CTAs and PDL.
+fn sameBuild(a: KernelJson, b: KernelJson) bool {
+    if (a.num_warps != b.num_warps or a.num_ctas != b.num_ctas or a.pdl != b.pdl or a.params.len != b.params.len) return false;
+    for (a.params, b.params) |x, y| {
+        if (!std.mem.eql(u8, x.name, y.name) or !std.mem.eql(u8, x.type, y.type) or x.div16 != y.div16 or x.nospec != y.nospec) return false;
+    }
+    if (a.consts.map.count() != b.consts.map.count()) return false;
+    var it = a.consts.map.iterator();
+    while (it.next()) |e| {
+        const o = b.consts.map.get(e.key_ptr.*) orelse return false;
+        if (!std.meta.eql(o, e.value_ptr.*)) return false;
+    }
+    return true;
+}
 
 fn matches(k: KernelJson, args: []const Arg, consts: []const Const, fit: Fit) bool {
     for (consts) |c| {

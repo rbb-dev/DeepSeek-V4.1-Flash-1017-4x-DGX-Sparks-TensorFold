@@ -35,7 +35,7 @@ const engram_io = @import("engram_io.zig");
 const engram_aio = @import("engram_aio.zig");
 const exact = @import("exact.zig");
 const tri_index = @import("tri_index.zig");
-const idx_split = @import("idx_split.zig");
+const idx_spread = @import("idx_spread.zig");
 const roci_engine = @import("roci_engine.zig");
 const roci = @import("rocinante.zig");
 const slab_plan = @import("slab_plan.zig");
@@ -1438,6 +1438,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         .scale = scale(hd),
         .window = c.window,
         .one_split = one_split,
+        .u = tri_attn.attn_u,
     });
     try tri_norm.ropeHeads(e.t, ch.o, rope.cos, rope.sin, ch.pos, rd, true, n, hl, hd);
     // ring[pos[-keep:] % R] = kv[-keep:] (ring mode wrote them before the attention)
@@ -1855,6 +1856,7 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
         const wb = ch.iw + r0 * ih * 2;
         const vr = ch.vis + r0 * 8;
         const out = ch.cidx + r0 * kk * 8;
+        if (idx_spread.enabled and ih == 32 and id == 128) try idx_spread.observe(e.d, e.s, e.mx.?, ch.iq + r0 * ih * id * 2, cs.idx_scales[src], vr, m, n_comp_end);
         if (keyed) {
             try tri_index.indexScore(e.t, q, k, wb, vr, n_comp_end, ch.keys, null, true, ch.tmax, false, m, ih, id);
             if (prunedOnTiles(if (e.mx) |x| x.topk_tiles else false, n_comp_end, kk)) {
@@ -3509,6 +3511,15 @@ test "a pass's view: its own rows when whole, the resume rows under them" {
     try std.testing.expectEqual(@as(usize, 4096), viewRows(4096, 2048));
     try std.testing.expectEqual(@as(usize, 2048), viewRows(2047, 2048));
     try std.testing.expectEqual(@as(usize, 2048), viewRows(1, 2048));
+}
+
+test "TF_DS_ATTN_U moves a prompt chunk's sparse attention only: its call asks for the twin, a round's and a pass's never" {
+    const src = @embedFile("prompt.zig");
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, @embedFile("round.zig"), "tri_attn.attn_u,"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, @embedFile("draft.zig"), "attn_u"));
+    // TF_DS_ATTN_U_DECODE: a round's call alone (the drafter's passes read bf16 compressed keys)
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, @embedFile("round.zig"), "        .parts = .{ .pm = rd.pm_, .pl = rd.pl_, .po = rd.po_ },\n        .u = tri_attn.attn_u_decode,\n    });"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, @embedFile("round.zig"), "attn_u_decode"));
 }
 
 test "the pruned top-k in one launch reads tile maxima its chunk's index score wrote from the keys: unique, no dead tile padded" {

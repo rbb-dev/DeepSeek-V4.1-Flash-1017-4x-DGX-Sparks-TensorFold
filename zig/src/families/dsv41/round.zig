@@ -780,6 +780,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         .ring_rows = ring_rows,
         .rot = if (e.mx != null) null else .{ .cos = rope.cos, .sin = rope.sin, .rd = rd_dim, .suh = rd.wo_suh[li], .xh = rd.xhwo, .gh = gk / hd },
         .parts = .{ .pm = rd.pm_, .pl = rd.pl_, .po = rd.po_ },
+        .u = tri_attn.attn_u_decode,
     });
     try rd.mark(e, .a_core);
     const uw = lay.groups * lay.wo_a[0].n;

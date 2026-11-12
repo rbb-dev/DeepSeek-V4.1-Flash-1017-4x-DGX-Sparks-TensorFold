@@ -69,7 +69,17 @@ pub const Attn = struct {
     parts: Parts = .{ .pm = 0, .pl = 0, .po = 0 },
     /// a small prompt chunk run as a large one (one split, out directly: the prompt chunks' variant)
     one_split: bool = false,
+    /// TF_DS_ATTN_U (a prompt chunk's call, `attn_u`) or TF_DS_ATTN_U_DECODE (a decode round's, `attn_u_decode`): with
+    /// packed latents the part from its twin _sparse_attn_part_u (Tri.runTwin: the hardware unpack, the same keys), else
+    /// from _sparse_attn_part
+    u: bool = false,
 };
+
+/// TF_DS_ATTN_U in effect (Model.open): a prompt chunk's sparse attention asks for _sparse_attn_part_u.
+pub var attn_u: bool = false;
+/// TF_DS_ATTN_U_DECODE in effect (Model.open): a decode round's sparse attention asks for _sparse_attn_part_u (the
+/// drafter's passes read bf16 compressed keys: nothing to unpack).
+pub var attn_u_decode: bool = false;
 
 /// sparse_attn's key splits for a call of `rows` rows: a decode window's (decode_rows rows or fewer) split the keys and
 /// merge them; a prompt chunk, and a small chunk run as one (`one_split`), take one split that writes out directly.
@@ -110,17 +120,21 @@ pub fn sparseAttn(t: Tri, a: Attn) !void {
     const cbase = if (based) a.cbase orelse a.wbase.? else a.pos;
     // switch "attn_pf" (on in the served build): a split's window keys into L2 before its PDL wait
     const wpf = a.ring and !final;
-    try t.run("_sparse_attn_part", .{ u(a.rows), u(groups), u(sp) }, &.{
+    const part_args = [_]aot.Arg{
         p("Q", "*bf16", a.q),              p("WSRC", "*bf16", a.wsrc),                  p("WLO", "*i64", a.wlo),    p("COMP", ct, codes),
         p("CSC", ct, csc),                 p("IDX", "*i64", if (has) a.idx else a.pos), p("POS", "*i64", a.pos),    p("PM", pt, pp.pm),
         p("PL", pt, pp.pl),                p("PO", pt, pp.po),                          p("SINK", "*fp32", a.sink), p("OUT", "*bf16", a.out),
         aot.float("scale", a.scale),       p("RBASE", "*i64", rbase),                   p("CBASE", "*i64", cbase),  aot.int("ring_size", @intCast(ring_size)),
         aot.int("n_idx", @intCast(n_idx)),
-    }, &.{
+    };
+    const part_consts = [_]aot.Const{
         ci("H", a.h),       ci("HD", a.hd),        ci("HB", hb),       ci("WIN", a.window), ci("BN", bn),
         cb("RING", a.ring), cb("HAS_COMP", has),   cb("PACKED", pack), ci("SPLITS", sp),    ci("NBLK", nblk),
         cb("FINAL", final), cb("HAS_BASE", based), t.pdlConst(),       cb("WPF", wpf),
-    });
+    };
+    const grid: [3]u32 = .{ u(a.rows), u(groups), u(sp) };
+    if (a.u and pack and !a.extra) {
+    } else try (if (a.extra) &Tri.runExtra else &Tri.run)(t, "_sparse_attn_part", grid, &part_args, &part_consts);
     if (final) return;
     const merged = [_]aot.Arg{ p("PM", "*fp32", pp.pm), p("PL", "*fp32", pp.pl), p("PO", "*fp32", pp.po), p("SINK", "*fp32", a.sink), p("OUT", "*bf16", a.out) };
     if (a.rot) |r| {
@@ -283,6 +297,60 @@ test "a small chunk run as one split launches the prompt chunks' variant: one pa
         try std.testing.expectEqual(@as(i32, if (one) 80 else 70), n_idx);
         try std.testing.expectEqual(@as(u32, 16), k.grid[0]);
     }
+}
+
+test "TF_DS_ATTN_U: a call with packed latents launches the part's twin with its arguments; else the part, as the baseline" {
+    const fp4: Comp = .{ .fp4 = .{ .codes = 0x600, .scales = 0x700 } };
+    const a: Attn = .{ .q = 0x100, .out = 0x200, .rows = 2048, .h = 16, .hd = 512, .sink = 0x300, .wsrc = 0x400, .wsrc_rows = 2048, .wlo = 0x500, .ring = false, .comp = fp4, .idx = 0x800, .n_idx = 512, .pos = 0x900, .scale = 0.044194173, .window = 128 };
+    // a prompt chunk (one split, FINAL) and a small chunk on the ring (8 splits, then the merge)
+    for ([_]Attn{ a, blk: {
+        var b = a;
+        b.rows = 6;
+        b.ring = true;
+        b.parts = .{ .pm = 0xa00, .pl = 0xb00, .po = 0xc00 };
+        break :blk b;
+    } }) |x| {
+        var today: tri.Log = .{ .gpa = std.testing.allocator };
+        defer today.deinit();
+        try sparseAttn(.{ .log = &today }, x);
+        var twin: tri.Log = .{ .gpa = std.testing.allocator };
+        defer twin.deinit();
+        var xu = x;
+        xu.u = true;
+        try sparseAttn(.{ .log = &twin }, xu);
+        try std.testing.expectEqual(today.items.items.len, twin.items.items.len);
+        for (today.items.items, twin.items.items, 0..) |p0, p1, i| {
+            // the part: its twin from the extra set, the same arguments and constexprs; the merge the baseline
+            try std.testing.expectEqualStrings(if (i == 0) "_sparse_attn_part_u" else p0.name, p1.name);
+            try std.testing.expectEqual(i == 0, p1.extra);
+            try std.testing.expectEqual(p0.grid, p1.grid);
+            try std.testing.expect(std.meta.eql(p0.args.len, p1.args.len) and std.meta.eql(p0.consts.len, p1.consts.len));
+            for (p0.args, p1.args) |q0, q1| try std.testing.expect(std.mem.eql(u8, q0.name, q1.name) and std.meta.eql(q0.value, q1.value));
+            for (p0.consts, p1.consts) |q0, q1| try std.testing.expect(std.mem.eql(u8, q0.name, q1.name) and std.meta.eql(q0.int, q1.int));
+        }
+    }
+    // keys without packed latents (bf16, or none): the part itself
+    for ([_]Comp{ .{ .bf16 = 0x600 }, .none }) |cmp| {
+        var log: tri.Log = .{ .gpa = std.testing.allocator };
+        defer log.deinit();
+        var b = a;
+        b.comp = cmp;
+        b.u = true;
+        try sparseAttn(.{ .log = &log }, b);
+        try std.testing.expectEqualStrings("_sparse_attn_part", log.items.items[0].name);
+        try std.testing.expect(!log.items.items[0].extra);
+    }
+}
+
+test "every _sparse_attn_part variant of the kit has its twin _sparse_attn_part_u, compiled the same way" {
+    // fixtures/kit-drafter*.json (tools/dsv41-zig/kit/kit_fixture.py): the base set's variants and the extra set's
+    var base = try cuda.aot.Manifest.parse(std.testing.allocator, @embedFile("fixtures/kit-drafter.json"));
+    defer base.deinit();
+    var extra = try cuda.aot.Manifest.parse(std.testing.allocator, @embedFile("fixtures/kit-drafter-extra.json"));
+    defer extra.deinit();
+    try std.testing.expectEqual([2]usize{ 36, 36 }, base.twinCoverage(&extra, "_sparse_attn_part", "_sparse_attn_part_u"));
+    // (and the four-way drafter's two, in the extra set itself)
+    try std.testing.expectEqual([2]usize{ 2, 2 }, extra.twinCoverage(&extra, "_sparse_attn_part", "_sparse_attn_part_u"));
 }
 
 test "fp4_store launches as recorded" {

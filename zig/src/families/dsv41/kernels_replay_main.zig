@@ -51,6 +51,17 @@
 //!   - TF_DS_ASSEMBLE_QUANT: a parity chunk's assembly of the expert intermediate and down's quant of it in one
 //!     launch against assemble_rest followed by the quant, at 4,096 rows of 7 slots and the node's 1,152 columns: the
 //!     assembled rows, down's codes and scales byte-equal; one pack value changed differs.
+//!   - TF_DS_ATTN_U: tri_attn.sparseAttn of packed latents with and without `u`, the base set's _sparse_attn_part
+//!     against the extra set's twin _sparse_attn_part_u (AOT_DIR/../aot-extra), prompt chunks at the window's end of
+//!     5 .. 512 picks (NBLK 5, 6, 8, 12, 20) and a small chunk on the ring (8 splits): the outputs byte-equal; one
+//!     picked row's code byte changed differs.
+//!   - TF_DS_IDX_U: tri_index.indexScore of a prompt chunk's row block with and without the switch, the base set's
+//!     _index_score_rows against the extra set's twin _index_score_rows_u (AOT_DIR/../aot-extra), at RB 2 and RB 1
+//!     (TREE), keys with tile maxima and plain scores, on packed keys of every code byte and every finite E8M0 scale
+//!     byte: byte-equal; one visible key's code byte changed differs; every call found its twin.
+//!   - TF_DS_ATTN_U_DECODE: tri_attn.sparseAttn of a decode round's shapes with and without `u` (the pool's ring, 1 ..
+//!     16 rows split 8 ways, each row's ring and compressed bases or none, 512 and 20 picks), the part against its
+//!     twin: OUT and the partials byte-equal; one picked row's code byte changed differs; every call found its twin.
 //!   - TF_DS_MMA_SF: mx.gemm of the dense FP8 GEMMs' shapes (the split ones and Engram's wkv) and mx.gateUp / mx.down of
 //!     a 2D node's experts (pf_run128's) on the block-scaled kernels (native_sf.cu; their own seed): the exact
 //!     arithmetic (each K block's MMA from zero, then an fp32 add), each GEMM's key proven first, against the baseline
@@ -141,7 +152,9 @@ const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
 const mx = dsv41.mx;
 const weights = dsv41.weights;
+const tri_attn = dsv41.tri_attn;
 const tri_hc = dsv41.tri_hc;
+const tri = dsv41.tri;
 
 /// CUDA's __float2bfloat16_rn of a non-NaN value: round to nearest, ties to even.
 fn bf16Rne(x: f32) u16 {
@@ -921,6 +934,121 @@ fn passTail(r: *Run, rng: std.Random) !void {
     r.report("pass_tail control: one visible key's code byte changed at 1,112 compressed keys: the keys", control, false);
 }
 
+// -- TF_DS_ATTN_U ----------------------------------------------------------------------------------------------------
+
+/// tri_attn.sparseAttn with and without `u` on random data with packed latents: the base set's _sparse_attn_part against
+/// the extra set's twin _sparse_attn_part_u. Prompt chunks at the window's end (positions up to 1,048,575) of 5 .. 512
+/// picks over 262,144 compressed rows (one split, FINAL; NBLK 5, 6, 8, 12, 20), two of them with their positions 8 bytes
+/// into the buffer (the unaligned variants); small chunks on the ring (8 splits, then the merge) of 512, 16, 3 and 1
+/// picks (a prompt of up to 16 tokens: NBLK 5, the pick count folded or not 16-divisible); and a chunk with q zero over
+/// the full range of scale bytes (0x01 .. 0x7e: uniform attention, OUT the values' mean): OUT and the split partials
+/// byte-equal; one picked row's code byte changed differs.
+fn attnU(r: *Run, rng: std.Random) !void {
+    const d = r.d;
+    const H: usize = 16;
+    const HD: usize = 512;
+    const WIN: usize = 128;
+    const RING: usize = WIN + 16;
+    const end: usize = 1 << 20; // the window: positions below it
+    const ncomp: usize = end / 4; // compressed rows at ratio 4 (int64 offsets either way)
+    var line: [256]u8 = undefined;
+    var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sarena.deinit();
+    const ha = sarena.allocator();
+    var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer for (keep.items) |*b| b.free();
+    // the latents: random code bytes (every value), E4M3 scales 2^-4 .. 1.75 (a soft attention a code byte can move)
+    const codes = try ha.alloc(u8, ncomp * HD / 2);
+    rng.bytes(codes);
+    const scales = try ha.alloc(u8, ncomp * HD / 16);
+    for (scales) |*x| x.* = 0x18 + rng.uintLessThan(u8, 0x3f - 0x18);
+    const cb = try upload(d, codes);
+    try keep.append(ha, cb);
+    const sb = try upload(d, scales);
+    try keep.append(ha, sb);
+    const Case = struct { rows: usize, n_idx: usize, ring: bool, pos_off: usize = 0, flat: bool = false };
+    const cases = [_]Case{
+        .{ .rows = 256, .n_idx = 5, .ring = false },                 .{ .rows = 256, .n_idx = 40, .ring = false },
+        .{ .rows = 256, .n_idx = 70, .ring = false },                .{ .rows = 256, .n_idx = 200, .ring = false },
+        .{ .rows = 256, .n_idx = 512, .ring = false },               .{ .rows = 6, .n_idx = 512, .ring = true },
+        .{ .rows = 6, .n_idx = 16, .ring = true },                   .{ .rows = 6, .n_idx = 3, .ring = true },
+        .{ .rows = 6, .n_idx = 1, .ring = true },                    .{ .rows = 256, .n_idx = 200, .ring = false, .pos_off = 8 },
+        .{ .rows = 256, .n_idx = 512, .ring = false, .pos_off = 8 }, .{ .rows = 256, .n_idx = 512, .ring = false, .flat = true },
+    };
+    for (cases) |cs| {
+        const R = cs.rows;
+        const start = end - R;
+        const split = tri_attn.splits(R, false) > 1;
+        const n_pad = if (split) cs.n_idx else (cs.n_idx + 15) / 16 * 16;
+        const wrows: usize = if (cs.ring) RING else R + WIN;
+        // (q zero: every score 0, the attention uniform; drawn last, so the cases before draw what they drew)
+        const q = if (cs.flat) try upload(d, blk: {
+            const z = try ha.alloc(u8, R * H * HD * 2);
+            @memset(z, 0);
+            break :blk z;
+        }) else try upload(d, try bf16s(R * H * HD, rng, 0.5, ha));
+        const wsrc = try upload(d, try bf16s(wrows * HD, rng, 0.5, ha));
+        const idx = try ha.alloc(i64, R * n_pad);
+        for (0..R) |i| for (0..n_pad) |j| {
+            idx[i * n_pad + j] = if (j >= cs.n_idx or (j + i) % 29 == 7) -1 else @intCast(rng.uintLessThan(usize, (start + i + 1) / 4));
+        };
+        const ib = try upload(d, std.mem.sliceAsBytes(idx));
+        // the positions, pos_off bytes into their buffer
+        const pos = try ha.alloc(i64, R + cs.pos_off / 8);
+        for (pos[cs.pos_off / 8 ..], 0..) |*x, i| x.* = @intCast(start + i);
+        const pb = try upload(d, std.mem.sliceAsBytes(pos));
+        var wlo_v = [1]i64{@intCast(start - WIN)};
+        const wb = try upload(d, std.mem.sliceAsBytes(&wlo_v));
+        const sink = try upload(d, try f32s(H, rng, ha));
+        const out = try cuda.DeviceBuffer.alloc(d, R * H * HD * 2);
+        const sp: usize = if (split) tri_attn.attn_splits else 1;
+        const pm = try cuda.DeviceBuffer.alloc(d, R * H * sp * 4);
+        const pl = try cuda.DeviceBuffer.alloc(d, R * H * sp * 4);
+        const po = try cuda.DeviceBuffer.alloc(d, R * H * sp * HD * 4);
+        for ([_]cuda.DeviceBuffer{ q, wsrc, ib, pb, wb, sink, out, pm, pl, po }) |b| try keep.append(ha, b);
+        // (with q zero: scale bytes over the whole range but the E4M3 NaN, 0x01 .. 0x7e)
+        const csb = if (cs.flat) blk: {
+            const wide = try ha.alloc(u8, ncomp * HD / 16);
+            for (wide) |*x| x.* = 1 + rng.uintLessThan(u8, 0x7e);
+            const w = try upload(d, wide);
+            try keep.append(ha, w);
+            break :blk w;
+        } else sb;
+        var a: tri_attn.Attn = .{ .q = q.ptr, .out = out.ptr, .rows = R, .h = H, .hd = HD, .sink = sink.ptr, .wsrc = wsrc.ptr, .wsrc_rows = wrows, .wlo = wb.ptr, .ring = cs.ring, .comp = .{ .fp4 = .{ .codes = cb.ptr, .scales = csb.ptr } }, .idx = ib.ptr, .n_idx = cs.n_idx, .pos = pb.ptr + cs.pos_off, .scale = dsv41.prompt.scale(HD), .window = WIN, .parts = .{ .pm = pm.ptr, .pl = pl.ptr, .po = po.ptr } };
+        // the outputs of a call: OUT, then the split partials
+        const Got = struct {
+            fn of(rr: *Run, x: tri_attn.Attn, bufs: [4]cuda.DeviceBuffer, sizes: [4]usize) ![]u8 {
+                for (bufs, sizes) |b, n| try poison(b.ptr, n, rr.d, rr.s);
+                try tri_attn.sparseAttn(rr.t, x);
+                try rr.s.synchronize();
+                var all: std.ArrayList(u8) = .empty;
+                for (bufs, sizes) |b, n| {
+                    const g = try get(b.ptr, n, rr.d);
+                    defer free(g);
+                    try all.appendSlice(std.heap.page_allocator, g);
+                }
+                return all.toOwnedSlice(std.heap.page_allocator);
+            }
+        };
+        const bufs = [4]cuda.DeviceBuffer{ out, pm, pl, po };
+        const sizes = [4]usize{ R * H * HD * 2, if (split) R * H * sp * 4 else 0, if (split) R * H * sp * 4 else 0, if (split) R * H * sp * HD * 4 else 0 };
+        const want = try Got.of(r, a, bufs, sizes);
+        defer std.heap.page_allocator.free(want);
+        a.u = true;
+        const got = try Got.of(r, a, bufs, sizes);
+        defer std.heap.page_allocator.free(got);
+        const nblk = WIN / 32 + if (split) tri.cdiv(n_pad, 32) else tri.pow2(tri.cdiv(n_pad, 32));
+        if (cs.n_idx == 512 and !cs.ring and cs.pos_off == 0 and !cs.flat) {
+            // the control: a code byte of the first row's first pick changed
+            const row: usize = @intCast(idx[0]);
+            var one = [1]u8{codes[row * HD / 2] ^ 0x11};
+            const moved = try Got.of(r, a, bufs, sizes);
+            defer std.heap.page_allocator.free(moved);
+        }
+    }
+    // (a call the extra set has no twin for would have run the part itself: the comparisons above would hold vacuously)
+}
+
 // -- TF_DS_IDX_PROJ_OWNED --------------------------------------------------------------------------------------------
 
 const I_CAP: usize = 2048;
@@ -1669,10 +1797,182 @@ fn quantOnce(r: *Run, rng: std.Random) !void {
     }
 }
 
+// -- TF_DS_ATTN_U_DECODE ---------------------------------------------------------------------------------------------
+
+/// tri_attn.sparseAttn of a decode round's shapes with and without `u`: the base set's _sparse_attn_part against the
+/// extra set's twin _sparse_attn_part_u on packed latents, on the pool's ring (as round.zig calls it; a round is at
+/// most 16 rows: 8 splits, then the merge): 1, 6 and 16 rows with each row's ring and compressed bases and 512 picks
+/// (NBLK 20), 6 rows without bases, and 1 row of 20 picks (NBLK 5): OUT and the split partials byte-equal; one picked
+/// row's code byte changed differs; every call found its twin.
+fn attnUDecode(r: *Run, rng: std.Random) !void {
+    const d = r.d;
+    const H: usize = 16;
+    const HD: usize = 512;
+    const WIN: usize = 128;
+    const RING: usize = WIN + 16; // a stream's ring rows
+    const STREAMS: usize = 8;
+    const ncomp: usize = 1 << 16; // the pool's compressed rows
+    var line: [256]u8 = undefined;
+    const misses = tri.twin_misses.load(.monotonic);
+    var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sarena.deinit();
+    const ha = sarena.allocator();
+    var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer for (keep.items) |*b| b.free();
+    // the latents: random code bytes (every value), E4M3 scales 2^-4 .. 1.875; the pool's ring of 8 streams
+    const codes = try ha.alloc(u8, ncomp * HD / 2);
+    rng.bytes(codes);
+    const scales = try ha.alloc(u8, ncomp * HD / 16);
+    for (scales) |*x| x.* = 0x18 + rng.uintLessThan(u8, 0x3f - 0x18);
+    const cb = try upload(d, codes);
+    const sb = try upload(d, scales);
+    const ring = try upload(d, try bf16s(STREAMS * RING * HD, rng, 0.5, ha));
+    const zbytes: [8]u8 = @splat(0);
+    const zero = try upload(d, &zbytes);
+    for ([_]cuda.DeviceBuffer{ cb, sb, ring, zero }) |b| try keep.append(ha, b);
+    const Case = struct { rows: usize, n_idx: usize, based: bool };
+    for ([_]Case{ .{ .rows = 1, .n_idx = 512, .based = true }, .{ .rows = 6, .n_idx = 512, .based = true }, .{ .rows = 16, .n_idx = 512, .based = true }, .{ .rows = 6, .n_idx = 512, .based = false }, .{ .rows = 1, .n_idx = 20, .based = false } }) |cs| {
+        const R = cs.rows;
+        const split = tri_attn.splits(R, false) > 1;
+        const n_pad = if (split) cs.n_idx else (cs.n_idx + 15) / 16 * 16;
+        const q = try upload(d, try bf16s(R * H * HD, rng, 0.5, ha));
+        // each row: a stream's ring base and compressed base, a position past the window, picks below its visible count
+        const wbase = try ha.alloc(i64, R);
+        const cbase = try ha.alloc(i64, R);
+        const pos = try ha.alloc(i64, R);
+        const idx = try ha.alloc(i64, R * n_pad);
+        for (0..R) |i| {
+            wbase[i] = @intCast(rng.uintLessThan(usize, STREAMS) * RING);
+            cbase[i] = @intCast(rng.uintLessThan(usize, ncomp / 2));
+            pos[i] = @intCast(4000 + rng.uintLessThan(usize, 100000));
+            for (0..n_pad) |j| idx[i * n_pad + j] = if (j >= cs.n_idx or (j + i) % 29 == 7) -1 else @intCast(rng.uintLessThan(usize, ncomp / 2));
+        }
+        const ib = try upload(d, std.mem.sliceAsBytes(idx));
+        const pb = try upload(d, std.mem.sliceAsBytes(pos));
+        const wbb = try upload(d, std.mem.sliceAsBytes(wbase));
+        const cbb = try upload(d, std.mem.sliceAsBytes(cbase));
+        const sink = try upload(d, try f32s(H, rng, ha));
+        const out = try cuda.DeviceBuffer.alloc(d, R * H * HD * 2);
+        const sp: usize = if (split) tri_attn.attn_splits else 1;
+        const pm = try cuda.DeviceBuffer.alloc(d, R * H * sp * 4);
+        const pl = try cuda.DeviceBuffer.alloc(d, R * H * sp * 4);
+        const po = try cuda.DeviceBuffer.alloc(d, R * H * sp * HD * 4);
+        for ([_]cuda.DeviceBuffer{ q, ib, pb, wbb, cbb, sink, out, pm, pl, po }) |b| try keep.append(ha, b);
+        var a: tri_attn.Attn = .{ .q = q.ptr, .out = out.ptr, .rows = R, .h = H, .hd = HD, .sink = sink.ptr, .wsrc = ring.ptr, .wsrc_rows = if (cs.based) STREAMS * RING else RING, .wlo = zero.ptr, .ring = true, .comp = .{ .fp4 = .{ .codes = cb.ptr, .scales = sb.ptr } }, .idx = ib.ptr, .n_idx = cs.n_idx, .pos = pb.ptr, .scale = dsv41.prompt.scale(HD), .window = WIN, .wbase = if (cs.based) wbb.ptr else null, .cbase = if (cs.based) cbb.ptr else null, .ring_rows = RING, .parts = .{ .pm = pm.ptr, .pl = pl.ptr, .po = po.ptr } };
+        const Got = struct {
+            fn of(rr: *Run, x: tri_attn.Attn, bufs: [4]cuda.DeviceBuffer, sizes: [4]usize) ![]u8 {
+                for (bufs, sizes) |b, n| try poison(b.ptr, n, rr.d, rr.s);
+                try tri_attn.sparseAttn(rr.t, x);
+                try rr.s.synchronize();
+                var all: std.ArrayList(u8) = .empty;
+                for (bufs, sizes) |b, n| {
+                    const g = try get(b.ptr, n, rr.d);
+                    defer free(g);
+                    try all.appendSlice(std.heap.page_allocator, g);
+                }
+                return all.toOwnedSlice(std.heap.page_allocator);
+            }
+        };
+        const bufs = [4]cuda.DeviceBuffer{ out, pm, pl, po };
+        const sizes = [4]usize{ R * H * HD * 2, if (split) R * H * sp * 4 else 0, if (split) R * H * sp * 4 else 0, if (split) R * H * sp * HD * 4 else 0 };
+        const want = try Got.of(r, a, bufs, sizes);
+        defer std.heap.page_allocator.free(want);
+        a.u = true;
+        const got = try Got.of(r, a, bufs, sizes);
+        defer std.heap.page_allocator.free(got);
+        if (R == 6 and cs.based) {
+            // the control: a code byte of row 0's first pick changed (its pool row: the pick past the row's base)
+            const row: usize = @intCast(idx[0] + cbase[0]);
+            var one = [1]u8{codes[row * HD / 2] ^ 0x11};
+            const moved = try Got.of(r, a, bufs, sizes);
+            defer std.heap.page_allocator.free(moved);
+        }
+    }
+}
+
     r.report("act_quant: the twin's codes and scales against the baseline kernel's (8 shapes x 4 fills)", diff_q + diff_s, true);
     r.report("act_quant: the twin's fake rows (wo_a's input) against the baseline kernel's", diff_f, true);
     r.report("act_quant control: one input value changed, the twin's codes against the baseline kernel's of the unchanged input", control, false);
     r.report("act_quant: a row stride of 644 (not a multiple of 8) runs the baseline kernel under either setting", strayed, true);
+
+/// tri_index.indexScore of a prompt chunk's row block with and without idx_u: the base set's _index_score_rows against
+fn idxU(r: *Run, rng: std.Random) !void {
+    const d = r.d;
+    const IH: usize = 32;
+    const ID: usize = 128;
+    var line: [256]u8 = undefined;
+    const keep_u = dsv41.tri_index.idx_u;
+    defer dsv41.tri_index.idx_u = keep_u;
+    const keep_rb = dsv41.tri_index.idx_rb;
+    defer dsv41.tri_index.idx_rb = keep_rb;
+    const misses = tri.twin_misses.load(.monotonic);
+    const IdxShape = struct { rows: usize, n: usize };
+    const shapes = [_]IdxShape{ .{ .rows = 64, .n = 4100 }, .{ .rows = 512, .n = 33000 }, .{ .rows = 37, .n = 131072 } };
+    const In = struct { q: cuda.DeviceBuffer, w: cuda.DeviceBuffer, codes: cuda.DeviceBuffer, scales: cuda.DeviceBuffer, vis: cuda.DeviceBuffer, out: cuda.DeviceBuffer, tmax: cuda.DeviceBuffer };
+    const Idx = struct {
+        fn make(rr: *Run, sh: IdxShape, rg: std.Random, aa: std.mem.Allocator, kp: *std.ArrayList(cuda.DeviceBuffer)) !In {
+            const codes = try aa.alloc(u8, sh.n * ID / 2);
+            rg.bytes(codes);
+            for (codes[0..256], 0..) |*c, i| c.* = @intCast(i);
+            const scales = try aa.alloc(u8, sh.n * ID / 32);
+            for (scales) |*x| x.* = 110 + rg.uintLessThan(u8, 18);
+            for (1..255) |e| @memset(scales[(4 + e - 1) * (ID / 32) ..][0 .. ID / 32], @intCast(e));
+            const vis = try aa.alloc(i64, sh.rows);
+            for (vis) |*v| v.* = @intCast(rg.uintAtMost(usize, sh.n));
+            vis[0] = @intCast(sh.n);
+            vis[1] = 0;
+            const in: In = .{
+                .q = try upload(rr.d, try bf16s(sh.rows * IH * ID, rg, 0.5, aa)),
+                .w = try upload(rr.d, try bf16s(sh.rows * IH, rg, 0.25, aa)),
+                .codes = try upload(rr.d, codes),
+                .scales = try upload(rr.d, scales),
+                .vis = try upload(rr.d, std.mem.sliceAsBytes(vis)),
+                .out = try cuda.DeviceBuffer.alloc(rr.d, sh.rows * sh.n * 8),
+                .tmax = try cuda.DeviceBuffer.alloc(rr.d, sh.rows * ((sh.n + 63) / 64) * 8),
+            };
+            for ([_]cuda.DeviceBuffer{ in.q, in.w, in.codes, in.scales, in.vis, in.out, in.tmax }) |b| try kp.append(aa, b);
+            return in;
+        }
+        /// the row block's keys (with their tile maxima) or scores, poisoned first: the bytes, the maxima after the keys
+            const ob = sh.rows * sh.n * @as(usize, if (keyed) 8 else 4);
+            const tb = sh.rows * ((sh.n + 63) / 64) * 8;
+            try poison(in.out.ptr, ob, rr.d, rr.s);
+            try poison(in.tmax.ptr, tb, rr.d, rr.s);
+            try dsv41.tri_index.indexScore(rr.t, in.q.ptr, .{ .fp4 = .{ .codes = in.codes.ptr, .scales = in.scales.ptr } }, in.w.ptr, in.vis.ptr, sh.n, in.out.ptr, null, keyed, if (keyed) in.tmax.ptr else null, false, sh.rows, IH, ID);
+            try rr.s.synchronize();
+            const all = try std.heap.page_allocator.alloc(u8, ob + if (keyed) tb else 0);
+            errdefer std.heap.page_allocator.free(all);
+            return all;
+        }
+    };
+    var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sarena.deinit();
+    const ha = sarena.allocator();
+    var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer for (keep.items) |*b| b.free();
+    var ins: [shapes.len]In = undefined;
+    for (&ins, shapes) |*in, sh| in.* = try Idx.make(r, sh, rng, ha, &keep);
+    for ([_]usize{ 2, 1 }) |rb| for ([_]bool{ true, false }) |keyed| {
+        dsv41.tri_index.idx_rb = rb;
+        var diff: usize = 0;
+        for (ins, shapes) |in, sh| {
+            defer free(want);
+            defer free(got);
+            diff += differs(want, got);
+        }
+    };
+    // the control: one visible key's code byte changed (key 300 of the first block), the twin's keys against the baseline
+    {
+        dsv41.tri_index.idx_rb = 2;
+        defer free(want);
+        const at = ins[0].codes.ptr + 300 * (ID / 2) + 7;
+        var was: [1]u8 = undefined;
+        const changed = [1]u8{was[0] ^ 0x11};
+        defer free(got);
+    }
+    // (a call the extra set has no twin for would have run the baseline kernel: the comparisons above would hold vacuously)
+}
+
 // -- TF_DS_MMA_SF ----------------------------------------------------------------------------------------------------
 
 /// The dense FP8 GEMMs of a prompt chunk on a 2D node (split_shapes) and Engram's wkv (no K split).
@@ -8346,6 +8646,9 @@ pub fn main(init: std.process.Init) !u8 {
     defer stream.deinit();
     var set = try cuda.aot.Set.load(init.gpa, io, &driver, ctx.device, args[1]);
     defer set.deinit();
+    // the kit's extra set beside it (aot-extra/: TF_DS_ATTN_U's twins); without one its lines fail
+    var extra: ?cuda.aot.Set = cuda.aot.Set.load(init.gpa, io, &driver, ctx.device, try std.fs.path.join(a, &.{ args[1], "..", "aot-extra" })) catch null;
+    defer if (extra) |*x| x.deinit();
     var k = try mx.Kernels.load(&driver, cuda.kernels.dsv41_native);
     defer k.unload();
     try k.useSplit(.a); // the configurations' kernels; each check sets the switch it runs
