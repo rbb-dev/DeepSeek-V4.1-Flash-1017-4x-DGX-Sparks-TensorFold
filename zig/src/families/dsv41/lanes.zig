@@ -1083,7 +1083,7 @@ pub const Lanes = struct {
         if (self.served_k == .all or (self.served_k == .solo and live == 1)) {
             const drafts: usize = if (self.m.dr) |dr| dr.n else 1;
             const kmax = @min(out.len, draft.depth(live, drafts, self.m.eng.round_rows));
-            const k = draft.chooseK(l.confs[0..out.len], kmax, live, drafts, self.m.eng.round_rows);
+            const k = draft.chooseKWith(l.confs[0..out.len], kmax, live, drafts, self.m.eng.round_rows, self.m.round_ms, draft.cost_ms);
             for (out[k..]) |*o| o.* = 0.0;
         }
         return true;

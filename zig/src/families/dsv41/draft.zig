@@ -1003,9 +1003,12 @@ pub fn landing(c: f32) f64 {
 /// sum, survival the sigmoid of each confidence, over the round's table cost with the other streams at their table
 /// depth), in Python's float64 arithmetic (libm's exp, as Python's math.exp calls it); the first best wins.
 pub fn chooseK(conf: []const f32, kmax: usize, live: usize, drafts: usize, round_rows: usize) usize {
+    return chooseKWith(conf, kmax, live, drafts, round_rows, &round_ms, draft_ms);
 }
 
 /// chooseK over a round table by rows (`table`, the lane's TF_DS_ROUND_MS) and a round's ms past its forward `dms`,
+/// each draft's survival its landing chance (conf_cal).
+pub fn chooseKWith(conf: []const f32, kmax: usize, live: usize, drafts: usize, round_rows: usize, table: []const f64, dms: f64) usize {
     const others = (live - 1) * (depth(live, drafts, round_rows) + 1);
     var best: usize = 0;
     var best_v: f64 = -1.0;
@@ -1017,6 +1020,8 @@ pub fn chooseK(conf: []const f32, kmax: usize, live: usize, drafts: usize, round
             exp_tokens += surv;
         }
         const rows = @min(table.len, others + kk + 1);
+        const fwd = table[rows - 1];
+        const v = exp_tokens * @as(f64, @floatFromInt(live)) / (fwd + dms);
         if (v > best_v) {
             best = kk;
             best_v = v;

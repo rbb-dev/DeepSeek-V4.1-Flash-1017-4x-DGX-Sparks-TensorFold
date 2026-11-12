@@ -7,7 +7,7 @@ pub const Cost = struct { width: u32, ms: f64 };
 
 /// Draft prefixes per stream with the most expected tokens a ms; fixed rows always run. Caller frees.
 pub fn allocate(gpa: Allocator, fixed: []const u32, probs: []const []const f64, costs: *const Table, overhead_ms: f64, max_rows: u64) ![]u32 {
-    return allocateDrafts(gpa, fixed, probs, costs, overhead_ms, max_rows, .{});
+    return allocateWith(gpa, fixed, probs, costs, overhead_ms, max_rows, .{});
 }
 
 /// What drafting the counted nodes costs: a head step each, or the deepest stream's steps when one batch drafts all.
@@ -18,6 +18,11 @@ pub const HeadCost = struct {
 
 /// allocate, each count also priced by the head steps that draft it.
 pub fn allocateDrafts(gpa: Allocator, fixed: []const u32, probs: []const []const f64, costs: *const Table, overhead_ms: f64, max_rows: u64, head: HeadCost) ![]u32 {
+    return allocateWith(gpa, fixed, probs, costs, overhead_ms, max_rows, head);
+}
+
+/// The allocation, each count priced by the head steps that draft it (`head`, zero: none).
+fn allocateWith(gpa: Allocator, fixed: []const u32, probs: []const []const f64, costs: *const Table, overhead_ms: f64, max_rows: u64, head: HeadCost) ![]u32 {
     const counts = try gpa.alloc(u32, probs.len);
     defer gpa.free(counts);
     const best_counts = try gpa.alloc(u32, probs.len);
