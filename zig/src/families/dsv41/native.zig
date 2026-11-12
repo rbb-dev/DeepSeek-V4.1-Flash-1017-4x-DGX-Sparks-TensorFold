@@ -239,11 +239,43 @@ const tri_attn = @import("tri_attn.zig");
 const tri_hc = @import("tri_hc.zig");
 const mx = @import("mx.zig");
 const weights = @import("weights.zig");
+const config = @import("config.zig");
 
 pub const model_type = "deepseek_v41";
 pub const formats: []const []const u8 = &.{"exl3-mul1"};
 /// The Python lane's default window; the server's --context moves it up to the model's 1,048,576.
 pub const default_context: i64 = 262144;
+
+/// The window the checkpoint reaches with the RoPE factor the engine runs, for the generic --context check before the family
+/// loads: config.json's max_position_embeddings (`base`), or original_max_position_embeddings x TF_DS_YARN_FACTOR when that
+/// asks for another factor (the start's checkRope then refuses a kit cut for a different one).
+pub fn nativeWindow(a: std.mem.Allocator, io: std.Io, dir: []const u8, base: i64) i64 {
+    const text: ?[]const u8 = if (std.c.getenv("TF_DS_YARN_FACTOR")) |v| std.mem.span(v) else null;
+    const asked = (config.yarnFactorAsked(text) catch return base) orelse return base;
+    const path = std.fs.path.join(a, &.{ dir, "config.json" }) catch return base;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch return base;
+    const doc = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return base;
+    if (doc != .object) return base;
+    // the served checkpoint keeps its text model's settings in text_config (as modelContext reads them), else at the top
+    const model_cfg = if (doc.object.get("text_config")) |t| (if (t == .object) t else doc) else doc;
+    const rope = model_cfg.object.get("rope_scaling") orelse doc.object.get("rope_scaling") orelse return base;
+    if (rope != .object) return base;
+    const orig = rope.object.get("original_max_position_embeddings") orelse return base;
+    if (orig != .integer or orig.integer <= 0) return base;
+    return windowFor(base, orig.integer, asked);
+}
+
+/// `base` unless a factor is asked: then original x factor (the positions YaRN reaches with it).
+pub fn windowFor(base: i64, original: i64, asked: ?f64) i64 {
+    const f = asked orelse return base;
+    return @intFromFloat(@round(f * @as(f64, @floatFromInt(original))));
+}
+
+test "the window follows TF_DS_YARN_FACTOR: unset is the checkpoint's own, factor 32 over 65,536 reaches 2,097,152" {
+    try std.testing.expectEqual(@as(i64, 1048576), windowFor(1048576, 65536, null));
+    try std.testing.expectEqual(@as(i64, 2097152), windowFor(1048576, 65536, 32));
+    try std.testing.expectEqual(@as(i64, 1048576), windowFor(1048576, 65536, 16));
+}
 pub const max_segments: u32 = 1;
 /// The served build's prompt chunk (TF_DS_PREFILL_CHUNK).
 pub const prompt_rows: u32 = 4096;

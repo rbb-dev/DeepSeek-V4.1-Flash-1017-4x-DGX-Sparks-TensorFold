@@ -2022,6 +2022,15 @@ pub const Model = struct {
         const d = ctx.d;
         m.cfg = try Config.read(a, io, o.model_dir);
         const c = &m.cfg;
+        {
+            // the context against the decode indexer's grid (before the weights load: a refused context costs seconds)
+            const config_mod = @import("config.zig");
+            var grid_why: config_mod.Why = .{};
+            config_mod.checkIndexWindow(c, m.ctx_cap, tri_index.tile, &grid_why) catch |e| {
+                std.log.err("{s}; not started", .{grid_why.text()});
+                return e;
+            };
+        }
         // TF_DS_ROCI_STAGGER_PRIO: pass A's stream (this one, which every other piece of work also runs on) at the priority the mode gives it
         m.pair_prio = roci_pair.prioOf(if (std.c.getenv("TF_DS_ROCI_STAGGER_PRIO")) |v| std.mem.span(v) else null);
         m.stream = if (prompt2d.roci_stagger_asked and m.pair_prio != .equal) blk: {
@@ -2210,6 +2219,41 @@ pub const Model = struct {
 
         // the RoPE tables (the served build's bits: torch CPU pow and polar), every position a stream reaches
         const half = c.rope_dim / 2;
+        // the factor the kit's tables were cut for against the factor the engine runs, and the context against the positions it
+        // reaches: unset TF_DS_YARN_FACTOR and a kit with no "factor" in rope.json are the checkpoint's own (16, 1,048,576)
+        {
+            const config_mod = @import("config.zig");
+            const yarn_text: ?[]const u8 = if (std.c.getenv("TF_DS_YARN_FACTOR")) |v| std.mem.span(v) else null;
+            const asked = config_mod.yarnFactorAsked(yarn_text) catch {
+                std.log.err("TF_DS_YARN_FACTOR={s}: not a number from 1 to 1024; not started", .{yarn_text.?});
+                return error.BadSetting;
+            };
+            const rope_json: ?[]const u8 = std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ o.kit_dir, "rope.json" }), a, .limited(1 << 16)) catch null;
+            const kit_factor = if (rope_json) |t| try config_mod.kitRopeFactor(a, t) else null;
+            var rope_why: config_mod.Why = .{};
+            const rr = config_mod.checkRope(c, asked, kit_factor, m.ctx_cap, &rope_why) catch |e| {
+                std.log.err("{s}; not started", .{rope_why.text()});
+                return e;
+            };
+            if (asked != null) std.log.info("TF_DS_YARN_FACTOR={d}: the RoPE tables are YaRN factor {d} over {d} positions (the checkpoint's own: {d} over {d})", .{ rr.factor, rr.factor, rr.max_position, c.rope_factor, c.max_position });
+        }
+        const rope_rows = m.ctx_cap + round.max_rows + 1;
+        m.rope_buf = try cuda.DeviceBuffer.alloc(d, 4 * rope_rows * half * 4);
+        errdefer m.rope_buf.free();
+        {
+            const part = try gpa.alloc(u8, rope_rows * half * 4);
+            defer gpa.free(part);
+            for ([_][]const u8{ "rope-plain-cos.f32", "rope-plain-sin.f32", "rope-compressed-cos.f32", "rope-compressed-sin.f32" }, 0..) |name, j| {
+                var f = try std.Io.Dir.cwd().openFile(io, try std.fs.path.join(a, &.{ o.kit_dir, name }), .{});
+                defer f.close(io);
+                if (try f.readPositionalAll(io, part, 0) != part.len) return error.ShortRopeTable; // a table of fewer rows than a stream's context
+                try m.rope_buf.upload(j * part.len, part);
+            }
+        }
+        const tbl = rope_rows * half * 4;
+        const rope: prompt.Rope = .{ .cos = m.rope_buf.ptr, .sin = m.rope_buf.ptr + tbl };
+        const rope_c: prompt.Rope = .{ .cos = m.rope_buf.ptr + 2 * tbl, .sin = m.rope_buf.ptr + 3 * tbl };
+
         // round over the host links)
         errdefer if (m.rdma_rings) |*x| x.close(gpa);
         // the first lane's proxy threads (Roci.openLane, below) run from its start: a later failure stops them before the arena and the
@@ -3626,6 +3670,21 @@ pub const Model = struct {
     fn forwardRows(m: *Model, rows: round.Rows) !void {
         const e = &m.eng;
         if (m.prof) try m.stream.synchronize(); // (the GPU idle, so the issue time shows whether the host keeps it fed)
+        try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.ctx_cap, null, if (m.graphs) |*g| g else null);
+        if (m.prof) {
+            m.t_enqueue = m.now() - t0;
+            try m.stream.synchronize();
+            m.t_forward = m.now() - t0;
+            if (m.timer) |t| try t.finish();
+            if (m.rd.clk != 0) {
+                var h: [1 + 2 * round.Round.max_clocks]u64 = undefined;
+                const d = m.ctx.d;
+                try d.check(d.api.cuMemcpyDtoH_v2(&h, m.rd.clk, h.len * 8), "cuMemcpyDtoH");
+                const n = @min(h[0], round.Round.max_clocks);
+                for (1..n) |i| {
+                    const tag = h[2 + 2 * i] & 0xff;
+                    m.clk_ph[tag] += h[1 + 2 * i] -% h[1 + 2 * (i - 1)];
+                    m.clk_cnt[tag] += 1;
                 }
                 m.clk_rounds += 1;
             }
@@ -4605,6 +4664,9 @@ test "Model.open reads TF_DS_HEAD_CAND with the kernel switches and puts it in e
     const fr = std.mem.indexOf(u8, src, "    fn forwardRows(") orelse return error.TestUnexpectedResult;
     const frb = src[fr .. fr + (std.mem.indexOf(u8, src[fr..], "\n    }\n") orelse return error.TestUnexpectedResult)];
     try std.testing.expect(std.mem.indexOf(u8, frb, "try round.forward(e, &m.rd,") != null);
+    // a round's bucket stops at the context Round.init sized its buffers for (m.ctx_cap), never at the pool: a
+    // 4,128,768-token context sized them for 4,128,768 keys and a 3.99M-deep round asked for the 4,194,304 bucket
+    try std.testing.expect(std.mem.indexOf(u8, frb, "rows, m.ctx_cap, null,") != null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, "head_cand.merge(m.cand_parts[0 .. 4 * lay.bytes], lay, head_cand.vocabOffsets(tw.hw), count, m.cand_vals[0 .. R * count], m.cand_ids[0 .. R * count])")); // headCandidates', and this test's text
 }
 

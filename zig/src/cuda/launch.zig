@@ -77,9 +77,30 @@ pub const Config = struct {
         const g = self.grid;
         const b = self.block;
         if (g.x == 0 or g.y == 0 or g.z == 0 or b.x == 0 or b.y == 0 or b.z == 0) return error.Invalid;
+        if (!gridFits(.{ g.x, g.y, g.z })) return error.Invalid;
         if (@as(u64, b.x) * b.y * b.z > 1024) return error.Invalid;
     }
 };
+
+/// CUDA's grid limits: x up to 2^31 - 1, y and z up to 65,535 (the driver refuses more with CUDA_ERROR_INVALID_VALUE).
+pub const grid_x_max: u32 = (1 << 31) - 1;
+pub const grid_yz_max: u32 = 65_535;
+
+pub fn gridFits(g: [3]u32) bool {
+    return g[0] <= grid_x_max and g[1] <= grid_yz_max and g[2] <= grid_yz_max;
+}
+
+test "a grid past CUDA's limits is refused before the driver" {
+    const ok: Config = .{ .grid = .{ .x = 3, .y = 65_535, .z = 1 }, .block = .{ .x = 128 } };
+    try ok.validate();
+    // the 4M-context round: _index_score over 4,194,304 keys in 64-key tiles
+    const past: Config = .{ .grid = .{ .x = 3, .y = 65_536, .z = 1 }, .block = .{ .x = 128 } };
+    try std.testing.expectError(error.Invalid, past.validate());
+    const z: Config = .{ .grid = .{ .x = 1, .y = 1, .z = 65_536 }, .block = .{ .x = 128 } };
+    try std.testing.expectError(error.Invalid, z.validate());
+    try std.testing.expect(gridFits(.{ grid_x_max, 1, 1 }));
+    try std.testing.expect(!gridFits(.{ grid_x_max + 1, 1, 1 }));
+}
 
 /// cuLaunchKernel for plain launches, cuLaunchKernelEx when a cluster, PDL or cooperative attribute is set.
 /// Kernel launches so far in this process (a profile's count by phase).

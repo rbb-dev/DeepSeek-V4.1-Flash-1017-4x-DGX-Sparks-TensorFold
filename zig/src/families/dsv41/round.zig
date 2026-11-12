@@ -219,7 +219,7 @@ pub const Round = struct {
     cur_ratio: u8 = 0, // the layer a stretch is on (its compress ratio) // clocks at every phase mark too (Model.useClock(true)), not only around the stretches
     clk: u64 = 0, // [1 + 2 * max_clocks] u64: the count, then each clock and its phase (PhaseTimer.Phase or clock_*)
 
-    pub fn init(e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator, pool_cap: usize) !Round {
+    pub fn init(e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator, ctx_cap: usize) !Round {
         const c = e.c;
         const w = e.w;
         const R = e.round_rows;
@@ -229,7 +229,7 @@ pub const Round = struct {
         const hd = c.head_dim;
         const hl = e.heads();
         const l0 = w.layers[0];
-        const nb_max = bucketFor(pool_cap, pool_cap);
+        const nb_max = bucketFor(ctx_cap, ctx_cap);
         var rd: Round = undefined;
         rd.r = 0;
         // the profile's clocks off until Model.useClock (rd starts undefined: a field default does not apply)
@@ -1193,8 +1193,9 @@ pub const Graphs = struct {
 /// A round of these rows through every layer and the head: rd.logits [R, vocab] and rd.taps. The caches (ring, the
 /// compressed rows, the positional store) are the prompt's, extended by the rows; eh: the Engram host (the rows' n-grams
 /// hashed from `seq`, the whole sequence's ids through the rows'). With `graphs` each stretch runs as its graph and a
-/// probe sees only the round's end (its logits and taps).
-pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, rings: []const u64, eh: ?*prompt.EngramHost, seq: []const i32, rows: Rows, pool_cap: usize, probe: ?Probe, graphs: ?*Graphs) !void {
+/// probe sees only the round's end (its logits and taps). ctx_cap: a stream's context, the cap Round.init sized the round's
+/// buffers for (the bucket stops there).
+pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, rings: []const u64, eh: ?*prompt.EngramHost, seq: []const i32, rows: Rows, ctx_cap: usize, probe: ?Probe, graphs: ?*Graphs) !void {
     const w = e.w;
     const R = rows.ids.len;
     if (R == 0 or R > e.round_rows or rows.pos.len != R) return error.BadRound;
@@ -1205,7 +1206,7 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
     defer tri.decode_rows = bound;
     var deepest: usize = 0;
     for (rows.pos) |p| deepest = @max(deepest, @as(usize, @intCast(p)) + 1);
-    rd.bucket = bucketFor(deepest, pool_cap);
+    rd.bucket = bucketFor(deepest, ctx_cap);
     rd.has_cand = false;
     rd.has_cblk = false;
     rd.kk = 0;
@@ -1518,6 +1519,17 @@ test "context buckets as graph.py makes them" {
     try std.testing.expectEqual(@as(usize, 4096), bucketFor(4096, 1 << 20));
     try std.testing.expectEqual(@as(usize, 8192), bucketFor(4097, 1 << 20));
     try std.testing.expectEqual(@as(usize, 4096), bucketFor(5000, 4096));
+    // a context that is no power of two: the deepest bucket is the context itself, never past what Round.init sized
+    // (bucketFor(ctx, ctx)); the power-of-two contexts (1M, 2M) keep every bucket they had
+    const ctx4m: usize = 4_194_240;
+    try std.testing.expectEqual(ctx4m, bucketFor(3_990_172, ctx4m));
+    try std.testing.expectEqual(ctx4m, bucketFor(ctx4m, ctx4m));
+    try std.testing.expectEqual(@as(usize, 2_097_152), bucketFor(2_000_000, ctx4m));
+    for ([_]usize{ 1 << 20, 1 << 21 }) |ctx| {
+        var n: usize = 1;
+        while (n <= ctx) : (n = n * 3 + 7) try std.testing.expectEqual(bucketFor(n, 13_565_952), bucketFor(n, ctx));
+        try std.testing.expectEqual(ctx, bucketFor(ctx, ctx));
+    }
 }
 
 /// error.NotPortedYet with its site on stderr (a request that reaches a path the port lacks names it in the log).

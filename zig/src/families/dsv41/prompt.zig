@@ -72,6 +72,20 @@ fn pmark(e: *const Engine, p: round.PhaseTimer.Phase) void {
 
 /// The indexer's [rows, n_comp] keys a row block holds at most (model.py: rb * n_comp <= 2^26 / 4 past 16 rows).
 const key_elems: usize = 1 << 24;
+/// A row block holds at least this many rows (the kit's index kernels were captured for 16-row-aligned views).
+const key_rows_floor: usize = 16;
+
+/// The most [rows, n_comp] keys a chunk's row block holds, for a context whose longest compressed length is `max_comp`:
+/// key_elems (2^24, the 1,048,576-token bound) while the floor's 16 rows fit it, else the floor's 16 rows of the longest
+/// n_comp. At the served 1M context this is exactly key_elems, so no buffer and no refusal changes there.
+fn keyCapFor(max_comp: usize) usize {
+    return @max(key_elems, key_rows_floor * max_comp);
+}
+
+/// Whether a row block of `rb` rows over `n_comp_end` compressed entries exceeds the chunk's key buffer.
+fn keysRefused(rb: usize, n_comp_end: usize, key_cap: usize) bool {
+    return rb * n_comp_end > key_cap;
+}
 /// A row block's rows at most where the layers before the candidate source prune (prunes: n_comp > 32,768, so rb =
 /// 2^26 / (4 n_comp) < 512).
 const pruned_rows: usize = 512;
@@ -355,12 +369,12 @@ pub const Chunk = struct {
     wl: u64 = 0, // fp32 [cap, index_heads]
     iw: u64 = 0, // bf16 [cap, index_heads]: the heads' weights
     vis: u64 = 0, // int64 [cap]: compressed entries a row sees
-    vis_blk: u64 = 0, // int64 [cap]: an indexer row block's vis when its view of vis is not 16-byte aligned
-    keys: u64 = 0, // int64 [rows of a block, n_comp]: at most key_elems
+    keys: u64 = 0, // int64 [rows of a block, n_comp]: at most key_cap
     score: u64 = 0, // fp32 [rows of a block, n_comp]: the candidate pool's layers' index scores
     tmax: u64 = 0, // int64 [rows of a block, cdiv(n_comp, 64)]
     cidx: u64 = 0, // int64 [cap, index_topk]: the selected latents
     max_comp: usize = 0,
+    key_cap: usize = key_elems, // the most keys a row block holds: keyCapFor(max_comp)
     // the candidate pool past candidate_blocks blocks (model.py _candidates, apply_candidates): the chunk's block mask
     // (u8 [cap, pool_ms]), a row block's block maxima (fp32) and their top blocks (int64 [rows, candidate_blocks]), a
     // row's every_vis (no mask); the layers before the candidate source's pruned selection (tpos, cand: up to
@@ -560,6 +574,7 @@ pub const Chunk = struct {
         if (min_ratio != 0) {
             const ih = c.index_heads * c.index_head_dim;
             ch.max_comp = tokens / min_ratio;
+            ch.key_cap = keyCapFor(ch.max_comp);
             ch.kvc = try a.take(cap * c.head_dim * 4);
             ch.scc = try a.take(cap * c.head_dim * 4);
             ch.lat = try a.take(cap * c.head_dim * 2);
@@ -573,9 +588,8 @@ pub const Chunk = struct {
             ch.wl = try a.take(cap * c.index_heads * 4);
             ch.iw = try a.take(cap * c.index_heads * 2);
             ch.vis = try a.take(cap * 8);
-            ch.vis_blk = try a.take(cap * 8);
-            // the indexer's row blocks keep rows * n_comp under 2^24 (model.py rb), so their keys under key_elems
-            const ke: usize = @min(cap * ch.max_comp, key_elems); // (typed: @min with a comptime bound narrows)
+            // the indexer's row blocks keep rows * n_comp under 2^24 (model.py rb; a context past 1,048,576 keeps the 16-row floor's rows, keyCapFor), so their keys under key_cap
+            const ke: usize = @min(cap * ch.max_comp, ch.key_cap);
             ch.keys = try a.take(ke * 8);
             ch.score = try a.take(ke * 4);
             ch.tmax = try a.take((ke / tri_index.tile + cap) * 8);
@@ -589,6 +603,7 @@ pub const Chunk = struct {
                 ch.pool = try a.take(cap * ch.pool_ms);
                 ch.bmax = try a.take(@max(16 * ch.pool_ms, key_elems / cb + cap) * 4);
                 ch.pidx = try a.take(cap * c.candidate_blocks * 8);
+                ch.bmax = try a.take(@max(16 * ch.pool_ms, ch.key_cap / cb + cap) * 4);
             }
             ch.every = try a.take(cap * 8);
             {
@@ -1927,6 +1942,7 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     // captured for (a 137,612-token prompt gave 121-row blocks: MissingTritonVariant at the second). A row's scores and
     // picks are its own, so the block size changes no bits.
     const rb = @max(16, @min(n, (@as(usize, 1) << 26) / (4 * @max(n_comp_end, 1)) / 16 * 16));
+    if (keysRefused(rb, n_comp_end, ch.key_cap)) return error.ChunkTooLong;
     const keyed = li != c.candidate_source and !(c.candidate_source < li) and kk & (kk - 1) == 0;
     const k: tri_index.IndexK = .{ .fp4 = .{ .codes = cs.idx_codes[src], .scales = cs.idx_scales[src] } };
     const torch_topk: tri_index.TopK = .{ .top = ch.ktop, .ctx = @ptrCast(@constCast(e)), .run = torchTopk };
@@ -3899,6 +3915,24 @@ test "the boundary's in-place gathers put every rank's owned groups of the four 
         for (0..start * row) |i| try std.testing.expectEqual(@as(u8, 0xee), m[buf + i]);
         for ((start + n) * row..(start + n + 4) * row) |i| try std.testing.expectEqual(@as(u8, 0xee), m[buf + i]);
     };
+}
+
+test "the indexer's key bound follows the context: 1M is the baseline's, 2M passes where 1M refuses" {
+    // served 1M context: max_comp 1,048,576 -> exactly key_elems, the same buffers and the same refusals as before
+    try std.testing.expectEqual(key_elems, keyCapFor(1_048_576));
+    try std.testing.expectEqual(key_elems, keyCapFor(524_288));
+    try std.testing.expectEqual(key_elems, keyCapFor(0));
+    // a ratio-1 layer's last chunk at n_comp 1,048,577: the 16-row floor needs 16 * n_comp keys
+    const floor = key_rows_floor;
+    try std.testing.expect(!keysRefused(floor, 1_048_576, keyCapFor(1_048_576)));
+    try std.testing.expect(keysRefused(floor, 1_048_577, keyCapFor(1_048_576))); // the 1M chunk refuses past 2^20
+    try std.testing.expect(keysRefused(floor, 2_097_152, keyCapFor(1_048_576))); // the baseline bound refuses at 2M
+    try std.testing.expect(!keysRefused(floor, 2_097_152, keyCapFor(2_097_152))); // the 2M chunk takes it
+    try std.testing.expectEqual(@as(usize, 1) << 25, keyCapFor(2_097_152));
+    // the 2^26 / 4 bound still sizes bigger blocks where they fit: rb at n_comp 600,000 is 16 * floor(2^26 / (4 * 600000) / 16)
+    const n: usize = 600_000;
+    const rb = @max(floor, (@as(usize, 1) << 26) / (4 * n) / 16 * 16);
+    try std.testing.expect(!keysRefused(rb, n, keyCapFor(1_048_576)));
 }
 
 test "a chunk's view of a pass stays within the rows its buffers hold" {

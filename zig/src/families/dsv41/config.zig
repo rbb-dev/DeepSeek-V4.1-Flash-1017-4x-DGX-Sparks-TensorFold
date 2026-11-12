@@ -297,6 +297,104 @@ pub fn checkShapes(c: Config, why: *Why) !void {
     }
 }
 
+/// What the RoPE tables are cut for: the YaRN factor and the largest position it reaches (original_max_position x factor).
+pub const Rope = struct { factor: f64, max_position: usize };
+
+/// TF_DS_YARN_FACTOR: unset or empty is the checkpoint's own factor; a number 1..1024 asks for another one (the kit's
+/// RoPE tables must have been cut for it: checkRope).
+pub fn yarnFactorAsked(text: ?[]const u8) error{BadYarnFactor}!?f64 {
+    const t = text orelse return null;
+    if (t.len == 0) return null;
+    const f = std.fmt.parseFloat(f64, t) catch return error.BadYarnFactor;
+    if (!(f >= 1.0 and f <= 1024.0)) return error.BadYarnFactor;
+    return f;
+}
+
+/// The "factor" of a kit's rope.json, null when it names none (a kit cut for the checkpoint's own factor).
+pub fn kitRopeFactor(gpa: std.mem.Allocator, text: []const u8) !?f64 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.BadConfig;
+    const v = parsed.value.object.get("factor") orelse return null;
+    return switch (v) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => error.BadConfig,
+    };
+}
+
+/// The factor the engine runs and the positions it reaches: the checkpoint's own (rope_scaling.factor, max_position_embeddings)
+/// unless TF_DS_YARN_FACTOR asks for another, which reaches original_max_position x that factor.
+pub fn ropeRange(c: *const Config, asked: ?f64) Rope {
+    const f = asked orelse return .{ .factor = c.rope_factor, .max_position = c.max_position };
+    return .{ .factor = f, .max_position = @intFromFloat(@round(f * @as(f64, @floatFromInt(c.original_max_position)))) };
+}
+
+/// The start's two length checks: the kit's RoPE tables were cut for the factor the engine runs (a kit that names none was cut
+/// for the checkpoint's), and a stream's context does not pass the positions that factor reaches.
+pub fn checkRope(c: *const Config, asked: ?f64, kit_factor: ?f64, context: usize, why: *Why) !Rope {
+    const r = ropeRange(c, asked);
+    const kf = kit_factor orelse c.rope_factor;
+    if (kf != r.factor) {
+        why.set("the kit's RoPE tables are cut for YaRN factor {d}, the engine runs factor {d} (TF_DS_YARN_FACTOR; unset is the checkpoint's {d}): use the kit and the setting together", .{ kf, r.factor, c.rope_factor });
+        return error.RopeFactorMismatch;
+    }
+    if (context > r.max_position) {
+        why.set("the context {d} is past the {d} positions YaRN factor {d} reaches over {d} (the checkpoint's {d}): TF_DS_YARN_FACTOR and a kit cut for it", .{ context, r.max_position, r.factor, c.original_max_position, c.rope_factor });
+        return error.ContextPastRope;
+    }
+    return r;
+}
+
+/// CUDA's grid: at most 65,535 programs along y (and z).
+pub const grid_yz_max = 65_535;
+
+/// The longest context the decode indexer reaches: `_index_score` runs a program a `tile`-key tile along CUDA's grid y over
+/// an index layer's keys (a round's bucket, which stops at the context, over the layer's compress ratio), so each index
+/// layer holds at most 65,535 tiles. Our checkpoint's ratio-1 layers (every token a key): 65,535 x 64 = 4,194,240 tokens.
+pub fn indexWindowMax(c: *const Config, tile: usize) usize {
+    var most: usize = std.math.maxInt(usize);
+    for (c.index_sources.items[0..c.index_sources.len]) |l| {
+        const r: usize = c.ratios[l];
+        if (r != 0) most = @min(most, grid_yz_max * tile * r);
+    }
+    return most;
+}
+
+/// A context that is no power of two is a round's top bucket (round.zig bucketFor stops there), and the sizes a decode round
+/// derives from it (an index layer's keys, their 64-key tiles, the candidate pool's stride) are integer arguments of Triton
+/// variants the kit captured at power-of-two buckets, each such integer divisible by 16 (cuda/aot.zig matches: a div16
+/// variant takes only a value divisible by 16). A multiple of 65,536 keeps them so down to bucket / 4,096: 4,128,768
+/// (63 x 65,536) answered 10 / 10; 4,194,240 read its whole prompt, then its tile count 65,535 (odd) found no
+/// variant at the first round.
+pub const bucket_step = 65_536;
+
+/// Whether a context keeps the kit's indexer variants (see bucket_step).
+pub fn contextKeepsVariants(context: usize) bool {
+    return context == 0 or std.math.isPowerOfTwo(context) or context % bucket_step == 0;
+}
+
+/// The longest context at or under `context` that keeps them: a multiple of 65,536, or below 65,536 a power of two.
+pub fn variantContextBelow(context: usize) usize {
+    if (context >= bucket_step) return context / bucket_step * bucket_step;
+    return if (context == 0) 0 else std.math.floorPowerOfTwo(usize, context);
+}
+
+/// The start's checks of the context against the decode indexer: within indexWindowMax (past it a round's first indexer launch
+/// is refused by the driver), and a power of two or a multiple of 65,536 (else the first round finds no kit variant).
+pub fn checkIndexWindow(c: *const Config, context: usize, tile: usize, why: *Why) !void {
+    const most = indexWindowMax(c, tile);
+    if (context > most) {
+        const works = variantContextBelow(most);
+        why.set("the context {d} is past {d}: the decode indexer scores an index layer's keys in {d}-key tiles along CUDA's grid y, at most {d} of them (compress ratio 1: every token a key): CONTEXT {d} works", .{ context, most, tile, grid_yz_max, works });
+        return error.ContextPastIndexGrid;
+    }
+    if (!contextKeepsVariants(context)) {
+        why.set("the context {d} is neither a power of two nor a multiple of {d}: it is a round's top bucket, and the kit's indexer variants take its tile counts divisible by 16 (else the first reply fails after the whole prompt): CONTEXT {d} works", .{ context, bucket_step, variantContextBelow(context) });
+        return error.ContextOffBucketGrid;
+    }
+}
+
 /// The fields our checkpoint's config.json has (DeepSeek-V4.1-Flash, EXL3 2.9 bpw mul1), trimmed to what parse reads.
 pub const test_config =
     \\{"model_type": "deepseek_v41", "bos_token_id": 0, "eos_token_id": 1, "image_token_id": 129264,
@@ -333,6 +431,32 @@ test "parse our checkpoint's config and accept its shapes" {
     try std.testing.expectEqual(@as(?u32, 129264), c.image_token);
     try std.testing.expect(c.vision);
     try std.testing.expectEqual(@as(f32, 1e-20), c.eps);
+}
+
+test "the context stops where an index layer's 64-key tiles fill CUDA's grid y" {
+    var why: Why = .{};
+    const c = try parse(std.testing.allocator, test_config, &why);
+    // ratio 1 on index layers 20, 24, 28, 32, 36: 65,535 tiles of 64 keys
+    try std.testing.expectEqual(@as(usize, 4_194_240), indexWindowMax(&c, 64));
+    try checkIndexWindow(&c, 1_048_576, 64, &why);
+    try checkIndexWindow(&c, 2_097_152, 64, &why);
+    // 4,128,768 = 63 x 65,536: 64,512 tiles, a 4M run that answered 10 / 10
+    try checkIndexWindow(&c, 4_128_768, 64, &why);
+    // 4,194,304 = 65,536 tiles: a 4M start served its prompt, then the driver refused the first round's launch
+    try std.testing.expectError(error.ContextPastIndexGrid, checkIndexWindow(&c, 4_194_304, 64, &why));
+    try std.testing.expect(std.mem.indexOf(u8, why.text(), "CONTEXT 4128768 works") != null);
+    // 4,194,240 = 65,535 tiles, odd: within the grid, but the first round found no kit variant
+    try std.testing.expectError(error.ContextOffBucketGrid, checkIndexWindow(&c, 4_194_240, 64, &why));
+    try std.testing.expect(std.mem.indexOf(u8, why.text(), "CONTEXT 4128768 works") != null);
+    try std.testing.expectError(error.ContextOffBucketGrid, checkIndexWindow(&c, 1_500_000, 64, &why));
+    try std.testing.expect(std.mem.indexOf(u8, why.text(), "CONTEXT 1441792 works") != null);
+    try std.testing.expect(contextKeepsVariants(0) and contextKeepsVariants(4096) and contextKeepsVariants(3 * 65_536));
+    try std.testing.expect(!contextKeepsVariants(65_536 + 4096) and !contextKeepsVariants(5000));
+    try std.testing.expectEqual(@as(usize, 4096), variantContextBelow(5000));
+    // index layers of ratio 2 only: twice as far
+    var c2 = c;
+    for (c2.index_sources.items[0..c2.index_sources.len]) |l| c2.ratios[l] = 2;
+    try std.testing.expectEqual(@as(usize, 8_388_480), indexWindowMax(&c2, 64));
 }
 
 test "refuse other model types, other quantization and other shapes" {
@@ -374,4 +498,33 @@ test "a refusal's reason is cut at the buffer, never past it" {
     const long: [400]u8 = @splat('x');
     why.set("{s}", .{&long});
     try std.testing.expectEqual(@as(usize, 320), why.text().len);
+}
+
+test "the YaRN factor: unset is the checkpoint's, 32 reaches 2,097,152, a kit and a setting must agree" {
+    const a = std.testing.allocator;
+    var why: Why = .{};
+    const c = try parse(a, test_config, &why);
+    // baseline: nothing set, a kit that names no factor, the 1M context
+    const r0 = try checkRope(&c, try yarnFactorAsked(null), null, 1_048_576, &why);
+    try std.testing.expectEqual(@as(f64, 16), r0.factor);
+    try std.testing.expectEqual(@as(usize, 1_048_576), r0.max_position);
+    try std.testing.expectEqual(@as(?f64, null), try yarnFactorAsked(""));
+    // asking for the checkpoint's own factor changes nothing
+    const r16 = try checkRope(&c, try yarnFactorAsked("16"), null, 1_048_576, &why);
+    try std.testing.expectEqual(@as(usize, 1_048_576), r16.max_position);
+    // 1M refuses past 1,048,576 with the checkpoint's factor; 2M passes with 32 and a kit that says 32
+    try std.testing.expectError(error.ContextPastRope, checkRope(&c, null, null, 2_097_152, &why));
+    const r32 = try checkRope(&c, try yarnFactorAsked("32"), 32.0, 2_097_152, &why);
+    try std.testing.expectEqual(@as(usize, 2_097_152), r32.max_position);
+    try std.testing.expectError(error.ContextPastRope, checkRope(&c, try yarnFactorAsked("32"), 32.0, 2_097_153, &why));
+    // a kit and a setting that disagree never start (either way)
+    try std.testing.expectError(error.RopeFactorMismatch, checkRope(&c, try yarnFactorAsked("32"), null, 1_048_576, &why));
+    try std.testing.expectError(error.RopeFactorMismatch, checkRope(&c, null, 32.0, 1_048_576, &why));
+    try std.testing.expect(why.len != 0);
+    try std.testing.expectError(error.BadYarnFactor, yarnFactorAsked("abc"));
+    try std.testing.expectError(error.BadYarnFactor, yarnFactorAsked("0.5"));
+    // rope.json: a factor field, integer or float; none
+    try std.testing.expectEqual(@as(?f64, 32.0), try kitRopeFactor(a, "{\"rows\": 2162688, \"half\": 32, \"factor\": 32}"));
+    try std.testing.expectEqual(@as(?f64, 32.5), try kitRopeFactor(a, "{\"factor\": 32.5}"));
+    try std.testing.expectEqual(@as(?f64, null), try kitRopeFactor(a, "{\"rows\": 1114112, \"half\": 32}"));
 }

@@ -664,6 +664,30 @@
    "secret": false
   },
   {
+   "id": 993,
+   "name": "tf_ds_yarn_factor",
+   "env": "TF_DS_YARN_FACTOR",
+   "group": "memory",
+   "tab": "Passes & memory",
+   "kind": "float",
+   "unit": "",
+   "min": 1,
+   "max": 1024,
+   "default": "",
+   "default_text": "The checkpoint's own (16: positions to 1,048,576)",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "YaRN factor of the RoPE tables",
+   "doc": "The YaRN factor the kit's RoPE tables were cut for, and with it the positions a stream may reach: 65,536 x the factor (16 = 1,048,576, the checkpoint's own; 32 = 2,097,152, outside what the model was trained on). Unset is the checkpoint's. The kit's rope.json names the factor its tables were cut for; a start whose kit and setting differ, or whose context is past the positions the factor reaches, is refused and says so. Every rank must use the same value; the context (CONTEXT) and the pool follow it.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:2913",
+   "secret": false
+  },
+  {
    "id": 994,
    "name": "tf_ds_pf_t64",
    "env": "TF_DS_PF_T64",

@@ -166,6 +166,11 @@ pub const Set = struct {
 
     /// Launches variant `v` (a find's or a lookup's) on `grid`, runtime arguments in its order.
     pub fn launchVariant(v: *const Variant, stream: Stream, grid: [3]u32, args: []const Arg) !void {
+        // (launch.validate refuses it too, without the kernel's name)
+        if (!launch.gridFits(grid)) {
+            std.log.err("{s}: grid ({d}, {d}, {d}) is past CUDA's limits (y and z at most 65,535)", .{ v.spec.@"fn", grid[0], grid[1], grid[2] });
+            return error.GridPastLimit;
+        }
         var packed_args: launch.Args = .{};
         for (v.spec.params) |p| {
             const a = argNamed(args, p.name).?;

@@ -339,11 +339,8 @@ const too_many = "--parallel {d} needs {d:.2} GiB for its streams at a {d}-token
     "and the CUDA memory budget leaves {d:.2} GiB{s}: serve --parallel {d}, or lower --context";
 
 fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
-    if (refusals.family(F, o)) |why| {
-        problem.* = why;
-        return null;
-    }
-    const native = modelContext(a, io, o.dir);
+    // a family whose window depends on its own settings (DeepSeek-V4.1: the YaRN factor of its RoPE tables) reports it
+    const native = if (@hasDecl(F, "nativeWindow")) F.nativeWindow(a, io, o.dir, modelContext(a, io, o.dir)) else modelContext(a, io, o.dir);
     const window = contextWindow(o.context, native, F.default_context) catch |e| {
         problem.* = switch (e) {
             error.Negative => try std.fmt.allocPrint(a, "--context {d}: a token count, or 0 for the model's window", .{o.context.?}),
