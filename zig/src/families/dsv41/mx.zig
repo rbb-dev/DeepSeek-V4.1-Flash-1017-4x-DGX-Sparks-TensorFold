@@ -299,6 +299,7 @@ fn launch(f: cuda.Function, s: cuda.Stream, grid: [3]usize, block: usize, args: 
 }
 
 /// The prefill tile kernels' dynamic shared memory (native.cu asserts the same: pf::kGemmSmem, kGuSmem, kDnSmem).
+pub const pf_gemm_smem: u32 = 76800;
 pub const pf_gu_smem: u32 = 79872;
 pub const pf_dn_smem: u32 = 53760;
 pub const pf_bf16_smem: u32 = 81920;
