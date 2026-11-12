@@ -125,12 +125,15 @@ test "planned families resume and keep only at the request's chunk starts" {
     var f: Fake = .{ .gpa = gpa };
     var s = Store.init(gpa, f.snapshots(), .{ .planned = true, .min_prompt = 0 }, 1 << 20);
     defer s.deinit();
-    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
-    const p = try s.begin(a, &t1, 7, &.{}, &.{ 4, 6 }, null, &.{});
-    try std.testing.expectEqualSlices(u32, &.{6}, p.marks); // history 7 floored to the start at 6
-    _ = f.pass(&s, &t1, p);
-    try std.testing.expect(s.find(&.{ 1, 2, 3, 4, 5, 6, 7, 9 }, &.{4}, &.{}) == null); // 6 is not one of this prompt's starts
-    try std.testing.expectEqual(@as(u32, 6), s.find(&.{ 1, 2, 3, 4, 5, 6, 7, 9 }, &.{ 4, 6 }, &.{}).?.at);
+    const long = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    _ = f.pass(&s, &long, .{ .marks = &.{ 4, 8 } });
+    const short = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 20, 21 }; // shares 8 tokens and ends 2 past them, inside the tail
+    var p = try s.begin(a, &short, 9, &.{}, &.{}, null);
+    try std.testing.expectEqual(@as(u32, 4), p.from);
+    try std.testing.expectEqual(fresh(&short), f.pass(&s, &short, p));
+    const next = long ++ [_]u32{ 13, 14 }; // the long conversation's next turn resumes its own state at 8
+    p = try s.begin(a, &next, 12, &.{}, &.{}, null);
+    try std.testing.expectEqual(@as(u32, 8), p.from);
 }
 
 test "a planned family's own grid gives the starts when a request names none, and a resumed pass equals a fresh one" {

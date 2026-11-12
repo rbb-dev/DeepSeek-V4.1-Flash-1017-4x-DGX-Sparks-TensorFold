@@ -98,6 +98,7 @@ pub const Snaps = struct {
     /// Whether a kept state restores for a prompt of this many tokens, and whether it still holds its rows.
     resumes: *const fn (*anyopaque, *anyopaque, u32) bool,
     live: *const fn (*anyopaque, *anyopaque) bool,
+    tail: u32 = 0,
 };
 
 /// The rank's model and the backend over it (what `open` hands the server, freed by `deinit`).
