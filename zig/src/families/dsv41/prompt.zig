@@ -43,8 +43,10 @@ const slab_plan = @import("slab_plan.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const mx = @import("mx.zig");
 const prompt2d = @import("prompt2d.zig");
+const keep_ahead = @import("keep_ahead.zig");
 const rdma = @import("rdma.zig");
 const round = @import("round.zig");
+const lanes = @import("lanes"); // the pass rule (stream.passRows), for the worker's per-pass read-ahead window
 
 /// A profile's (--profile 2) chunk timer (model.zig sets it while it times a chunk): the attention's and the MoE's
 /// steps marked inside their phases (a_in, a_q, a_idx, a_core, a_woa; m_rt, m_gu, m_x), the rest of each in its own.
@@ -2452,6 +2454,58 @@ pub fn ffnCodesOffAt(gpa: std.mem.Allocator, finds: anytype, native: bool, layer
 
 /// Engram on the host: the hasher (the compressed token map, the multipliers), this rank's hash columns [lo, hi) of
 /// each Engram layer's, its tables and readers, and host buffers for a chunk's rows (model.py's Engram).
+/// The worker's slots whose rows are still being copied to the device, by Engram layer: a slot is armed with the `used`
+/// count it frees (wk_used) once its copy's event is done, and freed in that order. At most two are pending a layer (the
+/// worker holds two slots).
+pub const PinSlots = struct {
+    live: [2][engram_rows.max_wk]bool = @splat(@splat(false)),
+    used: [2][engram_rows.max_wk]usize = @splat(@splat(0)),
+    next: [2]usize = .{ 0, 0 }, // the ring position of the next arm, by layer
+
+    /// The ring position the next arm of layer j takes, or null when both are pending (the caller waits for the oldest).
+    pub fn room(s: *const PinSlots, j: usize) ?usize {
+        const p = s.next[j] % s.ring;
+        return if (s.live[j][p]) null else p;
+    }
+
+    /// Layer j's slot `p` (room's) holds a copy that frees `used` slots of the worker when done.
+    pub fn arm(s: *PinSlots, j: usize, p: usize, used: usize) void {
+        std.debug.assert(!s.live[j][p]);
+        s.live[j][p] = true;
+        s.used[j][p] = used;
+        s.next[j] += 1;
+    }
+
+    /// The largest `used` pending for layer j (0: none), over the whole ring.
+    pub fn highest(s: *const PinSlots, j: usize) usize {
+        var u: usize = 0;
+        for (0..s.ring) |p| {
+            if (s.live[j][p]) u = @max(u, s.used[j][p]);
+        }
+        return u;
+    }
+
+    /// The pending position of layer j with the fewest `used` (the oldest), or null.
+    pub fn oldest(s: *const PinSlots, j: usize) ?usize {
+        var best: ?usize = null;
+        for (0..s.ring) |p| {
+            if (s.live[j][p] and (best == null or s.used[j][p] < s.used[j][best.?])) best = p;
+        }
+        return best;
+    }
+
+    /// Frees, oldest first, layer j's slots whose copies are done (`ctx.done(j, p)`, then `ctx.release(j, used)`); true while
+    /// one is still pending.
+    pub fn poll(s: *PinSlots, j: usize, ctx: anytype) !bool {
+        while (s.oldest(j)) |p| {
+            if (!try ctx.done(j, p)) return true;
+            ctx.release(j, s.used[j][p]);
+            s.live[j][p] = false;
+        }
+        return false;
+    }
+};
+
 pub const EngramHost = struct {
     hasher: engram.Hasher,
     tables: *const engram_io.Tables,
@@ -2496,14 +2550,23 @@ pub const EngramHost = struct {
     // uploaded), so the worker runs up to a chunk ahead of the layers: a chunk's table reads overlap the chunk before
     wk_rows: [engram_rows.max_wk][2][]u16 = @splat(.{ &.{}, &.{} }),
     wk_slots: usize = 2,
+    // the worker's row ids by chunk parity: a pass-major read leaves one chunk's layer-1 rows to read after the next
+    // chunk's layer 0 has hashed its ids, so each slot keeps its own (the chunk-major order read them back to back)
     wk_hashes: [engram_rows.max_wk][]i64 = @splat(&.{}),
     wk_flat: []i64 = &.{},
     wk_w: []u8 = &.{},
     wk_s: []u8 = &.{},
     wk_done: [2]std.atomic.Value(usize) = .{ .init(0), .init(0) },
     wk_used: [2]std.atomic.Value(usize) = .{ .init(0), .init(0) },
+    // TF_DS_ENGRAM_PINNED: the worker's slots in pinned host memory, uploaded without the host waiting for the stream; a slot
+    // goes back to the worker (wk_used) when the event recorded behind its copy is done (PinSlots)
+    pinned: bool = false,
+    pin_ev: [2][engram_rows.max_wk]?cuda.Event = @splat(@splat(null)),
+    pin: PinSlots = .{},
+    pin_host: [engram_rows.max_wk][2]?cuda.HostBuffer = @splat(.{ null, null }), // the unpacked rows' pinned slots
     // the engine thread's time in the pass (TF_DS_ROCI_PAIR_LOG's line): waiting for the worker's rows, and in the upload calls (a blocked copy is here)
     inst_wait_ns: u64 = 0,
+    ka: keep_ahead.Stats = .{}, // TF_DS_ENGRAM_KEEP_AHEAD: the worker's starts this prompt and the first layer's wait after a round (the engine thread alone)
     inst_apply_ns: u64 = 0,
     // the worker's own time and reads (its thread adds, the engine thread's pair line reads the difference from `inst_snap`): steps, hashing,
     // the rows' gather (the packed path's cache lookups and reads), decode on the host, rows asked, rows read (cache misses), bytes read
@@ -2520,7 +2583,10 @@ pub const EngramHost = struct {
     wk_thread: ?std.Thread = null,
     wk_seq: []const i32 = &.{}, // the prompt it reads (its whole ids)
     wk_start: usize = 0, // its first chunk's start
+    wk_ahead: bool = false, // TF_DS_ENGRAM_AHEAD_PASS in effect for this worker
     wk_group: usize = 0, // TF_DS_ROCI_WORKER_PAIR_MAJOR with two passes in flight: 4 chunks a group (WorkerOrder.group)
+    wk_pass_from: usize = 0, // the pass rule's pass_from (prompt2d.pass_from_asked)
+    wk_pass_rows: usize = 0, // the pass rule's pass_rows cap (Model.pass_rows)
     // engramApply's rows when the worker read them: the pass's resume units in order (use_n of them, use_unit rows each
     // but the last), or their records instead with packed shards (engramWorkerStage)
     use_n: usize = 0,
@@ -2617,83 +2683,69 @@ fn engramAhead1(eh: *EngramHost, c: *const Config, seq: []const i32, start: usiz
     eh.ahead_ready[j] = true;
 }
 
-/// Layer li's Engram on the chunk (engram_apply, no image span), as _forward_k runs it before the attention mixes: a
-/// pending MoE post into the streams first (hc_post), then the rows of each position's n-grams (hashed on the host from
-/// `seq`, the whole sequence's ids so far; read from the tables; decoded to bf16 as Engram._decode does), their
-/// projection summed over the ranks in rank order, rounded to bf16, and the gate into the streams.
-pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq: []const i32) !void {
-    const lay = e.w.layers[li];
-    const ew = lay.engram_wkv orelse return;
-    const c = e.c;
-    const n = ch.n;
-    if (ch.pending) {
-        try tri_basic.hcPostRs(e.t, ch.gm, ch.gm_rs, ch.h, ch.post, ch.comb, ch.h, e.world, n, c.hidden);
-        ch.pending = false;
-    }
-    const li32: u16 = @intCast(li);
-    const l = std.mem.indexOfScalar(u16, c.engram_layers.slice(), li32) orelse return error.NotAnEngramLayer;
-    const t = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
-    const cols = eh.hasher.cols();
-    const k = eh.hi - eh.lo;
-    const m = n * k;
-    const prof = eh.io != null;
-    var tq = if (prof) pstamp(e, eh) else 0;
-    // the rows read ahead (fillChunk's thread) when they start at this chunk and cover it (its first n rows), else
-    // read here
-    var rows: []u16 = eh.rows;
-    // (TF_DS_WAVES: a wave's are its part of the pass's rows; the last wave's use ends them)
-    const ahead_end = eh.ahead_start +| eh.ahead_n;
-    if (!waves and l < 2 and eh.ahead_ready[l] and eh.ahead_start == ch.start and eh.ahead_n >= n) {
-        rows = eh.ahead_rows[l];
-        eh.ahead_ready[l] = false;
-    } else if (waves and l < 2 and eh.ahead_ready[l] and ch.start >= eh.ahead_start and ch.start + n <= ahead_end) {
-        rows = eh.ahead_rows[l][(ch.start - eh.ahead_start) * k * t.row_w ..];
-        if (ch.start + n == ahead_end) eh.ahead_ready[l] = false;
-    } else {
-        eh.hasher.hashes(seq, ch.start, n, eh.hashes[0 .. n * eh.hasher.layers * cols]);
-        for (0..n) |r| {
-            for (0..k) |j| eh.flat[r * k + j] = eh.hashes[(r * eh.hasher.layers + l) * cols + eh.lo + j];
+/// TF_DS_ENGRAM_AHEAD_PASS=1: a fill's Engram worker schedules a prompt pass's chunks a layer at a time, so a 4,096-row
+/// pass's second chunk has its layer's rows read with the first chunk's and not behind the first chunk's later layer.
+/// Unset (the default): the worker keeps the baseline chunk-major order, every layer of a chunk before the next chunk.
+pub var ahead_pass_on: bool = false;
+pub const ahead_pass_line = "TF_DS_ENGRAM_AHEAD_PASS=1: the Engram worker reads a prompt pass's chunks a layer at a time (both chunks of a 4,096-row pass ready when it starts; a 2,048-row pass keeps the chunk order)";
+
+/// Read TF_DS_ENGRAM_AHEAD_PASS once at start (model.readWorkerEnv, from Model.open) and print its start line once.
+pub fn readAheadPassEnv() void {
+    if (std.c.getenv("TF_DS_ENGRAM_AHEAD_PASS")) |v| ahead_pass_on = !std.mem.eql(u8, std.mem.span(v), "0");
+    if (ahead_pass_on) std.log.info("{s}", .{ahead_pass_line});
+}
+
+/// The pass rule's rows at a fill's chunk `at`, from the host's quiet facts: while this worker reads, nothing decodes
+/// and no other prompt fills; a round that interrupts the fill joins the worker, so the next fill starts it afresh.
 /// `filling_pass` is the rule's filling switch, which changes nothing under these facts.
 fn workerRuleRows(at: usize, pass_from: usize, pass_rows: usize, chunk: usize, filling_pass: bool) usize {
+    const quiet: lanes.stream.Facts = .{ .decoding = false, .filling = false, .waiting = false, .step_rows = std.math.maxInt(u32) };
     return lanes.stream.passRows(quiet, at, pass_from, @intCast(pass_rows), @intCast(chunk), filling_pass);
+}
+
+/// One worker read: a chunk of `chunk` rows and one Engram layer, exactly the workerRows call of the chunk-major loop.
+pub const WorkerStep = struct { chunk: usize, layer: usize };
+
+/// The order the fill's Engram worker reads its chunks: the baseline chunk-major order, or with TF_DS_ENGRAM_AHEAD_PASS each
+/// pass's chunks a layer at a time, the pass's size from the pass rule at that chunk's position (stream.passRows).
+pub const WorkerOrder = struct {
+    start: usize, // the fill's first chunk start, the pass rule's absolute position
+    chunks: usize,
+    chunk: usize,
+    layers: usize,
+    pass_from: usize,
+    pass_rows: usize, // the pass rule's cap (<= chunk: the baseline chunk-major order)
     filling_pass: bool = false, // the pass rule's filling switch (TF_DS_PASS_FILLING)
     group: usize = 0, // chunks a pass-major group takes from pass_from on, whatever the pass rule says (0: the rule): two passes in flight read both passes' layer 0, then both layer 1
+    next_chunk: usize = 0,
+    next_layer: usize = 0,
+    base: usize = 0, // the current pass's first chunk
+    end: usize = 0, // and its end chunk (exclusive)
+
+    pub fn next(self: *WorkerOrder) ?WorkerStep {
+        if (self.next_chunk >= self.chunks or self.layers == 0 or self.chunk == 0) return null;
+        if (self.next_chunk == self.end) {
+            // a new pass: its rows from the pass rule at this chunk's absolute position (the fill's start + the chunk)
+            const at = self.start + self.next_chunk * self.chunk;
             const rows = if (self.group != 0 and at >= self.pass_from) self.group * self.chunk else if (self.pass_rows <= self.chunk) self.chunk else workerRuleRows(at, self.pass_from, self.pass_rows, self.chunk, self.filling_pass);
+            self.base = self.next_chunk;
+            self.end = @min(self.base + @max(@as(usize, 1), rows / self.chunk), self.chunks);
+            self.next_layer = 0;
         }
-        if (eh.paio) |aio| try aioGather(aio, t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]) else try eh.pool.gather(t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]);
-        engram.decodeRows(eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s], eh.rows[0 .. m * t.row_w], m, t.row_w, t.row_s, 8); // the rows on 8 threads
+        const step: WorkerStep = .{ .chunk = self.next_chunk, .layer = self.next_layer };
+        self.next_chunk += 1;
+        if (self.next_chunk == self.end) {
+            self.next_layer += 1;
+            self.next_chunk = self.base;
+            if (self.next_layer == self.layers) {
+                self.next_layer = 0;
+                self.next_chunk = self.end;
+            }
+        }
+        return step;
     }
-    if (m * t.row_w != n * ew.k) return error.EngramShape;
-    if (prof) eh.p_rows += lap(e, eh, &tq);
-    try upload(e, ch.eb, rows.ptr, m * t.row_w * 2);
-    if (prof) eh.p_upload += lap(e, eh, &tq);
-    try mm(e, ch, ew, ch.eb, ew.k, ch.ek, .fp32, ew.n);
-    if (prof) eh.p_mm += lap(e, eh, &tq);
-    // 2D (model.py esum): this node's columns of its rank's projection; the quarters give both ranks' whole ones
-    const en = if (e.two) |two| two.engramWidth() else ew.n;
-    // 2D chunks past the rings: the pair's sum then the pairs' bf16 halves (Two.engramSum), the same bits
-    const psum = if (e.two) |two| two.rings == null or n >= 64 else false;
-    if (psum) {
-        try e.two.?.engramSum(e, ch.ek, ch.ekg, ch.kv, n);
-        if (prof) eh.p_x += lap(e, eh, &tq);
-    } else {
-        if (e.two) |two| try two.quarters(e, ch.ek, ch.ekg, n, two.ew, 4) else try e.comm.allGather(ch.ek, ch.ekg, n * ew.n, .f32, e.s);
-        if (prof) eh.p_x += lap(e, eh, &tq);
-        if (e.world != 2) return notPorted(@src()); // Comm.sum of more ranks: acc += g[r]
-        try e.ops.add2Bf16(e.s, ch.ekg, ch.ekg + n * en * 4, ch.kv, n * en);
-    }
-    try tri_basic.engramGate(e.t, ch.h, ch.kv, lay.engram_qk, ch.h_alt, c.eps, n, c.hidden);
-    swapStreams(ch, ch.h_alt);
-    // image spans take no Engram contribution: their rows keep the streams they came with (engram_mask)
-    const rowb = c.hc * c.hidden * 2;
-    for (ch.spans) |sp| {
-        const o = overlap(sp, ch.start, n) orelse continue;
-        try e.ops.copyRows(e.s, ch.h_alt + o[0] * rowb, rowb, ch.h + o[0] * rowb, rowb, rowb, o[1] - o[0]);
-    }
-    if (prof) {
-        eh.p_gate += lap(e, eh, &tq);
-        eh.p_calls += 1;
-    }
+};
+
 }
 
 /// A profile's clock after the stream drains (prompt Engram split).
@@ -2711,44 +2763,47 @@ fn lap(e: *const Engine, eh: *const EngramHost, t: *u64) u64 {
 /// The fill's read-ahead worker (a thread of model.zig's fill): from the chunk at `start`, chunk after chunk of
 /// `chunk` rows to the end of `seq` (the prompt's whole ids), both Engram layers' rows hashed, read and decoded as
 /// engramApply would, into the chunk's slot once the layers freed it. Errors land in wk_err (wk_failed set).
-    }
-    for (batch[0..nb], 0..) |id, i| {
-        aio.wait(id) catch |err| {
-            for (batch[i + 1 .. nb]) |rest| aio.wait(rest) catch {};
-            nb = 0;
-            return err;
-        };
-    }
-    nb = 0;
-}
+/// TF_DS_ENGRAM_FAULT=R:C (a test: the drill of a failure on one rank alone): rank R's Engram worker fails its row read once,
+/// with the error the disk would give, at the C-th layer-0 step (0 is the first) it takes after the start; the switch is then
+/// spent. Every rank parses the same text and acts only when it is the named one. Unset or empty: nothing.
+pub const EngramFault = struct {
+    rank: u32 = 0,
+    at: u32 = 0,
+    asked: bool = false,
 
-/// The decoder's bounded replay at its first layer (_forward_k's `replay`, CED's prefill): the layer's attention mixes
-/// (the pending MoE post fused in) and its kv-source update over every row of the chunk, then the chunk cut to its rows
-/// at positions >= replay, the streams and their pre copied down (h[first:], pre[first:]) and their positions uploaded
-/// (pos[first:]). The decoder layers then run on those rows with no window key before replay and this layer's update
-/// done. False: an encoder-only chunk (no row at or past replay), which ends here.
-pub fn replayCut(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize, replay: usize, host_pos: []i64) !bool {
-    try attnMixes(e, ch, li);
-    if (e.w.layers[li].comp_wkv == null) return error.NoKvSource;
-    try kvSourceUpdate(e, ch, cs, sh, li);
-    const first = @max(ch.start, replay) - ch.start;
-    if (first >= ch.n) return false;
-    if (first == 0) return true;
-    const c = e.c;
-    const n = ch.n - first;
-    const row_h = c.hc * c.hidden * 2;
-    try e.ops.copyRows(e.s, ch.h + first * row_h, row_h, ch.h_alt, row_h, row_h, n);
-    std.mem.swap(u64, &ch.h, &ch.h_alt);
-    const row_p = c.hc * 4;
-    try e.ops.copyRows(e.s, ch.pre + first * row_p, row_p, ch.pre_f, row_p, row_p, n);
-    std.mem.swap(u64, &ch.pre, &ch.pre_f);
-    ch.start += first;
-    ch.n = n;
-    // pos[first:] into the chunk's own buffer (256-byte aligned), not a view first * 8 bytes in: with first odd the view
-    // sits 8 bytes off 16, an alignment the kit's ring-mode attention has no kernel for (MissingTritonVariant on a
-    // resumed image prompt). The same positions, written in the stream's order after this layer's reads of the old ones.
-    try upload(e, ch.pos0, host_pos[first..].ptr, n * 8);
-    ch.pos = ch.pos0;
+    pub const Error = error{BadFault};
+
+    pub fn parse(text: ?[]const u8, world: u32) Error!EngramFault {
+        const t = text orelse return .{};
+        if (t.len == 0) return .{};
+        const colon = std.mem.indexOfScalar(u8, t, ':') orelse return error.BadFault;
+        const rank = std.fmt.parseInt(u32, t[0..colon], 10) catch return error.BadFault;
+        const at = std.fmt.parseInt(u32, t[colon + 1 ..], 10) catch return error.BadFault;
+        if (rank >= world) return error.BadFault;
+        return .{ .rank = rank, .at = at, .asked = true };
+    }
+
+    /// The start line's words.
+    pub fn describe(f: EngramFault, buf: []u8, rank: u32) []const u8 {
+        if (!f.asked) return "off";
+        return std.fmt.bufPrint(buf, "{d}:{d} (this rank {s})", .{ f.rank, f.at, if (rank == f.rank) "fails its worker's row read once" else "carries on" }) catch "on";
+    }
+};
+
+/// The parsed switch, set at the start by the model; `engram_fault_seen` counts this rank's layer-0 worker steps and
+/// `engram_fault_spent` is set by the step that fired.
+pub var engram_fault: EngramFault = .{};
+pub var engram_fault_rank: u32 = 0; // this rank, for the worker thread
+pub var engram_fault_seen: std.atomic.Value(u32) = .init(0);
+pub var engram_fault_spent: std.atomic.Value(bool) = .init(false);
+
+/// Whether the worker step of layer `j` on rank `rank` is the one the switch names; true at most once.
+pub fn engramFaultFires(f: EngramFault, rank: u32, j: usize) bool {
+    if (!f.asked or f.rank != rank or j != 0) return false;
+    if (engram_fault_spent.load(.acquire)) return false;
+    const n = engram_fault_seen.fetchAdd(1, .acq_rel);
+    if (n != f.at) return false;
+    engram_fault_spent.store(true, .release);
     return true;
 }
 
@@ -2770,14 +2825,33 @@ pub fn engramWorker(eh: *EngramHost, c: *const Config, seq: []const i32, start: 
     const nl = @min(2, c.engram_layers.slice().len);
     const cols = eh.hasher.cols();
     const k = eh.hi - eh.lo;
+    if (chunk == 0) return;
+    const chunks = if (seq.len > start) (seq.len - start + chunk - 1) / chunk else 0;
+    var order: WorkerOrder = .{
+        .start = start,
+        .chunks = chunks,
+        .chunk = chunk,
+        .layers = nl,
+        .pass_from = eh.wk_pass_from,
         .filling_pass = prompt2d.pass_filling_asked,
         .group = eh.wk_group,
+    };
+    while (order.next()) |step| {
+        const at = start + step.chunk * chunk;
         const n = @min(chunk, seq.len - at);
+        const j = step.layer;
+        if (engramFaultFires(engram_fault, engram_fault_rank, j)) {
+            std.log.err("TF_DS_ENGRAM_FAULT: rank {d}: the worker's row read of layer {d} at position {d} fails once (a drill)", .{ engram_fault_rank, j, at });
+            eh.wk_err = error.InputOutput;
+            eh.wk_failed.store(true, .release);
+            return;
+        }
         workerRows(eh, c, seq, at, n, j, cols, k, eh.wk_rows[step.chunk % eh.wk_slots][j], step.chunk % eh.wk_slots) catch |err| {
             eh.wk_err = err;
             eh.wk_failed.store(true, .release);
             return;
         };
+        eh.wk_done[j].store(step.chunk + 1, .release);
     }
 }
 
@@ -2793,6 +2867,7 @@ fn workerRows(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize,
     // packed shards: the chunk's records staged in the worker's slot, decoded on the GPU when applied
     if (eh.pk) |pr| {
         const tg = nowNs();
+        try pr.chunkReadSplit(&pr.wk[slot][j], j, eh.wk_hashes[slot][0 .. n * eh.hasher.layers * cols], n, eh.hasher.layers, ((start / 2048) << 8) | j);
         _ = eh.inst_gather_ns.fetchAdd(@intCast(nowNs() - tg), .monotonic);
         const st = &pr.wk[slot][j];
         _ = eh.inst_rows.fetchAdd(n * pr.slots(), .monotonic);
@@ -2801,6 +2876,7 @@ fn workerRows(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize,
         return;
     }
     for (0..n) |r| {
+        for (0..k) |q| eh.wk_flat[r * k + q] = eh.wk_hashes[slot][(r * eh.hasher.layers + j) * cols + eh.lo + q];
     }
     const m = n * k;
     const tg = nowNs();
@@ -2814,7 +2890,13 @@ fn workerRows(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize,
     _ = eh.inst_bytes.fetchAdd(m * (t.row_w + t.row_s), .monotonic);
 }
 
+/// Start the worker for a fill of `seq` from chunk `start` (any worker before it stopped first). `pass_from` and
+/// `pass_rows` are the pass rule's setting (prompt2d.pass_from_asked, Model.pass_rows): with TF_DS_ENGRAM_AHEAD_PASS
+/// the worker takes each pass's size from that rule at the pass's chunk position; unset, it keeps the baseline order.
+pub fn engramWorkerStart(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize, chunk: usize, pass_from: usize, pass_rows: usize) !void {
     engramWorkerStop(eh);
+    try engramFlushPins(eh); // (a copy still reading a slot the new worker's first rows would overwrite)
+    eh.pin = .{ .ring = eh.wk_slots };
     for (&eh.wk_done) |*v| v.store(0, .release);
     for (&eh.wk_used) |*v| v.store(0, .release);
     eh.wk_stop.store(false, .release);
@@ -2822,7 +2904,11 @@ fn workerRows(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize,
     eh.wk_err = null;
     eh.wk_seq = seq;
     eh.wk_start = start;
+    eh.wk_ahead = ahead_pass_on;
+    eh.wk_pass_from = pass_from;
+    eh.wk_pass_rows = pass_rows;
     eh.wk_thread = try std.Thread.spawn(.{}, engramWorker, .{ eh, c, seq, start, chunk });
+    eh.ka.workerStarted();
 }
 
 /// Stop and join the worker (a fill's end, or its prompt about to change).
@@ -2834,16 +2920,111 @@ pub fn engramWorkerStop(eh: *EngramHost) void {
     eh.wk_seq = &.{};
 }
 
+/// The pinned slots' events and, without packed shards, the pinned rows (TF_DS_ENGRAM_PINNED, the worker on): the worker's
+/// rows land in page-locked memory, so the copy to the device is asynchronous. Returns the pinned bytes this rank holds
+/// (packed shards: their stages are pinned by engram_rows, counted here).
+pub fn engramPin(eh: *EngramHost, d: *const cuda.Driver) !usize {
+    var bytes: usize = 0;
+    for (&eh.pin_ev) |*row| for (row) |*ev| {
+        ev.* = try cuda.Event.init(d, false);
+    };
+    if (eh.pk) |pr| {
+        bytes = pr.pinnedBytes();
+    } else {
+        for (0..eh.wk_slots) |slot| for (0..2) |j| {
+            const n = eh.wk_rows[slot][j].len;
+            if (n == 0) continue;
+            var hb = try cuda.HostBuffer.alloc(d, n * 2);
+            eh.pin_host[slot][j] = hb;
+            eh.wk_rows[slot][j] = hb.slice(u16)[0..n];
+            bytes += n * 2;
+        };
+    }
+    eh.pin = .{ .ring = eh.wk_slots };
+    eh.pinned = true;
+    return bytes;
+}
+
+/// Frees what engramPin made (the events and pinned rows); the worker is stopped.
+pub fn engramUnpin(eh: *EngramHost) void {
+    for (&eh.pin_ev) |*row| for (row) |*ev| {
+        if (ev.*) |*x| x.deinit();
+        ev.* = null;
+    };
+    for (&eh.pin_host) |*row| for (row) |*hb| {
+        if (hb.*) |*x| x.free();
+        hb.* = null;
+    };
+    eh.pinned = false;
+}
+
+const PinCtx = struct {
+    eh: *EngramHost,
+
+    fn done(c: PinCtx, j: usize, p: usize) !bool {
+        return try c.eh.pin_ev[j][p].?.done();
+    }
+
+    fn release(c: PinCtx, j: usize, used: usize) void {
+        c.eh.wk_used[j].store(used, .release);
+    }
+};
+
+/// Gives back, oldest first, the worker's slots whose copies are done (no wait).
+pub fn engramPoll(eh: *EngramHost) !void {
+    if (!eh.pinned) return;
+    for (0..2) |j| _ = try eh.pin.poll(j, PinCtx{ .eh = eh });
+}
+
+/// The worker's `used` slots of layer j (up to `used`) copied by the stream `s`: the slots go back at once when the rows were
+/// pageable (the call returned with them staged), else when the event recorded here is done. A full ring waits for its oldest.
+pub fn engramRelease(eh: *EngramHost, s: cuda.Stream, j: usize, used: usize) !void {
+    if (!eh.pinned) {
+        eh.wk_used[j].store(used, .release);
+        return;
+    }
     const held = where.enter(.engram_release, @intCast(j), 0);
     defer where.leave(held);
+    while (eh.pin.room(j) == null) {
+        const p = eh.pin.oldest(j).?;
+        try eh.pin_ev[j][p].?.synchronize();
+        _ = try eh.pin.poll(j, PinCtx{ .eh = eh });
+    }
+    const p = eh.pin.room(j).?;
+    try eh.pin_ev[j][p].?.record(s);
+    eh.pin.arm(j, p, used);
+    try engramPoll(eh);
+}
+
+/// The worker's chunks of layer j the engine has uploaded: the slots given back (wk_used) and those whose copies are still
+/// pending. A pageable upload made wk_used at once; the engine thread's test that the running worker is still on this fill's
+/// chunks reads it (a pair's second pass counts too: its release names the larger count).
+pub fn engramUploaded(eh: *EngramHost, j: usize) usize {
+    return @max(eh.wk_used[j].load(.acquire), eh.pin.highest(j));
+}
+
+/// Waits for every pending copy and gives its slots back: before a worker starts afresh, whose first rows overwrite them.
+pub fn engramFlushPins(eh: *EngramHost) !void {
+    if (!eh.pinned) return;
     const prev = where.enter(.engram_flush, 0, 0);
     defer where.leave(prev);
+    for (0..2) |j| while (eh.pin.oldest(j)) |p| {
+        try eh.pin_ev[j][p].?.synchronize();
+        _ = try eh.pin.poll(j, PinCtx{ .eh = eh });
+    };
+}
+
 /// The worker's rows of Engram layer j for the chunk at `start` (waiting for them), for engramApply.
 pub fn engramWorkerRows(eh: *EngramHost, j: usize, start: usize, chunk: usize) ![]u16 {
     const ci = (start - eh.wk_start) / chunk;
     const prev_place = where.enter(.engram_rows, @intCast(j), @intCast(ci));
     defer where.leave(prev_place);
     const t_in = nowNs();
+    defer {
+        const waited: u64 = @intCast(nowNs() - t_in);
+        eh.inst_wait_ns += waited;
+        if (j == 0) eh.ka.firstLayerWait(waited);
+    }
     return eh.wk_rows[ci % eh.wk_slots][j];
 }
 
@@ -3699,6 +3880,80 @@ test "the pruned top-k in one launch reads tile maxima its chunk's index score w
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, fb, "cb(\"DEAD_PAD\","));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, fb, "cb(\"DEAD_PAD\", false)"));
 }
+
+fn expectWorkerOrder(order: *WorkerOrder, expected: []const WorkerStep) !void {
+    var i: usize = 0;
+    while (order.next()) |step| : (i += 1) {
+        try std.testing.expect(i < expected.len);
+        try std.testing.expectEqual(expected[i].chunk, step.chunk);
+        try std.testing.expectEqual(expected[i].layer, step.layer);
+    }
+    try std.testing.expectEqual(expected.len, i);
+}
+
+test "TF_DS_ENGRAM_AHEAD_PASS=1: a 4,096-row pass reads both chunks of a layer before the pass's next layer" {
+    var order: WorkerOrder = .{ .start = 0, .chunks = 4, .chunk = 2048, .layers = 2, .pass_from = 0, .pass_rows = 4096 };
+    try expectWorkerOrder(&order, &.{
+        .{ .chunk = 0, .layer = 0 }, .{ .chunk = 1, .layer = 0 },
+        .{ .chunk = 0, .layer = 1 }, .{ .chunk = 1, .layer = 1 },
+        .{ .chunk = 2, .layer = 0 }, .{ .chunk = 3, .layer = 0 },
+        .{ .chunk = 2, .layer = 1 }, .{ .chunk = 3, .layer = 1 },
+    });
+}
+
+test "TF_DS_ENGRAM_AHEAD_PASS off (the default): a 2,048-row pass keeps the baseline chunk order" {
+    var order: WorkerOrder = .{ .start = 0, .chunks = 2, .chunk = 2048, .layers = 2, .pass_from = 0, .pass_rows = 2048 };
+    try expectWorkerOrder(&order, &.{
+        .{ .chunk = 0, .layer = 0 }, .{ .chunk = 0, .layer = 1 },
+        .{ .chunk = 1, .layer = 0 }, .{ .chunk = 1, .layer = 1 },
+    });
+}
+
+test "TF_DS_ENGRAM_AHEAD_PASS=1: a tail pass of one chunk keeps that chunk's two layers together" {
+    var order: WorkerOrder = .{ .start = 0, .chunks = 3, .chunk = 2048, .layers = 2, .pass_from = 0, .pass_rows = 4096 };
+    try expectWorkerOrder(&order, &.{
+        .{ .chunk = 0, .layer = 0 }, .{ .chunk = 1, .layer = 0 },
+        .{ .chunk = 0, .layer = 1 }, .{ .chunk = 1, .layer = 1 },
+        .{ .chunk = 2, .layer = 0 }, .{ .chunk = 2, .layer = 1 },
+    });
+    var empty: WorkerOrder = .{ .start = 0, .chunks = 0, .chunk = 2048, .layers = 2, .pass_from = 0, .pass_rows = 4096 };
+    try std.testing.expectEqual(@as(?WorkerStep, null), empty.next());
+}
+
+test "TF_DS_PASS_FROM=8192, TF_DS_PASS_ROWS=4096: the fill's first four 2,048-row chunks are chunk-major, then 4,096-row passes" {
+    var order: WorkerOrder = .{ .start = 0, .chunks = 10, .chunk = 2048, .layers = 2, .pass_from = 8192, .pass_rows = 4096 };
+    try expectWorkerOrder(&order, &.{
+        .{ .chunk = 0, .layer = 0 }, .{ .chunk = 0, .layer = 1 },
+        .{ .chunk = 1, .layer = 0 }, .{ .chunk = 1, .layer = 1 },
+        .{ .chunk = 2, .layer = 0 }, .{ .chunk = 2, .layer = 1 },
+        .{ .chunk = 3, .layer = 0 }, .{ .chunk = 3, .layer = 1 },
+        .{ .chunk = 4, .layer = 0 }, .{ .chunk = 5, .layer = 0 },
+        .{ .chunk = 4, .layer = 1 }, .{ .chunk = 5, .layer = 1 },
+        .{ .chunk = 6, .layer = 0 }, .{ .chunk = 7, .layer = 0 },
+        .{ .chunk = 6, .layer = 1 }, .{ .chunk = 7, .layer = 1 },
+        .{ .chunk = 8, .layer = 0 }, .{ .chunk = 9, .layer = 0 },
+        .{ .chunk = 8, .layer = 1 }, .{ .chunk = 9, .layer = 1 },
+    });
+}
+
+test "TF_DS_PASS_FROM=8192, TF_DS_PASS_ROWS=8192: 8,192-row passes read four chunks a layer at a time" {
+    var order: WorkerOrder = .{ .start = 0, .chunks = 12, .chunk = 2048, .layers = 2, .pass_from = 8192, .pass_rows = 8192 };
+    try expectWorkerOrder(&order, &.{
+        .{ .chunk = 0, .layer = 0 },  .{ .chunk = 0, .layer = 1 },
+        .{ .chunk = 1, .layer = 0 },  .{ .chunk = 1, .layer = 1 },
+        .{ .chunk = 2, .layer = 0 },  .{ .chunk = 2, .layer = 1 },
+        .{ .chunk = 3, .layer = 0 },  .{ .chunk = 3, .layer = 1 },
+        .{ .chunk = 4, .layer = 0 },  .{ .chunk = 5, .layer = 0 },
+        .{ .chunk = 6, .layer = 0 },  .{ .chunk = 7, .layer = 0 },
+        .{ .chunk = 4, .layer = 1 },  .{ .chunk = 5, .layer = 1 },
+        .{ .chunk = 6, .layer = 1 },  .{ .chunk = 7, .layer = 1 },
+        .{ .chunk = 8, .layer = 0 },  .{ .chunk = 9, .layer = 0 },
+        .{ .chunk = 10, .layer = 0 }, .{ .chunk = 11, .layer = 0 },
+        .{ .chunk = 8, .layer = 1 },  .{ .chunk = 9, .layer = 1 },
+        .{ .chunk = 10, .layer = 1 }, .{ .chunk = 11, .layer = 1 },
+    });
+}
+
 test "TF_DS_PASS_FILLING: two fills alternating 4,096-row passes read each pass two chunks a layer, its own slots" {
     // a fill from the prompt's first row and one resumed at 4,096 (an alternating prompt's next pass): each pass is
     // two units, layer-major from its own start, and a pass's two chunks take the worker's two ring slots (wk_rows[2])
@@ -3845,6 +4100,36 @@ test "TF_DS_ROCI_STAGGER_LANES=3: a group of three passes' 3u chunks, layer 0's 
     try std.testing.expectEqual(engram_rows.workerSlots(2, false), engram_rows.workerSlotsN(2, 1));
 }
 
+test "TF_DS_PASS_FROM is tested at the fill's own start: a fill resumed at 8,192 starts pass-major" {
+    var order: WorkerOrder = .{ .start = 8192, .chunks = 4, .chunk = 2048, .layers = 2, .pass_from = 8192, .pass_rows = 4096 };
+    try expectWorkerOrder(&order, &.{
+        .{ .chunk = 0, .layer = 0 }, .{ .chunk = 1, .layer = 0 },
+        .{ .chunk = 0, .layer = 1 }, .{ .chunk = 1, .layer = 1 },
+        .{ .chunk = 2, .layer = 0 }, .{ .chunk = 3, .layer = 0 },
+        .{ .chunk = 2, .layer = 1 }, .{ .chunk = 3, .layer = 1 },
+    });
+    // a fill resumed at 4,096 is chunk-major for its two chunks below pass_from and pass-major from chunk 2
+    var mid: WorkerOrder = .{ .start = 4096, .chunks = 4, .chunk = 2048, .layers = 2, .pass_from = 8192, .pass_rows = 4096 };
+    try expectWorkerOrder(&mid, &.{
+        .{ .chunk = 0, .layer = 0 }, .{ .chunk = 0, .layer = 1 },
+        .{ .chunk = 1, .layer = 0 }, .{ .chunk = 1, .layer = 1 },
+        .{ .chunk = 2, .layer = 0 }, .{ .chunk = 3, .layer = 0 },
+        .{ .chunk = 2, .layer = 1 }, .{ .chunk = 3, .layer = 1 },
+    });
+}
+
+test "TF_DS_ENGRAM_AHEAD_PASS: the environment sets the switch and prints its start line when on" {
+    // show the start line in the test's output when the switch is on (the engine's log level does so at start)
+    const old = std.testing.log_level;
+    std.testing.log_level = .info;
+    defer std.testing.log_level = old;
+    readAheadPassEnv();
+    const v = std.c.getenv("TF_DS_ENGRAM_AHEAD_PASS");
+    const on = if (v) |s| !std.mem.eql(u8, std.mem.span(s), "0") else false;
+    try std.testing.expectEqual(on, ahead_pass_on);
+    if (on) try std.testing.expect(std.mem.startsWith(u8, ahead_pass_line, "TF_DS_ENGRAM_AHEAD_PASS=1: "));
+    try std.testing.expect(std.mem.startsWith(u8, ahead_pass_line, "TF_DS_ENGRAM_AHEAD_PASS=1: "));
+}
 
 /// Whether the kit's extra set has the two-block reader variant of every launch the owned path makes with TF_DS_ROCI at
 /// each row count of `rows` (a slab of a full pass): null when it has, else the reason. The launches are logged, not
@@ -3928,6 +4213,105 @@ test "TF_DS_ROCI_ENGRAM_AHEAD: engramApply is the pending post, the projection, 
     try std.testing.expect(std.mem.indexOf(u8, sa, "engramOwned(e, ch, li) orelse return") != null);
 }
 
+/// A device copy of a pinned slot, as the stream runs it later than the host call: the host buffer is read when `run` is
+/// called, not when `copy` is. The worker's rows are written into the slot whenever the slot is free (wk_used).
+const FakeCopies = struct {
+    host: [2]u32 = .{ 0, 0 }, // the slots' pinned bytes
+    queued: [8]struct { slot: usize, at: usize, done: bool } = undefined,
+    n: usize = 0,
+    device: [8]u32 = @splat(0), // what each queued copy read
+    wk_used: usize = 0,
+
+    fn copy(f: *FakeCopies, slot: usize, chunk: usize) void {
+        f.queued[f.n] = .{ .slot = slot, .at = chunk, .done = false };
+        f.n += 1;
+    }
+
+    fn run(f: *FakeCopies, i: usize) void {
+        f.device[f.queued[i].at] = f.host[f.queued[i].slot];
+        f.queued[i].done = true;
+    }
+
+    // PinSlots' context: layer 0 only
+    fn done(f: *FakeCopies, _: usize, p: usize) !bool {
+        return f.queued[p].done;
+    }
+
+    fn release(f: *FakeCopies, _: usize, used: usize) void {
+        f.wk_used = used;
+    }
+};
+
+test "TF_DS_ENGRAM_PINNED: a slot goes back to the worker only after its copy has run, and one freed early is overwritten before the copy reads it" {
+    // two slots, chunks 0..3: the worker writes chunk i into slot i % 2 once wk_used + 2 > i; the stream runs a chunk's copy
+    // late (here: after the worker has had every chance to write)
+    for ([_]bool{ false, true }) |early| {
+        var f: FakeCopies = .{};
+        var pins: PinSlots = .{};
+        var chunk: usize = 0; // the worker's next chunk
+        var uploaded: usize = 0;
+        var runs: usize = 0;
+        while (uploaded < 4) {
+            // the worker: every chunk its slot allows
+            while (chunk < 4 and chunk < f.wk_used + 2) : (chunk += 1) f.host[chunk % 2] = @intCast(100 + chunk);
+            // the engine thread uploads the next chunk the worker has written and arms its slot
+            if (uploaded < chunk) {
+                const c = uploaded;
+                f.copy(c % 2, c);
+                if (early) f.wk_used = c + 1 else pins.arm(0, pins.room(0).?, c + 1);
+                uploaded += 1;
+                // (the queue index of a chunk's copy is its position in `queued`; PinSlots' position p is the same here)
+                continue;
+            }
+            // the stream: runs its oldest copy not yet run, then the engine thread polls
+            if (runs < f.n) {
+                f.run(runs);
+                runs += 1;
+            }
+            if (!early) _ = try pins.poll(0, &f);
+        }
+        while (runs < f.n) : (runs += 1) f.run(runs);
+        var bad: usize = 0;
+        for (0..4) |c| bad += @intFromBool(f.device[c] != 100 + c);
+        // the proper release hands every chunk's bytes over; the early one lets the worker overwrite a slot before its copy
+        if (early) try std.testing.expect(bad > 0) else try std.testing.expectEqual(@as(usize, 0), bad);
+    }
+}
+
+test "PinSlots.highest: the largest count pending over a ring of four, so a pair's second pass uploaded but not yet given back is still the running worker's" {
+    var s: PinSlots = .{ .ring = 4 };
+    try std.testing.expectEqual(@as(usize, 0), s.highest(0));
+    s.arm(0, s.room(0).?, 2); // pass A's units
+    s.arm(0, s.room(0).?, 4); // pass B's
+    try std.testing.expectEqual(@as(usize, 4), s.highest(0));
+    try std.testing.expectEqual(@as(usize, 0), s.highest(1));
+    // control: a ring of two sees only two positions
+    var two: PinSlots = .{};
+    two.arm(0, 0, 2);
+    two.arm(0, 1, 4);
+    try std.testing.expectEqual(@as(usize, 4), two.highest(0));
+}
+
+test "PinSlots: two pending a layer, the oldest first, a full ring has no room, a done copy frees only up to itself" {
+    var s: PinSlots = .{};
+    var f: FakeCopies = .{};
+    try std.testing.expectEqual(@as(?usize, 0), s.room(0));
+    f.copy(0, 0);
+    s.arm(0, 0, 2);
+    try std.testing.expectEqual(@as(?usize, 1), s.room(0));
+    f.copy(1, 1);
+    s.arm(0, 1, 4);
+    try std.testing.expectEqual(@as(?usize, null), s.room(0)); // both pending
+    try std.testing.expect(try s.poll(0, &f)); // none done
+    try std.testing.expectEqual(@as(usize, 0), f.wk_used);
+    f.run(1); // the newer copy done first (it cannot be, on one stream; the free is still in order)
+    try std.testing.expect(try s.poll(0, &f));
+    try std.testing.expectEqual(@as(usize, 0), f.wk_used);
+    f.run(0);
+    try std.testing.expect(!(try s.poll(0, &f)));
+    try std.testing.expectEqual(@as(usize, 4), f.wk_used);
+    try std.testing.expectEqual(@as(?usize, 0), s.room(0)); // (both free again; the ring position is the arm count mod 2)
+}
 
 test "TF_DS_ROCI_ANY: the transport's plan of a chunk is the fixed plan at a whole pass and the rows' plan otherwise, with the top-k width riding along" {
     try std.testing.expectEqual(@as(u8, 0), (try roci_engine.Roci.shapeFor(4096, 4096, true, 0)).id);
@@ -3992,6 +4376,44 @@ test "TF_DS_ROCI_ANY with SENT_FIRST and COMBINE_DOOR: only a whole pass of a pl
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, a, "!fixedPlan(ch)"));
     const m = src[std.mem.indexOf(u8, src, "fn moeSendFirst(").?..std.mem.indexOf(u8, src, "const MoeRing = struct").?];
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, m, "ch.n == ch.cap and fixedPlan(ch)"));
+}
+
+test "TF_DS_ENGRAM_FAULT: R:C parses; anything else, or a rank past the world, is refused; unset is nothing" {
+    const f = try EngramFault.parse("2:5", 4);
+    try std.testing.expect(f.asked and f.rank == 2 and f.at == 5);
+    try std.testing.expect(!(try EngramFault.parse(null, 4)).asked);
+    try std.testing.expect(!(try EngramFault.parse("", 4)).asked);
+    for ([_][]const u8{ "2", "2:", ":5", "x:5", "2:y", "4:0", "2:5:1", "-1:0" }) |bad| try std.testing.expectError(error.BadFault, EngramFault.parse(bad, 4));
+    var b: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("off", (EngramFault{}).describe(&b, 0));
+    try std.testing.expect(std.mem.indexOf(u8, f.describe(&b, 2), "fails its worker's row read once") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f.describe(&b, 1), "carries on") != null);
+}
+
+test "TF_DS_ENGRAM_FAULT: the named rank fails at its C-th layer-0 step once and is then spent; other ranks and other layers never fail" {
+    engram_fault_seen.store(0, .release);
+    engram_fault_spent.store(false, .release);
+    defer {
+        engram_fault_seen.store(0, .release);
+        engram_fault_spent.store(false, .release);
+    }
+    const f = try EngramFault.parse("2:3", 4);
+    // another rank: never, and it does not use up the count
+    for (0..10) |_| try std.testing.expect(!engramFaultFires(f, 1, 0));
+    // layer 1 steps are not counted
+    for (0..10) |_| try std.testing.expect(!engramFaultFires(f, 2, 1));
+    var fired: u32 = 0;
+    for (0..12) |k| if (engramFaultFires(f, 2, 0)) {
+        fired += 1;
+        try std.testing.expectEqual(@as(usize, 3), k);
+    };
+    try std.testing.expectEqual(@as(u32, 1), fired);
+    // off: nothing
+    for (0..4) |_| try std.testing.expect(!engramFaultFires(.{}, 0, 0));
+    // the worker takes the fault where it would take the disk's error
+    const src = @embedFile("prompt.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (engramFaultFires(engram_fault, engram_fault_rank, j)) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "eh.wk_err = error.InputOutput;") != null);
 }
 
 test "TF_DS_ATTN_EPILOGUE: the switch, the kernel's shapes and the chunk's scratch decide the epilogue" {

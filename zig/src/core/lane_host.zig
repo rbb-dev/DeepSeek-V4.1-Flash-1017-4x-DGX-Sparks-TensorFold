@@ -74,6 +74,9 @@ pub const LaneHost = struct {
     /// TF_DS_PROMPT_TRACE=1: one log line per prompt step the host serves or holds back, with the order's reading of every
     /// admitted prompt, so a prompt that waited can be read off the engine log. Off: nothing is read or written.
     trace_fill: bool = false,
+    /// What every rank was last told for each slot of class A (`unset`: nothing yet, the start's): a cfg frame goes out only when a
+    /// slot's published value differs.
+    live_sent: [live_config.slot_count]u64 = @splat(live_config.unset),
 
     const Lesson = struct { request: *const api.LearnRequest, sink: api.LearnSink };
     const full_retry_ns: i96 = std.time.ns_per_s;
@@ -847,6 +850,32 @@ pub const LaneHost = struct {
         };
     }
 
+        // the slots of class A: one cfg frame to every rank when one changed
+        h.sendCfg(snap.vals);
+    }
+
+    /// The slots of class A whose published value is not the one the ranks were told: one cfg frame to every rank (Backend.live_cfg),
+    /// sent from here, the loop top, between two frames and with no round open. Only on a change; a turn that took nothing new never gets
+    /// here. A value no u32 holds is not sent (the API refuses it first).
+    fn sendCfg(h: *LaneHost, vals: [live_config.slot_count]u64) void {
+        var items: [live_config.slot_count]live_config.CfgItem = undefined;
+        var n: usize = 0;
+        for (std.enums.values(live_config.Slot)) |slot| {
+            if (!live_config.isA(slot)) continue;
+            const i = @backingInt(slot);
+            if (vals[i] == h.live_sent[i]) continue;
+            const value: u32 = if (vals[i] == live_config.unset) live_config.cfg_unset else std.math.cast(u32, vals[i]) orelse continue;
+            items[n] = .{ .slot = @backingInt(slot), .value = value };
+            n += 1;
+        }
+        if (n == 0) return;
+        // told once: a failed send ends the engine through the link's watch, and a retry at every turn would only repeat the line
+        for (items[0..n]) |it| h.live_sent[it.slot] = vals[it.slot];
+        const sent = h.core.liveCfg(h.live_seen, items[0..n]) catch |err| {
+            std.log.err("a live change of class A could not be sent to every rank ({s}); the ranks may disagree until a restart", .{@errorName(err)});
+            return;
+        };
+        if (!sent) std.log.warn("a live change of class A was published and this backend has no frame for it: it applies at the next start", .{});
     fn run(h: *LaneHost) void {
         while (true) {
             ends.takeCancels(h);

@@ -51,6 +51,9 @@ fn ioGetevents(ctx: aio_context_t, min: usize, n: usize, ev: [*]IoEvent, ts: ?*l
     return @bitCast(linux.syscall5(.io_getevents, ctx, min, n, @intFromPtr(ev), @intFromPtr(ts)));
 }
 
+/// A batch's reads are ring slots [first, first + n) (mod slots), and the per-read facts (where the row goes, the block skew, the row's bytes) live in
+/// the Aio's arrays at the same slot: a slot belongs to one live batch at a time (the ring-free wait in the submit guarantees it), so the arrays are
+/// made once with the ring and no batch allocates.
 const Batch = struct {
     first: u64, // reads [first, first + n) of the ring
     n: usize,
@@ -68,6 +71,13 @@ pub const Aio = struct {
     ctx: aio_context_t = 0,
     ring: []align(block) u8,
     slots: usize,
+    // per ring slot, made once in init: where the slot's row goes (null: a touch, nothing copied), the block skew, the row's bytes; and the
+    // submit's scratch (the iocbs and their pointers), used under the mutex
+    dst_s: []?[*]u8 = &.{},
+    skew_s: []usize = &.{},
+    bytes_s: []usize = &.{},
+    cb_s: []Iocb = &.{},
+    ptr_s: []*Iocb = &.{},
     head: u64 = 0, // reads issued so far (slot = index % slots)
     next_id: u64 = 1,
     batches: std.AutoHashMapUnmanaged(u64, Batch) = .empty,
@@ -80,6 +90,16 @@ pub const Aio = struct {
         errdefer gpa.destroy(a);
         a.* = .{ .gpa = gpa, .io = io, .ring = try gpa.alignedAlloc(u8, .fromByteUnits(block), slots * slot), .slots = slots };
         errdefer gpa.free(a.ring);
+        a.dst_s = try gpa.alloc(?[*]u8, slots);
+        errdefer gpa.free(a.dst_s);
+        a.skew_s = try gpa.alloc(usize, slots);
+        errdefer gpa.free(a.skew_s);
+        a.bytes_s = try gpa.alloc(usize, slots);
+        errdefer gpa.free(a.bytes_s);
+        a.cb_s = try gpa.alloc(Iocb, slots);
+        errdefer gpa.free(a.cb_s);
+        a.ptr_s = try gpa.alloc(*Iocb, slots);
+        errdefer gpa.free(a.ptr_s);
         if (linux.errno(ioSetup(@intCast(@min(slots, 65536)), &a.ctx)) != .SUCCESS) return error.AioUnavailable;
         return a;
     }
@@ -94,6 +114,11 @@ pub const Aio = struct {
         while (it.next()) |b| a.freeBatch(b.*);
         a.batches.deinit(a.gpa);
         a.live.deinit(a.gpa);
+        a.gpa.free(a.ptr_s);
+        a.gpa.free(a.cb_s);
+        a.gpa.free(a.bytes_s);
+        a.gpa.free(a.skew_s);
+        a.gpa.free(a.dst_s);
         a.gpa.free(a.ring);
         a.gpa.destroy(a);
     }
@@ -108,6 +133,14 @@ pub const Aio = struct {
         a.gpa.free(b.dst);
         a.gpa.free(b.skew);
         a.gpa.free(b.bytes);
+            const sl: usize = @intCast((b.first + j) % a.slots);
+            if (e.res < @as(i64, @intCast(a.skew_s[sl] + a.bytes_s[sl]))) {
+                b.failed = true;
+            } else if (a.dst_s[sl]) |d| {
+                const at = sl * slot + a.skew_s[sl];
+                @memcpy(d[0..a.bytes_s[sl]], a.ring[at..][0..a.bytes_s[sl]]);
+            }
+            b.left -= 1;
     }
 
     /// Whatever has completed (no wait): rows copied out, batches counted down. Holds `mutex`.
@@ -158,7 +191,7 @@ pub const Aio = struct {
         }
         const id = a.next_id;
         a.next_id += 1;
-        var b: Batch = .{
+        const b: Batch = .{
             .first = a.head,
             .n = reads,
             .left = reads,
@@ -167,10 +200,8 @@ pub const Aio = struct {
             .skew = try a.gpa.alloc(usize, reads),
             .bytes = try a.gpa.alloc(usize, reads),
         };
-        const cbs = try a.gpa.alloc(Iocb, reads);
-        defer a.gpa.free(cbs);
-        const ptrs = try a.gpa.alloc(*Iocb, reads);
-        defer a.gpa.free(ptrs);
+        const cbs = a.cb_s[0..reads];
+        const ptrs = a.ptr_s[0..reads];
         for (0..reads) |j| {
             const i = j >> 1;
             const sc = j & 1 == 1;
@@ -178,9 +209,10 @@ pub const Aio = struct {
             const row: u64 = @intCast(ids[i]); // checked above
             const off = (if (sc) t.base_s else t.base_w) + row * rb;
             const lo = std.mem.alignBackward(u64, off, block);
-            b.skew[j] = @intCast(off - lo);
-            b.bytes[j] = rb;
-            b.dst[j] = if (out_w) |w| (if (sc) out_s.?[i * t.row_s ..].ptr else w[i * t.row_w ..].ptr) else null;
+            const sl: usize = @intCast((a.head + j) % a.slots);
+            a.skew_s[sl] = @intCast(off - lo);
+            a.bytes_s[sl] = rb;
+            a.dst_s[sl] = if (out_w) |w| (if (sc) out_s.?[i * t.row_s ..].ptr else w[i * t.row_w ..].ptr) else null;
             cbs[j] = .{
                 .data = (id << 20) | j,
                 .lio_opcode = cmd_pread,
@@ -211,7 +243,7 @@ pub const Aio = struct {
             const lid = a.live.items[k][0];
             const lb = a.batches.get(lid);
             if (lb == null or (lb.?.touch and lb.?.left == 0)) {
-                if (a.batches.fetchRemove(lid)) |kv| a.freeBatch(kv.value);
+                _ = a.batches.fetchRemove(lid);
                 _ = a.live.orderedRemove(k);
             } else k += 1;
         }
@@ -242,14 +274,21 @@ pub const Aio = struct {
         }
         const id = a.next_id;
         a.next_id += 1;
+        const b: Batch = .{
             .first = a.head,
             .n = reads,
             .left = reads,
         };
+        const cbs = a.cb_s[0..reads];
+        const ptrs = a.ptr_s[0..reads];
         for (0..reads) |j| {
             const row: u64 = @intCast(ids[j]);
             const off = pk.base + (row - pk.lo) * pk.rec;
             const lo = std.mem.alignBackward(u64, off, block);
+            const sl: usize = @intCast((a.head + j) % a.slots);
+            a.skew_s[sl] = @intCast(off - lo);
+            a.bytes_s[sl] = pk.rec;
+            a.dst_s[sl] = dsts[j];
             cbs[j] = .{
                 .data = (id << 20) | j,
                 .lio_opcode = cmd_pread,
@@ -312,7 +351,7 @@ pub const Aio = struct {
             a.reap();
             if (b.left == 0) {
                 const failed = b.failed;
-                if (a.batches.fetchRemove(id)) |kv| a.freeBatch(kv.value);
+                _ = a.batches.fetchRemove(id);
                 for (a.live.items, 0..) |l, k| if (l[0] == id) {
                     _ = a.live.orderedRemove(k);
                     break;
@@ -416,4 +455,56 @@ test "a refused row id leaves the ring and its allocations as they were" {
     try aio.wait(id);
     try std.testing.expectEqualSlices(u8, &want_w, &w);
     try std.testing.expectEqualSlices(u8, &want_s, &sc);
+}
+
+test "a batch allocates nothing once the ring is warm: the per-read arrays and the submit scratch are made with the ring, whole laps of the ring give the same bytes as the pool" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const rows = 40;
+    var json_buf: [256]u8 = undefined;
+    const json = try std.fmt.bufPrint(&json_buf, "{{\"layers.1.engram.embed.weight\":{{\"dtype\":\"U8\",\"shape\":[{d},100],\"data_offsets\":[0,{d}]}},\"layers.1.engram.embed.scale\":{{\"dtype\":\"U8\",\"shape\":[{d},3],\"data_offsets\":[{d},{d}]}}}}", .{ rows, rows * 100, rows, rows * 100, rows * 103 });
+    var file: std.ArrayList(u8) = .empty;
+    defer file.deinit(a);
+    var len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len, json.len, .little);
+    try file.appendSlice(a, &len);
+    try file.appendSlice(a, json);
+    for (0..rows * 103) |i| try file.append(a, @intCast((i * 7 + 3) % 251));
+    try tmp.dir.writeFile(io, .{ .sub_path = "engram.safetensors", .data = file.items });
+    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer a.free(dir);
+    var t = try engram_io.Tables.open(a, io, dir);
+    defer t.close();
+    const tab = t.layers.get(1).?;
+    // the Aio on a counting allocator: every allocation after the warm-up batches is a failure of the claim
+    var fa = std.testing.FailingAllocator.init(a, .{});
+    const aio = Aio.init(fa.allocator(), io, 16) catch |e| switch (e) {
+        error.AioUnavailable => return error.SkipZigTest,
+        else => return e,
+    };
+    defer aio.deinit();
+    const pool = try engram_io.Pool.init(a, io, 2);
+    defer pool.deinit(a);
+    var prng = std.Random.DefaultPrng.init(11);
+    var warm_allocs: usize = 0;
+    // 40 batches of 5 rows (10 reads) wrap a 16-slot ring many times; touches and reads alternate
+    for (0..40) |round| {
+        var ids: [5]i64 = undefined;
+        for (&ids) |*x| x.* = prng.random().intRangeLessThan(i64, 0, rows);
+        var want_w: [5 * 100]u8 = undefined;
+        var want_s: [5 * 3]u8 = undefined;
+        try pool.gather(tab, &ids, &want_w, &want_s);
+        var got_w: [5 * 100]u8 = @splat(0);
+        var got_s: [5 * 3]u8 = @splat(0);
+        if (round % 4 == 1) try aio.touch(tab, ids[0..3]);
+        const id = try aio.start(tab, &ids, &got_w, &got_s);
+        try aio.wait(id);
+        try std.testing.expectEqualSlices(u8, &want_w, &got_w);
+        try std.testing.expectEqualSlices(u8, &want_s, &got_s);
+        if (round == 7) warm_allocs = fa.allocations;
+    }
+    try std.testing.expect(warm_allocs > 0);
+    try std.testing.expectEqual(warm_allocs, fa.allocations);
 }

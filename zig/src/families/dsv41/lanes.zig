@@ -28,6 +28,7 @@ const sampling = @import("sampling.zig");
 const head_cand = @import("head_cand.zig");
 const link = @import("link.zig");
 const cuda = @import("cuda");
+const live_config = model.live_config;
 
 const be = lanes.backend;
 const Model = model.Model;
@@ -112,7 +113,19 @@ pub fn copyRowsLine(buf: []u8, rows: u32) ![]const u8 {
 }
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_switch = 10 };
+pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_resume = 10, rdma_idle = 11, snap_land = 12, head_whole = 13, fill_pair = 14, snap_sync = 15, cfg = 16 };
+/// Whether a follower's frame leaves a standing Engram read-ahead alone: a prompt's own chunk and its snapshots always, a decode
+/// round's frames (verify, pass, head_whole) with TF_DS_ENGRAM_KEEP_AHEAD; any other frame (a prompt about to change or go) joins it.
+pub fn leavesAhead(kind: Kind, keep: bool) bool {
+    return switch (kind) {
+        .fill_chunk, .fill_pair, .snap_save, .snap_restore, .fill_images, .snap_land, .snap_sync => true,
+        // a live change of a setting (cfg): the frame itself leaves the read-ahead alone; one that touches the worker says so (its flag)
+        .cfg => true,
+        .verify, .pass, .head_whole => keep,
+        else => false,
+    };
+}
+
         try m.eng.comm.gatherHost(d, p.dev.ptr, p.dev.ptr + 32, 32, m.eng.s);
 
 /// A frame being written.
@@ -960,6 +973,7 @@ pub const Lanes = struct {
         var v = whole_vt;
         v.prefill_step = prefillStepFn;
         break :vt v;
+        v.live_cfg = liveCfg;
     };
 
     /// The pass `s` fills, if one runs.
@@ -1355,7 +1369,11 @@ pub const Lanes = struct {
         // its first pass where the prompt cache keeps a state or a hook runs, so every such stop is a stop of a pair.
         var n2: usize = 0;
         var n3: usize = 0; // the third pass of a group (TF_DS_ROCI_STAGGER_LANES=3), else 0
+        s.step_pair = false;
+        const rounds_now = if (hf) |x| x.rounds_beside else 0;
         // A whole pass is one the host's facts leave at the booted rows (stream.wholePass: at pass rows of 2,048 a cut pass has the same rows).
+        // Beside generating users a pair forms only under TF_DS_ROUNDS_BESIDE (2N rounds follow it).
+        if (pairMayForm(m.pair, decoding_now, rounds_now) and lanes.stream.wholePass(s.hostFacts(), f.start, prompt2d.pass_from_asked, prompt2d.pass_filling_asked, @intCast(m.pass_rows)) and n == m.pass_rows and f.start + n < len) {
             const mid = f.start + n;
             const n_b = passRowsAt(mid, len, cap, prompt2d.pass_tail_asked, s.reuse.marks, f.last_end, f.replay);
             const stop_between = mid <= f.replay and (mid == f.last_end or markEnds(s.reuse.marks, mid));
@@ -1368,6 +1386,7 @@ pub const Lanes = struct {
                 }
             }
         }
+        s.step_pair = n2 != 0; // (the host owes the streams twice the rounds after a pair)
         if (n2 != 0) {
             if (try self.begin(.fill_pair)) {
                 try self.wire.int(gpa, u64, f.start);
@@ -1402,6 +1421,9 @@ pub const Lanes = struct {
         if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and
             (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
         if (f.start < len) {
+            // TF_DS_PREFILL_YIELD no round runs between the chunks, so the read-ahead runs on, as served. A round joins it
+            // unless TF_DS_ENGRAM_KEEP_AHEAD: the round's Engram buffers, reader ring and records are its own
+            if (yieldOn() and !m.keep_ahead) if (s.between) |b| if (b.ready(b.ptr)) {
                 m.fill_seq = &.{};
             return false;
         }
@@ -1642,6 +1664,7 @@ pub const Lanes = struct {
         pf.steps = steps;
         if (dr.vocab != null) pf.full = dr.vocab_full;
         // a pass runs block rows a stream through the decode window's linears (prompt.grouped: 128 rows at most), so more
+        // streams than 128 / block (25 at the 5-row block) draft in passes of that many, each its own wire message
         // (TensorFold ba03026c; the followers are unchanged)
         var g0: usize = 0;
         while (g0 < n) : (g0 += per) {
@@ -1832,6 +1855,20 @@ pub const Lanes = struct {
 
         return .{ .ptr = self, .reserve = spillReserve, .install = spillInstall, .discard = spillDiscard, .info = spillInfo, .land = if (self.lander != null) spillLand else null, .probe = if (self.probe != null) spillProbe else null, .land_time = if (self.lander != null) &self.land_time else null, .land_counts = if (self.lander != null) &self.lander.?.counts else null, .sync_send = if (self.peer != null) syncSend else null, .sync_idle = landIdle };
         _ = piece_bytes;
+    /// Backend.live_cfg: settings of class A changed live, at the host's loop top. Every rank applies them between the same two frames:
+    /// rank 0 sends one cfg frame (kind 16: version, flags, then slot and value of each change, `unset` already the start's) and applies
+    fn liveCfg(ptr: *anyopaque, version: u64, items: []const lanes.backend.CfgItem) anyerror!void {
+        const self = of(ptr);
+        const m = self.m;
+        if (items.len > live_config.CfgFrame.max_items) return error.CfgTooLong;
+        var resolved: [live_config.CfgFrame.max_items]live_config.CfgItem = undefined;
+        if (try self.begin(.cfg)) {
+            var body: [live_config.CfgFrame.head_len + 5 * live_config.CfgFrame.max_items]u8 = undefined;
+            try self.wire.buf.appendSlice(self.gpa, try live_config.CfgFrame.encode(&body, version, flags, resolved[0..items.len]));
+            try self.flush();
+        }
+    }
+
     fn landBcast0(_: *anyopaque, _: []const land.Span) anyerror!void {
         return error.NoLanding; // (every rank restores from its own store: no span is broadcast)
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
@@ -1859,6 +1896,14 @@ const idle_commit = "rdma-idle-commit-v1";
 
 fn landBcast(_: *anyopaque, _: []const land.Span) anyerror!void {
     return error.NoLanding; // (every rank restores from its own store: no span is broadcast)
+/// TF_DS_ROCI_STAGGER's pair forms only where no stream decodes, or, beside generating users, under TF_DS_ROUNDS_BESIDE: the host
+/// owes the streams a count of rounds (2N follow a pair).
+pub fn pairMayForm(pair_on: bool, decoding: bool, rounds_beside: u32) bool {
+    if (!pair_on) return false;
+    if (!decoding) return true;
+    return rounds_beside != 0;
+}
+
 fn usesRdma(kind: Kind) bool {
     return switch (kind) {
         .fill_begin, .fill_chunk, .fill_pair, .verify, .pass, .head_whole => true,
@@ -2023,6 +2068,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             11 => .rdma_idle,
             13 => .head_whole,
             14 => .fill_pair,
+            16 => .cfg,
             else => return error.BadFrame,
         };
         if (usesRdma(kind) and rdma_idle) {
@@ -2141,6 +2187,11 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     var b = kv.value;
                     b.free();
                 }
+            },
+            .cfg => {
+                const d = try live_config.CfgFrame.decode(r.rest());
+                var items: [live_config.CfgFrame.max_items]live_config.CfgItem = undefined;
+                for (0..d.n) |i| items[i] = live_config.CfgFrame.item(d, i);
             },
             .rdma_idle => {
                 try m.ctx.synchronize();
@@ -2508,6 +2559,7 @@ test "a prefix two conversations share: the second one resuming it in place woul
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 },
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 },
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, // 9: the same kinds, the Rocinante-only Settings
+        &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }, // 10: and cfg, a live change of settings of class A
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }, // 11: the same kinds, fill_pair carries the third pass's rows
     m.watch = .{}; // (finish and deinit end the watch)
     m.watch = .{}; // (finish and deinit end the watch)
@@ -2788,8 +2840,66 @@ test "TF_DS_CAND_FIRST with TF_DS_HEAD_CAND or TF_DS_HEAD_KEY: the early read is
     try std.testing.expect(std.mem.indexOf(u8, vhb, ".candidates => |count| if (m.head_cand) head_cand.kFor(count) else 0,") != null);
 }
 
+test "TF_DS_ENGRAM_KEEP_AHEAD: a follower's decode-round frames leave the read-ahead alone with it and join it without; every other frame that is not the prompt's own still joins" {
+    const own = [_]Kind{ .fill_chunk, .fill_pair, .snap_save, .snap_restore, .fill_images, .snap_land, .snap_sync, .cfg };
+    for (own) |k| {
+        try std.testing.expect(leavesAhead(k, false));
+        try std.testing.expect(leavesAhead(k, true));
+    }
+    for ([_]Kind{ .verify, .pass, .head_whole }) |k| {
+        try std.testing.expect(!leavesAhead(k, false));
+        try std.testing.expect(leavesAhead(k, true));
+    }
+    // a prompt about to change or go, a slot switch, the end and the idle boundary: joined whatever the switch
+    for ([_]Kind{ .fill_begin, .fill_resume, .snap_drop, .done, .rdma_idle }) |k| {
+        try std.testing.expect(!leavesAhead(k, false));
+        try std.testing.expect(!leavesAhead(k, true));
+    }
+}
+
+test "TF_DS_ENGRAM_KEEP_AHEAD: rank 0 still joins the worker where a prompt changes or goes (startFill, selectFill's slot switch, the error path, release), and only the round's join is skipped" {
+    const src = @embedFile("lanes.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"TF_DS_ENGRAM_KEEP_AHEAD: a follower's") orelse return error.TestUnexpectedResult];
+    const sf = std.mem.indexOf(u8, code, "fn startFill(self: *Lanes, s: *lanes.Stream) !void {") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, code[sf..][0..400], "m.joinAhead();") != null);
+    const sel = std.mem.indexOf(u8, code, "fn selectFill(self: *Lanes, slot: usize, base: usize) !void {") orelse return error.TestUnexpectedResult;
+    const sel_end = std.mem.indexOfPos(u8, code, sel, "m.fill_seq = self.seqs[slot].items;") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, code[sel..sel_end], "if (self.filling_slot != slot) {\n            self.filling_slot = null;\n            m.joinAhead();") != null);
+    const ps = std.mem.indexOf(u8, code, "fn prefillStep(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, code[ps..][0..700], "errdefer {\n            m.joinAhead();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "if (self.filling_slot == slot) {\n                    self.m.joinAhead();") != null);
+    // the round's join: skipped by the switch, in that one place
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "if (yieldOn() and !m.keep_ahead) if (s.between) |b|"));
+    // the prompt's last chunk joins whatever the switch
+    const last = std.mem.indexOf(u8, code, "        m.joinAhead();\n        m.fill_seq = &.{};\n        if (!head) return error.NoPromptLogits;") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(last > ps);
+}
+
+test "TF_DS_ENGRAM_KEEP_AHEAD: beside a round a pair forms only with TF_DS_ROUNDS_BESIDE and the host's step rows at the pass rows, and the kept worker's four slots hold both passes" {
+    const resume_rows: u32 = model.chunk_rows;
+    var decoding: lanes.stream.Facts = .{ .decoding = true, .filling = false, .waiting = false, .step_rows = resume_rows };
+    for ([_]bool{ true, false }) |filling_pass| {
+        // the default step rows (the resume rows): the pass is a single unit, never a pair's 2-unit pass
+        const n = lanes.stream.passRows(decoding, 0, 0, 2 * resume_rows, resume_rows, filling_pass);
+        try std.testing.expect(n != 2 * model.chunk_rows);
+        // step rows at the pass rows with a count of rounds: the pass is whole and the pair may form
+        decoding.step_rows = 2 * resume_rows;
+        decoding.rounds_beside = 2;
+        try std.testing.expectEqual(@as(u32, 2 * model.chunk_rows), lanes.stream.passRows(decoding, 0, 0, 2 * resume_rows, resume_rows, filling_pass));
+        try std.testing.expect(pairMayForm(true, decoding.decoding, decoding.rounds_beside));
+        try std.testing.expect(lanes.stream.wholePass(decoding, 0, 0, filling_pass, 2 * resume_rows));
+        // a waiting request cuts the pass back to a unit: no pair
+        decoding.waiting = true;
+        try std.testing.expect(lanes.stream.passRows(decoding, 0, 0, 2 * resume_rows, resume_rows, filling_pass) != 2 * model.chunk_rows);
+        decoding = .{ .decoding = true, .filling = false, .waiting = false, .step_rows = resume_rows };
+    }
+}
+
+test "a pair of passes asks the pass rule's facts first: none forms while a stream decodes unless the host owes it a count of rounds" {
     const src = @embedFile("lanes.zig");
     const step = std.mem.indexOf(u8, src, "fn prefillStep(") orelse return error.TestUnexpectedResult;
+    const pair = std.mem.indexOfPos(u8, src, step, "if (pairMayForm(m.pair, decoding_now, rounds_now) and lanes.stream.wholePass(s.hostFacts(), f.start, prompt2d.pass_from_asked, prompt2d.pass_filling_asked, @intCast(m.pass_rows)) and n == m.pass_rows") orelse return error.TestUnexpectedResult;
+    const rule = std.mem.indexOfPos(u8, src, step, "lanes.stream.passRows(hf,") orelse return error.TestUnexpectedResult;
     try std.testing.expect(rule < pair);
 }
 
@@ -2854,6 +2964,26 @@ test "TF_DS_ROCI_STAGGER: a pair forms only where no stream decodes, or where th
     // a prompt alone: the pair forms
     try std.testing.expect(pairMayForm(true, false, 0));
     // decoders running: no pair without a count of rounds
+    try std.testing.expect(!pairMayForm(true, true, 0));
+    // no stagger configured: nothing ever pairs, with a count of rounds either
+    try std.testing.expect(!pairMayForm(false, false, 0));
+    try std.testing.expect(!pairMayForm(false, true, 3));
+    // TF_DS_ROUNDS_BESIDE: beside generating users the pair forms
+    try std.testing.expect(pairMayForm(true, true, 3));
+    // the decision point is in the code, behind the pass rule's facts
+    const code = @embedFile("lanes.zig");
+    try std.testing.expect(std.mem.indexOf(u8, code, "if (pairMayForm(m.pair, decoding_now, rounds_now) and lanes.stream.wholePass(") != null);
+}
+
+test "a step reports whether it ran as a pair: reset on every step, set where the pair's frame is chosen" {
+    const src = @embedFile("lanes.zig");
+    const step = std.mem.indexOf(u8, src, "fn prefillStep(") orelse return error.TestUnexpectedResult;
+    const reset = std.mem.indexOfPos(u8, src, step, "s.step_pair = false;") orelse return error.TestUnexpectedResult;
+    const pair = std.mem.indexOfPos(u8, src, step, "if (pairMayForm(m.pair, decoding_now") orelse return error.TestUnexpectedResult;
+    const set = std.mem.indexOfPos(u8, src, step, "s.step_pair = n2 != 0;") orelse return error.TestUnexpectedResult;
+    const frame = std.mem.indexOfPos(u8, src, step, "try self.begin(.fill_pair)") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(reset < pair and pair < set and set < frame);
+}
 
 // The pair rules (R1-R7 of the frame-order panel, tip 7ce258cdb), one host test each. The rules are why a pair beside
 // generating users is safe: frames cannot differ between ranks, and nothing waits on a frame that is not yet there.
@@ -2998,6 +3128,37 @@ test "draft chances are the prefix survivals chooseK sums" {
     try std.testing.expectApproxEqAbs(0.25 / (1.0 + @exp(@as(f64, -2.0))), out[2], 1e-12);
 }
 
+test "a cfg frame is kind 16 behind the frame header, reads back whole, and its sender sends in one frame, then applies on rank 0" {
+    const gpa = std.testing.allocator;
+    var w: Wire = .{};
+    defer w.deinit(gpa);
+    try w.begin(gpa, .cfg, 41);
+    var body: [live_config.CfgFrame.head_len + 5 * live_config.CfgFrame.max_items]u8 = undefined;
+    const items = [_]live_config.CfgItem{.{ .slot = @backingInt(live_config.Slot.keep_ahead), .value = 1 }};
+    var r: Reader = .{ .b = w.buf.items };
+    try std.testing.expectEqual(@as(u8, 16), try r.int(u8));
+    try std.testing.expectEqual(@as(u64, 41), try r.int(u64));
+    const d = try live_config.CfgFrame.decode(r.rest());
+    try std.testing.expectEqual(@as(u64, 9), d.version);
+    try std.testing.expectEqual(items[0], live_config.CfgFrame.item(d, 0));
+    // the frame with its header is one send() of the link (frames up to 2,048 bytes are written whole)
+    try std.testing.expect(w.buf.items.len <= 2048);
+    const code = @embedFile("lanes.zig");
+    const at = std.mem.indexOf(u8, code, "fn liveCfg(ptr: *anyopaque").?;
+    const end = std.mem.indexOfPos(u8, code, at, "/// One snap_sync frame").?;
+    const f = code[at..end];
+    const begin = std.mem.indexOf(u8, f, "if (try self.begin(.cfg)) {").?;
+    const flush = std.mem.indexOf(u8, f, "try self.flush();").?;
+    try std.testing.expect(begin < flush and flush < apply);
+    // the follower: the frame joins the worker only on the flag, then applies; and the backend offers it
+    const fol = std.mem.indexOf(u8, code, ".cfg => {\n                const d = try live_config.CfgFrame.decode(r.rest());").?;
+    const fend = std.mem.indexOfPos(u8, code, fol, ".rdma_idle => {").?;
+    const fb = code[fol..fend];
+    try std.testing.expect(std.mem.indexOf(u8, code, "v.live_cfg = liveCfg;") != null);
+    // a cfg frame is no round's: no RDMA wake is asked for it
+    try std.testing.expect(!usesRdma(.cfg));
+    try std.testing.expect(leavesAhead(.cfg, false) and leavesAhead(.cfg, true));
+}
 
 test "a run that reads whole rows on the host (--logits-log, --logits-sha 2) is refused while the head is sharded: rd.logits would be unwritten" {
     try std.testing.expect(wholeRowsRefusal(false, true, true) == null); // nothing read: any head

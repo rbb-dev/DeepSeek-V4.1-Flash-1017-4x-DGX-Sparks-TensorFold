@@ -131,9 +131,16 @@ pub fn besideRows(step_rows: u32, pass_rows: u32, resume_rows: u32) u32 {
 }
 
 /// Whether the step at `start` is a whole pass of the booted `pass_rows` by the host's facts alone, and may be the first of a pair:
+/// the facts passRows reads (a host without them: no), and no stream decoding (a pair is one frame behind which the rounds wait)
+/// unless the host owes the streams a count of rounds a step (`rounds_beside`, TF_DS_ROUNDS_BESIDE: 2N follow the pair) and its
+/// step rows reach the pass rows (`pass_rows`, the booted ones).
 /// Where `pass_rows` is the resume rows (TF_DS_PASS_ROWS=2048) a cut pass has the booted rows too, so the rows cannot tell a whole
 /// pass from a cut one; the facts do. For pass rows above the resume rows it is passRows(...) == pass_rows and !decoding (a test).
+/// Beside decoders without a count of rounds a pair is not formed, so "step rows" (Facts.step_rows) are a pass's, never a pair's.
+pub fn wholePass(f: ?Facts, start: usize, pass_from: usize, filling_pass: bool, pass_rows: u32) bool {
     const x = f orelse return false;
+    if (start < pass_from or x.waiting or (x.filling and !filling_pass)) return false;
+    return !x.decoding or (x.rounds_beside != 0 and x.step_rows >= pass_rows);
 }
 
     ready: *const fn (ptr: *anyopaque) bool, // whether `run` would run a round (another stream is live): `next == .round`
@@ -745,16 +752,39 @@ test "passRows over every combination: the switch changes a pass only for anothe
 
 test "wholePass: the facts of a pass at the booted rows, from pass_from on, with nothing decoding; the rows alone cannot tell it from a cut pass" {
     const quiet: Facts = .{ .decoding = false, .filling = false, .waiting = false, .step_rows = std.math.maxInt(u32) };
+    try std.testing.expect(wholePass(quiet, 8192, 8192, false, 8192));
+    try std.testing.expect(wholePass(quiet, 0, 0, false, 8192));
+    try std.testing.expect(!wholePass(quiet, 6144, 8192, false, 8192)); // below pass_from
+    try std.testing.expect(!wholePass(null, 16384, 8192, false, 8192)); // a host without facts
     var f = quiet;
     f.waiting = true;
+    try std.testing.expect(!wholePass(f, 16384, 8192, false, 8192));
+    try std.testing.expect(!wholePass(f, 16384, 8192, true, 8192)); // a waiting request cuts the pass whatever the filling switch says
     f = quiet;
     f.filling = true;
+    try std.testing.expect(!wholePass(f, 16384, 8192, false, 8192));
+    try std.testing.expect(wholePass(f, 16384, 8192, true, 8192));
     f = quiet;
     f.decoding = true;
+    f.step_rows = std.math.maxInt(u32); // (step rows that reach the pass: the pass is whole, a pair still is not without a count of rounds)
+    try std.testing.expect(!wholePass(f, 16384, 8192, true, 8192));
+    // a count of rounds (TF_DS_ROUNDS_BESIDE) makes it whole beside a decoding stream, when the step rows reach the booted pass rows
+    f.rounds_beside = 2;
+    try std.testing.expect(wholePass(f, 16384, 8192, true, 8192));
+    f.step_rows = 4096;
+    try std.testing.expect(!wholePass(f, 16384, 8192, true, 8192)); // (a step of 4,096 under passes of 8,192 is half a pass)
+    try std.testing.expect(wholePass(f, 16384, 8192, true, 4096));
+    f.waiting = true;
+    try std.testing.expect(!wholePass(f, 16384, 8192, true, 4096));
     // the rule's cut at every pass size (2,048 included, where the rows are the same cut or whole): wholePass is the rule's whole
     // pass with nothing decoding, for pass rows above the resume rows, over every combination of facts
         const g: Facts = .{ .decoding = decoding, .filling = filling, .waiting = waiting, .step_rows = step_rows };
         const rule_whole = passRows(g, start, 8192, p, 2048, fp) == p;
+        try std.testing.expectEqual(rule_whole and !decoding, wholePass(g, start, 8192, fp, p));
+        // with a count of rounds the rule's whole pass is the pass, decoding or not
+        var h = g;
+        h.rounds_beside = 3;
+        try std.testing.expectEqual(rule_whole, wholePass(h, start, 8192, fp, p));
     };
 }
 

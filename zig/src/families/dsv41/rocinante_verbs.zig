@@ -121,11 +121,14 @@ pub const VerbsNic = struct {
     rail: [roci.rails]Rail = undefined,
     peers: [roci.world]Info = @splat(.{}),
     opened: bool = false,
+    layout_hash: u64 = 0, // the lane's layout (equal on every node, compared at connect)
 
     /// Open both rails, register `arena` and `ctl` on each, and create the queue pairs (RESET). `info` then describes
     /// this node; `connect` takes every node's.
+    pub fn open(gpa: std.mem.Allocator, v: *const Verbs, set: Settings, me: u8, arena: []u8, ctl: []u8, layout_hash: u64) !*VerbsNic {
         const n = try gpa.create(VerbsNic);
         errdefer gpa.destroy(n);
+        n.* = .{ .gpa = gpa, .v = v, .set = set, .me = me, .arena = arena, .ctl = ctl, .layout_hash = layout_hash };
         // a word the card updates with an ATOMIC is 8-byte aligned: the control block starts on a line, its words are lines (comptime, below)
         if (@intFromPtr(ctl.ptr) % roci.line != 0) return error.Misaligned;
         if (set.signal == .atomic) {

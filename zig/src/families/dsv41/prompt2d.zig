@@ -279,6 +279,7 @@ pub const exch_roci_engram_ahead: u32 = 1 << 9;
 pub const exch_roci_sent_first: u32 = 1 << 11;
 pub const exch_roci_combine_door: u32 = 1 << 18;
 pub const exch_roci_stagger: u32 = 1 << 21;
+pub const exch_engram_partner: u32 = 1 << 22;
 pub const exch_ring_wc: u32 = 1 << 23;
 pub const exch_ring_inplace: u32 = 1 << 24;
 pub const exch_ring_word: u32 = 1 << 25;
@@ -333,6 +334,10 @@ pub var roci_stagger_lanes_set: bool = false;
 /// (tf_dsn_sf_gu_exact_q_kernel) and packQuant does not run. Bit-identical by contract (pack_epilogue.zig); default off.
 pub var pack_epilogue_asked: bool = false;
 
+/// TF_DS_ENGRAM_PARTNER as Model.open read it (switchAsked), once (Settings.exch; the ranks must agree: the start opens a lane on every rank or none):
+/// the column partners each read half of a prompt step's Engram misses and swap them over a third Rocinante lane.
+pub var engram_partner_asked: bool = false;
+
 /// Settings.exch of the switches Model.open read.
 pub fn exchAsked() u32 {
     var x: u32 = 0;
@@ -348,6 +353,7 @@ pub fn exchAsked() u32 {
     if (ring_word_asked) x |= exch_ring_word;
     if (ring_word_atomic_asked) x |= exch_ring_word_atomic;
     if (ring_wait_asked) x |= exch_ring_wait;
+    if (engram_partner_asked) x |= exch_engram_partner;
     return x;
 }
 
@@ -2195,6 +2201,7 @@ test "the exchange switches that remain: a named bit each in Settings.exch, aske
     var odd = lead;
     odd.exch = 1 << 0; // the old TF_DS_OWNER_YX bit
     try std.testing.expect(std.mem.indexOf(u8, odd.differ(lead, 1, &buf), "switches this build has no name for") != null);
+    odd.protocol = 9; // the layout before this one
     try std.testing.expectEqualStrings("rank 1 decodes frame protocol 9 and rank 0 sends 11: run every rank from the same image", odd.differ(lead, 1, &buf));
 }
 

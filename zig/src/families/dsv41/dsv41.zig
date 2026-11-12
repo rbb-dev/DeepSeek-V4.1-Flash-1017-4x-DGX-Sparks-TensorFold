@@ -165,7 +165,9 @@ test {
     _ = @import("pack_epilogue.zig");
     _ = @import("wc_verdict.zig");
     _ = @import("pair_spans.zig");
+    refAll(@import("keep_ahead.zig"));
     _ = @import("pass_meter.zig");
+    _ = @import("engram_partner.zig");
     _ = @import("rocinante_test.zig");
     _ = @import("rocinante_cd_test.zig");
     _ = @import("kset_test.zig");

@@ -62,6 +62,11 @@ pub const Region = enum(u8) {
     hand_pre, // ... and their pre (fp32 [hc] a row)
     g_taps, // a decoder window's DSpark taps: bf16 [hand_rows][3][hidden], the three taps of a row side by side; each rank's slab at its rows
     head_x, // the head's input row (bf16 [hidden]): the collapse of the window's last row, from the rank that owns it
+    // the host lane's (layoutOf(.host)): the partner exchange of the Engram worker's records; empty in the prompt lanes' layout
+    rec_send, // [host_slots][host_max_recs] records, the ones this node read for its partner
+    rec_land, // where the partner's land
+    rec_hs, // [host_slots] 64-byte headers sent
+    rec_hl, // and landed
 };
 
 /// The most rows a handoff carries: the decoder rows of a chunk (the window and the drafter's rows).
@@ -76,6 +81,19 @@ pub const head_row: usize = 5120 * 2;
 
 pub const n_regions = std.enums.values(Region).len;
 
+/// The partner exchange's geometry: a record is an Engram row's value bytes and scales (dim 256 + 8), a slot holds the records of half a
+/// step's misses (2,048 rows × 12 columns / 2), and the ring has this many slots.
+pub const host_rec: usize = 264;
+pub const host_max_recs: usize = 12288;
+pub const host_slots: usize = 16;
+pub const host_slot_bytes: usize = host_max_recs * host_rec;
+pub const host_hdr_bytes: usize = 64;
+/// The longest nap of a host wait, in microseconds: it ends when the awaited word is written; the bound lets the wait look at the other rail's word.
+pub const host_nap_us: u32 = 25;
+
+/// Which arena a lane has: the prompt lanes' (the exchanged tensors of a pass), or the host lane's (the Engram records of the partner split).
+pub const LayoutSet = enum { prompt, host };
+
 pub const pair_w: usize = 2560; // a pair's columns of the hidden state
 pub const eng_w: usize = 12800; // an Engram part's columns
 /// One boundary-layer row of the four cache arrays: compressed codes (head_dim / 2) and scales (head_dim / 16), index codes
@@ -83,8 +101,15 @@ pub const eng_w: usize = 12800; // an Engram part's columns
 pub const gb_row: usize = 256 + 32 + 64 + 4;
 
 /// A region's bytes at `cap` rows (cap a multiple of 4): the row-shaped sizes the maps give, before page rounding.
+fn regionBytes(r: Region, cap: usize, set: LayoutSet) usize {
     const q = cap / world;
+    if (set == .host) return switch (r) {
+        .rec_send, .rec_land => host_slots * host_slot_bytes,
+        .rec_hs, .rec_hl => host_slots * host_hdr_bytes,
+        else => 0,
+    };
     return switch (r) {
+        .rec_send, .rec_land, .rec_hs, .rec_hl => 0,
         .psum => cap * pair_w * 4,
         .stage => 2 * q * pair_w * 4,
         .send2 => q * pair_w * 2,
@@ -155,9 +180,15 @@ pub const Layout = struct {
 /// The arena's regions, each starting on a page and sized for `max_cap` rows (a pure function: every rank computes the
 /// same one).
 pub fn layout() Layout {
+    return layoutOf(.prompt);
+}
+
+/// The layout of a lane's arena (a pure function of the set: every rank computes the same one).
+pub fn layoutOf(set: LayoutSet) Layout {
     var l: Layout = undefined;
     var at: u64 = 0;
     for (0..n_regions) |i| {
+        const n = regionBytes(@fromBackingInt(@intCast(i)), max_cap, set);
         l.off[i] = at;
         l.len[i] = n;
         at += std.mem.alignForward(u64, n, page);
@@ -169,6 +200,7 @@ pub fn layout() Layout {
 // -- events ----------------------------------------------------------------------------------------------------------
 
 /// What a send is: one word class a kind. Pairwise events go to one partner; a gather goes to the other three.
+pub const Class = enum(u8) { own1, own2, eng1, eng2, wob, pack, gf, ga, gm, gi, gb, gh, gt, hx, rech, rec };
 pub const n_classes = std.enums.values(Class).len;
 
 /// One RDMA WRITE: `len` bytes from arena offset `src` to the peer's arena offset `dst`.
@@ -268,6 +300,7 @@ pub fn buildEvent(class: Class, cap: usize, g: usize, order: Order) Event {
             for (0..rails) |rail| e.chains[0][rail].add(pieces[rail]);
         },
         .gh, .gt, .hx => {}, // the handoff, the taps and the head's row have no full-cap plan: their rows are a decoder window's (buildEventX)
+        .rech, .rec => {}, // the host lane's events have their own plan (buildRecEvent)
         .gf, .ga, .gm, .gi, .gb => {
             const regs: []const Region = switch (class) {
                 .gf => &.{ .g_qr, .g_y },
@@ -375,6 +408,7 @@ pub fn buildEventX(class: Class, n: usize, x: usize, g: usize, order: Order) Eve
             }
             e.n_peers = j;
         },
+        .rech, .rec => {}, // the host lane's events have their own plan (buildRecEvent)
         .gf, .ga, .gm, .gi, .gb => {
             const regs: []const Region = switch (class) {
                 .gf => &.{ .g_qr, .g_y },
@@ -417,6 +451,22 @@ pub fn headOwner(n: usize) usize {
     return (n - 1) / slabs.q(n);
 }
 
+/// The host lane's event `class` (rech: a 64-byte header, rec: `count` records) of node `g` for ring slot `slot`: to the partner g ^ 2, from this
+/// node's send region to the same offset of the partner's land region, in the two rails' halves.
+pub fn buildRecEvent(class: Class, g: usize, slot: usize, count: usize) Event {
+    const L = layoutOf(.host);
+    var e: Event = .{ .class = class };
+    e.peers[0] = @intCast(g ^ 2);
+    e.n_peers = 1;
+    const src_r: Region = if (class == .rec) .rec_send else .rec_hs;
+    const dst_r: Region = if (class == .rec) .rec_land else .rec_hl;
+    const per: u64 = if (class == .rec) host_slot_bytes else host_hdr_bytes;
+    const len: u64 = if (class == .rec) count * host_rec else host_hdr_bytes;
+    const pieces = split(L.at(src_r) + slot * per, L.at(dst_r) + slot * per, len);
+    for (0..rails) |rail| e.chains[0][rail].add(pieces[rail]);
+    return e;
+}
+
 /// The word classes a rank receives on: from which sources an event of this class arrives.
 pub fn sourcesOf(class: Class, g: usize, out: *[world]u8) []const u8 {
     var n: usize = 0;
@@ -425,6 +475,7 @@ pub fn sourcesOf(class: Class, g: usize, out: *[world]u8) []const u8 {
             out[0] = @intCast(g ^ 1);
             n = 1;
         },
+        .own2, .eng2, .wob, .pack, .rech, .rec => {
             out[0] = @intCast(g ^ 2);
             n = 1;
         },
@@ -797,11 +848,80 @@ pub const Transport = struct {
         t.host.stream_writes += 1;
     }
 
+    /// A send posted by the host (the host lane: nothing else rings this doorbell): ring slot `slot`, `count` records for `.rec`. The
+    /// ticket's entry is written, then the doorbell, which the proxy watches in host memory like a stream write's.
+    pub fn sendRec(t: *Transport, class: Class, slot: u8, count: usize) !void {
+        std.debug.assert(class == .rec or class == .rech);
+        const ticket = try t.reserveEntry(class, slot, count, 0);
         if (t.set.wait_qp) {
             @atomicStore(u64, &t.ctl.doorbell.v, t.go(ticket), .release);
             t.host.stream_writes += 1;
             return;
         }
+        @atomicStore(u64, &t.ctl.doorbell.v, ticket, .release);
+        t.host.stream_writes += 1;
+    }
+
+    /// Whether the partner's words of `class` have reached `want` on both rails (the cyclic compare a stream wait makes).
+    pub fn hostWordReached(t: *Transport, class: Class, want: u64) bool {
+        var srcs: [world]u8 = undefined;
+        for (sourcesOf(class, t.g, &srcs)) |s| for (0..rails) |r| {
+            const have = @atomicLoad(u64, &t.word(class, s, r).v, .acquire);
+            if (@as(i64, @bitCast(have -% want)) < 0) return false;
+        };
+        return true;
+    }
+
+    /// What one host wait did: the looks it took at the words, the naps among them, and its length.
+    pub const HostWait = struct {
+        looks: u32 = 0,
+        naps: u32 = 0,
+        ns: u64 = 0,
+    };
+
+    /// The first of the partner's words of `class` that has not reached `want` (the cyclic compare a stream wait makes), or null when
+    /// every one has.
+    fn firstWordBehind(t: *Transport, class: Class, want: u64) ?*u64 {
+        var srcs: [world]u8 = undefined;
+        for (sourcesOf(class, t.g, &srcs)) |s| for (0..rails) |r| {
+            const w = &t.word(class, s, r).v;
+            if (@as(i64, @bitCast(@atomicLoad(u64, w, .acquire) -% want)) < 0) return w;
+        };
+        return null;
+    }
+
+    /// The host waits for the partner's words of `class` to reach `want` (no stream): true when they have, false after `deadline_ns`
+    /// (0: no deadline). Between looks the thread naps on the first word still behind, with the Arm wait the proxies use (the write that
+    /// completes the word ends the nap), at most `host_nap_us` at a time so the other rail's word is looked at too; a CPU that cannot
+    /// nap sleeps `host_nap_us` between looks. A failed transport ends the wait with an error. `st` receives the wait's looks, naps and length.
+    pub fn waitHostStats(t: *Transport, class: Class, want: u64, deadline_ns: u64, st: *HostWait) !bool {
+        const t0 = nowNs();
+        defer st.ns +%= nowNs() - t0;
+        const can_nap = nap.available() and nap.clock() == .fine;
+        const ticks = nap.ticksPerUs();
+        while (t.firstWordBehind(class, want)) |w| {
+            st.looks += 1;
+            try t.check();
+            if (deadline_ns != 0 and nowNs() - t0 >= deadline_ns) return false;
+            if (can_nap) {
+                const seen = @atomicLoad(u64, w, .acquire);
+                st.naps += 1;
+                _ = nap.napOnce(w, seen, nap.now() + ticks * host_nap_us);
+            } else {
+                const ts: std.c.timespec = .{ .sec = 0, .nsec = host_nap_us * std.time.ns_per_us };
+                _ = std.c.nanosleep(&ts, null);
+            }
+        }
+        try t.check(); // (a failure stores the abort value into every word: they read as reached)
+        return true;
+    }
+
+    /// waitHostStats without the statistics.
+    pub fn waitHost(t: *Transport, class: Class, want: u64, deadline_ns: u64) !bool {
+        var st: HostWait = .{};
+        return t.waitHostStats(class, want, deadline_ns, &st);
+    }
+
     fn reserveEntry(t: *Transport, class: Class, shape: u8, rows: usize, x: usize) !u64 {
         if (t.set.wait_qp) return t.reserveWait(class, shape, rows, x);
         try t.check();
@@ -822,6 +942,7 @@ pub const Transport = struct {
         t.ticket += 1;
         const slot = &t.ctl.sched[t.ticket % sched_len];
         @atomicStore(u32, &t.ctl.sched_x[t.ticket % sched_len], @intCast(x), .monotonic);
+        @atomicStore(u64, slot, if (shape == any_shape) schedEntryN(t.ticket, class, rows) else schedEntry(t.ticket, class, shape) | (@as(u64, @intCast(rows)) << 48), .release);
         t.host.events += 1;
         t.host.doorbells += 1;
         return t.ticket;
@@ -1197,6 +1318,10 @@ fn nowNs() u64 {
                 e = @atomicLoad(u64, &t.ctl.sched[i % sched_len], .acquire);
             }
             var built: Event = undefined;
+            const ev: *const Event = if (schedClass(e) == .rec or schedClass(e) == .rech) blk: {
+                built = buildRecEvent(schedClass(e), t.g, schedShape(e), schedRows(e));
+                break :blk &built;
+            } else if (schedShape(e) == any_shape) blk: {
                 built = buildEventX(schedClass(e), schedRows(e), @atomicLoad(u32, &t.ctl.sched_x[i % sched_len], .monotonic), t.g, t.order);
                 break :blk &built;
             } else &t.events[schedShape(e)][@backingInt(schedClass(e))];

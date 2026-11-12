@@ -91,6 +91,13 @@ pub const Engine = struct {
         return e.backend.vtable.prefill_step != null;
     }
 
+    /// A change of class A (Backend.live_cfg): false when the backend has none.
+    pub fn liveCfg(e: *Engine, version: u64, items: []const be.CfgItem) !bool {
+        const send = e.backend.vtable.live_cfg orelse return false;
+        try send(e.backend.ptr, version, items);
+        return true;
+    }
+
     /// One prompt chunk; a completed prompt joins the ordinary lane rounds with the same first-token path.
     pub fn fillStream(e: *Engine, s: *Stream, first: bool) !bool {
         _ = e.arena.reset(.retain_capacity);

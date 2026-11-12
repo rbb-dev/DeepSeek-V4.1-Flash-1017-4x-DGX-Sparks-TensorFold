@@ -42,6 +42,9 @@ test "the arena: 25 regions on pages, 639,893,504 bytes, the offsets of the desi
         .{ .r = .g_taps, .off = 635_949_056, .len = 3_932_160 },
         .{ .r = .head_x, .off = 639_881_216, .len = 10_240 },
     };
+    // (the host lane's four regions are empty in the prompt lanes' layout)
+    try std.testing.expectEqual(want.len + 4, roci.n_regions);
+    for ([_]R{ .rec_send, .rec_land, .rec_hs, .rec_hl }) |r| try std.testing.expectEqual(@as(u64, 0), l.bytes(r));
     var prev_end: u64 = 0;
     for (want) |w| {
         try std.testing.expectEqual(w.off, l.at(w.r));
@@ -96,6 +99,7 @@ fn srcRegion(c: C) []const R {
         .gh => &.{ .hand_h, .hand_pre },
         .gt => &.{.g_taps},
         .hx => &.{.head_x},
+        .rech, .rec => &.{},
     };
 }
 
@@ -151,6 +155,7 @@ test "every event of every node, both orders and caps: pieces inside their regio
 }
 
 test "the per-pass counts of the design: 974 data writes, 512 words, 2,590,060,544 bytes each way" {
+    const per_pass = [roci.n_classes]u64{ 40, 40, 2, 2, 20, 20, 17, 3, 20, 3, 1, 0, 0, 0, 0, 0 };
     var events: u64 = 0;
     for (0..roci.world) |g| {
         var writes: u64 = 0;
@@ -216,6 +221,8 @@ const Mode = struct {
     gap_ns: u64 = 0,
     /// Control: this net's chains and words land in another net's nodes (two lanes wired into one).
     cross_to: ?*Net = null,
+    /// The nodes' arenas are the host lane's (the partner exchange of the Engram records), not a pass's.
+    host: bool = false,
     /// Control (with word_first): every chain's bytes held back, the words not, until the test opens the gate (Net.openGate),
     /// so a consumer that trusts the word looks before any byte has landed, whatever else the machine is doing.
     hold_data: bool = false,
@@ -287,6 +294,7 @@ const Net = struct {
     fn open(mode: Mode, set: roci.Settings, orders: roci.Order) !*Net {
         const n = try gpa.create(Net);
         n.* = .{ .mode = mode };
+        const total = roci.layoutOf(if (mode.host) .host else .prompt).total;
         for (&n.nodes, 0..) |*nd, g| {
             nd.arena = try std.posix.mmap(null, total, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
             nd.ctl = try gpa.create(roci.Control);
@@ -2150,6 +2158,449 @@ test "four nodes: a decoder window's taps and head row land every byte at window
         for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
         for (&net.nodes) |*nd| try std.testing.expectEqual(@as(?@TypeOf(nd.t.failure().?), null), nd.t.failure());
     }
+}
+
+// -- the host lane: the Engram records between column partners ------------------------------------------------------------
+
+test "the host lane's layout: four regions on pages, nothing else, the prompt lanes' layout has none of them" {
+    const h = roci.layoutOf(.host);
+    const p = roci.layout();
+    try std.testing.expectEqual(@as(u64, 0), h.bytes(.psum));
+    try std.testing.expectEqual(@as(u64, 0), h.bytes(.g_b));
+    for ([_]R{ .rec_send, .rec_land }) |r| try std.testing.expectEqual(@as(u64, roci.host_slots * roci.host_slot_bytes), h.bytes(r));
+    for ([_]R{ .rec_hs, .rec_hl }) |r| try std.testing.expectEqual(@as(u64, roci.host_slots * roci.host_hdr_bytes), h.bytes(r));
+    for (0..roci.n_regions) |i| try std.testing.expectEqual(@as(u64, 0), h.off[i] % roci.page);
+    try std.testing.expectEqual(@as(u64, 0), roci.host_slot_bytes % roci.page);
+    try std.testing.expect(h.hash() != p.hash());
+    try std.testing.expect(h.total < 120 << 20);
+}
+
+test "a record event goes to the column partner from the send region to the same offset of the land region, in the two rails' halves" {
+    for ([_]usize{ 0, 1, 2, 3 }) |g| for ([_]usize{ 0, 5, 15 }) |slot| for ([_]usize{ 0, 1, 777, roci.host_max_recs }) |count| {
+        const e = roci.buildRecEvent(.rec, g, slot, count);
+        try std.testing.expectEqual(@as(u8, 1), e.n_peers);
+        try std.testing.expectEqual(@as(u8, @intCast(g ^ 2)), e.peers[0]);
+        const L = roci.layoutOf(.host);
+        var bytes: u64 = 0;
+        for (0..roci.rails) |r| for (e.chains[0][r].slice()) |p| {
+            try std.testing.expect(p.src >= L.at(.rec_send) + slot * roci.host_slot_bytes);
+            try std.testing.expect(p.src + p.len <= L.at(.rec_send) + (slot + 1) * roci.host_slot_bytes);
+            try std.testing.expectEqual(p.src - L.at(.rec_send), p.dst - L.at(.rec_land));
+            bytes += p.len;
+        };
+        try std.testing.expectEqual(@as(u64, count * roci.host_rec), bytes);
+        const h = roci.buildRecEvent(.rech, g, slot, 99);
+        var hb: u64 = 0;
+        for (0..roci.rails) |r| for (h.chains[0][r].slice()) |p| {
+            hb += p.len;
+        };
+        try std.testing.expectEqual(@as(u64, roci.host_hdr_bytes), hb);
+    };
+}
+
+const HostRun = struct {
+    net: *Net,
+    steps: usize,
+    bad: [2]u64 = .{ 0, 0 },
+    err: [2]?anyerror = .{ null, null },
+};
+
+fn hostMain(run: *HostRun, who: usize) void {
+    hostBody(run, who) catch |e| {
+        run.err[who] = e;
+    };
+}
+
+/// Node 0 (who 0) and node 2 (who 1) send each other, every step, a header and a packed run of records whose bytes name (step, sender, index);
+/// each waits for the other's words and checks the landed bytes. The ring wraps (steps > slots).
+fn hostBody(run: *HostRun, who: usize) !void {
+    const g: usize = who * 2;
+    const nd = &run.net.nodes[g];
+    const L = roci.layoutOf(.host);
+    for (0..run.steps) |step| {
+        const slot = step % roci.host_slots;
+        const count: usize = 1 + (step * 977) % roci.host_max_recs;
+        // the records: 264 bytes each, a value naming (step, sender, index)
+        const send = nd.arena[L.at(.rec_send) + slot * roci.host_slot_bytes ..][0 .. count * roci.host_rec];
+        for (0..count) |i| @memset(send[i * roci.host_rec ..][0..roci.host_rec], @truncate(step *% 31 +% g *% 7 +% i));
+        const hdr = nd.arena[L.at(.rec_hs) + slot * roci.host_hdr_bytes ..][0..roci.host_hdr_bytes];
+        std.mem.writeInt(u64, hdr[0..8], step, .little);
+        std.mem.writeInt(u64, hdr[8..16], count, .little);
+        try nd.t.sendRec(.rech, @intCast(slot), 1);
+        try nd.t.sendRec(.rec, @intCast(slot), count);
+        const want: u64 = step + 1;
+        if (!try nd.t.waitHost(.rech, want, 5 * std.time.ns_per_s)) return error.WaitTimeout;
+        const phdr = nd.arena[L.at(.rec_hl) + slot * roci.host_hdr_bytes ..][0..roci.host_hdr_bytes];
+        const pstep = std.mem.readInt(u64, phdr[0..8], .little);
+        const pcount: usize = @intCast(std.mem.readInt(u64, phdr[8..16], .little));
+        if (pstep != step) run.bad[who] += 1;
+        if (!try nd.t.waitHost(.rec, want, 5 * std.time.ns_per_s)) return error.WaitTimeout;
+        const land = nd.arena[L.at(.rec_land) + slot * roci.host_slot_bytes ..][0 .. pcount * roci.host_rec];
+        const peer: usize = g ^ 2;
+        for (0..pcount) |i| {
+            const want_b: u8 = @truncate(step *% 31 +% peer *% 7 +% i);
+            for (land[i * roci.host_rec ..][0..roci.host_rec]) |b| run.bad[who] += @intFromBool(b != want_b);
+        }
+    }
+}
+
+test "the host lane between column partners: headers and packed records land byte for byte, the 16 slots wrap, the words keep their order" {
+    const net = try Net.open(.{ .host = true }, .{ .nap = false, .gathers = false }, roci.identity);
+    defer net.close();
+    try net.start();
+    var run: HostRun = .{ .net = net, .steps = 40 };
+    var th: [2]std.Thread = undefined;
+    for (&th, 0..) |*t, who| t.* = try std.Thread.spawn(.{}, hostMain, .{ &run, who });
+    for (th) |t| t.join();
+    for (run.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+    for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+    for ([_]usize{ 0, 2 }) |g| try std.testing.expectEqual(@as(?@TypeOf(net.nodes[g].t.failure().?), null), net.nodes[g].t.failure());
+}
+
+test "control: a NIC that writes the word before the records lets the partner read stale records" {
+    const net = try Net.open(.{ .host = true, .word_first = true, .gap_ns = 5 * std.time.ns_per_ms }, .{ .nap = false }, roci.identity);
+    defer net.close();
+    try net.start();
+    var run: HostRun = .{ .net = net, .steps = 6 };
+    var th: [2]std.Thread = undefined;
+    for (&th, 0..) |*t, who| t.* = try std.Thread.spawn(.{}, hostMain, .{ &run, who });
+    for (th) |t| t.join();
+    // the checks read right after the word: records or headers not there yet
+    try std.testing.expect(run.bad[0] + run.bad[1] > 0 or run.err[0] != null or run.err[1] != null);
+}
+
+test "waitHost: false at its deadline when the partner's word is not there, and a failed transport ends it with an error" {
+    const net = try Net.open(.{ .host = true }, .{ .nap = false, .dead_ms = 100_000 }, roci.identity);
+    defer net.close();
+    try net.start();
+    const nd = &net.nodes[0];
+    try std.testing.expect(!(try nd.t.waitHost(.rec, 1, 30 * std.time.ns_per_ms)));
+    try std.testing.expect(!nd.t.hostWordReached(.rec, 1));
+    nd.t.fail(.watchdog, .rec, 2);
+    try std.testing.expectError(error.RociFailed, nd.t.waitHost(.rec, 1, 0));
+}
+
+test "waitHostStats: a word written while the host waits ends the wait, which counts its looks, naps and length" {
+    const net = try Net.open(.{ .host = true }, .{ .nap = false }, roci.identity);
+    defer net.close();
+    try net.start();
+    const nd = &net.nodes[0];
+    const Poster = struct {
+        fn run(t: *roci.Transport) void {
+            sleep(8 * std.time.ns_per_ms);
+            t.sendRec(.rech, 0, 1) catch {};
+        }
+    };
+    // node 2 (the partner) posts its header to node 0
+    const th = try std.Thread.spawn(.{}, Poster.run, .{net.nodes[2].t});
+    var st: roci.Transport.HostWait = .{};
+    try std.testing.expect(try nd.t.waitHostStats(.rech, 1, 5 * std.time.ns_per_s, &st));
+    th.join();
+    try std.testing.expect(st.ns >= 8 * std.time.ns_per_ms);
+    try std.testing.expect(st.naps >= 1 and st.looks >= st.naps);
+    // a wait that is already satisfied looks once and does not nap
+    var st2: roci.Transport.HostWait = .{};
+    try std.testing.expect(try nd.t.waitHostStats(.rech, 1, 5 * std.time.ns_per_ms, &st2));
+    try std.testing.expectEqual(@as(u32, 0), st2.naps);
+}
+
+test "waitHost naps on the word it waits for (the Arm wait the proxies use), and sleeps a fixed time only where the CPU cannot nap" {
+    const src = @embedFile("rocinante.zig");
+    const at = std.mem.indexOf(u8, src, "pub fn waitHostStats(").?;
+    const body = src[at..std.mem.indexOfPos(u8, src, at, "\n    }\n").?];
+    try std.testing.expect(std.mem.indexOf(u8, body, "nap.napOnce(w, seen,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (can_nap) {").? < std.mem.indexOf(u8, body, "std.c.nanosleep(").?);
+    try std.testing.expect(std.mem.indexOf(u8, body, "20 * std.time.ns_per_us") == null);
+}
+
+// -- the partner split of the Engram records over the host lane ----------------------------------------------------------
+
+const partner = @import("engram_partner.zig");
+
+fn recordOf(id: i64, out: []u8) void {
+    for (out, 0..) |*b, k| b.* = @truncate(@as(u64, @bitCast(id)) *% 131 +% k *% 7 +% 5);
+}
+
+const PReader = struct {
+    reads: usize = 0, // records read
+    calls: usize = 0,
+    delay_ns: u64 = 0, // a slow drive
+    entered_ns: u64 = 0, // when the step's splitRead was entered (set by the test)
+    lag_max_ns: u64 = 0, // the longest time from entering a step to its first read
+
+    fn read(ctx: *anyopaque, ids: []const i64, dsts: []const [*]u8) anyerror!void {
+        const self: *PReader = @ptrCast(@alignCast(ctx));
+        if (self.calls == 0 or self.entered_ns != 0) {
+            self.lag_max_ns = @max(self.lag_max_ns, nowNsT() -| self.entered_ns);
+            self.entered_ns = 0;
+        }
+        self.calls += 1;
+        self.reads += ids.len;
+        if (self.delay_ns != 0) sleep(self.delay_ns);
+        for (ids, dsts) |id, d| recordOf(id, d[0..roci.host_rec]);
+    }
+};
+
+fn nowNsT() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+const PRun = struct {
+    net: *Net,
+    steps: usize,
+    link: [2]partner.Link = undefined,
+    rd: [2]PReader = .{ .{}, .{} },
+    outcome: [2][64]partner.Outcome = undefined,
+    bad: [2]u64 = .{ 0, 0 },
+    err: [2]?anyerror = .{ null, null },
+    /// the lists differ at these steps on the second node (a diverged cache)
+    diverge_every: usize = 0,
+    late_start_ns: u64 = 0, // the second node starts each step this late
+    slack_ns: u64 = std.time.ns_per_s, // what a node gives its partner beyond its own read (long: no timing decides a test unless it sets this)
+    delay0_ns: u64 = 0, // the first node's reads take this long
+    skip1: u8 = 0, // the second node starts out backing off for this many steps
+    step_ns_max: [2]u64 = .{ 0, 0 }, // the longest a node spent in one step
+    slow_half_ns: u64 = 0, // the second node's reads take this long
+    seed: u64 = 11,
+};
+
+fn partnerMain(run: *PRun, who: usize) void {
+    partnerBody(run, who) catch |e| {
+        run.err[who] = e;
+    };
+}
+
+fn partnerBody(run: *PRun, who: usize) !void {
+    const a = std.heap.page_allocator;
+    const l = &run.link[who];
+    if (who == 1) run.rd[1].delay_ns = run.slow_half_ns else run.rd[0].delay_ns = run.delay0_ns;
+    var prng = std.Random.DefaultPrng.init(run.seed);
+    const rng = prng.random();
+    var stage: [3000 * roci.host_rec]u8 = undefined;
+    for (0..run.steps) |step| {
+        const m = 1 + rng.uintLessThan(usize, 2999);
+        const ids = try a.alloc(i64, m);
+        defer a.free(ids);
+        for (ids) |*x| x.* = rng.intRangeLessThan(i64, 0, 5000);
+        // a diverged cache on the second node: one id differs
+        if (who == 1 and run.diverge_every != 0 and step % run.diverge_every == 0) ids[m / 2] = 9999;
+        const dsts = try a.alloc([*]u8, m);
+        defer a.free(dsts);
+        for (dsts, 0..) |*d, i| d.* = stage[i * roci.host_rec ..].ptr;
+        @memset(stage[0 .. m * roci.host_rec], 0);
+        if (who == 1 and run.late_start_ns != 0) sleep(run.late_start_ns);
+        const t_enter = nowNsT();
+        run.rd[who].entered_ns = t_enter;
+        const out = try partner.splitRead(l, ids, dsts, step, .{ .ctx = &run.rd[who], .read = PReader.read }, roci.host_rec);
+        run.step_ns_max[who] = @max(run.step_ns_max[who], nowNsT() - t_enter);
+        if (step < 64) run.outcome[who][step] = out;
+        // the stage holds exactly what a whole local read gives
+        var want: [roci.host_rec]u8 = undefined;
+        for (ids, 0..) |id, i| {
+            recordOf(id, &want);
+            if (!std.mem.eql(u8, &want, stage[i * roci.host_rec ..][0..roci.host_rec])) run.bad[who] += 1;
+        }
+    }
+}
+
+fn runPartners(run: *PRun) !void {
+    for (&run.link, 0..) |*l, who| {
+        const g: usize = who * 2;
+        l.* = .{ .t = run.net.nodes[g].t, .arena = run.net.nodes[g].arena, .role = @intCast(who), .gpa = std.heap.page_allocator };
+        l.slack_ns = run.slack_ns;
+        if (who == 1) l.skip = run.skip1;
+    }
+    defer for (&run.link) |*l| l.deinit();
+    var th: [2]std.Thread = undefined;
+    for (&th, 0..) |*t, who| t.* = try std.Thread.spawn(.{}, partnerMain, .{ run, who });
+    for (th) |t| t.join();
+}
+
+test "partner split: each partner reads half of the misses, the stages equal a whole local read, the 16 slots wrap" {
+    const net = try Net.open(.{ .host = true }, .{ .nap = false }, roci.identity);
+    defer net.close();
+    try net.start();
+    var run: PRun = .{ .net = net, .steps = 40 };
+    try runPartners(&run);
+    for (run.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+    for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+    for (0..40) |s| for (0..2) |w| try std.testing.expectEqual(partner.Outcome.split, run.outcome[w][s]);
+    // each read about half: together a whole list once (not twice)
+    var total: usize = 0;
+    var prng = std.Random.DefaultPrng.init(11);
+    for (0..40) |_| {
+        const m = 1 + prng.random().uintLessThan(usize, 2999);
+        total += m;
+        for (0..m) |_| _ = prng.random().intRangeLessThan(i64, 0, 5000);
+    }
+    try std.testing.expectEqual(total, run.rd[0].reads + run.rd[1].reads);
+    try std.testing.expect(run.rd[0].reads * 10 < total * 6 and run.rd[1].reads * 10 < total * 6);
+}
+
+test "control: a NIC that writes the words before the data is seen: a stale header is a mismatch (both read everything) or stale records land in a stage" {
+    const net = try Net.open(.{ .host = true, .word_first = true, .gap_ns = 3 * std.time.ns_per_ms }, .{ .nap = false }, roci.identity);
+    defer net.close();
+    try net.start();
+    var run: PRun = .{ .net = net, .steps = 6 };
+    try runPartners(&run);
+    // the ordering the hardware keeps matters: with it broken, either the header check caught the stale header, or stale records were read
+    const caught = run.link[0].c.mismatch + run.link[1].c.mismatch + run.link[0].c.header_late + run.link[1].c.header_late;
+    try std.testing.expect(caught > 0 or run.bad[0] + run.bad[1] > 0 or run.err[0] != null or run.err[1] != null);
+}
+
+test "partner split: a diverged list on one partner makes both read everything, and the stages still equal a whole read" {
+    const net = try Net.open(.{ .host = true }, .{ .nap = false }, roci.identity);
+    defer net.close();
+    try net.start();
+    var run: PRun = .{ .net = net, .steps = 30, .diverge_every = 3 };
+    try runPartners(&run);
+    for (run.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+    for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+    for (0..30) |s| {
+        const want: partner.Outcome = if (s % 3 == 0) .local_mismatch else .split;
+        for (0..2) |w| try std.testing.expectEqual(want, run.outcome[w][s]);
+    }
+    try std.testing.expect(run.link[0].c.mismatch == 10 and run.link[1].c.mismatch == 10);
+}
+
+test "partner split: a partner late with its header is read around, and the stages are still right on both" {
+    const net = try Net.open(.{ .host = true }, .{ .nap = false }, roci.identity);
+    defer net.close();
+    try net.start();
+    var run: PRun = .{ .net = net, .steps = 6, .late_start_ns = 120 * std.time.ns_per_ms, .slack_ns = 20 * std.time.ns_per_ms };
+    try runPartners(&run);
+    for (run.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+    for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+    try std.testing.expect(run.link[0].c.header_late >= 1);
+}
+
+test "partner split: a node reads its half before the partner's header is in (a partner that starts 40 ms late costs the other node's read nothing)" {
+    const net = try Net.open(.{ .host = true }, .{ .nap = false }, roci.identity);
+    defer net.close();
+    try net.start();
+    var run: PRun = .{ .net = net, .steps = 4, .late_start_ns = 40 * std.time.ns_per_ms };
+    try runPartners(&run);
+    for (run.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+    for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+    for (0..4) |s| for (0..2) |w| try std.testing.expectEqual(partner.Outcome.split, run.outcome[w][s]);
+    // node 0 began each step 40 ms before its partner: its first read waited for nothing
+    try std.testing.expect(run.rd[0].lag_max_ns < 15 * std.time.ns_per_ms);
+}
+
+test "partner split: a partner that is late costs a node at most its half read, a wait as long as that read, and the rest (not the old fixed deadlines)" {
+    const net = try Net.open(.{ .host = true }, .{ .nap = false }, roci.identity);
+    defer net.close();
+    try net.start();
+    // node 0 reads in 10 ms a call; node 1 takes 300 ms a call, so it is late with its records every step
+    var run: PRun = .{ .net = net, .steps = 4, .slow_half_ns = 300 * std.time.ns_per_ms, .delay0_ns = 10 * std.time.ns_per_ms, .slack_ns = 2 * std.time.ns_per_ms };
+    try runPartners(&run);
+    for (run.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+    for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+    try std.testing.expect(run.link[0].c.half_late + run.link[0].c.header_late >= 1);
+    // without the early wake: half 10 + records deadline (3 x 10 + 20 = 50) + rest 10 >= 70 ms; with it: half 10 + wait <= 10 + 2 + rest 10 = about 32 ms
+    try std.testing.expect(run.step_ns_max[0] < 55 * std.time.ns_per_ms);
+}
+
+test "partner split: a node that was let down backs off (whole lists for 2, 4, 8 steps), so a persistently late partner costs one probe now and then" {
+    const net = try Net.open(.{ .host = true }, .{ .nap = false }, roci.identity);
+    defer net.close();
+    try net.start();
+    var run: PRun = .{ .net = net, .steps = 10, .slow_half_ns = 120 * std.time.ns_per_ms, .delay0_ns = 5 * std.time.ns_per_ms, .slack_ns = 2 * std.time.ns_per_ms };
+    try runPartners(&run);
+    for (run.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+    for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+    const c = run.link[0].c;
+    // probes at steps 0, 3 and 8 (after 2 and 4 steps of backing off): three were let down, seven steps read whole lists
+    try std.testing.expectEqual(@as(u64, 3), c.half_late + c.header_late);
+    try std.testing.expectEqual(@as(u64, 7), c.skipped);
+    for (0..10) |s| {
+        const o = run.outcome[0][s];
+        if (s == 0 or s == 3 or s == 8) {
+            try std.testing.expect(o == .partner_half_late or o == .local_header_late);
+        } else try std.testing.expectEqual(partner.Outcome.skipped, o);
+    }
+}
+
+test "partner split: a partner that reads its whole list says so in its header, and the other node reads the rest at once, without waiting" {
+    const net = try Net.open(.{ .host = true }, .{ .nap = false }, roci.identity);
+    defer net.close();
+    try net.start();
+    var run: PRun = .{ .net = net, .steps = 6, .skip1 = 100, .delay0_ns = 10 * std.time.ns_per_ms, .slack_ns = std.time.ns_per_s };
+    try runPartners(&run);
+    for (run.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+    for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+    for (0..6) |s| try std.testing.expectEqual(partner.Outcome.partner_declined, run.outcome[0][s]);
+    try std.testing.expectEqual(@as(u64, 6), run.link[0].c.declined);
+    try std.testing.expectEqual(@as(u64, 6), run.link[1].c.skipped);
+    // it did not sit out its (one second) budget on the second node's records, which were not coming
+    try std.testing.expect(run.step_ns_max[0] < 200 * std.time.ns_per_ms);
+    // and it was not let down: no backing off of its own
+    try std.testing.expectEqual(@as(u64, 0), run.link[0].c.skipped);
+}
+
+test "partner split: a partner late with its records is read around (the half read here), and the stages are still right" {
+    const net = try Net.open(.{ .host = true }, .{ .nap = false }, roci.identity);
+    defer net.close();
+    try net.start();
+    var run: PRun = .{ .net = net, .steps = 5, .slow_half_ns = 200 * std.time.ns_per_ms, .slack_ns = 5 * std.time.ns_per_ms };
+    try runPartners(&run);
+    for (run.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+    for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+    try std.testing.expect(run.link[0].c.half_late >= 1);
+}
+
+test "partner split: the counters name the records read, sent and received, the waits and the read of the half against the whole list" {
+    const net = try Net.open(.{ .host = true }, .{ .nap = false }, roci.identity);
+    defer net.close();
+    try net.start();
+    var run: PRun = .{ .net = net, .steps = 30, .diverge_every = 3, .slow_half_ns = 2 * std.time.ns_per_ms };
+    try runPartners(&run);
+    for (run.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+    for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+    // the lists' lengths, as the run drew them: a split step reads its half, sends it and gets the other; a mismatched step reads the whole list
+    var prng = std.Random.DefaultPrng.init(11);
+    var want_read: [2]u64 = .{ 0, 0 };
+    var want_sent: [2]u64 = .{ 0, 0 };
+    var want_got: [2]u64 = .{ 0, 0 };
+    for (0..30) |s| {
+        const m = 1 + prng.random().uintLessThan(usize, 2999);
+        for (0..m) |_| _ = prng.random().intRangeLessThan(i64, 0, 5000);
+        for (0..2) |w| {
+            const mine = partner.mineCount(m, @intCast(w));
+            want_sent[w] += mine; // (the records go out whatever the headers say)
+            if (s % 3 == 0) {
+                want_read[w] += m;
+            } else {
+                want_read[w] += mine;
+                want_got[w] += m - mine;
+            }
+        }
+    }
+    for (0..2) |w| {
+        const c = run.link[w].c;
+        try std.testing.expectEqual(@as(u64, 30), c.steps);
+        try std.testing.expectEqual(@as(u64, 10), c.mismatch);
+        try std.testing.expectEqual(want_read[w], c.records_read);
+        try std.testing.expectEqual(want_sent[w], c.records_sent);
+        try std.testing.expectEqual(want_got[w], c.records_got);
+        try std.testing.expectEqual(@as(u64, 50), c.waits); // a header wait each step and a records wait of each split step
+        try std.testing.expect(c.wait_max_ns > 0 and c.wait_max_ns <= c.hdr_wait_ns + c.rec_wait_ns);
+        try std.testing.expect(c.wait_looks >= c.wait_naps);
+        // the slow node's half took 2 ms a step at least; the whole list at the same rate is more than the half
+        try std.testing.expect(c.read_ns > 0 and c.full_ns >= c.read_ns);
+        try std.testing.expect(c.copy_ns > 0);
+    }
+    try std.testing.expect(run.link[1].c.read_ns >= 30 * 2 * std.time.ns_per_ms);
+    // the line's difference: counts since a copy, the longest wait kept
+    var base = run.link[0].c;
+    base.steps -= 10;
+    base.wait_max_ns = 1;
+    const d = run.link[0].c.since(base);
+    try std.testing.expectEqual(@as(u64, 10), d.steps);
+    try std.testing.expectEqual(run.link[0].c.wait_max_ns, d.wait_max_ns);
+    try std.testing.expectEqual(@as(u64, 0), d.records_read);
 }
 
 test "a rank that refuses a primitive fails its lanes at once: the refused reason is named, the host place is logged, and the failed lane's check ends every wait with an error" {

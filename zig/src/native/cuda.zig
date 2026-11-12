@@ -219,6 +219,72 @@ const Host = struct {
                     return x.inner.vtable.prefill_step.?(x.inner.ptr, s);
                 }
             }.f else null,
+            .live_cfg = if (v.live_cfg != null) struct {
+                fn f(p: *anyopaque, version: u64, items: []const lanes.backend.CfgItem) anyerror!void {
+                    const x = bind(p);
+                    return x.inner.vtable.live_cfg.?(x.inner.ptr, version, items);
+                }
+            }.f else null,
+            .first = struct {
+                fn f(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
+                    const x = bind(p);
+                    return x.inner.vtable.first(x.inner.ptr, s, position);
+                }
+            }.f,
+            .queue = struct {
+                fn f(p: *anyopaque, s: *lanes.Stream, feed: lanes.backend.Feed, position: u64) anyerror!u64 {
+                    const x = bind(p);
+                    return x.inner.vtable.queue(x.inner.ptr, s, feed, position);
+                }
+            }.f,
+            .read = struct {
+                fn f(p: *anyopaque, handle: u64) anyerror!u32 {
+                    const x = bind(p);
+                    return x.inner.vtable.read(x.inner.ptr, handle);
+                }
+            }.f,
+            .verify = struct {
+                fn f(p: *anyopaque, w: []const lanes.backend.Window, out: []lanes.backend.Verified) anyerror!void {
+                    const x = bind(p);
+                    return x.inner.vtable.verify(x.inner.ptr, w, out);
+                }
+            }.f,
+            .keep = struct {
+                fn f(p: *anyopaque, w: []const lanes.backend.Window, paths: []const []const u32) anyerror!void {
+                    const x = bind(p);
+                    return x.inner.vtable.keep(x.inner.ptr, w, paths);
+                }
+            }.f,
+            .draft = struct {
+                fn f(p: *anyopaque, r: []const lanes.backend.DraftRequest) anyerror!void {
+                    const x = bind(p);
+                    return x.inner.vtable.draft(x.inner.ptr, r);
+                }
+            }.f,
+            .unspeculate = if (v.unspeculate != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream) anyerror!void {
+                    const x = bind(p);
+                    return x.inner.vtable.unspeculate.?(x.inner.ptr, s);
+                }
+            }.f else null,
+            .probabilities = if (v.probabilities != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream, out: []f64) anyerror!bool {
+                    const x = bind(p);
+                    return x.inner.vtable.probabilities.?(x.inner.ptr, s, out);
+                }
+            }.f else null,
+            .tree = if (v.tree != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream, gpa: Allocator) anyerror!?lanes.stream.Held {
+                    const x = bind(p);
+                    return x.inner.vtable.tree.?(x.inner.ptr, s, gpa);
+                }
+            }.f else null,
+            .alternatives = if (v.alternatives != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream, out: []lanes.backend.Alternative) anyerror!usize {
+                    const x = bind(p);
+                    return x.inner.vtable.alternatives.?(x.inner.ptr, s, out);
+                }
+            }.f else null,
             .first_masked = if (v.first_masked != null) struct {
                 fn f(p: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
                     const x = bind(p);

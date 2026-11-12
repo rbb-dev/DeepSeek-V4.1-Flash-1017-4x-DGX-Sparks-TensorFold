@@ -57,8 +57,10 @@ const ring2d = @import("ring2d.zig");
 const roci_engine = @import("roci_engine.zig");
 const roci_pair = @import("roci_pair.zig");
 const pair_spans = @import("pair_spans.zig");
+const keep_ahead = @import("keep_ahead.zig");
 const pack_epilogue = @import("pack_epilogue.zig");
 const pass_meter = @import("pass_meter.zig");
+const engram_partner = @import("engram_partner.zig");
 const pair_nap = @import("rdma_nap.zig");
 const any_check = @import("any_check.zig");
 const rdma = @import("rdma.zig");
@@ -78,9 +80,17 @@ pub const chunk_rows = prompt2d.chunk_rows;
 /// TF_DS_ENGRAM_WORKER=0: a fill's Engram rows read by a thread a chunk (the chunk before's end to this one's first
 /// Engram layer) instead of the fill's worker.
 var wk_on: bool = true;
+/// TF_DS_ENGRAM_PINNED (a pass's Engram worker stages its rows in pinned host memory, the upload waiting for nothing).
+var pinned_on: bool = false;
+/// TF_DS_ENGRAM_KEEP_AHEAD=1 (every rank alike): the decode round between a prompt's chunks leaves the fill's Engram worker running.
+var keep_ahead_asked: bool = false;
 pub fn readWorkerEnv() void {
+    if (std.c.getenv("TF_DS_ENGRAM_KEEP_AHEAD")) |v| keep_ahead_asked = std.mem.eql(u8, std.mem.span(v), "1");
     if (std.c.getenv("TF_DS_ENGRAM_WORKER")) |v| wk_on = !std.mem.eql(u8, std.mem.span(v), "0");
+    if (std.c.getenv("TF_DS_ENGRAM_PINNED")) |v| pinned_on = !std.mem.eql(u8, std.mem.span(v), "0");
+    prompt.readAheadPassEnv(); // TF_DS_ENGRAM_AHEAD_PASS (its start line printed here, once)
 }
+pub const live_config = engine_api.live_config;
 /// The pool's streams (--parallel 4).
 pub const max_streams = draft.max_streams;
 /// The pool's streams when unset (--parallel 4).
@@ -1401,10 +1411,52 @@ pub fn lanesChoice(want: usize, set: bool, fits_all: bool) LanesChoice {
 fn pairShortText(buf: []u8, free: u64, pass_rows: usize, lane_arena: u64, v: PoolView, lanes: usize) ![]const u8 {
     const what = if (lanes >= 3) "the second and third passes (TF_DS_ROCI_STAGGER_LANES=3)" else "the second pass";
     return memoryRefusal(buf, what, true, pass_rows, (lanes - 1) * pairEstimate(pass_rows, lane_arena) + pair_guard_bytes, free, v);
+/// TF_DS_ENGRAM_PARTNER's start: the column partners (nodes g and g ^ 2) share the reads of a prompt step's misses over a third Rocinante lane. Every
+/// rank's checks agree before anything is allocated; a rank that cannot run it ends the start naming its reason.
+fn openPartner(m: *Model, gpa: std.mem.Allocator, d: *const cuda.Driver, o: Options, sp: plan.Split) !void {
+    var why: ?[]const u8 = null;
+    const two = if (m.two) |*t| t else null;
+    if (sp.pair == null or two == null or two.?.rc == null) {
         why = "needs the four-node 2D split with Rocinante";
+    } else if (m.eh == null or !wk_on or m.erows == null) {
+        why = "needs the Engram worker with packed shards (TF_DS_ENGRAM_PACKED)";
+    } else if (m.erows.?.owned) {
+        why = "needs whole tables on every node (TF_DS_ENGRAM_OWNED=0)";
+    } else if (m.erows.?.rec != @import("rocinante.zig").host_rec or m.erows.?.slots() * chunk_rows > 2 * @import("rocinante.zig").host_max_recs) {
+        why = "needs 264-byte records and at most 12 columns a rank (the host lane's slots are sized for them)";
+    } else if (o.rdma_devices == null) {
+        why = "needs the rails' devices (TF_DS_RDMA_DEVICES)";
+    }
+    if (!try m.eng.agreeAll(why == null)) {
         switch (speed_defaults.verdict(why orelse "another rank cannot run it", speed_defaults.defaulted("TF_DS_ENGRAM_PARTNER"))) {
+            .refuse => {
+                if (why) |w| std.log.err("TF_DS_ENGRAM_PARTNER=1: off: {s}", .{w}) else std.log.err("TF_DS_ENGRAM_PARTNER=1: off: another rank cannot run it (its line names the reason)", .{});
+                return error.PartnerRefused;
+            },
             // the default: one WARN naming why and what it costs; every rank decided the same (all agreed above), no lane was opened
+            else => {
+                std.log.warn("TF_DS_ENGRAM_PARTNER: off: {s}; without it: {s} (set TF_DS_ENGRAM_PARTNER=1 to make this a refusal, 0 to silence it)", .{ why orelse "another rank cannot run it (its line names the reason)", speed_defaults.costOf("TF_DS_ENGRAM_PARTNER") });
+                prompt2d.engram_partner_asked = false;
+                return;
+            },
+        }
+    }
+    var devs_it = std.mem.splitScalar(u8, o.rdma_devices.?, ',');
+    const rails: [2][]const u8 = .{ devs_it.next() orelse return error.RociRails, devs_it.next() orelse return error.RociRails };
+    const node: u8 = @intCast(m.two.?.node());
     const rc = try roci_engine.Roci.openLane(gpa, d, m.comm.rank, node, m.comm.world, m.two.?.rank_of, &m.fan, rails, Model.rdmaGid() orelse 3, 1, m.two.?.rc.?, .host);
+    errdefer rc.close();
+    const plink = try m.gpa.create(engram_partner.Link);
+    errdefer m.gpa.destroy(plink);
+    plink.* = .{ .t = rc.t, .arena = rc.arena.bytes, .role = @intCast(node >> 1), .gpa = m.gpa };
+    m.partner_rc = rc;
+    m.partner_link = plink;
+    // TF_DS_ENGRAM_PARTNER_SPLIT=0 (every rank alike): the lane is open and nothing crosses it, to tell what the open lane costs from what the split costs
+    const split = if (std.c.getenv("TF_DS_ENGRAM_PARTNER_SPLIT")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+    if (split) m.erows.?.partner = plink;
+    std.log.info("TF_DS_ENGRAM_PARTNER=1: rank {d} (node {d}): {s}; records are {d} bytes, {d} slots a ring, the host lane's arena {d} bytes", .{ m.comm.rank, node, if (!split) "the host lane is open and the Engram worker does not use it (TF_DS_ENGRAM_PARTNER_SPLIT=0)" else if (node >> 1 == 0) "the Engram worker reads the even positions of each prompt step's misses and takes the other positions from node 2 over the host lane (a header first; the partner waited for as long as this node's read took, then the rest read here)" else "the Engram worker reads the odd positions of each prompt step's misses and takes the other positions from node 0 over the host lane (a header first; the partner waited for as long as this node's read took, then the rest read here)", @import("rocinante.zig").host_rec, @import("rocinante.zig").host_slots, rc.layout.total });
+}
+
 /// TF_DS_ROCI_STAGGER's start: two whole passes in flight need every exchange of a full pass on the transport (so no collective of
 /// another communicator runs beside a stream's memop waits), the Engram uploads from pinned memory (a pageable copy blocks the host thread
 /// that issues both passes), a second chunk, node of the split, lane, stream, cuBLAS handle and the per-layer cache events. Every rank's
@@ -1414,6 +1466,7 @@ fn openPair(m: *Model, gpa: std.mem.Allocator, d: *const cuda.Driver, o: Options
     var free: usize = 0;
     const two = if (m.two) |*t| t else null;
     const connections: ?usize = if (std.c.getenv("CUDA_DEVICE_MAX_CONNECTIONS")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch null else null;
+    const pinned = pinned_on and wk_on;
     if (sp.pair == null or two == null) {
         why = "needs the four-node 2D split";
     } else if (c.format != .native) {
@@ -1444,10 +1497,12 @@ fn openPair(m: *Model, gpa: std.mem.Allocator, d: *const cuda.Driver, o: Options
     if (!try m.eng.agreeAll(why == null)) {
         const is_default = speed_defaults.defaulted("TF_DS_ROCI_STAGGER");
         switch (speed_defaults.verdict(why orelse "another rank cannot run it", is_default)) {
+            .refuse => {
                 if (why) |w| std.log.err("TF_DS_ROCI_STAGGER=1: off: {s}", .{w}) else std.log.err("TF_DS_ROCI_STAGGER=1: off: another rank cannot run it (its line names the reason)", .{});
                 return error.StaggerRefused;
             },
             // the default: one WARN naming why and what it costs, the single pass runs (every rank decided the same, all agreed above)
+            else => {
                 std.log.warn("TF_DS_ROCI_STAGGER: off: {s}; without it: {s} (the engine runs one pass at a time; set TF_DS_ROCI_STAGGER=1 to make this a refusal, 0 to silence it)", .{ why orelse "another rank cannot run it (its line names the reason)", speed_defaults.costOf("TF_DS_ROCI_STAGGER") });
                 prompt2d.roci_stagger_asked = false;
                 return;
@@ -1542,6 +1597,70 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     _ = std.c.close(fd);
 }
 
+/// buffer and two rows a slot, and three ranges for each of a slot's two record stages. The round's list is shorter (11).
+/// Sized by `engram_rows.max_wk`, so a wider ring grows the list with it; a list that is still full is an error, never a
+/// silent drop (a range not listed is one the overlap check calls "no shared byte" without having seen it).
+
+/// Why keepRanges cannot list every region.
+const KeepRangesError = error{KeepAheadRangesFull};
+
+/// The memory a round writes through the Engram host (`round`) and the memory the fill's worker writes (`worker`), as address ranges.
+fn keepRanges(eh: *const prompt.EngramHost, round_r: *[keep_ahead_ranges]keep_ahead.Range, worker_r: *[keep_ahead_ranges]keep_ahead.Range) KeepRangesError!void {
+    var nr: usize = 0;
+    var nw: usize = 0;
+    const R = struct {
+        fn add(list: *[keep_ahead_ranges]keep_ahead.Range, n: *usize, r: keep_ahead.Range) KeepRangesError!void {
+            if (n.* >= list.len) return error.KeepAheadRangesFull;
+            list[n.*] = r;
+            n.* += 1;
+        }
+    };
+    try R.add(round_r, &nr, keep_ahead.rangeOf(i64, eh.hashes));
+    try R.add(round_r, &nr, keep_ahead.rangeOf(i64, eh.flat));
+    try R.add(round_r, &nr, keep_ahead.rangeOf(u8, eh.w));
+    try R.add(round_r, &nr, keep_ahead.rangeOf(u8, eh.s));
+    try R.add(round_r, &nr, keep_ahead.rangeOf(u16, eh.rows));
+    try R.add(worker_r, &nw, keep_ahead.rangeOf(i64, eh.wk_flat));
+    try R.add(worker_r, &nw, keep_ahead.rangeOf(u8, eh.wk_w));
+    try R.add(worker_r, &nw, keep_ahead.rangeOf(u8, eh.wk_s));
+    for (eh.wk_hashes) |h| try R.add(worker_r, &nw, keep_ahead.rangeOf(i64, h));
+    for (eh.wk_rows) |row| for (row) |x| try R.add(worker_r, &nw, keep_ahead.rangeOf(u16, x));
+    if (eh.pk) |pr| {
+        for (&pr.round) |*st| {
+            try R.add(round_r, &nr, keep_ahead.rangeOf(u8, st.bytes));
+            try R.add(round_r, &nr, keep_ahead.rangeOf(i64, st.ids));
+            try R.add(round_r, &nr, keep_ahead.rangeOf([*]u8, st.dsts));
+        }
+        nw = try workerStageRanges(worker_r, nw, &pr.wk, pr.wk_n);
+    }
+}
+
+/// The worker's record stages as ranges, appended to `list` after its first `n0`; returns the new count. Only the first `wk_n` slots
+/// exist (2 without the stagger, max_wk with it): the others are not the worker's memory.
+fn workerStageRanges(list: *[keep_ahead_ranges]keep_ahead.Range, n0: usize, wk: *const [engram_rows.max_wk][2]engram_rows.Stage, wk_n: usize) KeepRangesError!usize {
+    var n = n0;
+    for (wk[0..wk_n]) |*row| for (row) |*st| {
+        for ([_]keep_ahead.Range{ keep_ahead.rangeOf(u8, st.bytes), keep_ahead.rangeOf(i64, st.ids), keep_ahead.rangeOf([*]u8, st.dsts) }) |r| {
+            if (n >= list.len) return error.KeepAheadRangesFull;
+            list[n] = r;
+            n += 1;
+        }
+    };
+    return n;
+}
+
+pub const Model = struct {
+    gpa: std.mem.Allocator,
+    host: std.heap.ArenaAllocator, // allocations that live as long as the model
+    io: std.Io,
+    ctx: *const cuda.Context,
+    stream: cuda.Stream,
+    cfg: Config,
+    rank: u32,
+    world: u32,
+    streams: usize, // the pool's streams (Options.streams)
+    round_ms: []const f64, // the lane core's round costs by rows (Options.round_ms, else draft.round_ms)
+    pool_cap: usize,
     pass_rows: usize = chunk_rows, // a pass's rows at most (TF_DS_PASS_ROWS, every rank alike): the chunk's allocation
     cache_dir: std.Io.Dir,
     cache_file: std.Io.File,
@@ -1628,10 +1747,16 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     span_join: []cuda.Event = &.{},
     span_slot: ?usize = null, // the slot of the pair being issued
     pair_t0: ?cuda.Event = null, // timing events: the pair's first queued work on stream A, and its second pass's last (pair_join)
+    keep_ahead: bool = false, // TF_DS_ENGRAM_KEEP_AHEAD in effect: a round between chunks leaves the Engram worker running (keep_ahead.zig)
+    keep_ahead_start: bool = false, // what the start gave it (a live `unset` returns to it)
+    keep_ahead_able: bool = false, // the start verified it can run (an Engram worker, its own reader rings, no shared scratch): a live change may turn it on
     pair_log: bool = false, // TF_DS_ROCI_PAIR_LOG: one line a pair (a value starting with / also appends them to that file on rank 0)
     pair_gap: usize = roci_pair.gap,
     pair_prio: roci_pair.Prio = .equal, // TF_DS_ROCI_STAGGER_PRIO
     pair_major: bool = false, // TF_DS_ROCI_WORKER_PAIR_MAJOR
+    partner_rc: ?*roci_engine.Roci = null, // TF_DS_ENGRAM_PARTNER: the host lane to the column partner, and the worker's side of the exchange
+    partner_link: ?*engram_partner.Link = null,
+    partner_seen: engram_partner.Counters = .{}, // the partner counters at the last line of the pair log
     fill_t0: u64 = 0, // the fill's admission (fillBegin), for the pair log's first line of a prompt
     pair_in_fill: u64 = 0, // pairs run since fillBegin
     pair_count: u64 = 0,
@@ -1693,6 +1818,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             }
             prompt2d.roci_stagger3_asked = prompt2d.roci_stagger_lanes == 3; // every rank alike (Settings)
         }
+        prompt2d.engram_partner_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ENGRAM_PARTNER")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.pf_split_asked = readPfSplit(); // every rank alike (Settings)
         prompt2d.pf_raster_asked = try readPfRaster(); // every rank alike (Settings)
         prompt2d.woa_w8_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_WOA_W8")) |v| std.mem.span(v) else null); // every rank alike (Settings)
@@ -1861,9 +1987,13 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         m.span_join = &.{};
         m.span_slot = null;
         m.pair_log = false;
+        m.keep_ahead = false;
         m.pair_gap = roci_pair.gap;
         m.pair_prio = .equal;
         m.pair_major = false;
+        m.partner_rc = null;
+        m.partner_link = null;
+        m.partner_seen = .{};
         m.fill_t0 = 0;
         m.pair_in_fill = 0;
         m.pair_count = 0;
@@ -2260,6 +2390,18 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             };
             m.tables = try engram_io.Tables.open(gpa, io, edir);
             m.epool = try engram_io.Pool.init(gpa, io, 64);
+            // the drill names the engine's own rank among all its Sparks (0-3 on four), never the 2D split's position in a ring of two
+            prompt.engram_fault = prompt.EngramFault.parse(if (std.c.getenv("TF_DS_ENGRAM_FAULT")) |v| std.mem.span(v) else null, @intCast(o.world)) catch {
+                std.log.err("TF_DS_ENGRAM_FAULT must be R:C, a rank below {d} and the layer-0 step to fail at", .{o.world});
+                return error.BadEngramFault;
+            };
+            prompt.engram_fault_rank = @intCast(o.rank);
+            prompt.engram_fault_seen.store(0, .release);
+            prompt.engram_fault_spent.store(false, .release);
+            if (prompt.engram_fault.asked) {
+                var fb: [96]u8 = undefined;
+                std.log.info("TF_DS_ENGRAM_FAULT {s}", .{prompt.engram_fault.describe(&fb, @intCast(o.rank))});
+            }
             // TF_DS_ENGRAM_PACKED (a folder of tf-dsv41-engram-pack's shards): a row is one read, kept in a row cache
             // (TF_DS_ENGRAM_CACHE_MIB, default 2048, 0 none) and decoded on the GPU; TF_DS_ENGRAM_OWNED=1: each node
             // reads only its range of the rows and a byte max over the nodes fills the rest; TF_DS_ENGRAM_INSTREAM=1:
@@ -2290,6 +2432,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
                     .cache_bytes = mib << 20,
                     .prefault = prefault,
                     .instream = engram_rows.envOn("TF_DS_ENGRAM_INSTREAM"),
+                    .pinned = pinned_on and wk_on,
                     .round_dev = try m.arena.take(round.max_rows * sl * rec),
                     .chunk_dev = try m.arena.take(m.pass_rows * sl * rec),
                     .chunk_dev_b = if (prompt2d.roci_stagger_asked) try m.arena.take(m.pass_rows * sl * rec) else 0,
@@ -2298,6 +2441,18 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
                 eh.pk = m.erows;
                 if (prefault) logPrefault(m.erows.?, mib, huge0, hugeKiB(io));
             }
+            if (pinned_on) {
+                if (!wk_on) {
+                    std.log.info("TF_DS_ENGRAM_PINNED=1: no effect, the Engram worker is off (TF_DS_ENGRAM_WORKER=0)", .{});
+                } else {
+                    const bytes = try prompt.engramPin(&m.eh.?, d);
+                }
+            }
+        } else if (c.engram_layers.slice().len > 0) return error.NoEngramTables;
+        if (keep_ahead_asked) try m.useKeepAhead();
+        m.keep_ahead_start = m.keep_ahead;
+        m.keep_ahead_able = m.keep_ahead or m.keepAheadAble();
+        live_config.setAble(.keep_ahead, m.keep_ahead_able);
         if (c.vision and c.format == .exl3) { // (Format.native: the checkpoint's own gate.bias_vl, loaded with the weights)
             const path = o.vision_bias orelse try std.fs.path.join(a, &.{ o.kit_dir, "vision", "gate_bias_vl.safetensors" });
             m.loadVisionBias(path) catch |err| if (o.vision_bias != null or err != error.FileNotFound) return err;
@@ -2307,6 +2462,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         m.ids64 = try a.alloc(i64, m.pass_rows);
         m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
         m.logits = try a.alloc(f32, round.max_rows * m.vocab);
+        if (prompt2d.engram_partner_asked) try openPartner(m, gpa, d, o, sp);
         return engram_rows.workerSlotsN(m.pass_rows / chunk_rows, if (prompt2d.roci_stagger_asked) prompt2d.roci_stagger_lanes else 1);
     /// A pair's second pass: its lane before the first's (it borrows the first's arena), then its events, handle and stream.
     fn closePair(m: *Model) void {
@@ -2348,8 +2504,18 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         m.flushDiag(true);
         if (m.stream_b) |s| s.synchronize() catch {};
         if (m.stream_c) |s| s.synchronize() catch {};
+        if (m.partner_link) |l| {
+            l.deinit();
+            m.gpa.destroy(l);
+        }
+        if (m.partner_rc) |rc| rc.close(); // the host lane before the others: it is paired with the first lane
         m.closePair(); // the second lane before the first: it borrows the first's arena
         m.ilead_ev.free(LeadEvents{ .d = m.ctx.d });
+        if (m.eh) |*eh| prompt.engramUnpin(eh);
+        if (m.img_buf) |*b| b.free();
+        m.spans.deinit(m.gpa);
+        if (m.graphs) |*g| g.deinit();
+        if (m.pgraphs) |*g| g.deinit();
         if (m.dr) |*dr| dr.deinit();
         if (m.timer) |t| {
             t.deinit();
@@ -2681,14 +2847,79 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
                 m.img_buf = try cuda.DeviceBuffer.alloc(m.ctx.d, rows.len);
             }
             const d = m.ctx.d;
+    /// TF_DS_ENGRAM_KEEP_AHEAD at start (every rank alike): the decision (keep_ahead.decide), the check that the round's Engram
+    /// buffers and the worker's share no byte, and the start line. A round reads through eh.hashes/flat/w/s/rows, its own AIO ring
+    /// (eh.aio) and its own stages and records (Rows.round); the worker through wk_*, the prompt ring (eh.paio) and Rows.wk. The row
+    /// cache is the one thing both touch (a lock a set).
+    fn useKeepAhead(m: *Model) !void {
+        const d = keep_ahead.decide(true, m.eh != null, wk_on, m.aio != null, m.paio != null);
+        switch (d) {
+            .off => {},
+            .no_effect => |why| std.log.info("TF_DS_ENGRAM_KEEP_AHEAD=1: rank {d}: no effect, {s}", .{ m.rank, why }),
+            .refuse => |why| {
                 // the default: one WARN naming why and what it costs, the round joins the worker as before; set to 1 by the operator: the refusal
                 if (speed_defaults.verdict(why, speed_defaults.defaulted("TF_DS_ENGRAM_KEEP_AHEAD")) == .fallback) {
                     std.log.warn("TF_DS_ENGRAM_KEEP_AHEAD: rank {d}: off: the Engram reads are not asynchronous (TF_DS_ENGRAM_AIO=0), so the round and the worker would share one reader pool; without it: {s} (set TF_DS_ENGRAM_KEEP_AHEAD=1 to make this a refusal, 0 to silence it)", .{ m.rank, speed_defaults.costOf("TF_DS_ENGRAM_KEEP_AHEAD") });
                     return;
                 }
+                std.log.err("{s}", .{why});
+                return error.KeepAheadSharesReader;
+            },
+            .keep => {
+                const eh = &m.eh.?;
+                var round_r: [keep_ahead_ranges]keep_ahead.Range = @splat(.{});
+                var worker_r: [keep_ahead_ranges]keep_ahead.Range = @splat(.{});
+                try keepRanges(eh, &round_r, &worker_r);
+                if (keep_ahead.firstShared(&round_r, &worker_r)) |at| {
+                    std.log.err("TF_DS_ENGRAM_KEEP_AHEAD=1: the round's Engram scratch (range {d}) and the worker's (range {d}) share memory", .{ at[0], at[1] });
+                    return error.KeepAheadSharesScratch;
+                }
+                m.keep_ahead = true;
+                std.log.info("TF_DS_ENGRAM_KEEP_AHEAD=1: rank {d}: the decode round between a prompt's chunks leaves the Engram worker and its read-ahead running (the round's buffers, AIO ring and records are its own and checked apart; the row cache's per-set locks are the only shared state): 0 MiB of scratch more, the KV pool unchanged", .{m.rank});
+            },
+        }
+    }
+
+    /// Whether TF_DS_ENGRAM_KEEP_AHEAD could run on this rank, silently (useKeepAhead's decision and scratch check without its lines and
+    /// refusals): what a live change to it may rely on when the start did not ask.
+    fn keepAheadAble(m: *Model) bool {
+        if (keep_ahead.decide(true, m.eh != null, wk_on, m.aio != null, m.paio != null) != .keep) return false;
+        var round_r: [keep_ahead_ranges]keep_ahead.Range = @splat(.{});
+        var worker_r: [keep_ahead_ranges]keep_ahead.Range = @splat(.{});
+        keepRanges(&m.eh.?, &round_r, &worker_r) catch return false;
+        return keep_ahead.firstShared(&round_r, &worker_r) == null;
+    }
+
+    /// The value a slot of class A has when a live change says `unset`: the start's.
+    pub fn cfgStart(m: *const Model, slot: u8) u32 {
+        return switch (slot) {
+            @backingInt(live_config.Slot.keep_ahead) => @intFromBool(m.keep_ahead_start),
+            else => live_config.cfg_unset,
+        };
+    }
+
+    /// A cfg frame's changes on this rank, between two frames (rank 0 after it sent them, a follower when it read them): the same
+    /// values on every rank by construction (rank 0 resolved `unset`, the frames are in order). A rank that could not take a
+    /// value keeps what it has and says so; the Engram read-ahead is joined by the caller when the frame says it is touched.
+        for (items) |it| switch (it.slot) {
+            @backingInt(live_config.Slot.keep_ahead) => {
+                const want = it.value != 0 and it.value != live_config.cfg_unset;
+                if (want and !m.keep_ahead_able) {
+                    std.log.warn("TF_DS_ENGRAM_KEEP_AHEAD: rank {d} cannot run it (cfg version {d}): left off", .{ m.rank, version });
+                    continue;
+                }
+                if (want == m.keep_ahead) continue;
+                m.keep_ahead = want;
+                std.log.info("TF_DS_ENGRAM_KEEP_AHEAD is now {d} on rank {d} (cfg version {d})", .{ @intFromBool(want), m.rank, version });
+            },
+            else => std.log.warn("a cfg frame names slot {d}, which this build does not know (rank {d})", .{ it.slot, m.rank }),
+        };
+    }
+
         try m.pairJoin();
         m.fill_t0 = m.now();
         m.pair_in_fill = 0;
+        if (m.eh) |*eh| eh.ka.newPrompt();
     /// Layer li's Engram on the chunk, in phases: all (the baseline order: the pending MoE post, the rows and their projection, the
     /// sums and the gate), pre (TF_DS_ROCI_ENGRAM_AHEAD: the rows and the projection, then the part-1 send, a layer early) and finish
     /// (the pending post, the sums, the gate).
@@ -2721,6 +2952,9 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
                 try prompt.engramProject(e, ch, eh, li, seq);
                 try prompt.engramSendAhead(e, ch, li);
             } else try prompt.engramApply(e, ch, eh, li, seq);
+            // the rows are uploaded (a pageable copy is staged before it returns; a pinned one is done when its event is): the
+            // units' slots go back to the worker
+            try prompt.engramRelease(eh, e.s, j, first + units);
             eh.inst_apply_ns += m.now() - t_apply;
         } else {
             if (ahead.*) |th| {
@@ -2752,6 +2986,8 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         if (n > chunk_rows and n % chunk_rows != 0) {
             if (!prompt2d.pass_tail_asked or start % chunk_rows != 0) return error.BadChunk;
         }
+        if (m.eh) |*eh| eh.ka.chunkBegins();
+        const e = &m.eng;
         const c = e.c;
         const ch = &m.ch;
         try ch.view(n, chunk_rows);
@@ -2785,6 +3021,8 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
                 ahead = null;
                 const same = eh.wk_thread != null and eh.wk_seq.ptr == m.fill_seq.ptr and eh.wk_seq.len == m.fill_seq.len and
                     start >= eh.wk_start and (start - eh.wk_start) % chunk_rows == 0 and
+                    (start - eh.wk_start) / chunk_rows <= prompt.engramUploaded(eh, 0);
+                if (!same) try prompt.engramWorkerStart(eh, c, m.fill_seq, start, chunk_rows, prompt2d.pass_from_asked, m.pass_rows);
             } else {
                 prompt.engramWorkerStop(eh);
                 if (ahead != null and (eh.ahead_start != start or eh.ahead_n != n)) {
@@ -2899,6 +3137,21 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
                     eh.ahead_err = null;
                     m.ahead = std.Thread.spawn(.{}, prompt.engramReadAheadAll, .{ eh, c, m.fill_seq[0 .. start + n + nn], start + n, nn }) catch null;
         if (m.two_c) |*t| if (t.rc) |rc| try rc.t.check();
+        const ka: keep_ahead.Taken = if (m.eh) |*eh| eh.ka.take() else .{ .wait_ns = 0, .chunks = 0 };
+        const starts: u64 = if (m.eh) |*eh| eh.ka.starts else 0;
+        pairLog("ROCI {s} at {d} (rank {d}): engine thread CPU {d:.1} ms of {d:.1} ms wall ({d:.2}); issue lead {d}: {d} layers, the host asleep {d:.1} ms in {d} sleeps of {d} slices, {d} layers entered with nothing queued inside the pass and {d} at its first layer; Engram worker starts this prompt {d}, first-layer wait after a round {d:.1} ms in {d} chunks", .{ what, at, m.comm.rank, cpu, wall, if (wall > 0) cpu / wall else 0.0, if (m.ilead) |g| g.n else 0, st.layers, ms(st.sleep_ns), st.sleeps, st.slices, st.bare, st.bare_first, starts, @as(f64, @floatFromInt(ka.wait_ns)) / 1e6, ka.chunks });
+        if (m.partner_link) |pl| {
+            // TF_DS_ENGRAM_PARTNER, what the worker's steps did since the last line (the counts of a pass in flight may fall in the next line)
+            const c = pl.c.since(m.partner_seen);
+            m.partner_seen = pl.c;
+            const mb = struct {
+                fn of(records: u64) f64 {
+                    return @as(f64, @floatFromInt(records * rocinante_mod.host_rec)) / 1e6;
+                }
+            }.of;
+            pairLog("ROCI {s} at {d} (rank {d}) partner: {d} steps, {d} split, {d} mismatched, {d} header late, {d} half late, {d} skipped, {d} declined; records read here {d}, sent {d} ({d:.1} MB), received {d} ({d:.1} MB)", .{ what, at, m.comm.rank, c.steps, c.split, c.mismatch, c.header_late, c.half_late, c.skipped, c.declined, c.records_read, c.records_sent, mb(c.records_sent), c.records_got, mb(c.records_got) });
+            pairLog("ROCI {s} at {d} (rank {d}) partner time: header wait {d:.1} ms, records wait {d:.1} ms in {d} waits ({d} looks, {d} naps, the longest {d:.2} ms); own half read {d:.1} ms (the whole lists at that rate {d:.1} ms), rest read {d:.1} ms, copies {d:.1} ms", .{ what, at, m.comm.rank, ms(c.hdr_wait_ns), ms(c.rec_wait_ns), c.waits, c.wait_looks, c.wait_naps, ms(c.wait_max_ns), ms(c.read_ns), ms(c.full_ns), ms(c.redo_ns), ms(c.copy_ns) });
+        }
     /// The stream, cuBLAS handle and node of the split of one pass of a pair: A is the model's, B the second lane's. Every launch and
     /// exchange a layer makes reads `Engine.s`, `Engine.t.stream`, `Engine.blas` and `Engine.two` (whose transport is the lane), so
     /// swapping them runs the same serial calls on the pass's own stream and lane.
@@ -3093,6 +3346,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             end += n;
         }
         if (seq.len < end) return error.BadChunk;
+        if (m.eh) |*eh| eh.ka.chunkBegins();
         const e = &m.eng;
         const c = e.c;
         const half = c.layers / 2;
@@ -3114,6 +3368,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         if (m.eh) |*eh| {
             const same = eh.wk_thread != null and eh.wk_seq.ptr == m.fill_seq.ptr and eh.wk_seq.len == m.fill_seq.len and
                 start_a >= eh.wk_start and (start_a - eh.wk_start) % chunk_rows == 0 and
+                (start_a - eh.wk_start) / chunk_rows <= prompt.engramUploaded(eh, 0);
             if (!same) try prompt.engramWorkerStart(eh, c, m.fill_seq, start_a, chunk_rows, prompt2d.pass_from_asked, m.pass_rows);
         }
         var chs: [roci_pair.max_lanes]*prompt.Chunk = undefined;
@@ -3263,6 +3518,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     /// else TF_DS_HEAD_CAND's count a node.
     pub fn verify(m: *Model, rows: round.Rows, absorb: []const bool, head: u8) !void {
         try m.pairJoin();
+        if (m.eh) |*eh| eh.ka.roundRan();
         if (head != 0 and !(if (head == head_cand.key) m.head_key else m.head_cand)) return error.HeadCandOff;
         m.rd.head_k = head;
         try m.forwardRows(rows);
@@ -3423,6 +3679,11 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     /// its positions below q0), `steps` drafts each (the drafter's drafts and confidences on the host).
     pub fn pass(m: *Model, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize) !void {
         try m.pairJoin();
+        if (m.eh) |*eh| eh.ka.roundRan();
+        if (m.dr == null) return error.NoDrafter;
+        const dr = &m.dr.?;
+        const pool = &m.dpool.?;
+        for (q0, slots) |q, s| pool.absorbed[@intCast(s)] = @intCast(q);
 
 test "TF_DS_PASS_BESIDE is read after TF_DS_PASS_ROWS, refuses a bad start, and reaches the host as its beside rows" {
     const src = @embedFile("model.zig");
@@ -4276,6 +4537,19 @@ test "TF_DS_HEAD_KEY's line, its read with the kernel switches, its agreement be
     try std.testing.expect(std.mem.indexOf(u8, hb, "if (m.cand_parts.len != 0) return;") != null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, "head_cand.mergeKeys(m.cand_parts[0..n], R, head_cand.vocabOffsets(tw.hw), m.amax_host[0..R]);")); // headTokens', and this test's text
 }
+test "TF_DS_ENGRAM_PINNED: the worker's slots go back through engramRelease after the uploads, the wait for the worker polls the events, a new worker flushes them first" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    try std.testing.expect(std.mem.indexOf(u8, code, "eh.wk_used[j].store(") == null); // (only prompt.engramRelease stores it)
+    const up = std.mem.indexOf(u8, code, "} else try prompt.engramApply(e, ch, eh, li, seq);\n            // the rows are uploaded") orelse return error.TestUnexpectedResult;
+    const rel = std.mem.indexOf(u8, code[up..], "try prompt.engramRelease(eh, e.s, j, first + units);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rel > 0);
+    const p = @embedFile("prompt.zig");
+    const start = std.mem.indexOf(u8, p, "pub fn engramWorkerStart(") orelse return error.TestUnexpectedResult;
+    const flush = std.mem.indexOf(u8, p[start..], "try engramFlushPins(eh);") orelse return error.TestUnexpectedResult;
+    const spawn = std.mem.indexOf(u8, p[start..], "eh.wk_thread = try std.Thread.spawn(") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(flush < spawn);
+}
 
 test "TF_DS_ROCI_STAGGER: every write to state a later pass reads is issued before the cache event that gates it, and the tier's copies join the pair first" {
     const model_src = @embedFile("model.zig");
@@ -4329,6 +4603,13 @@ test "a pair's pass B: every entry that touches the model's stream starts with p
         // before any other call that is not a bare local: the join is within the function's first statements
         try std.testing.expect(first - at < 600);
     }
+}
+
+test "TF_DS_ENGRAM_PINNED: the check that the running worker is still on this fill counts the chunks uploaded, given back or pending, in a pass and in a pair" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, code, "chunk_rows <= prompt.engramUploaded(eh, 0);"));
+    try std.testing.expect(std.mem.indexOf(u8, code, "eh.wk_used[0]") == null);
 }
 
 test "TF_DS_ROCI_PAIR_LOG: the pair line names the engine thread's CPU time, the worker's hash, gather and decode time, rows and bytes, and a fill's first pair names the admission to its first launch" {
@@ -4395,6 +4676,108 @@ test "Model.open: a refusal or failure after partial setup unwinds what already 
     // 5. close() uses the same pair teardown
     const close = code[try at(code, "pub fn close(m: *Model) void {")..];
     try std.testing.expect(std.mem.indexOf(u8, close, "m.closePair();") != null);
+}
+
+test "TF_DS_ENGRAM_KEEP_AHEAD: the switch is read as 1 and nothing else, the decision runs at the start of every rank, and rank 0 and the followers test one flag" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    try std.testing.expect(std.mem.indexOf(u8, code, "keep_ahead_asked = std.mem.eql(u8, std.mem.span(v), \"1\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "if (keep_ahead_asked) try m.useKeepAhead();") != null);
+    // the round counts itself once in a verify and once in a pass, on every rank (the same Model methods), the prompt's fill resets the count
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, code, "if (m.eh) |*eh| eh.ka.roundRan();"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "if (m.eh) |*eh| eh.ka.newPrompt();"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, code, "if (m.eh) |*eh| eh.ka.chunkBegins();"));
+    // the pass line names the worker's starts and the first-layer wait
+    try std.testing.expect(std.mem.indexOf(u8, code, "Engram worker starts this prompt {d}, first-layer wait after a round {d:.1} ms in {d} chunks") != null);
+    // the worker's starts and the wait are counted where they happen
+    const p = @embedFile("prompt.zig");
+    try std.testing.expect(std.mem.indexOf(u8, p, "eh.ka.workerStarted();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "if (j == 0) eh.ka.firstLayerWait(waited);") != null);
+}
+
+test "TF_DS_ENGRAM_KEEP_AHEAD: the round's buffers and the worker's are separate memory in a built EngramHost's field list, and a shared one is named" {
+    const a = std.testing.allocator;
+    const hashes = try a.alloc(i64, 64);
+    defer a.free(hashes);
+    const wk0 = try a.alloc(i64, 64);
+    defer a.free(wk0);
+    var round_r: [keep_ahead_ranges]keep_ahead.Range = @splat(.{});
+    var worker_r: [keep_ahead_ranges]keep_ahead.Range = @splat(.{});
+    round_r[0] = keep_ahead.rangeOf(i64, hashes);
+    worker_r[0] = keep_ahead.rangeOf(i64, wk0);
+    try std.testing.expect(keep_ahead.firstShared(&round_r, &worker_r) == null);
+    worker_r[1] = keep_ahead.rangeOf(i64, hashes[8..16]); // a worker slot placed inside the round's hashes
+    try std.testing.expectEqual([2]usize{ 0, 1 }, keep_ahead.firstShared(&round_r, &worker_r).?);
+    // every region keepRanges lists is one the round or the worker writes: the EngramHost fields it reads exist under these names
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    const at = std.mem.indexOf(u8, code, "fn keepRanges(") orelse return error.TestUnexpectedResult;
+    const body = code[at .. std.mem.indexOfPos(u8, code, at, "\n}\n") orelse return error.TestUnexpectedResult];
+    for ([_][]const u8{ "eh.hashes", "eh.flat", "eh.w)", "eh.s)", "eh.rows", "eh.wk_flat", "eh.wk_w", "eh.wk_s", "eh.wk_hashes", "eh.wk_rows", "pr.round", "pr.wk" }) |w|
+        try std.testing.expect(std.mem.indexOf(u8, body, w) != null);
+}
+
+test "TF_DS_ENGRAM_KEEP_AHEAD: the overlap list holds every region of the widest worker ring, and a full list is an error, never a silent drop" {
+    const Stage = engram_rows.Stage;
+    const wk: [engram_rows.max_wk][2]Stage = @splat(@splat(Stage.empty));
+    // the worker's own fields, a hash list and two row lists a slot, then every slot's record stages: all of them fit
+    var list: [keep_ahead_ranges]keep_ahead.Range = @splat(.{});
+    const fields: usize = 3 + engram_rows.max_wk * (1 + 2);
+    try std.testing.expectEqual(fields + engram_rows.max_wk * 6, try workerStageRanges(&list, fields, &wk, engram_rows.max_wk));
+    // a list with one entry left refuses the stages instead of dropping the ones that do not fit
+    try std.testing.expectError(error.KeepAheadRangesFull, workerStageRanges(&list, keep_ahead_ranges - 1, &wk, engram_rows.max_wk));
+    // the capacity follows the ring (the worker's side at max_wk slots fits with the round's 11 ranges beside it)
+    try std.testing.expect(keep_ahead_ranges >= 11 and keep_ahead_ranges >= fields + engram_rows.max_wk * 6);
+    const src = @embedFile("model.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, "const keep_ahead_ranges = 3 + 9 * engram_rows.max_wk;") != null);
+    const silent = "if (n.* < list" ++ ".len) {";
+    try std.testing.expect(std.mem.indexOf(u8, src, silent) == null);
+}
+
+test "TF_DS_ENGRAM_KEEP_AHEAD: with two worker slots (the stagger off) the slots past them are not the worker's memory, whatever they hold" {
+    const a = std.testing.allocator;
+    const Stage = engram_rows.Stage;
+    const hashes = try a.alloc(i64, 64);
+    defer a.free(hashes);
+    const real = try a.alloc(u8, 32);
+    defer a.free(real);
+    var wk: [engram_rows.max_wk][2]Stage = @splat(@splat(Stage.empty));
+    wk[0][0].bytes = real;
+    // slots 2 and 3 as an `undefined` array may leave them: pointing into the round's hashes
+    for (wk[2..]) |*row| for (row) |*st| {
+        st.bytes = std.mem.sliceAsBytes(hashes[8..16]);
+        st.ids = hashes[16..24];
+    };
+    var round_r: [keep_ahead_ranges]keep_ahead.Range = @splat(.{});
+    round_r[0] = keep_ahead.rangeOf(i64, hashes);
+    var worker_r: [keep_ahead_ranges]keep_ahead.Range = @splat(.{});
+    _ = try workerStageRanges(&worker_r, 0, &wk, 2);
+    try std.testing.expect(keep_ahead.firstShared(&round_r, &worker_r) == null);
+    // with four slots they are the worker's and the overlap is named
+    var worker4: [keep_ahead_ranges]keep_ahead.Range = @splat(.{});
+    _ = try workerStageRanges(&worker4, 0, &wk, engram_rows.max_wk);
+    try std.testing.expect(keep_ahead.firstShared(&round_r, &worker4) != null);
+    // Rows.open leaves the slots it does not make empty, never undefined
+    try std.testing.expect(std.mem.indexOf(u8, @embedFile("engram_rows.zig"), "var wk: [max_wk][2]Stage = @splat(@splat(Stage.empty));") != null);
+}
+
+test "TF_DS_ENGRAM_PARTNER: the worker reads through chunkReadSplit, the start is agreed before the host lane opens, and the host lane closes before the others" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    const p = @embedFile("prompt.zig");
+    try std.testing.expect(std.mem.indexOf(u8, p, "pr.chunkReadSplit(&pr.wk[slot][j]") != null);
+    const f = code[std.mem.indexOf(u8, code, "fn openPartner(").?..std.mem.indexOf(u8, code, "fn openPair(").?];
+    try std.testing.expect(std.mem.indexOf(u8, f, "agreeAll(why == null)").? < std.mem.indexOf(u8, f, "Roci.openLane(").?);
+    const close = code[std.mem.indexOf(u8, code, "pub fn close(m: *Model) void {").?..];
+    try std.testing.expect(std.mem.indexOf(u8, close, "m.partner_rc) |rc| rc.close()").? < std.mem.indexOf(u8, close, "m.closePair()").?);
+}
+
+test "TF_DS_ENGRAM_PARTNER: each pass's line of the pair log carries the partner's counts and its times since the last line" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    const lr = code[std.mem.indexOf(u8, code, "    fn leadReport(").?..];
+    for ([_][]const u8{ "partner: {d} steps, {d} split, {d} mismatched, {d} header late, {d} half late, {d} skipped, {d} declined; records read here", "partner time: header wait", "own half read", "the whole lists at that rate", "pl.c.since(m.partner_seen)" }) |w|
+        try std.testing.expect(std.mem.indexOf(u8, lr, w) != null);
 }
 
     /// Wave w's partial `src` gathered into `dst` on cs (events k, k + 1: ready on the stream, gathered on cs).
@@ -4540,6 +4923,7 @@ test "TF_DS_ROCI_STAGGER_LANES: a group of three is issued by groupSchedule, eac
     /// The monotonic clock (ns).
     pub fn now(m: *const Model) u64 {
         return @intCast(std.Io.Timestamp.now(m.io, .awake).nanoseconds);
+    try std.testing.expectEqual(6 * engram_rows.max_wk, try workerStageRanges(&list, 0, &wk, engram_rows.max_wk));
     m.two_c = null;
     m.partner_rc = null;
     m.ring = null;
@@ -4572,6 +4956,18 @@ test "TF_DS_ROCI_STAGGER_LANES: a group of three is issued by groupSchedule, eac
     try std.testing.expect(std.mem.indexOfPos(u8, pbody, std.mem.indexOf(u8, pbody, "try m.pass(").?, "try m.checkTransport();") != null);
 }
 
+test "TF_DS_ENGRAM_FAULT names the engine's rank among all its Sparks (o.rank below o.world), never the 2D split's ring position" {
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "prompt.engram_fault = prompt.EngramFault" ++ ".parse(").?; // (split: the test must not find itself)
+    const tail = src[at..][0..400];
+    try std.testing.expect(std.mem.indexOf(u8, tail, "@intCast(o.world)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "prompt.engram_fault_rank = @intCast(o." ++ "rank);") != null);
+    // on four Sparks the split is a ring of two: rank 2 would be refused and both rings' rank 0 would fire
+    const sp = try prompt2d.split(2, 4);
+    try std.testing.expectEqual(@as(u32, 2), sp.world);
+    try std.testing.expect((try prompt.EngramFault.parse("2:3", 4)).asked);
+    try std.testing.expectError(error.BadFault, prompt.EngramFault.parse("2:3", sp.world));
+}
 
 test "this rank's weight digest comes from TF_DS_RANK_CACHE_SHA; unset, empty or not a digest, none (and the start goes on)" {
     const env = struct {
@@ -4632,6 +5028,31 @@ test "the start-up settings carry this rank's options and the math switches it r
         try m.synchronize();
         try d.check(d.api.cuMemcpyDtoH_v2(m.logits.ptr, m.rd.logits, R * m.vocab * 4), "cuMemcpyDtoH");
         return m.logits[0 .. R * m.vocab];
+
+test "a cfg frame's keep-ahead: on only where the start verified it can run, off always, unset is the start's; the other ranks' rule is the same function" {
+    var m: Model = undefined;
+    m.rank = 2;
+    m.keep_ahead = false;
+    m.keep_ahead_start = false;
+    m.keep_ahead_able = false;
+    const slot = @backingInt(live_config.Slot.keep_ahead);
+    // a rank that could not run it keeps it off (the start's check is the only thing that turns it on)
+    try std.testing.expect(!m.keep_ahead);
+    m.keep_ahead_able = true;
+    try std.testing.expect(m.keep_ahead);
+    try std.testing.expect(!m.keep_ahead);
+    // `unset` is resolved by rank 0 from its start's value before it travels; a rank never reads the marker as "on"
+    try std.testing.expectEqual(@as(u32, 0), m.cfgStart(slot));
+    m.keep_ahead_start = true;
+    try std.testing.expectEqual(@as(u32, 1), m.cfgStart(slot));
+    try std.testing.expect(!m.keep_ahead);
+    // a slot this build does not know changes nothing
+    try std.testing.expect(!m.keep_ahead);
+    // off stays possible when the start could not have turned it on (a start that asked, then a live off, then a live on again)
+    m.keep_ahead_able = false;
+    m.keep_ahead = true;
+    try std.testing.expect(!m.keep_ahead);
+}
 
 test "TF_DS_RING_WAIT's fallback to the proxy threads is for the default only: unset without the kernels or libmlx5 says why, 1 is left to Ring.create to refuse by name" {
     try std.testing.expect(Model.ringWaitFallback(false, true, true, null) == null);
@@ -4872,14 +5293,7 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
     }
 }
 
-    /// The drafter's batched pass for N streams: each one's pending token at position q0 in its slot (its rings hold
-    /// its positions below q0), `steps` drafts each (the drafter's drafts and confidences on the host).
-    pub fn pass(m: *Model, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize) !void {
-        if (m.dr == null) return error.NoDrafter;
-        const dr = &m.dr.?;
-        const pool = &m.dpool.?;
-        for (q0, slots) |q, s| pool.absorbed[@intCast(s)] = @intCast(q);
-        try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
+test "TF_DS_ENGRAM_PARTNER and TF_DS_ENGRAM_KEEP_AHEAD: a failed precondition falls back with one warning when it is the default and refuses by name when the operator set it" {
     const src = @embedFile("model.zig");
     // the partner split: the refusal is the operator's branch, the warning and the cleared flag the default's, and no lane is opened before either
     const v = std.mem.indexOf(u8, body, "speed_defaults.verdict(why orelse").?;
@@ -4887,12 +5301,16 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
     const refused = std.mem.indexOf(u8, body[v..], "return error.PartnerRefused;").?;
     const warn = std.mem.indexOf(u8, body[v..], "std.log.warn(\"TF_DS_ENGRAM_PARTNER: off:").?;
     try std.testing.expect(refuse < refused and refused < warn and warn < cleared);
+    // keep-ahead: the shared reader pool refuses only a switch the operator set
     const ka = std.mem.indexOf(u8, src, "fn useKeepAhead(").?;
     const kv = std.mem.indexOf(u8, kb, "speed_defaults.verdict(why, speed_defaults.defaulted(\"TF_DS_ENGRAM_KEEP_AHEAD\")) == .fallback").?;
     const kwarn = std.mem.indexOf(u8, kb[kv..], "std.log.warn(\"TF_DS_ENGRAM_KEEP_AHEAD: rank").?;
     const kerr = std.mem.indexOf(u8, kb[kv..], "return error.KeepAheadSharesReader;").?;
     try std.testing.expect(kwarn < kerr);
     // both are in the defaults table, so the speed report lists a fallback with its reason
+    try std.testing.expect(speed_defaults.find("TF_DS_ENGRAM_PARTNER") != null and speed_defaults.find("TF_DS_ENGRAM_KEEP_AHEAD") != null);
+}
+
     const gib: usize = 1 << 30;
     try std.testing.expect(passRowsFallback("4096", true, 64 * gib) != null); // a small box, the default: falls back
     try std.testing.expect(passRowsFallback("4096", true, 121 * gib) == null); // a Spark: runs
@@ -4902,6 +5320,7 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
     try std.testing.expect(passRowsFallback(null, true, 64 * gib) == null);
 }
 
+test "TF_DS_ROCI_STAGGER: a failed precondition falls back with one warning when it is the default and refuses by name when the operator set it" {
     const src = @embedFile("model.zig");
     const v = std.mem.indexOf(u8, body, "speed_defaults.verdict(why orelse").?;
     const refuse = std.mem.indexOf(u8, body[v..], ".refuse => {").?;

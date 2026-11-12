@@ -59,6 +59,11 @@ pub const DraftRequest = struct {
     ranks: bool = false, // also keep each chained level's best tokens (alternatives(), for grafts)
 };
 
+/// A setting of class A changed live, as it travels to every rank: the slot (a dense index, live_config.Slot) and its value
+/// (`cfg_unset`: the start's).
+pub const CfgItem = struct { slot: u8, value: u32 };
+pub const cfg_unset: u32 = std.math.maxInt(u32);
+
 pub const Backend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -68,6 +73,9 @@ pub const Backend = struct {
         prefill: *const fn (ptr: *anyopaque, s: *Stream) anyerror!void,
         /// One bounded prompt step; true once the first token can be drawn, null for whole-pass backends.
         prefill_step: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!bool = null,
+        /// Settings of class A changed live (CfgItem): send them to every rank and apply them on this one, between two
+        /// frames. Asked on the engine thread at a loop top, only on a change; a `cfg_unset` value is the start's. null: none.
+        live_cfg: ?*const fn (ptr: *anyopaque, version: u64, items: []const CfgItem) anyerror!void = null,
         /// Draw the first token from the prompt's last row at `position`; a handle to it.
         first: *const fn (ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64,
         /// Feed one token and queue the draw of the next at `position` (a one-token round); a handle to it.

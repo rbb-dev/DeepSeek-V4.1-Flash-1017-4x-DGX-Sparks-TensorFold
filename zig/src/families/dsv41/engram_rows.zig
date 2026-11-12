@@ -12,6 +12,7 @@ const engram_cache = @import("engram_cache.zig");
 pub const anonHugeKiB = engram_cache.anonHugeKiB;
 pub const Fault = engram_cache.Fault;
 const engram_gpu = @import("engram_gpu.zig");
+const engram_partner = @import("engram_partner.zig");
 const comm = @import("comm.zig");
 
 fn nowNs() u64 {
@@ -28,6 +29,9 @@ pub fn envOn(name: [:0]const u8) bool {
 
 /// A staging buffer: rows x slots records, the misses' row ids and where each lands, their AIO batch.
 pub const Stage = struct {
+    /// A stage that holds nothing: the slots a Rows does not make.
+    pub const empty: Stage = .{ .j = 0, .bytes = &.{}, .ids = &.{}, .dsts = &.{} };
+
     j: usize, // the Engram layer slot it serves (its cache)
     bytes: []u8,
     ids: []i64,
@@ -80,6 +84,7 @@ pub const Options = struct {
     cache_bytes: usize, // the row cache over the layers (0: none)
     prefault: bool = false, // its records faulted in at the open (TF_DS_ENGRAM_PREFAULT: engram_cache.Cache.initFaulted)
     instream: bool, // a round's landing as a host step on the stream (needs the round's AIO ring)
+    pinned: bool = false, // the fill worker's stages in pinned host memory (TF_DS_ENGRAM_PINNED)
     round_dev: u64, // device records of a round (round_rows * slots * record bytes)
     chunk_dev: u64, // of a chunk (chunk_rows * slots * record bytes)
     chunk_dev_b: u64 = 0, // the second lane's pass: its own (0: one pass at a time)
@@ -116,6 +121,8 @@ pub const Rows = struct {
     instream: bool,
     fault: [2]engram_cache.Fault = .{ .{}, .{} }, // how each layer's cache was faulted in (Options.prefault)
     fault_ns: u64 = 0, // and the time it took
+    // TF_DS_ENGRAM_PARTNER: the fill worker's steps read half of their misses and take the other half from the column partner
+    partner: ?*engram_partner.Link = null,
 
     /// The shards of node o.node of o.nodes (owned) or the whole ones, checked against `tables`; the kernels; the
     /// staging buffers and the caches. Needs the CUDA context current.
@@ -147,6 +154,7 @@ pub const Rows = struct {
         errdefer ahead0.deinit(gpa);
         var ahead1 = try Stage.init(gpa, null, 1, o.chunk_rows * sl, rec);
         errdefer ahead1.deinit(gpa);
+        var wk: [max_wk][2]Stage = @splat(@splat(Stage.empty));
         var made: usize = 0;
         errdefer for (0..made) |i| wk[i / 2][i % 2].deinit(gpa);
         for (0..2 * o.wk_slots) |i| {
@@ -315,10 +323,30 @@ pub const Rows = struct {
         if (bad) return error.ReadFailed;
     }
 
+    /// The pinned bytes of the fill worker's stages (Options.pinned; 0 without).
+    pub fn pinnedBytes(r: *const Rows) usize {
+        var n: usize = 0;
+        for (r.wk[0..r.wk_n]) |*row| for (row) |*st| {
+            if (st.host) |h| n += h.bytes.len;
+        };
+        return n;
+    }
+
     /// A prompt chunk's rows of Engram layer slot `j` staged in `st` (the chunk's own, or a read-ahead's) and read.
     pub fn chunkRead(r: *Rows, st: *Stage, j: usize, hashes: []const i64, n: usize, layers: usize) !void {
         try r.plan(st, j, hashes, n, layers);
         try r.readMisses(st, r.paio);
+    }
+
+    /// chunkRead for the fill worker with the partner split on (else chunkRead): the step's misses are planned as ever, then each of the two
+    /// column partners reads half and they swap (engram_partner.splitRead), and the cache keeps the whole list in the list's order. `tag`: the
+    /// step's place in the fill, the same on both partners.
+    pub fn chunkReadSplit(r: *Rows, st: *Stage, j: usize, hashes: []const i64, n: usize, layers: usize, tag: u64) !void {
+        const link = r.partner orelse return r.chunkRead(st, j, hashes, n, layers);
+        try r.plan(st, j, hashes, n, layers);
+        var ctx: ReadCtx = .{ .r = r, .j = j };
+        _ = try engram_partner.splitRead(link, st.ids[0..st.misses], st.dsts[0..st.misses], tag, .{ .ctx = &ctx, .read = readIds }, r.rec);
+        r.keep(st);
     }
 
     /// A staged chunk's records uploaded, combined over the nodes (owned) and decoded into `out` (bf16 [n][k][dim]).
@@ -339,6 +367,15 @@ pub const Rows = struct {
         try r.kernels.decodeRows(s, dev, out, n, sl, if (r.owned) r.lo else 0, r.k, r.dim);
     }
 };
+
+const ReadCtx = struct { r: *Rows, j: usize };
+
+/// The partner split's reader: records of row ids of layer slot `j` through the prompt ring (else the reader pool).
+fn readIds(ctx: *anyopaque, ids: []const i64, dsts: []const [*]u8) anyerror!void {
+    const c: *ReadCtx = @ptrCast(@alignCast(ctx));
+    const pk = c.r.pk[c.j];
+    if (c.r.paio) |x| try aioRecords(x, pk, ids, dsts) else try c.r.pool.gatherRecords(pk, ids, dsts);
+}
 
 /// A stream's host step for a staged round layer: its AIO batch waited for and its misses kept (no CUDA call).
 fn stepLand(data: ?*anyopaque) callconv(.c) void {

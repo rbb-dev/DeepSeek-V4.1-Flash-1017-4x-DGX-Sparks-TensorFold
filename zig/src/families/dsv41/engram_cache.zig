@@ -204,3 +204,43 @@ test "a kernel that refuses the populate advice: a write of 0 to each page fault
     try std.testing.expect(c.mapped and !got.populated and got.written and got.why == null);
     try expectResidentZeros(c.data);
 }
+
+test "a round's lookups and the pass worker's fills race on one cache and never see a torn record" {
+    const a = std.testing.allocator;
+    const rec = 48;
+    var c = try Cache.init(a, 64 * rec * 4, rec, 4);
+    defer c.deinit(a);
+    const Fill = struct {
+        fn row(id: u64, out: *[rec]u8) void {
+            for (out, 0..) |*b, i| b.* = @truncate(id *% 31 +% i);
+        }
+        fn writer(cache: *Cache, base: u64) void {
+            var out: [rec]u8 = undefined;
+            for (0..20000) |i| {
+                const id = base + i % 997;
+                row(id, &out);
+                cache.put(id, &out);
+            }
+        }
+        fn reader(cache: *Cache, torn: *std.atomic.Value(usize)) void {
+            var out: [rec]u8 = undefined;
+            var want: [rec]u8 = undefined;
+            for (0..20000) |i| {
+                const id: u64 = i % 997;
+                if (cache.get(id, &out)) {
+                    row(id, &want);
+                    if (!std.mem.eql(u8, &out, &want)) _ = torn.fetchAdd(1, .monotonic);
+                }
+            }
+        }
+    };
+    var torn: std.atomic.Value(usize) = .init(0);
+    const w = try std.Thread.spawn(.{}, Fill.writer, .{ &c, @as(u64, 0) });
+    const r1 = try std.Thread.spawn(.{}, Fill.reader, .{ &c, &torn });
+    const r2 = try std.Thread.spawn(.{}, Fill.reader, .{ &c, &torn });
+    w.join();
+    r1.join();
+    r2.join();
+    try std.testing.expectEqual(@as(usize, 0), torn.load(.monotonic));
+    try std.testing.expect(c.hits.load(.monotonic) > 0);
+}

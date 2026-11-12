@@ -138,10 +138,18 @@ pub const Roci = struct {
         const pages: Pages = .mmap; // (locked anonymous pages registered with cuMemHostRegister: the arena the transport's kernels run at device speed on)
         if (world != roci.world) return error.NotFourRanks;
         if (lanes < 1 or lanes > 3) return error.BadLanes;
+        if (layout_set == .host and first == null) return error.NoFirstLane;
         const r = try gpa.create(Roci);
         errdefer gpa.destroy(r);
+        r.* = .{ .gpa = gpa, .d = d, .g = node, .layout = roci.layoutOf(layout_set), .arena = undefined, .arena_mem = undefined, .pages = pages, .ctl_mem = undefined, .verbs = undefined, .nic = undefined, .t = undefined };
         const total: usize = @intCast(r.layout.total);
+        if (layout_set == .host) {
+            // the host lane: its own small arena, locked pages the CPU reads and writes at full speed
             r.lane = 3;
+            r.arena_mem = try Arena.alloc(d, total, .mmap);
+            r.arena = .{ .bytes = r.arena_mem.mem.bytes[0..total], .dev = r.arena_mem.mem.dev };
+            r.span = .{ r.arena.dev, r.arena.dev + total };
+        } else if (first) |f| {
             // the second or third lane: the first lane's block, the part of its place (`lanes` is 2 or 3 here)
             if (lanes < 2 or f.lane != 0 or f.span[1] - f.span[0] < lanes * total) return error.NoSecondArena;
             r.lane = lanes - 1;
@@ -218,6 +226,7 @@ pub const Roci = struct {
         r.t = try roci.Transport.init(gpa, r.g, o, ctl, r.ctl_mem.dev, r.nic.nic(), set);
         errdefer r.t.deinit();
         if (first) |f| roci.Transport.pair(f.t, r.t);
+        try r.t.start(if (layout_set == .host) cpusFromEnvH() else if (first != null) cpusFromEnvB() else cpusFromEnv());
         var buf: [768]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
         const rails_text = try std.fmt.allocPrint(gpa, "{s},{s}", .{ devices[0], devices[1] });
@@ -362,6 +371,13 @@ pub fn waitMode(text: ?[]const u8, signal: roci.Signal, mlx_ok: bool) WaitMode {
 /// threads use).
 fn cpusFromEnvB() ?[roci.rails]u16 {
     const v = std.c.getenv("TF_DS_ROCI_CPUS_B") orelse return .{ 1, 2 };
+    var it = std.mem.splitScalar(u8, std.mem.span(v), ',');
+    var out: [roci.rails]u16 = undefined;
+    for (&out) |*c| c.* = std.fmt.parseInt(u16, it.next() orelse return null, 10) catch return null;
+    return out;
+}
+
+fn cpusFromEnvH() ?[roci.rails]u16 {
     var it = std.mem.splitScalar(u8, std.mem.span(v), ',');
     var out: [roci.rails]u16 = undefined;
     for (&out) |*c| c.* = std.fmt.parseInt(u16, it.next() orelse return null, 10) catch return null;

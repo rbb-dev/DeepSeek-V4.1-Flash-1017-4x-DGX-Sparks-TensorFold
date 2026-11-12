@@ -493,3 +493,63 @@ test "TF_DS_ROUNDS_BESIDE's text: whole numbers from 1; unset is none; anything 
     try std.testing.expectEqual(@as(?u32, 50), roundsText("50"));
     for ([_][]const u8{ "", "0", "-1", "+2", "2.0", "1.5", " 2", "2 ", "two", "4294967296", "1_0", "0x10" }) |t| try std.testing.expectEqual(@as(?u32, null), roundsText(t));
 }
+
+var cfg_seen: [8]api.live_config.CfgItem = undefined;
+var cfg_versions: [8]u64 = undefined;
+var cfg_count: usize = 0;
+
+fn recordCfg(_: *anyopaque, version: u64, items: []const api.live_config.CfgItem) anyerror!void {
+    for (items) |it| {
+        cfg_seen[cfg_count] = it;
+        cfg_versions[cfg_count] = version;
+        cfg_count += 1;
+    }
+}
+
+test "the host sends a cfg frame for a slot of class A only when its value changed, once, with the start's value for unset, and never for a slot of class H" {
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var be = target.chunkedBackend();
+    var vt = be.vtable.*;
+    vt.live_cfg = recordCfg;
+    be.vtable = &vt;
+    var core = lanes.Engine.init(gpa, &cfg, be, clock.clock());
+    defer core.deinit();
+    var host = api.LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2, .resume_rows = 4, .rounds_beside = 3 });
+    const live = api.live_config;
+    var blk: live.Block = .{};
+    host.live = &blk;
+    cfg_count = 0;
+    const ka = @backingInt(live.Slot.keep_ahead);
+    // nothing published: no frame; a class H slot published: no frame
+    host.liveTurn();
+    blk.publish(.rounds_beside, 6, 1);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(usize, 0), cfg_count);
+    // a class A slot: one item, at the version taken
+    blk.publish(.keep_ahead, 1, 2);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(usize, 1), cfg_count);
+    try std.testing.expectEqual(@as(u8, ka), cfg_seen[0].slot);
+    try std.testing.expectEqual(@as(u32, 1), cfg_seen[0].value);
+    try std.testing.expectEqual(@as(u64, 2), cfg_versions[0]);
+    // the same value again (a new version, nothing changed): no frame
+    blk.publish(.keep_ahead, 1, 3);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(usize, 1), cfg_count);
+    // a change of a class H slot beside it sends nothing more; unset travels as the marker the ranks read as the start's
+    blk.publish(.rounds_beside, 5, 4);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(usize, 1), cfg_count);
+    blk.publish(.keep_ahead, live.unset, 5);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(usize, 2), cfg_count);
+    try std.testing.expectEqual(live.cfg_unset, cfg_seen[1].value);
+    // a value no u32 holds is not sent
+    blk.publish(.keep_ahead, 1 << 40, 6);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(usize, 2), cfg_count);
+}
