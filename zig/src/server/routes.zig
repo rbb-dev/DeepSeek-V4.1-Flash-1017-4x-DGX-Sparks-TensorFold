@@ -25,9 +25,14 @@ const fact_path = "/v1/slide/fact/";
 
 pub fn dispatch(srv: *Server, conn: *Conn, a: Allocator) void {
     const m = conn.method;
-    if (std.mem.eql(u8, m, "GET")) return get(srv, conn, a);
+    // a GET or DELETE that carries a body leaves it in the socket for the next request on a kept connection
+    if (std.mem.eql(u8, m, "GET")) {
+        discardBody(conn, a);
+        return get(srv, conn, a);
+    }
     if (std.mem.eql(u8, m, "POST")) return post(srv, conn, a);
     if (std.mem.eql(u8, m, "DELETE")) {
+        discardBody(conn, a);
         const route = auth.routePath(conn.path);
         if (std.mem.eql(u8, route, "/v1/slide/graph")) return slide.forget(srv, conn, a);
         if (std.mem.startsWith(u8, route, fact_path)) return slide_forget.route(srv, conn, a, route[fact_path.len..]);
