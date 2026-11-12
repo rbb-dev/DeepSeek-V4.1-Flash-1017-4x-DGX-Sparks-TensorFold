@@ -1,0 +1,32 @@
+{
+ "what": "The runs behind the README's performance tables and the LongBench v2 result, on four Sparks set up from scratch with ./setup.sh",
+ "image": "tensorfold-dsv41:native-8c6e8e88d875",
+ "image_tag_covers": "git's hashes of scripts/config.sh ENGINE_PATHS (zig/, build.zig, build.zig.zon, .zig-version, tools/dsv41-zig, the licence files): a build of any commit with the same engine files prints this tag",
+ "image_id": "sha256:b3072390c08dd19699e820c2af99f439fcf7be6150bde5f17f7c7387d04f9ad9",
+ "base_image": "nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c",
+ "kernel_kit": {
+  "repo": "https://github.com/rbb-dev/deepseek-v4.1-tensorfold-tp4-4xgb10.git",
+  "commit": "b88aca850cb2e473069a4cd5d225e7a4b188fe8b",
+  "fetched": "from its published default by the setup"
+ },
+ "model": {
+  "id": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+  "abliteration": "off (ABLIT=0, the shipped default)"
+ },
+ "hardware": "4 x Dell Pro Max with GB10 (DGX Spark platform), one ConnectX-7 200G port each, one switch, RoCE v2 with PFC on priority 3",
+ "software": {
+  "os": "DGX OS 7.6.0",
+  "kernel": "7.0.0-1019-nvidia",
+  "driver": "580.178.04",
+  "same_on_all_four": true
+ },
+ "settings": {
+  "all_runs": "scripts/served.sh as shipped: the 1M window, GPU clock limit 2200 MHz",
+  "recipe-main.json and code.jsonl": "PROMPT_CACHE_GIB=0 SPILL_GIB=0 (every prompt read cold)",
+  "recipe-turbo.json": "PROMPT_CACHE_GIB=0 SPILL_GIB=0 TF_DS_PASS_ROWS=8192 TF_DS_GEMM_HALVES=1 (Turbo)",
+  "longbench2-long-thinking-off.jsonl": "the shipped defaults (prompt cache and SSD tier on), thinking off"
+ },
+ "client": "a separate machine on the same network, one process, the repository's own tools",
+ "removed": "the client's host name, the engine's address, wall-clock times and local paths; nothing else is changed"
+}
