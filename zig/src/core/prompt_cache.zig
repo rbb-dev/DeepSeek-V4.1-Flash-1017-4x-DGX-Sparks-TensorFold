@@ -106,6 +106,7 @@ pub const Entry = struct {
     tokens: []u32, // the state's tokens and `lookahead` more
     decode_spans: []modes.Span = &.{}, // canonical row arithmetic through at, excluding lookahead
     at: u32,
+    images: u64 = 0, // the images key of the tokens before `at` (0: none, the tokens alone decide)
     saved: Saved,
     bytes: u64,
     born: u32, // the prompt length of the request that kept it (a reply's end and its warm pass: that reply's): a later turn's is longer
@@ -115,6 +116,23 @@ pub const Entry = struct {
     branched: bool = false, // resumed again after a later prompt kept a longer state extending it: never superseded
     expired: bool = false, // hidden from lookups immediately, reclaimed only at safe host boundaries
     borrowers: u32 = 0, // outstanding lookups: released by resumed or release, never evicted while borrowed
+/// What a kept state depends on beyond its tokens: the images inside its prefix. An image's positions hold only its
+/// placeholder's token, so two prompts with the same tokens but different pictures must not share a state.
+pub const Images = struct {
+    ctx: ?*const anyopaque = null,
+    /// The key of the images in a prompt's `[0, at)`: 0 when it holds none (the tokens alone decide, as before).
+    hash: *const fn (ctx: ?*const anyopaque, at: u32) u64 = noImages,
+    /// No images: every prefix keys to 0, so the tokens alone decide.
+    pub const none: @This() = .{};
+
+    /// The key of the images in a prompt's `[0, at)`.
+    pub fn key(im: Images, at: u32) u64 {
+        return im.hash(im.ctx, at);
+    }
+
+    fn noImages(_: ?*const anyopaque, _: u32) u64 {
+        return 0;
+    }
 };
 
 pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
@@ -226,14 +244,16 @@ pub const Store = struct {
             if (best == null or e.at > best.?) best = e.at;
         }
         return best;
+        return s.findKeyed(prompt, starts, .none);
     }
 
-    /// Find a kept token prefix with matching canonical spans through its position, leaving at least one row.
-    pub fn find(s: *Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span) ?*Entry {
+    /// `find` for a prompt with images: a kept state also matches only if it holds the same images in its prefix.
+    pub fn findKeyed(s: *Store, prompt: []const u32, starts: []const u32, images: Images) ?*Entry {
         var best: ?*Entry = null;
         for (s.entries.items) |e| {
             if (e.expired or e.tokens.len > prompt.len or e.at >= prompt.len or !s.usable(e.at, starts)) continue;
             if (best != null and e.at <= best.?.at) continue;
+            if (e.images != images.key(e.at)) continue;
             const n = e.tokens.len;
             if (prompt[n - 1] != e.tokens[n - 1] or !std.mem.eql(u32, prompt[0..n], e.tokens)) continue;
             if (!modes.equal(e.decode_spans, spans, e.at)) continue;
@@ -275,24 +295,14 @@ pub const Store = struct {
         return .{ .from = from, .marks = l.marks };
     }
 
-    /// Look up canonical-span state and marks without restoring; the caller later reports resumed.
-    pub fn lookup(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32, spans: []const modes.Span) !Lookup {
-        return s.lookupRewind(a, prompt, @intCast(prompt.len), history_len, 0, shared, starts, spans);
+    /// begin without the restore, for backends that restore inside their own prompt pass and then call `resumed`.
+    pub fn lookup(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32) !Lookup {
+        return s.lookupKeyed(a, prompt, history_len, shared, starts, .none);
     }
 
-    /// `lookup` plus a rewind state on the starts or grid (or one under min_gap before it); `born` as in keepBorn.
-    pub fn lookupRewind(s: *Store, a: Allocator, prompt: []const u32, born: u32, history_len: u32, rewind_len: u32, shared: []const u32, starts: []const u32, spans: []const modes.Span) !Lookup {
-        s.collectExpired();
-        const endpoint = if (s.rules.planned) s.startAt(starts, history_len) else history_len;
-        const rewind = if (s.rules.planned) s.startAt(starts, rewind_len -| s.rules.lookahead) else rewind_len -| s.rules.lookahead;
-        const endpoint_bytes = if (endpoint > 0 and (endpoint < prompt.len or (s.rules.warm != .off and endpoint == prompt.len)) and endpoint + s.rules.lookahead <= prompt.len) s.family.vtable.bytes(s.family.ptr, endpoint) else 0;
-        const rewind_bytes = if (rewind > 0 and rewind < prompt.len and rewind + s.rules.lookahead <= prompt.len and s.usable(rewind, starts)) s.family.vtable.bytes(s.family.ptr, rewind) else 0;
-        const priority_bytes = if (endpoint_bytes <= s.budget) endpoint_bytes else 0;
-        s.active_rewind_at = if (prompt.len >= s.rules.min_prompt and rewind_bytes > 0 and rewind != endpoint and rewind_bytes <= s.budget - priority_bytes) rewind else 0;
-        if (s.active_rewind_at > 0) if (s.keptNear(prompt, starts, spans, s.active_rewind_at)) |at| {
-            s.active_rewind_at = at; // a state kept under min_gap before it is the rewind state: no new copy
-        };
-        const e = rows.read.recall(s, prompt, born, starts, spans, s.recall(prompt, born, starts, spans, s.find(prompt, starts, spans)));
+    /// `lookup` for a prompt with images: the states it resumes and keeps are keyed by its images as well.
+    pub fn lookupKeyed(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32, images: Images) !Lookup {
+        const e = s.recall(prompt, starts, s.findKeyed(prompt, starts, images), images);
         if (e == null) s.counts.misses += 1;
         const from = if (e) |x| x.at else 0;
         const marks_ = if (s.active_rewind_at == 0)
@@ -449,9 +459,12 @@ pub const Store = struct {
         return out.toOwnedSlice(a);
     }
 
-    /// Keep the state at `at` with its span prefix, evicting within the budget; `starts` are a learned cut's chunks.
-    pub fn keep(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32, spans: []const modes.Span) bool {
-        return s.keepBorn(prompt, @intCast(prompt.len), at, owner, starts, spans);
+    /// The prompt pass stands at `at`: keep its state for `prompt`, evicting to fit; refused (counted) past the budget.
+    pub fn keep(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32) bool {
+    }
+
+    /// `keep` for a prompt with images: the state is keyed by its images too, and a state with images is never learned.
+    pub fn keepKeyed(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32, images: Images) bool {
     }
 
     /// `keep` as a prompt of `born` tokens: a reply's end and its warm pass supersede none of their request's states.
@@ -460,8 +473,9 @@ pub const Store = struct {
         const n = @as(usize, at) + s.rules.lookahead;
         if (at == 0 or n > prompt.len) return false;
         s.clock += 1;
+        const key = images.key(at);
         const shared = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(prompt[0..n])) != null;
-        for (s.entries.items) |e| if (!e.expired and e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n]) and modes.equal(e.decode_spans, spans, at)) {
+        for (s.entries.items) |e| if (e.at == at and e.images == key and std.mem.eql(u32, e.tokens, prompt[0..n])) {
             e.used = s.clock; // the same state again: no copy
             e.shared = e.shared or shared;
             if (shared) learned.learn(s, e, starts);
@@ -516,21 +530,16 @@ pub const Store = struct {
         if (shared) learned.learn(s, e, starts);
         if (s.disk) |r| rows.write.queued(r, e, starts);
         if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held); // spare storage only inside what the budget leaves
+        if (shared and key == 0) s.learn(e, starts); // a learned state is found by its tokens alone: image-free cuts only
         return true;
     }
 
     /// A learned state on disk longer than `have`, read back as a shared entry; else `have` (none, or reading failed).
-    fn recall(s: *Store, prompt: []const u32, born: u32, starts: []const u32, spans: []const modes.Span, have: ?*Entry) ?*Entry {
+    fn recall(s: *Store, prompt: []const u32, starts: []const u32, have: ?*Entry, images: Images) ?*Entry {
         const im = s.imprint orelse return have;
         const read = s.family.vtable.read orelse return have;
         const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
-        if (!modes.equal(&.{}, spans, m.at)) return have; // the request decodes rows the learned prompt pass prefilled
-        const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
-        while (bytes <= s.budget and s.held + s.spare() + bytes > s.budget) {
-            s.remove(s.victimBut(have, prompt, born) orelse return have);
-            s.counts.evicted += 1;
-        }
-        if (bytes > s.budget) return have;
+        if (images.key(m.at) != 0) return have; // a learned state was kept for a prefix without images
         const e = s.gpa.create(Entry) catch return have;
         e.* = .{ .tokens = &.{}, .at = m.at, .saved = undefined, .bytes = bytes, .born = born, .used = s.clock, .last = &.{}, .shared = true };
         e.tokens = s.gpa.dupe(u32, m.tokens) catch return s.drop(e, have, false);

@@ -757,6 +757,7 @@ pub const Lanes = struct {
                 noteRefusal(sn, len, why, "it runs from 0");
                 s.reuse_failed = true;
             } else {
+            if (self.usable(sn, len)) {
                 kept = sn;
                 // in place unless the extent runs past the pool, a live stream holds it, or another kept state has
                 // rows past the kept ones (resuming there would stale it: the rows go to a free extent instead, as

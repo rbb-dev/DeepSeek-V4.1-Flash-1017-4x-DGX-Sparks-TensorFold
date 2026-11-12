@@ -5,12 +5,72 @@ const Snapshots = pc.Snapshots;
 const Saved = pc.Saved;
 const Store = pc.Store;
 const Plan = pc.Plan;
+const Images = pc.Images;
 const Allocator = std.mem.Allocator;
 
 const Peer = @import("prompt_cache_fake.zig").Peer;
 pub const Fake = @import("prompt_cache_fake.zig").Fake;
 
-pub fn fresh(prompt: []const u32) u64 {
+    fn request(p: *Peer) void {
+        p.held -= p.pending;
+        p.pending = 0;
+    }
+};
+
+/// A family over host memory for tests: its live state is a position and a running sum of the prompt's tokens.
+const Fake = struct {
+    gpa: Allocator,
+    at: u32 = 0,
+    sum: u64 = 0,
+    fail_save: bool = false,
+    fail_restore: bool = false,
+    live: usize = 0,
+    spare_bytes: u64 = 0,
+    peer: ?*Peer = null, // speed-up mode's rank 1: it keeps the same states and drops them only when a request names them
+        return f.passKeyed(s, prompt, plan.from, plan.marks, .none);
+    }
+
+    /// `pass` for a prompt with images: the states it keeps are keyed by them too.
+    fn passKeyed(f: *Fake, s: *Store, prompt: []const u32, from: u32, marks: []const u32, images: Images) u64 {
+        if (from == 0) f.* = .{ .gpa = f.gpa, .fail_save = f.fail_save, .fail_restore = f.fail_restore, .live = f.live, .spare_bytes = f.spare_bytes, .peer = f.peer };
+        if (f.peer) |p| p.in_pass = true;
+        defer if (f.peer) |p| {
+            p.in_pass = false;
+        };
+        var mi: usize = 0;
+        for (prompt[from..]) |t| {
+            f.sum = f.sum *% 31 +% t;
+            f.at += 1;
+            if (mi < marks.len and marks[mi] == f.at) {
+                _ = s.keepKeyed(prompt, f.at, null, &.{}, images);
+                mi += 1;
+            }
+        }
+        return f.sum;
+    }
+};
+
+/// Where a lookup's pass starts: the resumed state's mark, else 0.
+fn startsAt(l: pc.Lookup) u32 {
+    return if (l.entry) |e| e.at else 0;
+}
+
+/// A prompt's one image: its span starts at `at`, and its bytes are told apart by `tag`.
+const OneImage = struct {
+    at: u32,
+    tag: u64,
+
+    fn images(o: *const OneImage) Images {
+        return .{ .ctx = @ptrCast(o), .hash = key };
+    }
+
+    fn key(ctx: ?*const anyopaque, at: u32) u64 {
+        const o: *const OneImage = @ptrCast(@alignCast(ctx orelse return 0));
+        return if (o.at < at) o.tag | 1 else 0; // a state's prefix holds the images that start before its mark
+    }
+};
+
+fn fresh(prompt: []const u32) u64 {
     var sum: u64 = 0;
     for (prompt) |t| sum = sum *% 31 +% t;
     return sum;
@@ -420,31 +480,43 @@ test "a dead state leaves lookup at once and storage at the next safe boundary" 
     try std.testing.expectEqual(@as(u64, 1), s.counts.evicted);
 }
 
-test "a state the family does not resume for a prompt that ends too near it: an earlier one resumes, and it stays for its own conversation" {
+test "a kept state keys the prompt's images: another picture at the same tokens resumes nothing" {
     const gpa = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    var f: Fake = .{ .gpa = gpa, .window = 3 }; // as DeepSeek's window: a state resumes a prompt 3 or more tokens before its end
-    var s = Store.init(gpa, f.checked(), .{ .min_prompt = 0 }, 1 << 20);
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 1 << 20);
     defer s.deinit();
-    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6 };
-    _ = f.pass(&s, &t1, try s.begin(a, &t1, 2, &.{}, &.{}, null, &.{})); // keeps 2
-    const t2 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
-    var p = try s.begin(a, &t2, 5, &.{}, &.{}, null, &.{});
-    try std.testing.expectEqual(@as(u32, 2), p.from);
-    try std.testing.expectEqual(fresh(&t2), f.pass(&s, &t2, p)); // keeps 5
-    const five = s.find(&t2, &.{}, &.{}).?;
-    try std.testing.expectEqual(@as(u32, 5), five.at);
-    const near = [_]u32{ 1, 2, 3, 4, 5, 6, 7 }; // ends 2 past the state at 5: the family refuses it, the one at 2 resumes
-    p = try s.begin(a, &near, 2, &.{}, &.{}, null, &.{});
-    try std.testing.expectEqual(@as(u32, 2), p.from);
-    try std.testing.expectEqual(fresh(&near), f.pass(&s, &near, p));
-    try std.testing.expectEqual(five, s.find(&t2, &.{}, &.{}).?); // the state at 5 stays for t2's conversation
-    try std.testing.expectEqual(@as(u64, 2), s.counts.hits);
-    try std.testing.expectEqual(@as(u64, 0), s.counts.failed);
-    try std.testing.expectEqual(@as(u64, 0), s.counts.evicted);
-    try std.testing.expectEqual(@as(usize, 2), f.live);
+    // an image's positions hold its placeholder token, so two different pictures give one prompt's tokens
+    const prompt = [_]u32{ 7, 7, 7, 7, 7, 7, 7, 7 };
+    const first: OneImage = .{ .at = 2, .tag = 0x1111 };
+    const other: OneImage = .{ .at = 2, .tag = 0x2222 };
+    const later: OneImage = .{ .at = 5, .tag = 0x3333 }; // starts at the mark: outside the state's prefix
+    const plan = try s.lookupKeyed(a, &prompt, 5, &.{}, &.{}, first.images());
+    try std.testing.expectEqual(@as(?*pc.Entry, null), plan.entry);
+    try std.testing.expectEqual(fresh(&prompt), f.passKeyed(&s, &prompt, startsAt(plan), plan.marks, first.images()));
+    // the same picture resumes at the history mark, and the pass past it equals a fresh one
+    const again = try s.lookupKeyed(a, &prompt, 5, &.{}, &.{}, first.images());
+    try std.testing.expectEqual(@as(u32, 5), again.entry.?.at);
+    try Fake.restoreFn(&f, null, again.entry.?.saved); // the backend restores before its first chunk
+    s.resumed(again.entry.?, &prompt, true);
+    try std.testing.expectEqual(fresh(&prompt), f.passKeyed(&s, &prompt, startsAt(again), again.marks, first.images()));
+    // another picture at that span resumes nothing, and keeps its state beside the first
+    const diff = try s.lookupKeyed(a, &prompt, 5, &.{}, &.{}, other.images());
+    try std.testing.expectEqual(@as(?*pc.Entry, null), diff.entry);
+    try std.testing.expectEqual(fresh(&prompt), f.passKeyed(&s, &prompt, startsAt(diff), diff.marks, other.images()));
+    try std.testing.expectEqual(@as(usize, 2), s.entries.items.len);
+    // an image that starts at the mark is outside the prefix: its key is 0, so no picture's state resumes...
+    try std.testing.expectEqual(@as(?*pc.Entry, null), (try s.lookupKeyed(a, &prompt, 5, &.{}, &.{}, later.images())).entry);
+    // ...and a prompt without images keeps, and then resumes, its own state beside both pictures'
+    const plain = try s.lookup(a, &prompt, 5, &.{}, &.{});
+    try std.testing.expectEqual(@as(?*pc.Entry, null), plain.entry);
+    try std.testing.expectEqual(fresh(&prompt), f.passKeyed(&s, &prompt, startsAt(plain), plain.marks, .none));
+    try std.testing.expectEqual(@as(u32, 5), (try s.lookup(a, &prompt, 5, &.{}, &.{})).entry.?.at);
+    try std.testing.expectEqual(@as(u32, 5), (try s.lookupKeyed(a, &prompt, 5, &.{}, &.{}, later.images())).entry.?.at);
+    try std.testing.expectEqual(@as(u32, 5), (try s.lookupKeyed(a, &prompt, 5, &.{}, &.{}, other.images())).entry.?.at);
+}
 }
 
 test "a state that lost its rows: an earlier one resumes, and the lost one leaves the store" {

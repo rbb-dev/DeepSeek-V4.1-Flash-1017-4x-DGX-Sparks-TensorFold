@@ -94,14 +94,28 @@ pub const LaneHost = struct {
         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
         kept0: u64 = 0, // the store's kept count when the job looked it up
-        seq: u64 = 0, // its admission's number
-        waits_since: ?u64 = null, // the admissions count when it first waited at the head for pool room
+        images: pc.Images = .none, // the images key of the prompt's prefixes (0 for a prompt without images)
 
         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
             const job: *Job = @ptrCast(@alignCast(ptr));
             job.reported(); // before a keep can evict the entry the pass restored
             if (job.host.cache) |store| _ = store.keepBorn(job.request.cacheKey(), job.request.bornLen(), at, s, job.request.chunks, job.host.spans(job.request)); // a lane image's rows keyed by its digest
+        }
+
+        /// The images key of the request's `[0, at)`: its pictures' spans and bytes, hashed. A kept state holds its
+        /// image spans' placeholders as tokens, so the key is what tells one picture from another (0: none).
+        fn imageKey(ctx: ?*const anyopaque, at: u32) u64 {
+            const r: *const Request = @ptrCast(@alignCast(ctx orelse return 0));
+            var h = std.hash.Wyhash.init(0x696d61676573); // "images"
+            var any = false;
+            for (r.lane_images) |img| {
+                if (img.at >= at) continue; // the image starts past the kept prefix
+                any = true;
+                var fields = [3]u64{ img.at, img.tokens, std.hash.Wyhash.hash(0, img.bytes) };
+                h.update(std.mem.asBytes(&fields));
+            }
+            return if (any) h.final() | 1 else 0; // odd: never 0, which means no image in the prefix
         }
 
         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
