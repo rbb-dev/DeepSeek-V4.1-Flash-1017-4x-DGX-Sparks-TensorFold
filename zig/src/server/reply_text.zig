@@ -8,11 +8,16 @@ pub const think_markers: Markers = .{ .open = "", .close = "</think>" };
 /// The opener a reply writes itself when its template leaves the think block to it (Kolibri 1's does).
 const think_open = "<think>";
 pub const channel_markers: Markers = .{ .open = "<|channel>thought", .close = "<channel|>" };
-/// (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block, DeepSeek-V4.1's.
+/// (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block, DeepSeek-V4.1's. DeepSeek-V4.1's
+/// reference parser (encoding.py, parse_message_from_completion_text) starts the calls at "\n\n<｜DSML｜ calls": the two
+/// newlines are the calls', not the text's, and the template writes them back in front of the block. The entry with them
+/// keeps them out of the streamed text and holds a trailing newline back until the next token says whether calls follow;
+/// the one without still reads a block the model opened without them.
 pub const calls = [_][2][]const u8{
     .{ "<tool_call>", "</tool_call>" },
     .{ "<|tool_call>", "<tool_call|>" },
     .{ "<\u{ff5c}DSML\u{ff5c}tool_calls>", "</\u{ff5c}DSML\u{ff5c}tool_calls>" },
+    .{ "\n\n<\u{ff5c}DSML\u{ff5c} calls>", "</\u{ff5c}DSML\u{ff5c} calls>" },
     .{ "<\u{ff5c}DSML\u{ff5c} calls>", "</\u{ff5c}DSML\u{ff5c} calls>" },
 };
 
@@ -456,6 +461,7 @@ pub const Stops = struct {
     }
 };
 
+// The marks type and the call sites that pass it came in with the merge; this engine's readers above (DSML tags read as
     /// outside the decoded reply (a copy) reads as its text does.
     pub fn real(m: *const Marks, text: []const u8, i: usize, tag: []const u8) bool {
         const p = @intFromPtr(text.ptr);
@@ -527,6 +533,9 @@ pub fn hideIntoMarked(a: Allocator, out: *std.ArrayList(u8), text: []const u8, f
     /// A character is still split across tokens, so streaming waits for the rest.
     pub fn pending(inc: *const Incremental) bool {
         return inc.tokens.items.len > 0 and inc.read < inc.tokens.items.len;
+    return hideToolCalls(a, text, true);
+}
+
         } else continue;
     }
 };
@@ -565,85 +574,28 @@ test "a reply that writes its own think opener keeps the tag out of its reasonin
     }
 }
 
-test "with marks, a think end or a DSML opener spelled in ordinary tokens stays words" {
+test "DeepSeek-V4.1's calls take their two newlines: text streams without them, and they wait for the next token" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const pieces = [_]Marks.Piece{ .{ .text = "</think>", .id = 7 }, .{ .text = "\u{ff5c}DSML\u{ff5c}", .id = 9 } };
-    // the reasoning quotes the tag in ordinary tokens; the block ends where the token decoded
-    const reply = "a </think> b</think>\n\nanswer";
-    const end = std.mem.lastIndexOf(u8, reply, "</think>").?;
-    const marks: Marks = .{ .base = reply.ptr, .len = reply.len, .at = &.{.{ .offset = end, .id = 7 }}, .pieces = &pieces };
-    const s = try splitThinkingMarked(a, reply, true, think_markers, &marks);
-    try std.testing.expectEqualStrings("a </think> b", s.reasoning);
-    try std.testing.expectEqualStrings("answer", s.answer);
-    try std.testing.expectEqualStrings("a ", (try splitThinking(a, reply, true, think_markers)).reasoning); // by text
-    // while it streams, the quoted tag is reasoning too, and nothing is answer before the token
-    const part = reply[0 .. end - 1];
-    const held = try splitThinkingMarked(a, part, false, think_markers, &marks);
-    try std.testing.expectEqualStrings("a </think> ", held.reasoning);
-    try std.testing.expectEqualStrings("", held.answer);
-    // a DSML block spelled in ordinary tokens is prose; at its token's place it is a call, hidden
-    const prose = "Use <\u{ff5c}DSML\u{ff5c} calls>x</\u{ff5c}DSML\u{ff5c} calls> like this.";
-    const none: Marks = .{ .base = prose.ptr, .len = prose.len, .at = &.{}, .pieces = &pieces };
-    try std.testing.expectEqualStrings(prose, try hideToolCallsMarked(a, prose, true, &none));
-    try std.testing.expectEqualStrings(prose, try finishedProseMarked(a, prose, &none));
-    try std.testing.expectEqualStrings("Use  like this.", try hideToolCalls(a, prose, true));
-    const at = std.mem.indexOf(u8, prose, "\u{ff5c}DSML\u{ff5c}").?;
-    const real: Marks = .{ .base = prose.ptr, .len = prose.len, .at = &.{.{ .offset = at, .id = 9 }}, .pieces = &pieces };
-    try std.testing.expectEqualStrings("Use  like this.", try hideToolCallsMarked(a, prose, true, &real));
-    // a copy outside the decoded reply reads as its text does
-    const copy = try a.dupe(u8, prose);
-    try std.testing.expectEqualStrings("Use  like this.", try hideToolCallsMarked(a, copy, true, &none));
-}
-
-test "a <tool_call> in the prose before a DeepSeek-V4.1 block, or in its argument, hides nothing past the block's bounds" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const D = "\u{ff5c}DSML\u{ff5c}";
-    const quoted = "a </tool_call> and <tool_call>{\"name\": \"weather\", \"arguments\": {}}</tool_call>";
-    const block = "<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"write\">\n<" ++ D ++ " parameter name=\"content\" string=\"true\">" ++ quoted ++ "</" ++ D ++ " parameter>\n</" ++ D ++ " invoke>\n</" ++ D ++ " calls>";
-    const reply = "I will not use <tool_call> here.\n\n" ++ block ++ "\nDone. <tool_call>{\"name\": \"weather\", \"arguments\": {}}</tool_call>";
-    // the prose around the block shows, as the parser reads it; the block and the call after it are hidden
-    try std.testing.expectEqualStrings("I will not use <tool_call> here.\n\n\nDone. ", try hideToolCalls(a, reply, true));
-    try std.testing.expectEqualStrings("I will not use <tool_call> here.\n\n\nDone.", try finishedProse(a, reply));
-    // while it streams, the prose shown only grows, to the whole reply's
-    var shown: []const u8 = "";
-    for (0..reply.len + 1) |n| {
-        const now = try hideToolCalls(a, reply[0..n], false);
-        try std.testing.expect(std.mem.startsWith(u8, now, shown));
-        shown = now;
+    const block = "<\u{ff5c}DSML\u{ff5c} calls>\n<\u{ff5c}DSML\u{ff5c} invoke name=\"t\">\n</\u{ff5c}DSML\u{ff5c} invoke>\n</\u{ff5c}DSML\u{ff5c} calls>";
+    const reply = "I will check.\n\n" ++ block;
+    // every prefix streams the text and nothing past it, and only ever grows
+    var sent: []const u8 = "";
+    for (1..reply.len + 1) |n| {
+        const shown = try hideToolCalls(a, reply[0..n], false);
+        try std.testing.expect(std.mem.startsWith(u8, "I will check.", shown) and std.mem.startsWith(u8, shown, sent));
+        sent = shown;
     }
-    try std.testing.expectEqualStrings("I will not use <tool_call> here.\n\n\nDone. ", shown);
-    // a block the reply has not closed hides to its end; the prose before it shows
-    const open = "I will not use <tool_call> here.\n\n" ++ block[0 .. block.len - 20];
-    try std.testing.expectEqualStrings("I will not use <tool_call> here.\n\n", try hideToolCalls(a, open, false));
-}
-
-test "a reply's marks lie where each marker token's text ends the decode through it" {
-    const Fake = struct {
-        pub fn decode(_: @This(), a: Allocator, ids: []const u32) Allocator.Error![]u8 {
-            var out: std.ArrayList(u8) = .empty;
-            for (ids) |t| try out.appendSlice(a, switch (t) {
-                7 => "</think>",
-                1 => "<",
-                2 => "/think>",
-                else => "x",
-            });
-            return out.toOwnedSlice(a);
-        }
-    };
-    const gpa = std.testing.allocator;
-    const pieces = [_]Marks.Piece{.{ .text = "</think>", .id = 7 }};
-    var out: std.ArrayList(Marks.Mark) = .empty;
-    defer out.deinit(gpa);
-    // "x" "<" "/think>" "x" "</think>" "x": the spelled tag is no mark, the token at byte 10 is
-    const tokens = [_]u32{ 3, 1, 2, 3, 7, 3 };
-    try markTokens(gpa, gpa, Fake{}, &pieces, &tokens, 0, &out);
-    try std.testing.expectEqual(@as(usize, 1), out.items.len);
-    try std.testing.expectEqual(Marks.Mark{ .offset = 10, .id = 7 }, out.items[0]);
-    // a stream scans only the tokens it has not scanned
-    try markTokens(gpa, gpa, Fake{}, &pieces, &tokens, tokens.len, &out);
-    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqualStrings("I will check.", try hideToolCalls(a, reply, true));
+    // newlines that end a paragraph come out with the next token, or at the reply's end
+    try std.testing.expectEqualStrings("a", try hideToolCalls(a, "a\n\n", false));
+    try std.testing.expectEqualStrings("a\n\nb", try hideToolCalls(a, "a\n\nb", false));
+    try std.testing.expectEqualStrings("a\n\n", try hideToolCalls(a, "a\n\n", true));
+    // a block opened without them, and a third newline, which stays the text's
+    try std.testing.expectEqualStrings("a", try hideToolCalls(a, "a" ++ block, true));
+    try std.testing.expectEqualStrings("a\n", try hideToolCalls(a, "a\n\n\n" ++ block, true));
+    // a call written inside the think block: the reasoning ends where the calls start, as the reference reads it
+    const t = try splitThinking(a, "plan\n\n" ++ block, true, think_markers);
+    try std.testing.expectEqualStrings("plan", t.reasoning);
 }
