@@ -2146,6 +2146,22 @@ pub const Model = struct {
         m.cand_parts = &.{};
         m.head_cand = false;
         m.head_key = false;
+        // (no field's default applies after the line above, so each is set here or below: rank 0's server, a
+        // ReleaseSafe build, gets its memory filled with 0xaa where ranks 1-3 read zeros)
+        m.fill_seq = &.{};
+        m.ahead = null;
+        m.clk_ph = @splat(0);
+        m.clk_cnt = @splat(0);
+        m.clk_rounds = 0;
+        m.host = std.heap.ArenaAllocator.init(gpa);
+        errdefer m.host.deinit();
+        const a = m.host.allocator();
+        m.io = io;
+        m.ctx = ctx;
+        m.rank = o.rank;
+        m.world = o.world;
+        if (o.streams == 0 or o.streams > max_streams) return error.BadStreams;
+        m.streams = o.streams;
         // WP6 (docs/prefill-plan.md): TF_DS_IDX_RB=2 batches the indexer's prompt-chunk scoring kernel to the
         // kit's own captured RB=2 variant (dequantizing a 64-key tile once for 2 rows instead of 1); the kit
         // never captured RB above 2. Off (RB=1, today's behavior) unless set; validate on your own ring first.
@@ -5575,6 +5591,55 @@ test "TF_DS_MMA_SF_EXACT's line: experts kept for their packing, apart from a sc
     try std.testing.expectEqualStrings("more GEMMs than its guard can prove", guardWhy(&wb, error.TooManyProven));
 }
 
+/// A line of the Model struct that declares a field with a default other than undefined: its name.
+fn defaultedField(line: []const u8) ?[]const u8 {
+    if (line.len < 6 or !std.mem.startsWith(u8, line, "    ") or !std.ascii.isLower(line[4])) return null;
+    const colon = std.mem.indexOf(u8, line, ": ") orelse return null;
+    const name = line[4..colon];
+    for (name) |ch| if (!(std.ascii.isLower(ch) or std.ascii.isDigit(ch) or ch == '_')) return null;
+    const eq = std.mem.indexOfPos(u8, line, colon, " = ") orelse return null;
+    if (std.mem.startsWith(u8, line[eq + 3 ..], "undefined")) return null;
+    return name;
+}
+
+test "a Model line's defaulted field: named only for a field with a default other than undefined" {
+    try std.testing.expectEqualStrings("cand_parts", defaultedField("    cand_parts: []u8 = &.{},") orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("head_ready", defaultedField("    head_ready: ?cuda.Event = null, // verifyHead's event after the head reads") orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("clk_ph", defaultedField("    clk_ph: [256]u64 = @splat(0), // by the phase of the clock that ends it") orelse return error.TestUnexpectedResult);
+    for ([_][]const u8{
+        "    amax_host: [round.max_rows]u32 = undefined,", // no default to lose
+        "    vocab: usize,", // no default
+        "    pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, o: Options) !*Model {",
+        "    pub const Cands = struct { vals: []const f32, ids: []const i64, flags: []const i32 };",
+        "    // the start-up exchange: rank 0's Settings = its own",
+        "        rows: usize = 0, // a nested struct's field",
+        "",
+    }) |line| try std.testing.expect(defaultedField(line) == null);
+}
+
+test "Model.open sets every field that has a default, at its own top level: it starts from undefined, so no default applies (rank 0's server, a ReleaseSafe build, gets new memory filled with 0xaa where ranks 1-3 read zeros)" {
+    const src = @embedFile("model.zig");
+    const s = std.mem.indexOf(u8, src, "pub const Model = struct {") orelse return error.TestUnexpectedResult;
+    const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator") orelse return error.TestUnexpectedResult;
+    const body = src[at .. at + (std.mem.indexOf(u8, src[at..], "\n    }\n") orelse return error.TestUnexpectedResult)];
+    try std.testing.expect(std.mem.indexOf(u8, body, "\n        m.* = undefined;\n") != null);
+    var checked: usize = 0;
+    var unset: usize = 0;
+    var lines = std.mem.splitScalar(u8, src[s..at], '\n');
+    while (lines.next()) |line| {
+        const name = defaultedField(line) orelse continue;
+        checked += 1;
+        var buf: [96]u8 = undefined;
+        const set = std.fmt.bufPrint(&buf, "\n        m.{s} = ", .{name}) catch return error.TestUnexpectedResult;
+        if (std.mem.indexOf(u8, body, set) == null) {
+            std.debug.print("Model.{s}: open never sets it at its top level, so its default never applies\n", .{name});
+            unset += 1;
+        }
+    }
+    try std.testing.expect(checked >= 30); // the struct's defaulted fields were found (a parse that finds none passes nothing)
+    try std.testing.expectEqual(@as(usize, 0), unset);
+}
+
 test "TF_DS_RDMA_COLLECT_PEERS: read as a switch (the text 1); its line on with the kernel, off without it" {
     try std.testing.expect(prompt2d.switchAsked("1") and !prompt2d.switchAsked("0") and !prompt2d.switchAsked(null));
     const src = @embedFile("model.zig");
@@ -7027,6 +7092,7 @@ test "TF_DS_ENGRAM_PARTNER and TF_DS_ENGRAM_KEEP_AHEAD: a failed precondition fa
     try std.testing.expect(speed_defaults.find("TF_DS_ENGRAM_PARTNER") != null and speed_defaults.find("TF_DS_ENGRAM_KEEP_AHEAD") != null);
 }
 
+test "the default 4,096-row passes fall back to 2,048 on a box with too little memory, and only the default does" {
     const gib: usize = 1 << 30;
     try std.testing.expect(passRowsFallback("4096", true, 64 * gib) != null); // a small box, the default: falls back
     try std.testing.expect(passRowsFallback("4096", true, 121 * gib) == null); // a Spark: runs
