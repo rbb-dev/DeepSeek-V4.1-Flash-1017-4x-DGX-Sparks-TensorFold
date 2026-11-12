@@ -2,29 +2,33 @@
 
 ## Reporting a vulnerability
 
-Report security problems privately: open this repository's Security tab and choose "Report a vulnerability". Please
-don't open a public issue or pull request for a problem that isn't fixed yet. You'll get a reply within three days, and
-a fix or a mitigation ships in a release as soon as it is gated, within two weeks for anything serious. If the problem
-is already public, a pull request with the fix is welcome.
+Report a security problem privately: open this repository's Security tab and choose "Report a vulnerability". Please do
+not open a public issue for a problem that is not fixed yet. A problem in TensorFold's own engine or server, not
+specific to this repository, should also be reported to [ashhart/TensorFold](https://github.com/ashhart/TensorFold)'s
+Security tab.
 
-## Supported versions
-
-Only the latest release gets security fixes. The Python 0.6.6 engine at the `v0.6.6` tag gets none.
+Only the default branch's latest commit gets fixes.
 
 ## What is in scope
 
-- The native server (`tensorfold serve`): its HTTP API, its prompt cache and the files it keeps on disk.
-- `--cortheon`: web search, page reads, and the filter that removes orders aimed at the model from web text. That
-  filter is a heuristic; [docs/cortheon.md](docs/cortheon.md) and [docs/known-issues.md](docs/known-issues.md) say
-  what it does not catch.
-- Living Weights (`--slide` and `/v1/slide/*`): a lesson changes the checkpoint's own files. Serve it with `--api-key`.
-- `tensorfold pull` and the checkpoint loaders, which read files from Hugging Face as untrusted input.
-- The Mac app under `app/`.
+- The engine's HTTP API on the first Spark (port 8000, every address: `HOST=0.0.0.0`) and its keys: with an API key file,
+  every route needs a key except `/health`, which without one says only that the engine is up, and `/metrics`, which is
+  readable without a key by default (`METRICS_OPEN=1`; set it to 0 to require a key there too).
+- The dashboard and its admin keys (`/admin`): off until the engine is given an admin key file; scoped keys; plain HTTP
+  on the API's port.
+- What `./setup.sh` installs as root on each Spark: the fabric rails' netplan file, the RoCE flow-control unit
+  (`roce-pfc.service`) and, on a Spark without passwordless sudo, a sudo rule that lets the setup's user run one root
+  helper (`/usr/local/sbin/dsv41-root`: the GPU clock limit and the page-cache drop) and nothing else.
+- The RDMA copy between the Sparks (`tools/fabric-xfer`): a receiver accepts one connection, from the sender's addresses,
+  after an HMAC challenge; it writes only beneath its destination folder.
+- The files the engine keeps: the SSD tier's saved prompts, which hold conversation state, and the keys.
 
-Out of scope: what a model writes, a model following instructions in text you gave it, and a client sending the server
-more work than its machine can do.
+Out of scope: what the model writes, a model following instructions in text it was given, and a client sending more
+work than four Sparks can do.
 
-## Release files
+## Operating assumptions
 
-Each release's archives have SHA-256 files beside them on the release page, and Homebrew checks the macOS archive's
-SHA-256. The Mac app is signed and notarized.
+The setup is made for four Sparks that serve this engine and nothing else. Each start drops the page caches and compacts
+memory on all four, the setup changes their network configuration, and the API listens on every address. On a shared
+network, keep port 8000 behind a firewall or a gateway that holds the keys, or reach the dashboard through an ssh tunnel.
+The fabric copy does not encrypt the data it sends: keep the fabric private to the four Sparks.

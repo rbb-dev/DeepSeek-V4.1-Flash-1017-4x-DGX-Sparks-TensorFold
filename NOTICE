@@ -1,3 +1,111 @@
+DeepSeek-V4.1-Flash-1017 on four DGX Sparks with TensorFold
+
+This project's own code, scripts and documentation are licensed under the Apache License, Version 2.0 (see LICENSE). If
+you redistribute this project or a modified version of it, keep this NOTICE file and state what you changed
+(Apache-2.0, section 4). FORK.md states what this project adds to its upstreams.
+
+This project is a git fork of BertholomusAI's TensorFold branch deepseek-v41-zig-tp4, with its own engine work added on top, and a
+deployment for four DGX Sparks that began as MiaAI-Lab's recipe. It builds on third-party work that keeps its
+own license:
+
+TensorFold
+  https://github.com/ashhart/TensorFold
+  Copyright 2026 TensorFold contributors. Apache License, Version 2.0. TensorFold's NOTICE reads: "TensorFold /
+  Copyright 2026 TensorFold contributors / https://github.com/ashhart/TensorFold". Its full NOTICE is kept below.
+
+DeepSeek-V4.1-Flash on TensorFold's native engine (BertholomusAI's fork)
+  https://github.com/bertholomus/TensorFold (branch deepseek-v41-zig-tp4)
+  Written by BertholomusAI (Albert Lee, @bertholomus), on TensorFold. Apache License, Version 2.0. This project is a
+  fork of that branch: its history is kept, each commit under its author's name, and zig/Dockerfile builds the image from
+  this checkout. The engine work this project adds on top is under Apache-2.0; the code it modifies stays under its
+  authors' license. The branch's own NOTICE is kept below, and its ATTRIBUTION.md is this repository's ATTRIBUTION.md.
+
+The DeepSeek-V4.1 kernel kit (BertholomusAI's four-node recipe)
+  https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10 (kit/)
+  Written by BertholomusAI. Apache License, Version 2.0; the parts it carries keep the licenses its
+  kit/KIT-LICENSES.md lists (Triton: MIT; PyTorch's attention kernel: BSD-3-Clause, on NVIDIA CUTLASS: BSD-3-Clause;
+  the EXL3 format of ExLlamaV3 by turboderp: MIT). scripts/prepare.sh fetches it; it is not part of this repository.
+  This project's fork of the kit, https://github.com/rbb-dev/deepseek-v4.1-tensorfold-tp4-4xgb10 (branch extra-set),
+  is BertholomusAI's kit with an extra kernel set and its own README added, by rbb-dev, under Apache-2.0.
+
+MiaAI-Lab's four-Spark recipe: DeepSeek-V4.1-Flash-1017 on 4x DGX Spark with TensorFold
+  https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold
+  Copyright 2026 MiaAI-Lab and its contributors. Apache License, Version 2.0. This project's scripts began as that
+  recipe's, and it carries the recipe's engine changes (Engram's packed rows among them), the chat template and tools,
+  each under the name CREDITS.md gives.
+
+DeepSeek-V4.1-Flash-1017
+  https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017
+  Copyright (c) 2023 DeepSeek. MIT License. The weights are downloaded by scripts/prepare.sh, not distributed here.
+  The native FP8 / MXFP4 kernels in zig/ follow the arithmetic of DeepSeek's reference inference code
+  (inference/model.py, kernel.py, convert.py), written anew; no DeepSeek code is included.
+
+Chat template (model/chat_template.jinja)
+  https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw
+  Written by MiaAI-Lab (Mia-AiLab): a port of the checkpoint's encoding/encoding.py (DeepSeek, MIT) to Jinja.
+
+GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  Copyright 2026 MiaAI-Lab and its contributors. Apache License, Version 2.0. scripts/config.sh, scripts/nodes.sh,
+  start.sh and stop.sh are adapted from it, including code by webzone, Alexbob0 and john (see CREDITS.md).
+
+DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks
+  https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks
+  Copyright 2026 MiaAI-Lab. Apache License, Version 2.0. tools/recipe_bench.py is its tools/bench.py, unchanged.
+
+Keys abliteration overlay (optional, ABLIT=1)
+  https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated
+  By drowzeys. MIT License, gated. Downloaded by scripts/prepare.sh when ABLIT=1; not distributed here.
+
+xgrammar, dlpack and picojson
+  https://github.com/mlc-ai/xgrammar (v0.2.8)
+  Copyright (c) 2024 by XGrammar Contributors. Apache License, Version 2.0. The dlpack headers (Apache-2.0) and
+  picojson (BSD-2-Clause, Cybozu Labs and Kazuho Oku) come with it. Compiled with TensorFold's tf_grammar.cc into the
+  image's libtfgrammar.so; their licenses are in the image's /opt/tensorfold/share/doc/tensorfold/LICENSES.
+
+Device-interface layouts used by Rocinante's queue pairs (layouts only; nothing is linked)
+  NVIDIA DOCA GPUNetIO: BSD-3-Clause, Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES
+  (LICENSES/NVIDIA-DOCA-GPUNetIO-BSD-3-Clause.txt).
+  DPDK mlx5 driver: BSD-3-Clause, Copyright 2016 and 2021 6WIND S.A. and Mellanox Technologies, Ltd
+  (LICENSES/DPDK-mlx5-BSD-3-Clause.txt).
+  rdma-core mlx5 provider: Copyright (c) 2017 Mellanox Technologies, Inc., used under the OpenIB.org BSD license it
+  offers beside the GPL-2.0 (LICENSES/rdma-core-mlx5-OpenIB-BSD.txt).
+
+PyAV
+  https://github.com/PyAV-Org/PyAV
+  Copyright the PyAV contributors. BSD 3-Clause License. Installed into the image (pip, av==18.1.0) for video input;
+  its wheel bundles FFmpeg libraries, which report themselves as LGPL version 3 or later.
+
+NVIDIA PyTorch container (nvcr.io/nvidia/pytorch:26.07-py3)
+  The image's base, under NVIDIA's container license and its components' own licenses.
+
+Pillow
+  https://github.com/python-pillow/Pillow
+  MIT-CMU License (LICENSES/Pillow-MIT-CMU.txt). Called in a python3 child for image formats other than PNG; not bundled.
+
+Zig 0.17.0
+  https://ziglang.org
+  MIT License. The compiler, used at build time.
+
+This project (https://github.com/rbb-dev/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold)
+  adds the engine work FORK.md lists (Rocinante and the other changes under zig/src, the dashboard under
+  zig/src/server/admin_ui, the kernel replay and the engine's tests), the settings and scripts it lists (in
+  scripts/config.sh, scripts/local.sh.example, scripts/served.sh, scripts/nodes.sh, scripts/prepare.sh,
+  scripts/engram-pack.sh, scripts/engram-verify.py, start.sh, stop.sh and tools/validate.py, with their tests in
+  tests/test_scripts.py and tests/test_validation_tools.py), the setup (setup.sh, scripts/setup-data.sh,
+  scripts/fabric-copy.sh, scripts/banner.sh), tools/bench.py, the network preparation (NETWORK.md and network/), and the
+  notes about them (FORK.md, ROCINANTE.md, and entries in README.md, CHANGELOG.md and CREDITS.md).
+  Some of these changes are by others, each under the name CREDITS.md and FORK.md give; the rest are by rbb-dev,
+  developed with Claude Code. The changes to tools/validate.py and tools/needle_bench.py, and
+  tests/test_validation_tools.py, are SvangenStudios's, from MiaAI-Lab's recipe pull request #5; the changes to stop.sh,
+  start.sh, scripts/config.sh, scripts/nodes.sh, scripts/prepare.sh and tests/test_scripts.py are SvangenStudios's, from
+  pull requests #4 and #33 and two commits (CREDITS.md lists each). All are under the Apache License, Version 2.0.
+
+------------------------------------------------------------------------------------------------------------------------
+
+The engine: BertholomusAI's TensorFold fork (and TensorFold), whose NOTICE follows unchanged. In it, "this fork" and
+"this branch" mean BertholomusAI's.
+
 TensorFold
 Copyright 2026 TensorFold contributors
 https://github.com/ashhart/TensorFold

@@ -217,6 +217,32 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 its stage sequences and their purposes, its rules for when a task needs outside sources, and its instruction-filter patterns,
 rewritten in Zig. MIT License, Copyright (c) 2026 Cortheon contributors; the license text is below.
 
+## Structured output: libtfgrammar
+
+`lib/libtfgrammar` in the release archives is `zig/src/grammar/tf_grammar.cc` compiled with the C++ sources of
+[xgrammar](https://github.com/mlc-ai/xgrammar) v0.2.8, Apache License 2.0, Copyright (c) 2024 by XGrammar Contributors
+(its `NOTICE`: "XGrammar Copyright (c) 2024 by XGrammar Contributors"), and the headers it bundles:
+[dlpack](https://github.com/dmlc/dlpack), Apache License 2.0, and [picojson](https://github.com/kazuho/picojson),
+BSD 2-Clause License, Copyright 2009-2010 Cybozu Labs, Inc. and 2011-2014 Kazuho Oku. Nothing of theirs is in this
+repository; the build reads a checkout given with `-Dxgrammar=DIR`, and each archive carries xgrammar's and dlpack's
+license and xgrammar's notice in `LICENSES/`. picojson's license:
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the
+following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following
+   disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following
+   disclaimer in the documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
 ## MIT License text
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -247,6 +273,22 @@ The multimodal rotary and image-feature integration is adapted from MiaAI-Lab's
 [Flash Next vision patch 0008](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/blob/a3aa89835022c55ca8e55008c37785954834e04f/patches/0008-flash-next-vision.patch),
 MIT License, Copyright (c) 2026 MiaAI-Lab. The license is included in `LICENSES/MiaAI-Lab-MIT.txt`.
 The port preserves the v0.5 CUDA execution APIs and adds an offline EXL3 vision adapter.
+
+## Rocinante's queue pairs that wait in the card (TF_DS_ROCI_WAIT)
+
+`zig/src/families/dsv41/mlx5_devx.zig`, `rocinante_cd.zig` and `ring_wait.zig` create a Core Direct queue pair through DEVX, write its work
+queue entries by hand and read its completions by hand. What they take is the layout of the device interface, as facts,
+with the notices kept in the file header:
+
+- The `qpc` and the QP create / modify / query command layouts, their field order and the transitions' parameters:
+  NVIDIA DOCA GPUNetIO (`include/host/mlx5_ifc.h`, `src/doca_verbs_qp.cpp`), BSD-3-Clause, Copyright (c) 2025 NVIDIA
+  CORPORATION & AFFILIATES. The licence is in `LICENSES/NVIDIA-DOCA-GPUNetIO-BSD-3-Clause.txt`. Nothing of GPUNetIO is linked or called.
+- The WAIT work queue entry's segment (`struct mlx5_wqe_wseg`) and its condition codes: DPDK `drivers/common/mlx5/mlx5_prm.h`
+  and `drivers/net/mlx5/mlx5_tx.h`, BSD-3-Clause, Copyright 2016 and 2021 6WIND S.A. and Mellanox Technologies, Ltd
+  (`LICENSES/DPDK-mlx5-BSD-3-Clause.txt`).
+- The control, remote-address, data and inline segments, the completion entry, the DEVX entry points and the doorbell record
+  index: rdma-core `providers/mlx5/mlx5dv.h` and `qp.c`, Copyright (c) 2017 Mellanox Technologies, Inc., used under the
+  OpenIB.org BSD licence it offers beside the GPL (`LICENSES/rdma-core-mlx5-OpenIB-BSD.txt`). libmlx5 is loaded at run time by dlopen.
 
 ## Pictures in the native engine
 

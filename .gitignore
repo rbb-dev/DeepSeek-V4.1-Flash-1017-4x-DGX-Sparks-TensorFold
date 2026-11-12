@@ -15,9 +15,21 @@ venv/
 .zig-toolchain
 .zig-cache/
 zig-out/
+zig/src/server/admin_ui/render/
 
 # Native Qwen CPU-only Metal compiler receipts.
 .q27-metal-check/
 
 # Versioned GUI build resources, generated app engines stay ignored in app/.gitignore.
 !app/build/
+
+# the deployment (setup.sh / start.sh): the Spark-local settings, secrets and work files
+scripts/local.sh
+.env
+work/
+__pycache__/
+tools/fabric-xfer/fabric-xfer
+tools/fabric-xfer/tests/test_core
+tools/fabric-xfer/tests/test_engine
+# the long-context reasoning sets, downloaded by tools/reason4m/prepare_data.py
+tools/reason4m/data/

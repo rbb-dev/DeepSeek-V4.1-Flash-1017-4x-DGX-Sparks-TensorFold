@@ -1,6 +1,288 @@
-# What's new in TensorFold
+# Changelog
+
+## This repository
+
+What this repository adds to BertholomusAI's TensorFold branch `deepseek-v41-zig-tp4`, grouped by area, the largest
+changes of each group first. [`FORK.md`](FORK.md) gives each change with its settings, its author and what it measured;
+the speeds are measured on four DGX Sparks with the GPU clock limited to 2,200 MHz, each against its own control, with
+the replies compared byte for byte. Run-to-run noise on these Sparks is about 4-5 percent: a smaller figure is listed as
+measured, and the change is kept because its output is identical at no measured loss.
+
+### Dashboard and live settings
+
+- A dashboard built into the engine at `/admin/ui/`, with a JSON API under `/admin/api/v1`: the four Sparks, the
+  requests in flight, the KV pool and the SSD tier, Turbo, and every setting.
+- Live settings on all four Sparks: set, revert, or keep across restarts in `engine.cfg`; every setting has its default,
+  range and documentation; a setting name the engine does not have is refused at start with the reason.
+- Admin keys of their own, scoped by label (`admin` may change settings; other labels read), with a policy file for
+  agent keys; every refusal of a caller without a valid key looks like an unknown path.
+- A Goals tab that reports decode speed for each user and prompt speed against targets and changes nothing.
+
+### Long context
+
+- Windows of 2M (`TF_DS_YARN_FACTOR=32`) and 4M tokens (factor 64) past the trained 1M; the start refuses a window the
+  decode indexer's grid cannot launch and names the nearest one that works.
+- Needle tests that hide codes in filler text: every code found at 1,995,164 tokens (2M window) and at 3,990,287 tokens
+  (4M window); a 4M prompt sent a second time after an engine restart answered in 7.2 s from the SSD tier, against 21
+  minutes cold.
+
+### KV pool and Turbo
+
+- Turbo: prompt passes of 8,192 rows with the dense matrix multiplies in 4,096-row halves, set from the dashboard; a
+  cold prompt of real text of about 152K tokens 11.0 percent faster, paid for with 43.2 percent of the KV pool; replies
+  byte-identical.
+- A KV pool sized from free memory in a CUDA virtual-memory reservation, resized while serving (`TF_DS_KV_VMM`,
+  `TF_DS_KV_FREE_TARGET_GIB`).
+
+### Transport
+
+- Rocinante, an RDMA transport that replaces NCCL for every exchange between the Sparks: zero-copy memory, GPU-triggered
+  sends that wait in the network card, completion flags, no CPU thread in the transfer path; prompts 8 to 29 percent
+  faster than with NCCL, 5 percent less GPU energy for the same prompt work (`nvidia-smi`, one run of three prompts
+  each), outputs byte-identical.
+- Two prompt passes in flight, one computing while the other's data is on the wire: 9.2 percent faster on a cold prompt
+  of about 147K tokens.
+- Send-order options for prompt passes (`TF_DS_ROCI_P2_FIRST`, `TF_DS_ROCI_ENGRAM_AHEAD`, `TF_DS_ROCI_COMBINE_DOOR`,
+  `TF_DS_ROCI_SENT_FIRST`).
+- Decode rings that signal by completion flag, wait in the card, use write-combined slots and write in place
+  (`TF_DS_RING_WORD`, `TF_DS_RING_WAIT`, `TF_DS_RING_WC`, `TF_DS_RING_INPLACE`, `TF_DS_ADD2_VEC`).
+- A watchdog that fails the transport on a Spark whose peer stops advancing for 5 seconds, naming the Spark, the
+  exchange and the peer.
+- The image's build fails if any engine binary links NCCL; the NCCL-era settings are refused at start.
+
+### Heat: no spinning threads
+
+- The engine thread sleeps while issuing a prompt (`TF_DS_ISSUE_LEAD`): CPU time over wall time from 1.00 to 0.01-0.05
+  on all four Sparks, prompt speed unchanged.
+- The RDMA proxies nap with the Arm CPU's WFET (`TF_DS_RDMA_WFE`): 93.7 to 98.9 percent asleep, small-core zones 3.2 to
+  6.6 °C cooler.
+- Every CUDA event wait sleeps (`TF_DS_CUDA_EVENTS=blocking`): the first Spark's engine thread from 91 to 4 percent of a
+  fast core.
+- A host thread waiting on the GPU sleeps (`TF_DS_CUDA_SCHED=blocking`): the spinning cluster 10 to 14 °C cooler, speed
+  unchanged.
+- Sleeps for Engram's reader, a decode round's reads and idle transport threads (`TF_DS_ENGRAM_WAIT_US`,
+  `TF_DS_HYBRID_WAIT`, `TF_DS_ROCI_IDLE_PARK_US`).
+
+### Kernels and the kernel kit's extra set
+
+- A fork of BertholomusAI's kernel kit with an extra kernel set, fetched at a pinned commit and checked against its
+  manifest.
+- Kernels with fewer launches or cycles and the same bytes: the fused attention epilogue (prompts 2.0 percent faster),
+  the indexer looping over four key tiles, the four-lane activation quantizer, `wo_a`'s groups in one launch, `wkv` and
+  `wq_a` on a 64 x 64 tile, the next layer's L2 prefetch placed behind gate/up, and others listed in `FORK.md`.
+- Sparse attention and the indexer from FP4 unpacked in hardware (prompts 1.1 and 1.6 percent faster; decode rounds
+  too).
+- Block-scaled FP8 matrix multiplies with the exact accumulation: prompts 2.2 percent faster.
+- Prompt GEMM and quantization changes: split FP8 GEMMs (1.0 percent faster); quantize-once, grouped expert tiles,
+  one-launch top-k, indexer projections on owned rows and 16-row bf16 tiles together (1.2 percent faster); MXFP4 expert
+  tiles staged 128 bytes at a time (0.7 percent faster); `wo_a` from its FP8 rows (about 0.67 GB less memory a Spark).
+
+### Prompt path
+
+- Whole passes of 4,096 rows in turn while several prompts fill: two and three prompts at once read 15.9 percent more
+  prompt tokens a second in total.
+- Prompt passes of 4,096 rows instead of 2,048: 13.7 percent faster.
+- Further cuts of the bytes exchanged on owned rows (Engram's layer sums, an encoder-only chunk's boundary, `wo_b`'s
+  partner input as FP8 codes): 2.8, 2.3 and 1.7 percent faster.
+- Exchanges that carry only owned rows or FP8 codes, sent where the receiver would compute the same codes: 13.3 percent
+  faster on top of the owner sums, about 806 MB less a chunk on each Spark.
+- Owner sums: each Spark receives only the partial sums for its own rows, a gather of 13.1 MB instead of 62.9 MB: 21.2
+  percent faster.
+
+### Decode
+
+- Each Spark ranks its own quarter of the vocabulary for sampled and greedy rounds: sampled prose 0.74 percent faster,
+  greedy code 1.35 percent, at 16 requests.
+- The decode rings' copy-out from every peer at once, candidates first, the drafter's main projection four ways and
+  wider copy windows: one request 1.3 percent faster.
+- The drafter split four ways like the rest of the model: one request 2.9 percent faster, 16 requests 4.0 percent.
+- MiaAI-Lab's MXFP4 output head for the drafter (`TF_DS_DRAFT_HEAD=fp4`) on by default: prose 1.9 percent faster, code
+  1.0 percent.
+- The drafter proposing from a list of 32,768 token ids, with a guard that returns to the whole head when more than 2
+  percent of committed tokens fall outside it.
+- Decode rounds counted by plan on `/metrics`.
+
+### Engram
+
+- Read-ahead for prompt passes, a layer at a time: the first prompt after a start 5,457 against 4,330 tokens a second.
+- The row cache faulted in at start, in 2 MiB pages where the kernel gives them.
+- The whole tables on every Spark, with MiaAI-Lab's packed rows: prompts 44.8 percent faster beside four requests
+  writing replies.
+- Scripts that pack, check and copy Engram's shards, each shard checked record by record against its table.
+
+### The SSD tier
+
+- Kept conversations on every Spark's NVMe, restored after the state left memory or after an engine restart; by rbb-dev
+  with Robert Wojciechowski (wojo) and Coinupbtc, built on wojo's tier for MiaAI-Lab's two-Spark recipe (its pull
+  request #30), the between-chunks test following Coinupbtc's pull request #5; a problem turns the tier off and the
+  engine serves from memory.
+
+### The network and the setup
+
+- A RoCE network with priority flow control on one MikroTik CRS812 with its configuration included: 0 drops and 0
+  resends under overload.
+- `./setup.sh`: config, access, network and data from one config file, every rail checked with a full-size ping that
+  may not be split, every file copied over the fabric and checked by SHA-256 on both ends.
+- `scripts/served.sh`: every setting the engine runs with, each described; per-worker settings numbered 1 to 3.
+- A start that drops each Spark's page cache, limits the GPU clock, checks the rails and refuses a mismatch of the
+  ranks' frame kinds; a stop that waits for running requests (`DRAIN_TIMEOUT`).
+- Weights read by each Spark from its own disk, past the page cache: the weights load in 27 to 47 seconds.
+- API keys with `/metrics` open, and `/health` whole for a request with a key.
+
+### Serving fixes
+
+- A request without `max_tokens` is served with every token left; one asking for more than fits gets a 400 naming the
+  limit.
+- Prompt passes in flight, the process start and the cached-token counter on `/health` and `/metrics`; `/health` answers
+  503 after a sticky CUDA fault.
+- A cancelled prompt pass keeps the state its finished chunks reached.
+- A failed CUDA graph capture on one rank runs that work eagerly on every rank; the graph cache has a cap.
+- The reasoning split ends at the model's own close token; a DSML block cut by `max_tokens` reaches a stream as text; a
+  `<tool_call>` that only opens a DSML block is no call.
+- Quiet polls in the log, a grammar that cannot start failing its request alone, blank lines only next to an image so
+  kept states match.
+- Fixes by others, each under its author's name, are listed in `FORK.md` and `CREDITS.md`.
+
+### Tests
+
+- The kernel replay (`tf-dsv41-kernels-replay`) gates each section's output, and `TF_DS_REPLAY_ONLY` runs chosen
+  sections.
+- Offline tests for the scripts and tools, a check of the dashboard's page against a fixture, and a build check that the
+  engine links no NCCL.
+- Every change is checked for byte-identical replies against its control before it ships.
+
+## The recipe (MiaAI-Lab), up to the fork point
+
+- **2026-10-28** -- `0036`, structured output and required tool calls
+  ([#6](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/6)): upstream TensorFold's
+  structured output (BobClawblaw's lane-core grammar and libtfgrammar, Ash Hart's required tool calls and grammar-aware
+  drafting) and BertholomusAI's DeepSeek-V4.1 hooks and DSML tool-call grammar (bertholomus), ported onto this pin; the
+  image builds libtfgrammar from xgrammar v0.2.8. `response_format` (`json_schema`, `json_object`), the `guided_*`
+  fields and `tool_choice` "required" or a named function used to return HTTP 400; now every token is drawn among the
+  tokens the grammar allows. Tested on this cluster: 15 of 15 checks (a JSON schema greedy, sampled and with thinking,
+  `json_object`, `guided_regex`, `guided_choice`, a streamed schema, `tool_choice` required with and without thinking, a
+  named function, `auto` as before, a malformed regex refused with xgrammar's reason, a plain reply beside a structured
+  one equal to its solo run); eight requests at once, half structured, all valid; `tools/validate.py` passed with its 8
+  greedy replies equal to the saved ones; decode speed unchanged (61 tok/s on one stream). One structured stream alone
+  runs about as fast as the same reply unconstrained (25 cities as a JSON schema: 108 tok/s greedy and 121 sampled,
+  against 104 and 109).
+- **2026-10-28** -- `model/chat_template.jinja` writes each piece out as it is made instead of appending to one string
+  with `{% set ns.out = ns.out + ... %}` (hashd1ve's fix from the two-Spark recipe, its issue #1 and `fd2cdb2`, carried
+  over byte for byte by manuel1618 in #18, for #17). The engine's Jinja copies the whole string on every `+` and keeps
+  each copy until the render ends, and every request renders twice, so rank 0's host memory grew with messages x prompt
+  length: in the engine's own template module one render of a 1,500-turn conversation (1.6 MB of prompt) peaked at 24.8
+  GB, now 0.4 GB. Prompts are unchanged: 14,688 conversations render byte-identically before and after, in the engine's
+  template module and in jinja2. On this cluster: `/tokenize` of a 500-turn agent conversation (108k tokens) gave the
+  same ids with both templates while rank 0's memory rose 1,967 MiB before and 110 MiB after (200 turns: 349 and 36
+  MiB); `tools/validate.py` passed with its 8 greedy replies equal to the saved ones, and 5,000 random conversations
+  rendered identically in jinja2.
+- **2026-10-28** -- `0035` (MiaAI-Lab), the ranks' startup rendezvous
+  ([#3](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/3)). Rank 0 used to open
+  its ports for workers 1, 2 and 3 one after another, each only once the worker before it had connected, and only
+  after its own weights had loaded; a worker retries its connect for 300 s after loading its own weights. So a worker
+  that loaded more than 300 s before the ones ahead of it exited with `error: ConnectFailed` (in #3: rank 3 loaded in
+  113 s, ranks 1 and 2 in ~843 s over NFS). Rank 0 now opens all three ports when it starts, before its weights load,
+  and a worker that connects early waits in its port's backlog. `TF_DS_CONNECT_S` sets a worker's retry window (300 s
+  by default; it now covers only rank 0's own start), and a worker that gives up logs the address and port it tried.
+  Diagnosed by shanedertrain in #3, reported by tlacerdap. Tested on this cluster with rank 0 and rank 3 started
+  together and ranks 1 and 2 nine minutes later: before `0035` rank 3 exited with `ConnectFailed` 427 s in; with it,
+  rank 3's connection waited on rank 0's port and the server answered 696 s in.
+- **2026-10-28** -- seven pull requests merged (#2, #4, #5, #8, #10, #13, #15), tested together on this cluster. Three
+  of them had named their patch `0027`: #10's keeps the number, #8's is `0033` here and #2's `0034`. Against the image
+  before them (`0001`-`0025`), on four GB10s with this cluster's switches: `tools/validate.py` passed and its 8 greedy
+  replies were equal; a 131k-token prompt read cold in 34.7 s as before; a follow-up resumed from the previous turn's
+  state gave the same tokens as the same prompt read cold (8 of 8); a 35-image prompt resent read in 1.0 s instead of
+  20.1 s, its tokens equal; a 12-screenshot history resumed on every turn, and a changed or swapped picture resumed none
+  of what followed it; a 9-token request arriving 1 s into a cold 50,939-token prompt had its first token in 0.3 s; idle
+  CPU fell from ~310 % to 0.15-0.35 % a rank.
+- **2026-10-28** -- `0032` (MiaAI-Lab): `0031`'s bounded admission only with `TF_DS_PREFILL_YIELD=1` (on, this
+  cluster). Without the switch a prompt is read whole, as before `0031`, and its Engram read-ahead keeps running
+  between its chunks.
+- **2026-10-28** -- `0030`, `0031` (Mauvis Ledford): `0030` skips vision work covered by a restored image-keyed prefix;
+  `0031` admits and advances requests between unchanged prompt chunks. Partially filled streams keep separate progress
+  and image rows on the head, and all TP ranks select the same slot when resuming. No arithmetic or checkpoint
+  settings change.
+- **2026-10-28** -- `0028`, `0029` (upstream TensorFold, backported by Mauvis Ledford): native SSE keepalives, every 15
+  seconds during silent streaming generations (Chat/Responses use comments; Messages uses ping events;
+  `TF_SSE_KEEPALIVE_S=0` disables them), and the golden test server's stdout drained so a full log pipe cannot stall the
+  regression suite. Authorship and source commits are recorded in `CREDITS.md`.
+- **2026-10-27** -- `0033` (manuel1618, its PR's `0027`): `/metrics` publishes `prompt_tokens_cached_total`, the prompt
+  tokens of finished requests restored from kept prompt states, and repeats the split under vLLM's
+  `prefix_cache_hits_total` / `prefix_cache_queries_total`. Before, `/metrics` had only `prompt_tokens_total`, which
+  counts cached and computed prompt tokens alike, so a dashboard could not tell them apart (a 93 %-cached agent workload
+  read as all computed). The per-request `usage.prompt_tokens_details.cached_tokens` is unchanged. Backport of
+  BertholomusAI's `ce0d9053` to this recipe's engine pin, plus the one line that turns the series on for the
+  DeepSeek-V4.1 engine.
+- **2026-10-27** -- `0027` (Thomas Kempka), the image-keyed prompt cache: a kept prompt state is keyed by the request's
+  images as well as its tokens, so a chat whose history holds a picture (a screenshot in a tool result, say) resumes
+  its prefill instead of re-running it from 0 on every turn. Measured on 4x GB10 TP4 (16 streams, 2.8k tok/s prefill):
+  one 150k-token prompt replayed in 0.64 s (82x) without an image and 53.6 s (1.0x) with one before this patch; both
+  replay now. Text-only requests are unchanged (the key is 0 for every prefix, so the tokens alone decide), a state
+  kept for a picture is never learned to disk, and it is not resumed by a prompt whose prefix holds no image.
+- **2026-10-26** -- `0034` (uchkw, its PR's `0027`): park the three RDMA proxy threads when no streams are live.
+  Synchronize CUDA on every rank, agree READY/COMMIT, then block in futex waits; wake before compute and before
+  stop/join. Idle followers block on the control link instead of spinning. A four-GB10 ring measured about 300% CPU per
+  node before and 0.21-0.32% after; three idle/wake chat cycles passed. Numerical kernels and weights are unchanged.
+  All ranks must run the updated image (new idle control frame). Ported onto `0031` (its frame value is 11).
+- **2026-10-26** -- (SvangenStudios) `stop.sh` exits 1 when a rank may still run (a rank it could not stop, or a Spark
+  whose containers it could not list); `DRY_RUN=1` writes no NCCL graph files; the prepared marker also covers
+  `HF_CACHE`, the NFS settings and the chat template, and a state that cannot be computed never reads as ready. Offline
+  regression tests in `tests/test_scripts.py` (standard library only, no Spark).
+- **2026-10-26** -- (SvangenStudios) `tools/validate.py`, `tools/needle_bench.py`: a check passes only on a real
+  completion. An HTTP error, an `error` object, a reply that is not the assistant's, a malformed tool call or a short or
+  empty `--compare` reference now fails instead of passing; bad arguments stop with a message. Offline regression tests
+  in `tests/test_validation_tools.py` (standard library only, no GPU).
+- **2026-10-26** -- `0026` (knapcio): the RDMA rings' queue pairs take the port's active MTU (`ibv_query_port`,
+  capped at 4096) as their path MTU instead of a fixed 4096. On a switched fabric whose Ethernet MTU is 1500 the RoCE
+  active MTU is 1024, and with the fixed 4096 every request failed (`RDMA=1`); with the port's MTU it serves. On a
+  fabric whose active MTU is 4096 the value is the same as before.
+- **2026-10-25** -- `ABLIT` (new, off by default): grafts drowzeys's Keys abliteration overlay (`attn.wo_b`,
+  layers 10-35) onto the checkpoint before the rank caches are baked, applied via a new checkpoint view rather
+  than the vendor's own index-remap script (our engine never reads `model.safetensors.index.json`). Live-validated:
+  tensor-level proof the grafted bytes match the sidecar, `validate.py` all passed, needle test passed at 65k/262k.
+- **2026-10-25** -- `tools/needle_bench.py` (new): a needle-in-a-haystack retrieval sweep, 4k to ~997k tokens x
+  0/25/50/75/100% depth. 45 of 45 cells passed.
+- **2026-10-25** -- WP6(b), `TF_DS_IDX_SHARD` (`0025`): the indexer scores and picks only its own owned quarter of a
+  chunk's rows, instead of every node redundantly scoring all of them. On by default (`scripts/local.sh`).
+- **2026-10-25** -- resumable prefill, expert early exit, draft-row costs (`0022`-`0024`, opt-in): `TF_DS_PREFILL_YIELD`
+  and `TF_DS_EXPERT_EXIT` on (this cluster); `TF_DS_DRAFT_ROW_MS` measured mixed, kept off.
+- **2026-10-25** -- the decode plan's Gate 0 and draft economics (`0017`-`0021`, `ROUND_MS`, `DRAFT_MS`): 64-row
+  drafting slabs fix 13+ concurrent drafting streams failing outright; CUDA graph capture agreed across every rank;
+  PDL controls (off); `ROUND_MS`/`DRAFT_MS` set from measurement; `TF_DS_SAMPLE_CAND` opt-in.
+- **2026-10-24** -- WP5, `TF_DS_OWNER_GATHER` (`0016`): the quarter-HC gather moves only each rank's owned quarter
+  over the column link, instead of the full chunk. On by default.
+- **2026-10-24** -- WP4, `TF_DS_QUARTER_HC` (`0015`): each node computes the HC-mix step for only its own quarter
+  of a chunk, then all-gathers the result. On by default.
+- **2026-10-24** -- WP6(a), `TF_DS_IDX_RB` (`0014`): the indexer's prompt-chunk scoring kernel at the kit's own RB=2
+  capture instead of RB=1. Off by default (opt-in).
+- **2026-10-24** -- WP2, projection-tile tuning (`0013`, Hector's measured tuning): a better tile config for the
+  K-split dense FP8 GEMMs. On by default.
+- **2026-10-24** -- WP0 4.3b (`0012`): an offline replay tool proves the HC-mix kernels are row-independent, the
+  entry gate WP4 needed.
+- **2026-10-24** -- pair-sum hardening (`0009`-`0011`): `TF_DS_PAIR_SUM`'s startup agreement hardened, Engram
+  worker-wait timing, a multi-layer tensor dump.
+- **2026-10-23** -- guarded live-trial tooling for the prefill work (removed later, once the work was done).
+- **2026-10-23** -- pair-sum gathers, opt-in (`0008`, Hector): sums each column's two TP2 partials over the cable
+  between the partners and swaps with the other pair, instead of a four-quarter all-gather.
+- **2026-10-18** -- reasoning effort `max` by default; aligned indexer row blocks (`0006`, `0007`).
+- **2026-10-18** -- a resumed chunk's positions copied to a 16-byte boundary (`0005`).
+- **2026-10-18** -- a general Triton variant when no exact one was captured (`0004`).
+- Engram's packed rows, opt-in (`0003`): off by default, not yet measured.
+- **2026-10-18** -- the four speed agents' work merged: native FP8/MXFP4 kernels, the ring's node order and links,
+  video input, tool-call arguments as objects.
+- **v0.1.0 (unreleased)** -- first version: DeepSeek-V4.1-Flash-1017 on four DGX Sparks, TP4, on BertholomusAI's
+  DeepSeek-V4.1-Flash family of TensorFold's native engine.
+
+---
+
+# TensorFold (upstream): what is new
 
 Each release's page on GitHub has its notes and measurements. See [the 1.0.0 release notes](RELEASE-NOTES-1.0.0.md) for the native binary's supported models and migration details.
+
+## Unreleased
+
+- [The runbook](RUNBOOK.md#prompt-prefill-share) documents `TENSORFOLD_PREFILL_SHARE`, the share of wall time long prompt steps get beside decoding streams: what it accepts, its default, and how it trades a long prompt's finish against the decoders' rounds. Ported from ashhart/TensorFold.
+- The DeepSeek CUDA engine follows the share, and `TF_DS_PASS_BESIDE` (2048 or 4096, default 2048) sets the rows of a prompt step beside a decoding stream, with or without `TF_DS_PASS_FILLING`. With nothing set the engine runs as before.
 
 ## 1.0.12
 

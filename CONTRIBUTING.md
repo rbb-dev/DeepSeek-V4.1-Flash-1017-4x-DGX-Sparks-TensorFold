@@ -1,108 +1,65 @@
-# Contributing to TensorFold
+# Contributing
 
-TensorFold's main line is the Zig engine and server.
-Python 0.6.6 stays available at the `v0.6.6` tag and takes no further changes; Python clients and references under `tools` are development tools.
-Start from the release branch named in the issue, and keep one change per pull request.
-Open an issue before a new model family, backend or arithmetic change so we can agree on its gate.
+This repository serves DeepSeek-V4.1-Flash-1017 on four DGX Sparks. It is built on BertholomusAI's DeepSeek branch of
+TensorFold, and TensorFold is Ash Hart's engine; see [`CREDITS.md`](CREDITS.md). Send each change where it belongs:
 
-## Build and host tests
+- the engine's core and server, for every model: [ashhart/TensorFold](https://github.com/ashhart/TensorFold);
+- the DeepSeek family's four-Spark decomposition, drafting, vision and decode rings:
+  [BertholomusAI's TensorFold](https://github.com/bertholomus/TensorFold) and its kernel kit;
+- what this repository adds (Rocinante, the prompt path's exchanges, the SSD tier's integration, the setup, the scripts
+  and the tools in [`FORK.md`](FORK.md); the setup began as MiaAI-Lab's recipe): an issue or a pull request here, against
+  the `deepseek-v41-zig-tp4` branch.
 
-Use the exact Zig version in `.zig-version`, currently 0.17.0.
-Metal builds need Xcode's macOS SDK and Metal toolchain.
+Open an issue before a change of arithmetic, of a kernel, or of what an exchange carries, so the test it needs is agreed
+first.
 
-```sh
-zig build native -Dcpu=apple_m1 -Dversion=1.0.0
-zig build test test-golden -Dcpu=apple_m1
-```
+## The checks
 
-`native` writes `zig-out/native/bin/tensorfold-native`.
-The `apple_m1` CPU target keeps the macOS binary compatible with M1 through M5.
-`test` runs host checks; `test-golden` compares the frozen server corpus and records known differences separately.
-Neither host result substitutes for an actual model/device gate.
-
-Linux release builds use the CUDA backend and qualified GPU kernel assets.
-[Packaging](packaging/README.md) lists the flat fatbin set and optional captured CUDA files required by `dist`.
-Compile success alone does not qualify a GPU or checkpoint.
-
-## Exactness and precision
-
-A draft is accepted only when it equals the same engine's plain token.
-Keep shared lane verification, caches and per-stream state in the core; add model operators and weight handling in the family.
-A new family does not add another scheduler beside the engine.
-
-Verify these contracts at the same checkpoint, backend, runtime and settings:
-
-- Drafted output equals `"draft": false` output, token for token.
-- A supported resumed path equals a fresh execution of the full prompt.
-- Each concurrently requested reply equals its solo run, including engines that queue requests.
-- Prompt chunks and decode use the required row arithmetic, with recurrent state, KV and final logits checked at seams.
-- Cancellation, reset and partial acceptance leave the next request's state valid.
-
-A new or changed GPU kernel registers with the [kernel contract](docs/kernel-contract.md), and its pull request posts each backend's `SUMMARY` line.
-Keep the checkpoint's activation precision and the required accumulation precision.
-A changed reduction order needs an independent FP64 reference for each affected projection class, with native error no worse than the current reference.
-Compare prompt and decode references separately on identical input rows.
-Report worst per-column differences as well as aggregate error; an average must not hide a worse column.
-For model fidelity, use teacher-forced histories and record all top-token differences and margins.
-A documented one-step tie policy applies only to the same two contenders with both margins within that policy.
-
-## Performance receipts
-
-Measure before and after on the same machine, using the same checkpoint, public prompt IDs and settings.
-Name the commit/version, GPU, OS, checkpoint revision, runtime libraries and request parameters.
-Record pass, fail and skip counts and explain any unrun platform or feature.
-
-For served decode, the existing standard-library client needs Python 3.11 or newer:
+Every pull request passes these; the no-GPU and format workflows run them on every pull request and on every push to
+`deepseek-v41-zig-tp4`:
 
 ```sh
-python3 tools/bench_openai.py http://127.0.0.1:8080 local-model \
-  --tokens 256 --reps 3 --temperatures 0 --label candidate --output decode.json
-python3 tools/bench_concurrent.py http://127.0.0.1:8080 local-model \
-  --tokens 256 --reps 3 --temperatures 0 --levels 1,4 --alone --serial --output concurrent.json
+python3 -m unittest discover -s tests                   # the scripts, the setup, the tools (no GPU, no Sparks)
+zig build test                                          # the engine's host tests, Zig 0.17.0 (.zig-version)
+zig build test-kernel-contract test-golden              # the kernel contract and the server's golden corpus
+zig build fuzz-cortheon                                 # the web-text readers under the fuzz harness
+python3 tools/zig/lean_check.py                         # file and comment length: a pull request adds no problem
+zig fmt --check build.zig zig                           # formatting, as Zig 0.17.0 writes it
+python3 tools/schema/check_env_schema.py                # every setting the engine reads has a schema row
+make -C tools/fabric-xfer test                          # the RDMA copy's own tests (a loopback backend)
 ```
 
-The server in these commands is the native binary.
-The clients measure requests; Python is not part of native inference or the native build.
-Include ordinary greedy prose and code in the measured prompts.
-For cold prefill, attach exact 2k, 8k, 32k and 64k token arrays, request bodies, timings and cached-token counts.
-Disable supported prefix retention with `--prompt-cache-gib 0` and use fresh KV state for each measurement.
-Record 64k, 128k and the native window separately where the model/platform admits them.
-Compare against the previous release and the applicable standard server, such as `mlx_lm` or `vLLM`.
-When a difference is only a few percent, alternate before/after runs to separate it from temperature and load changes.
+None of these runs the model. A change that reaches the GPU, an exchange or the replies is also run on four Sparks,
+and its pull request says how: the replies compared byte for byte with the build before it (`tools/validate.py`
+`--compare`), and the speed measured as below.
 
-Memory receipts include peak physical process footprint and device/pinned allocations where the backend reports them.
-State the hardware RAM class and context; a budget on a larger host is not a measurement on a smaller machine.
-Use a single model process per test machine, the existing GPU lock and admission guard, and record load/cleanup boundaries.
-Never raise a shared machine's limits to get a test through without its owner's authorization.
+## Exactness
 
-## Lean code and review
+A change keeps these equal, at the same checkpoint, settings and kernel kit (TensorFold's own rules, kept here):
 
-Each module has one job, source files stay at or below 600 lines, and comments/docstrings are single lines of at most 120 columns.
-Measurements and history belong in a receipt or recipe, not source comments.
-The lean checker must add zero problems over the branch's pinned baseline:
+- drafted output equals `"draft": false` output, token for token;
+- a reply from a cached or SSD-restored prompt equals the reply from the whole prompt read fresh;
+- each of several requests at once equals its run alone;
+- an exchange that carries less (owned rows, FP8 codes) gives the receiver the same bytes it would have computed.
 
-```sh
-python3 tools/zig/lean_check.py
-```
+A changed reduction order or accumulation needs a reference that shows its error is no worse than before, column by
+column, not only on average.
 
-Attach the baseline count and identify inherited findings instead of claiming a nonzero checker exit is clean.
-Write tests that demonstrate a real failure and its correction; keep the failing receipt when changing arithmetic or lifecycle behavior.
-Run the host suite and the device/model checks for every affected platform.
-We review a candidate, preserve its authorship and run the release gates before landing it.
+## Measuring
 
-## Public identity and privacy
+Measure before and after on the same four Sparks, the same build of everything else, the same prompts and settings,
+with the GPU clock limit `served.sh` sets. Run-to-run noise on these Sparks is about ±4-5 %: a difference smaller than
+that needs repeated, alternating runs before it is called a gain. Label every number with what was measured, on which
+build, and against what. Use one client per comparison: `tools/recipe_bench.py` and `tools/bench.py` count totals
+differently, so their tables are not compared with each other.
 
-Use your approved public Git identity and GitHub noreply address.
-Keep every contributor's authorship through a port or merge; tool co-author trailers do not belong in the history.
-Keep private emails, machine names, local user paths, addresses, keys and confidential data out of source, fixtures and receipts intended for publication.
-Examples use fictional identities and reserved documentation addresses.
-Inspect the complete publication tree, outgoing history and packaged artifacts before uploading them.
-A clean diff or a passing test suite does not replace that review.
+## Commits
 
-## Bug reports and license
+One commit a feature: its code, its tests and its documentation together, with a message that says what it does and
+what it measured. Use your public Git identity with GitHub's noreply address. Keep private names, addresses, paths and
+keys out of the code, the tests and the history; examples use reserved addresses (192.0.2.x).
 
-Include the native version, model revision, GPU/OS, exact command, startup error and a public request that reproduces the problem.
-A token mismatch report should include both drafted and plain token hashes at the same settings.
+## License
 
-TensorFold is Apache-2.0; a contribution follows that license.
-Model weights keep their own licenses, and the archive retains the project's required third-party notices.
+TensorFold is Apache-2.0, and a contribution follows that license. The model's weights keep their own license
+([`ATTRIBUTION.md`](ATTRIBUTION.md)).

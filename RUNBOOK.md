@@ -222,6 +222,41 @@ Upgrade a Homebrew installation with `brew upgrade tensorfold` and restart its s
 For an archive installation, verify and unpack the replacement archive, then restart from that binary.
 Python 0.6.6 remains a separate release line.
 
+## Prompt prefill share
+
+The native server reads `TENSORFOLD_PREFILL_SHARE` when it opens its lane host (the host loop that schedules prompt steps and
+decode rounds; a lane is one request's slot). It is optional: set it before starting the server.
+It takes a number from 0.01 to 1. The default is 1, and a value that is not a number from 0.01 to 1 gives the default.
+Do not set it together with `TF_DS_ROUNDS_BESIDE` (the same balance counted in rounds a step): the start is refused.
+It is the share of wall time long prompt steps get while other streams are decoding.
+A step of length t at share p owes the decoders t (1 - p) / p of decode time.
+The debt grows after each long prompt step and falls after each decode round.
+A long prompt's next step runs only when no debt is owed or no stream can decode, and the host runs decode rounds until the debt is paid.
+At the default 1 no debt is recorded: the host runs one prompt step, then one decode round.
+Lower values add that debt, finish the long prompt later and leave more time for the decoding streams.
+A share cannot give the decoders less than that one round per step.
+A prompt whose whole uncached pass is at most 512 rows runs outside the share, and goes before a long prompt's next step.
+The check compares the prompt's length with the cached state, not how far the fill has reached, so a long prompt whose last rows remain does not become exempt when its unfilled tail is small.
+`--decode-share` is the Python engine's flag; this server does not take it.
+
+The DeepSeek CUDA engine follows the share and adds the other half of the balance, the size of a prompt step beside a decoding stream.
+While a stream generates, a prompt step is cut to the resume rows (2,048), and `TF_DS_PASS_BESIDE` sets that size.
+`TF_DS_PASS_BESIDE` takes any whole number of 2,048-row units up to `TF_DS_PASS_ROWS`; the default is 2,048, and a larger step needs `TF_DS_PASS_ROWS` at least as large at the start, because the pass buffers are sized by that.
+The same cap applies whether or not `TF_DS_PASS_FILLING` (whole passes while several prompts fill, on by default) is set.
+Any other text, or a step above the pass rows, refuses the start and says why.
+`TF_DS_PASS_ROWS` is the rows of a prompt pass where nothing decodes: any whole number of 2,048-row units from 2,048 to 16,384 (4,096 when unset; the same on every rank); anything else refuses the start by name.
+`TF_DS_ROCI_STAGGER` (on by default; 0 turns it off) runs two such passes in flight at every size.
+A pass of 4,096 rows takes 3,370,548,688 bytes (3.14 GiB) of device memory for its chunk and node (measured on a Spark; other sizes scale with the rows, estimated).
+Two passes in flight (the stagger) take a second such set.
+The start checks on every rank that 6 GiB stays free (for one pass above 4,096 rows, and for the pair at every size); when it does not, it names the GiB short and the `POOL` that fits.
+`POOL` (the `scripts/config.sh` setting; `TF_DS_WINDOW` on rank 0, `--pool` on the followers, one value on every rank) is the KV pool, at about 890 bytes a position on a Spark: 16,777,216 positions, for example, take about 13.9 GiB.
+A workload of fresh contexts (one serial pass a request, no reuse) can give pool back for a larger pass. With `POOL` set by hand the engine never lowers the pool itself; with `TF_DS_KV_FREE_TARGET_GIB` it sizes the pool from the free memory. Either way it refuses a pool under one stream's `--context`, so the 1,048,576-token window stays whole.
+A request waiting for a lane still cuts the next step to 2,048 rows, whatever is set, and no pair of passes (`TF_DS_ROCI_STAGGER`) forms while a stream generates.
+With nothing set a step beside a decoder is 2,048 rows and one decode round follows it.
+The rounds that follow a step run from the host's loop one at a time, so a request arriving or a cancel is taken between any two of them.
+A step owed to decoders ends on the device before the host reads the clock, so the share counts the whole step and not just the part the host issued.
+The rank 0 start line names the share, the rows of a step beside a decoder and the rule for the rounds that follow.
+
 ## Troubleshooting
 
 | Symptom | Check |
