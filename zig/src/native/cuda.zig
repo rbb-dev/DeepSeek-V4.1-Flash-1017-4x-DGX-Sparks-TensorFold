@@ -114,6 +114,7 @@ const Host = struct {
     dir: []u8 = &.{}, // the model folder the learner writes its lessons into
     recording: ?*record.Recording = null, // --record: the recorder in front of the family's backend
     snap_vt: api.prompt_cache.Snapshots.VTable = undefined, // a family's own kept states (Loaded.snaps), `store` copies through it
+    graph_fallbacks: ?*const std.atomic.Value(u64) = null, // the family's failed graph captures, when it counts them
 
     fn close(p: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(p));
@@ -163,6 +164,7 @@ const Host = struct {
         h.host.warm_quiet = if (info.warm_turns) nemotron.native.warm_quiet else 0;
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true, .logprobs = h.inner.vtable.first_row != null, .structures = h.inner.vtable.first_masked != null, .min_budget = nemotron.native.lone_min_budget, .resumes = true };
         if (h.learn != null) h.host.learner = h.learner();
+        h.host.graph_fallbacks = h.graph_fallbacks;
         try h.host.start();
     }
 
@@ -304,6 +306,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const g = try gpa.create(Gpu);
     var opened = false;
     defer if (!opened) gpa.destroy(g);
+    // a family's own process settings (the DeepSeek engine's sleeping waits and 16 hardware queues), before the context reads them
+    if (@hasDecl(F, "applyFamilyDefaults")) F.applyFamilyDefaults();
     g.driver = cuda.Driver.open() catch |e| {
         problem.* = try std.fmt.allocPrint(a, "no CUDA driver ({s})", .{@errorName(e)});
         return null;
@@ -446,16 +450,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         if (cache > 0) try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(cache)}) else ", no prompt cache", if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
     });
     errdefer gpa.free(h.startup);
-    if (@hasDecl(F, "snap_save") and cache > 0) {
-        const pc = api.prompt_cache;
-        const store = try gpa.create(pc.Store);
-        // rules and budget from the family's snap_* declarations (cuda_snaps.zig)
-        const image: ?*const pc.rows.Image = if (F == nemotron.native) &cuda_disk.image else null; // its disk rows
-        const copies: pc.Snapshots = .{ .ptr = loaded.target, .vtable = &snaps.Snaps(F, image).vtable };
-        store.* = pc.Store.init(gpa, copies, snaps.cacheRules(F), try snaps.cacheBudget(F, loaded.target, cache));
-        h.store = store;
-        if (F == nemotron.native and o.learn_conversations) {
-            if (o.learn) |root| try cuda_disk.attach(a, io, &g.ctx, o, root, kernels, loaded, store);
+    if (@hasDecl(F, "graphFallbacks")) h.graph_fallbacks = F.graphFallbacks(loaded.ctx);
         }
     }
     // a family that keeps prompt states its own way (Loaded.snaps) gets a store over them, as before 1.0.12

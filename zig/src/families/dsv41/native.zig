@@ -208,6 +208,13 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     // a follower that stops stops this server too, with a line that names it, instead of a wait on it for good
     st.m.watchPeers() catch |err| std.log.warn("dsv41: rank 0 cannot watch its followers: {s}", .{@errorName(err)});
     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .lane_vision = if (st.vision) |v| v.hook() else null, .fill_rounds = if (st.lanes.fill_chunks > 0) fill_rounds else 0 };
+/// The work this engine ran eagerly after a CUDA graph capture failed on a rank (every rank runs it so, and counts
+/// alike; /metrics shows rank 0's); null without graphs.
+pub fn graphFallbacks(ctx: *anyopaque) ?*const std.atomic.Value(u64) {
+    const st: *State = @ptrCast(@alignCast(ctx));
+    return if (st.m.graphs != null) &st.m.graph_fallbacks else null;
+}
+
 }
 
 fn deinitFn(ptr: *anyopaque) void {
@@ -250,11 +257,17 @@ test "refusals name what to set" {
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
 }
 
-/// TF_DS_PASS_ROWS: a multiple of the resume grid, at most the build's pass rows.
-fn passRows(t: []const u8) !usize {
-    const n = std.fmt.parseInt(usize, t, 10) catch return error.BadPassRows;
-    if (n == 0 or n % model.resume_rows != 0 or n > model.chunk_rows) return error.BadPassRows;
-    return n;
+test "an engine with graphs counts its work run eagerly after failed captures; one without reports no count" {
+    var m: model.Model = undefined;
+    m.graphs = null;
+    m.graph_fallbacks = .init(0);
+    var st: State = undefined;
+    st.m = &m;
+    try std.testing.expect(graphFallbacks(&st) == null);
+    m.graphs = round.Graphs.init(std.testing.allocator, 0);
+    defer m.graphs.?.deinit();
+    try std.testing.expect(graphFallbacks(&st).? == &m.graph_fallbacks);
+}
 }
 
 test "passRows takes multiples of the resume grid up to the pass rows" {

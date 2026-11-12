@@ -29,6 +29,7 @@ const engram = @import("engram.zig");
 const exact = @import("exact.zig");
 const ops_mod = @import("ops.zig");
 const graph_cache = @import("graph_cache.zig");
+const graph_fallback = @import("graph_fallback.zig");
 
 const Engine = prompt.Engine;
 const Chunk = prompt.Chunk;
@@ -984,12 +985,16 @@ const Carry = struct {
 /// --graph-cap; 0: all): past it the least recently replayed one is destroyed and captured again when it next comes
 /// up. Uncapped, the keys (rows x buckets x stretches) add up over days of growing conversations, each graph holding
 /// device and host memory until the process ends. Every rank sees the same keys in the same order, so with the same
+/// cap they keep and drop the same stretches. A stretch whose capture fails on a rank runs eagerly on every rank
+/// instead, and stays eager for a while (graph_fallback.zig).
 pub const Graphs = struct {
     gpa: std.mem.Allocator,
     lru: graph_cache.Lru(Key, Entry),
+    lazy: Lazy = .{}, // the stretches held eager after a failed capture, the captures attempted (TF_DS_GRAPH_FAIL_TEST)
 
     pub const Key = struct { rows: u32, bucket: u64, stretch: u32 };
     const Entry = struct { exec: cuda.graph.Exec, start: Carry, end: Carry };
+    const Lazy = graph_fallback.Lazy(graph_fallback.Cuda, Key);
 
     pub fn init(gpa: std.mem.Allocator, cap: usize) Graphs {
         return .{ .gpa = gpa, .lru = .init(cap) };
@@ -998,6 +1003,7 @@ pub const Graphs = struct {
     pub fn deinit(g: *Graphs) void {
         var it = g.lru.valueIterator();
         g.lru.deinit(g.gpa);
+        g.lazy.deinit(g.gpa);
         g.* = undefined;
     }
 
@@ -1007,7 +1013,10 @@ pub const Graphs = struct {
     }
 
     fn run(g: *Graphs, key: Key, e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, rings: []const u64, cy: *Carry, li: usize, end: usize) !void {
-        if (g.map.getPtr(key)) |en| {
+        // a replay or a capture starts joined: an eager stretch that failed (after a failed capture) may have left a
+        // fork open, on an event recorded outside any graph
+        try rd.joinSide(e);
+        try rd.joinPrefetch(e);
         if (g.lru.get(key)) |en| {
             if (!std.meta.eql(en.start, cy.*)) return error.GraphStateMismatch;
             try en.exec.launchOn(e.s);
@@ -1019,7 +1028,24 @@ pub const Graphs = struct {
         }
         // G0.3 (docs/UNIFIED-DECODE-IMPROVEMENTS.md): a capture or instantiate that fails on one rank only (Hector saw
         // cuGraphInstantiateWithFlags fail with 800 after hours) left that rank out of the stretch's exchanges and the
+        // others waiting in them for good. Every rank captures and instantiates, then all agree on the outcome before
+        // any launches (graph_fallback: launch and keep, every rank eager, or the round failed on every rank).
+        var site: Site = .{ .e = e, .rd = rd, .ch = ch, .cs = cs, .rings = rings, .cy = cy, .li = li, .end = end, .key = key, .start = cy.*, .marks = if (rd.timer) |t| t.n else 0 };
+        try g.lazy.run(g.gpa, e.s, key, &site, Store{ .g = g }, prompt.CaptureRanks{ .e = e, .kind = .round });
     }
+
+    /// The cache as Lazy's store: room for one more stretch before the ranks vote, and a launched one kept (past the
+    /// cap, the least recently replayed destroyed).
+    const Store = struct {
+        g: *Graphs,
+
+        pub fn reserve(st: Store, gpa: std.mem.Allocator) !void {
+            try st.g.lru.ensureUnusedCapacity(gpa, 1);
+        }
+
+        pub fn keep(st: Store, key: Key, en: Entry) void {
+            const g = st.g;
+            if (g.lru.putAssumeCapacity(key, en)) |old| {
                 var x = old.exec;
                 x.deinit();
                 if (std.math.isPowerOfTwo(g.lru.evicted)) std.log.info("dsv41: CUDA graphs: {d} kept (the cap), {d} destroyed for newer ones so far; a count that keeps rising means TF_DS_GRAPH_CAP is below the working set", .{ g.lru.count(), g.lru.evicted });
@@ -1027,6 +1053,54 @@ pub const Graphs = struct {
         }
     };
 
+    /// A stretch as Lazy's site: its launches, the host state it starts from (put back after a failed capture), and
+    /// its entry once captured.
+    const Site = struct {
+        e: *const Engine,
+        rd: *Round,
+        ch: *const Chunk,
+        cs: *const Caches,
+        rings: []const u64,
+        cy: *Carry,
+        li: usize,
+        end: usize,
+        key: Key,
+        start: Carry,
+        marks: usize, // the profile's marks at the start (rd.timer)
+
+        pub fn body(s: *Site) !void {
+            return stretch(s.e, s.rd, s.ch, s.cs, s.rings, s.cy, s.li, s.end, null);
+        }
+
+        /// A capture cut short: the forks it opened closed (their events were in the dropped graph).
+        pub fn abort(s: *Site) void {
+            s.rd.abortCapture(s.e);
+        }
+
+        /// The stretch's start back after a capture that recorded some or all of it: its Carry, kk, the candidate
+        /// flags, no open fork (a stretch starts joined) and the profile's marks.
+        pub fn undo(s: *Site) void {
+            s.cy.* = s.start;
+            s.rd.kk = s.start.kk;
+            s.rd.has_cand = s.start.has_cand;
+            s.rd.has_cblk = s.start.has_cblk;
+            s.rd.abortCapture(s.e);
+            if (s.rd.timer) |t| t.n = s.marks;
+        }
+
+        pub fn value(s: *Site, exec: cuda.graph.Exec) Entry {
+            return .{ .exec = exec, .start = s.start, .end = s.cy.* };
+        }
+
+        pub fn fellBack(s: *Site, err: ?anyerror, left: u32) void {
+            std.log.warn("dsv41: the CUDA graph capture of rows {d} bucket {d} stretch {d} failed ({s}): every rank runs it eagerly for its next {d} uses, then captures it again (logged once a stretch)", .{ s.key.rows, s.key.bucket, s.key.stretch, if (err) |x| @errorName(x) else "on another rank", left });
+        }
+
+        pub fn failed(s: *Site, err: ?anyerror) void {
+            const k = s.key;
+            if (err) |x| {
+        }
+    };
 };
 
 /// A round of these rows through every layer and the head: rd.logits [R, vocab] and rd.taps. The caches (ring, the

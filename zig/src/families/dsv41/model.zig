@@ -727,6 +727,7 @@ pub fn startSettings(o: Options) prompt2d.Settings {
     mxk: ?mx.Kernels = null, // Format.native: DeepSeek's own FP8 / MXFP4 checkpoint's kernels (mx.zig)
     rope_buf: cuda.DeviceBuffer,
     arena: prompt.Arena,
+    graph_fallbacks: std.atomic.Value(u64) = .init(0), // either kind's work run eagerly after a failed capture (/metrics)
     // Track B (TF_DS_SAMPLE_CAND=1): a round's candidates on the device (vals f32, ids i64, flags i32; max_rows rows of
     // sampling.max_candidates) and on the host
     cand: u64 = 0,
@@ -741,6 +742,7 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
         if (std.c.getenv("TF_DS_L2_DN_MB")) |v| round.l2_dn_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dn_mb;
         if (std.c.getenv("TF_DS_L2_DEC_MB")) |v| round.l2_dec_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dec_mb;
+        m.graph_fallbacks = .init(0);
         // rank 0's ports for its followers listen before its weights load: a follower that loads first connects and
         // waits in its port's backlog instead of retrying until rank 0 and the followers before it are in
         m.fan = try prompt2d.Fan.listenAt(o.master, o.listen, o.port, o.rank, o.world);
@@ -794,6 +796,16 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         logPdlControls(m.comm.rank);
         if (m.mxk) |*x| m.eng.mx = x;
         m.cand = try m.arena.take(round.max_rows * (sampling.max_candidates * 12 + 4));
+        m.eng.agree_flag = try m.arena.take(64); // G0.3: the graph captures' agreement bytes (agreeAll, agreeCapture)
+        if (o.graphs) {
+            m.graphs = round.Graphs.init(gpa, o.graph_cap);
+            m.graphs.?.lazy.fallbacks = &m.graph_fallbacks;
+        }
+        if (o.side) try m.rd.useSide(&m.eng);
+                m.pgraphs.?.lazy.fallbacks = &m.graph_fallbacks;
+                m.dr.?.graphs = &m.pgraphs.?;
+            }
+        }
         if (c.vision and c.format == .exl3) { // (Format.native: the checkpoint's own gate.bias_vl, loaded with the weights)
             const path = o.vision_bias orelse try std.fs.path.join(a, &.{ o.kit_dir, "vision", "gate_bias_vl.safetensors" });
             m.loadVisionBias(path) catch |err| if (o.vision_bias != null or err != error.FileNotFound) return err;

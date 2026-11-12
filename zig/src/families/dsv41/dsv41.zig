@@ -94,6 +94,7 @@ test {
     refAll(text);
     refAll(round);
     refAll(@import("graph_cache.zig"));
+    refAll(@import("graph_fallback.zig"));
     refAll(round2d);
     refAll(draft2d);
     refAll(markov_tokens);

@@ -26,6 +26,7 @@ const exl3_experts2d = @import("exl3_experts2d.zig");
 const ops = @import("ops.zig");
 const cublas = @import("cublas.zig");
 const comm = @import("comm.zig");
+const graph_fallback = @import("graph_fallback.zig");
 const engram = @import("engram.zig");
 const engram_io = @import("engram_io.zig");
 const engram_aio = @import("engram_aio.zig");
@@ -126,14 +127,40 @@ pub const Arena = struct {
     }
 };
 
+/// The kinds of CUDA graphs: a round's stretches (round.Graphs), the drafter's passes (draft.PassGraphs).
+pub const CaptureKind = enum { round, pass };
+
 /// TF_DS_GRAPH_FAIL_TEST=RANK:N (round graphs) or RANK:N:pass (the drafter's pass graphs): a test of G0.3, never in
 /// service: rank RANK's Nth capture of that kind reports a failed instantiate (its graph dropped). Unset: never.
+pub fn injectedCaptureFailure(kind: CaptureKind, rank: u32, nth: u64) bool {
     const v = std.mem.span(std.c.getenv("TF_DS_GRAPH_FAIL_TEST") orelse return false);
     var it = std.mem.splitScalar(u8, v, ':');
     const r = std.fmt.parseInt(u32, it.next() orelse return false, 10) catch return false;
     const n = std.fmt.parseInt(u64, it.next() orelse return false, 10) catch return false;
+    const want: CaptureKind = if (it.next()) |x| (if (std.mem.eql(u8, x, "pass")) .pass else return false) else .round;
     return r == rank and n == nth and want == kind;
 }
+
+/// injected failure.
+pub const CaptureRanks = struct {
+    e: *const Engine,
+    kind: CaptureKind,
+
+    pub fn agreeAll(r: CaptureRanks, ok: bool) !bool {
+        return r.e.agreeAll(ok);
+    }
+
+    pub fn agreeCapture(r: CaptureRanks, stage: graph_fallback.Stage, recorded: u32) !graph_fallback.Outcome {
+        return r.e.agreeCapture(stage, recorded);
+    }
+
+    pub fn calls(_: CaptureRanks) u32 {
+    }
+
+    pub fn injected(r: CaptureRanks, nth: u64) bool {
+        return injectedCaptureFailure(r.kind, r.e.comm.rank, nth);
+    }
+};
 
 /// A RoPE kind's tables on the device: cos, sin fp32 [rows, rope_dim / 2] (ops.RopeTables' rows).
 pub const Rope = struct { cos: u64, sin: u64 };
@@ -160,6 +187,7 @@ pub const Engine = struct {
     ring: ?*rdma.Ring = null, // TP2: the decode-size all-gathers over the RDMA ring (the served lane's), else NCCL
     par: ?*const exl3_experts2d.ParKernels = null, // the parity split's gate / up in one launch (null: the served two)
     mx: ?*const mx.Kernels = null, // Format.native: DeepSeek's own FP8 / MXFP4 checkpoint's kernels (mx.zig)
+    agree_flag: u64 = 0, // device bytes for agreeAll and agreeCapture (64: Model.init, layer_main); 0 at world > 1: they refuse
 
     /// G0.3 (docs/UNIFIED-DECODE-IMPROVEMENTS.md): whether `ok` holds on every rank, after a graph capture and
     /// failure), read after a synchronize. Called in the same order on every rank (a new graph key comes up at the same
@@ -175,6 +203,17 @@ pub const Engine = struct {
         return v[0] == 0;
     }
 
+    /// The ranks' vote on a capture, after it and before any launch (graph_fallback: keep the graphs, run the work
+    /// rank decides the same. Called in the same order on every rank, as agreeAll. World 1: this rank's own ballot.
+    pub fn agreeCapture(e: *const Engine, stage: graph_fallback.Stage, recorded: u32) !graph_fallback.Outcome {
+        const mine = graph_fallback.ballot(stage, recorded);
+        if (e.comm.world <= 1) return graph_fallback.decide(mine);
+        if (e.agree_flag == 0) return error.NoAgreeFlag;
+        try e.s.synchronize(); // (also the end of the copy from `mine`, on this stack)
+        var v: [graph_fallback.ballot_len]u8 = undefined;
+        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&v, e.agree_flag, v.len), "cuMemcpyDtoH");
+        return graph_fallback.decide(v);
+    }
 
     /// A decode-size all-gather of `count` fp32 a rank into `dst`, rank after rank: the RDMA ring when the engine has
     /// one and the slice fits a slot (whole float4s), else NCCL. The same bytes either way.

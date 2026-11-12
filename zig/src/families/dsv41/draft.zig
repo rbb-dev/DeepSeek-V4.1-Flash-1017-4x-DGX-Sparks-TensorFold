@@ -25,6 +25,7 @@ const mx = @import("mx.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const markov_tokens = @import("markov_tokens.zig");
 const draft2d = @import("draft2d.zig");
+const graph_fallback = @import("graph_fallback.zig");
 
 const Engine = prompt.Engine;
 const Chunk = prompt.Chunk;
@@ -262,8 +263,10 @@ const MarkovGather = struct {
 pub const PassGraphs = struct {
     gpa: std.mem.Allocator,
     map: std.AutoHashMapUnmanaged(Key, cuda.graph.Exec) = .empty,
+    lazy: Lazy = .{}, // the passes held eager after a failed capture, the captures attempted (TF_DS_GRAPH_FAIL_TEST=RANK:N:pass)
 
     pub const Key = struct { streams: u32, steps: u32 };
+    const Lazy = graph_fallback.Lazy(graph_fallback.Cuda, Key);
 
     pub fn init(gpa: std.mem.Allocator) PassGraphs {
         return .{ .gpa = gpa };
@@ -273,6 +276,7 @@ pub const PassGraphs = struct {
         var it = g.map.valueIterator();
         while (it.next()) |x| x.deinit();
         g.map.deinit(g.gpa);
+        g.lazy.deinit(g.gpa);
         g.* = undefined;
     }
 
@@ -297,12 +301,53 @@ pub const PassGraphs = struct {
         errdefer exec.deinit();
         try g.map.put(g.gpa, key, exec);
         try exec.launchOn(e.s);
+        // G0.3, as round.Graphs.run: every rank captures and instantiates, then all agree before any launch
+        // (graph_fallback: launch and keep, every rank eager, or the pass failed on every rank)
+        var site: Site = .{ .dr = dr, .e = e, .ch = ch, .pool = pool, .N = N, .steps = steps };
+        try g.lazy.run(g.gpa, e.s, key, &site, Store{ .g = g }, prompt.CaptureRanks{ .e = e, .kind = .pass });
     }
+
+    /// The map as Lazy's store: room for one more pass before the ranks vote, and a launched one kept.
+    const Store = struct {
+        g: *PassGraphs,
+
+        pub fn reserve(st: Store, gpa: std.mem.Allocator) !void {
+            try st.g.map.ensureUnusedCapacity(gpa, 1);
         }
+
+        pub fn keep(st: Store, key: Key, x: cuda.graph.Exec) void {
+            st.g.map.putAssumeCapacity(key, x);
         }
     };
+
+    /// A pass as Lazy's site. It changes no host state as it records (its inputs are uploaded before it; it has no
+    /// side stream), so a failed capture has nothing to put back.
+    const Site = struct {
+        dr: *Drafter,
+        e: *const Engine,
+        ch: *const Chunk,
+        pool: *const Pool,
+        N: usize,
+        steps: usize,
+
+        pub fn body(s: *Site) !void {
+            return s.dr.body(s.e, s.ch, s.pool, s.N, s.steps, null);
         }
+
+        pub fn abort(_: *Site) void {}
+
+        pub fn undo(_: *Site) void {}
+
+        pub fn value(_: *Site, exec: cuda.graph.Exec) cuda.graph.Exec {
+            return exec;
         }
+
+        pub fn fellBack(s: *Site, err: ?anyerror, left: u32) void {
+            std.log.warn("dsv41: the drafter pass graph of {d} streams, {d} steps failed ({s}): every rank runs it eagerly for its next {d} uses, then captures it again (logged once a pass)", .{ s.N, s.steps, if (err) |x| @errorName(x) else "on another rank", left });
+        }
+
+        pub fn failed(s: *Site, err: ?anyerror) void {
+            if (err) |x| {
 };
 
 pub const Drafter = struct {
