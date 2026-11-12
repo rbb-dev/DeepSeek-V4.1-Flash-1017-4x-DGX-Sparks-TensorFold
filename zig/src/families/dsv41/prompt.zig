@@ -42,6 +42,14 @@ const round = @import("round.zig");
 /// steps marked inside their phases (a_in, a_q, a_idx, a_core, a_woa; m_rt, m_gu, m_x), the rest of each in its own.
 pub var ptimer: ?*round.PhaseTimer = null;
 
+/// The monotonic clock (ns), for the engramWorker thread: no
+/// std.Io handle reaches that thread, so this calls libc directly rather than going through Model.now's std.Io path.
+fn nowNs() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
+}
+
 fn pmark(e: *const Engine, p: round.PhaseTimer.Phase) void {
     if (ptimer) |t| t.mark(e.s, p) catch {};
 }
