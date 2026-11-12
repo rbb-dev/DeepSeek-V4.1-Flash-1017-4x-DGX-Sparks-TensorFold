@@ -78,10 +78,40 @@ pub const Engine = struct {
         return n;
     }
 
-    pub const addStream = open.add;
-    pub const opened = open.opened;
-    pub const fills = open.fills;
-    pub const fillStream = open.fillStream;
+    /// Prefill a stream, draw its first token and ask for its first drafts; it takes part from the next round.
+    pub fn addStream(e: *Engine, s: *Stream) !void {
+        _ = e.arena.reset(.retain_capacity);
+        try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
+        e.backend.prefill(s) catch |err| {
+        try e.prefilled(s);
+    }
+
+    /// Whether this backend can return to admission between prompt chunks.
+    pub fn fills(e: *const Engine) bool {
+        return e.backend.vtable.prefill_step != null;
+    }
+
+    /// One prompt chunk; a completed prompt joins the ordinary lane rounds with the same first-token path.
+    pub fn fillStream(e: *Engine, s: *Stream, first: bool) !bool {
+        _ = e.arena.reset(.retain_capacity);
+        if (first) try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
+        const done = e.backend.vtable.prefill_step.?(e.backend.ptr, s) catch |err| {
+            return err;
+        };
+        if (!done) return false;
+        try e.prefilled(s);
+        return true;
+    }
+
+    fn prefilled(e: *Engine, s: *Stream) !void {
+        if (s.isCancelled()) { // cancelled in its last chunk: no first token
+            e.backend.release(s);
+            return error.Cancelled;
+        }
+        s.context.shrinkRetainingCapacity(s.prompt_len);
+        s.pending = null;
+        s.cache_len = s.prompt_len;
+        const position: u64 = s.prompt_len;
 
     /// Take over a stream another driver decoded so far: its cache settled, `pending` and `cache_len` set, no drafts held.
     pub fn adopt(e: *Engine, s: *Stream) !void {

@@ -200,6 +200,12 @@ const Host = struct {
     /// The family's backend, each call made with the context current on the calling thread.
     fn backend(h: *Host) lanes.backend.Backend {
         h.vtable = lane_backend.vtable(Host, h.inner.vtable.*);
+            .prefill_step = if (v.prefill_step != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream) anyerror!bool {
+                    const x = bind(p);
+                    return x.inner.vtable.prefill_step.?(x.inner.ptr, s);
+                }
+            }.f else null,
         return .{ .ptr = h, .vtable = &h.vtable };
     }
 };
@@ -605,4 +611,21 @@ test "a cancel during a long prompt stops it, and the next request's reply is un
         try history.append(gpa, t);
     }
     try std.testing.expectEqual(@as(usize, 40), restored.tokens.items.len);
+}
+
+test "the CUDA context wrapper forwards bounded prefill and keeps its capability optional" {
+    const gpa = std.testing.allocator;
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var h: Host = undefined;
+    h.gpu = null;
+    h.inner = target.backend();
+    try std.testing.expect(h.backend().vtable.prefill_step == null);
+    h.inner = target.chunkedBackend();
+    const be = h.backend();
+    var s = try lanes.Stream.init(gpa, .{ .id = "partial", .prompt = &.{ 1, 2, 3, 4, 5 }, .max_new = 1 });
+    defer s.deinit(gpa);
+    defer be.release(&s);
+    try std.testing.expect(!try be.vtable.prefill_step.?(be.ptr, &s));
+    try std.testing.expect(try be.vtable.prefill_step.?(be.ptr, &s));
 }

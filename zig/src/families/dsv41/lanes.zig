@@ -349,6 +349,20 @@ const Lane = struct {
     nheld: usize = 0,
 };
 
+/// Host-owned prompt progress; the KV rows and rings already live in its slot between chunks.
+const Fill = struct {
+    start: usize,
+    replay: usize,
+    last_end: usize,
+    spans: std.ArrayList(@import("prompt.zig").Span),
+    rows: std.ArrayList(u8),
+
+    fn deinit(f: *Fill, gpa: std.mem.Allocator) void {
+        f.spans.deinit(gpa);
+        f.rows.deinit(gpa);
+    }
+};
+
 extern "c" fn exp(x: f64) f64;
 
 /// A kept prompt state (the prompt cache's saved state, kept at a chunk end the prompt pass reached before its
@@ -427,6 +441,8 @@ pub const Lanes = struct {
     sc: [max_rows]lanes.config.Cost = undefined, // the shared forwards' costs (init)
     used: [max_streams]bool = @splat(false),
     seqs: [max_streams]std.ArrayList(i32) = @splat(.empty),
+    fills: [max_streams]?Fill = @splat(null),
+    filling_slot: ?usize = null,
     built: Built = .{},
     prof: ?Profile = null,
     fix_k: ?usize = null, // a measurement (tf-dsv41-lanes --fix-k): K drafts a stream, chances 1 to K and 0 past it
@@ -484,6 +500,7 @@ pub const Lanes = struct {
             self.m.unwatch(); // (the followers end on done: their links close)
             self.send(.done) catch {};
         }
+        for (&self.fills) |*f| if (f.*) |*x| x.deinit(self.gpa);
         self.streams.deinit(self.gpa);
         for (&self.seqs) |*q| q.deinit(self.gpa);
         self.wire.deinit(self.gpa);
@@ -665,78 +682,49 @@ pub const Lanes = struct {
     /// A prompt pass's rows at most when it starts at `start`.
     pub fn passCap(self: *const Lanes, start: usize) usize {
         return if (start < self.pass_from) model.resume_rows else self.pass_rows;
+        while (!try prefillStep(ptr, s)) {
+        }
     }
 
-    fn prefillPart(self: *Lanes, s: *lanes.Stream, chunks: usize) !bool {
+    fn fillImages(self: *Lanes, spans: []const @import("prompt.zig").Span, rows: []const u8) !void {
+        const gpa = self.gpa;
         const m = self.m;
-        const t0 = m.now();
-        defer if (self.prof) |*p| {
-            p.prefill += m.now() - t0;
-        };
-        const f = self.fillOf(s) orelse blk: {
-            if (!self.fill_many and self.anyFill()) return error.FillBusy;
-            try self.fillOpen(s);
-            break :blk self.fillOf(s).?;
-        };
-        errdefer self.dropFill(f.slot);
-        if (self.cur != f.slot) try self.fillSwitch(f);
-        const seq = self.seqs[f.slot].items;
-        m.fill_seq = seq;
-        // a round may run before the next piece: the read-ahead done and the prompt's ids gone, as rank 1 does at its frame
-        defer {
-            m.joinAhead();
-            m.fill_seq = &.{};
-        }
-        var ran: usize = 0;
-        // past its chunks the pass runs on while nothing else waits (s.shares), so a pass alone runs as a whole one
-        while (f.start < f.len and (ran < chunks or !s.shares())) : (ran += 1) {
-            const start = f.start;
-            const len = f.len;
-            if (start > 0 and s.isCancelled()) return error.Cancelled;
-            const n = cutAtKeep(s.reuse.marks, f.last_end, f.replay, len, start, @min(self.passCap(start), len - start));
-            m.next_rows = self.passCap(start + n);
-            if (try self.begin(.fill_chunk)) {
-                try self.wire.int(self.gpa, u64, start);
-                try self.wire.int(self.gpa, u32, @intCast(n));
-                try self.wire.int(self.gpa, u64, f.replay);
-                try self.flush();
+        if (spans.len > 0) {
+            // the spans and their rows, image_piece bytes of rows a frame (a follower's frame buffer holds 64 KiB and
+            // the ids of a full pool)
+            var off: usize = 0;
+            while (off < rows.len) {
+                const n = @min(image_piece, rows.len - off);
+                if (try self.begin(.fill_images)) {
+                    try self.wire.int(gpa, u32, @intCast(spans.len));
+                    for (spans) |sp| {
+                        try self.wire.int(gpa, u64, sp.at);
+                        try self.wire.int(gpa, u64, sp.len);
+                    }
+                    try self.wire.int(gpa, u64, off);
+                    try self.wire.buf.appendSlice(gpa, rows[off..][0..n]);
+                    try self.flush();
+                }
+                off += n;
             }
-            f.head = try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
-            f.start += n;
-            if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
-        }
-        if (f.start < f.len) return false;
-        const done = f.*;
-        self.dropFill(done.slot);
-        if (self.prof) |*p| p.prefills += 1;
-        if (!done.head) return error.NoPromptLogits;
-        const logits = try m.promptLogitsHost();
-        if (logits_sha) {
-            var dg: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &dg, .{});
-            std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\"}}\n", .{ s.id, std.fmt.bytesToHex(dg, .lower) });
-        }
-        const token = try draw(logits, done.len, s.sampling);
-        self.streams.getPtr(s).?.first = self.take(token);
-        // a stream with a grammar: the row stays for its first token's draw among the grammar's tokens
-        if (s.grammar != null) {
-            self.first_row = try self.gpa.realloc(self.first_row, logits.len);
-            @memcpy(self.first_row, logits);
-            self.first_of = s;
+            try m.setImages(spans, rows);
         }
         return true;
     }
 
-    /// A prompt pass's start: its slot and extent, its images, rank 1's fill and the kept state it resumes from.
-    fn fillOpen(self: *Lanes, s: *lanes.Stream) !void {
+    /// Placement, image encoding and a cached restore happen once, before this prompt's first chunk.
+    fn startFill(self: *Lanes, s: *lanes.Stream) !void {
         const m = self.m;
         const gpa = self.gpa;
+        m.joinAhead();
+        m.fill_seq = &.{};
+        self.filling_slot = null; // a failed setup must not leave another prompt's slot falsely selected
         const ids = s.prompt();
         const len = ids.len;
         if (len == 0) return error.EmptyPrompt;
         const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
         if (size > m.ctx_cap) return error.PromptTooLong;
-        if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
+        releaseFn(self, s);
         const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
         var taken: [max_streams][2]usize = undefined;
         var nt: usize = 0;
@@ -790,9 +778,9 @@ pub const Lanes = struct {
         // its rows ready (a gate's) or the tower's (rank 0), all of them sent to rank 1 after the fill's start; an image
         // the kept state holds whole needs no rows (the pass resumes past it)
         var spans: std.ArrayList(@import("prompt.zig").Span) = .empty;
-        defer spans.deinit(gpa);
+        errdefer spans.deinit(gpa);
         var rows: std.ArrayList(u8) = .empty;
-        defer rows.deinit(gpa);
+        errdefer rows.deinit(gpa);
         if (s.lane_images.len > 0) {
             const image_id = m.cfg.image_token orelse return error.NoVision;
             const row_bytes = m.cfg.hidden * 2;
@@ -825,16 +813,7 @@ pub const Lanes = struct {
             try self.flush();
         }
         try m.fillBegin(slot, base);
-        self.cur = slot;
-        if (spans.items.len > 0) {
-            try self.sendImages(spans.items, rows.items);
-            try m.setImages(spans.items, rows.items);
-            if (self.fill_many) { // kept for a switch back to this pass
-                const im = &self.imgs[slot];
-                try im.spans.appendSlice(gpa, spans.items);
-                try im.rows.appendSlice(gpa, rows.items);
-            }
-        }
+        try self.fillImages(spans.items, rows.items);
         const replay = len -| m.cfg.window;
         var start: usize = 0;
         if (kept) |sn| {
@@ -862,35 +841,76 @@ pub const Lanes = struct {
         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
         if (position != s.prompt_len) return error.PositionMismatch;
         return l.first;
+        self.fills[slot] = .{
+            .start = start,
+            .replay = replay,
+            .last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows,
+            .spans = spans,
+            .rows = rows,
+        };
+        self.filling_slot = slot;
     }
 
-    /// `first` among a grammar's tokens: the prompt's last row (the prompt pass kept it for the stream) drawn again
-    /// with the other tokens at -inf, at the same keyed position.
-    fn firstMaskedFn(ptr: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
+    /// Select a partially filled slot on every rank, without resending its full prompt or re-encoding its images.
+    fn selectFill(self: *Lanes, slot: usize, base: usize) !void {
+        const m = self.m;
+        if (self.filling_slot != slot) {
+            self.filling_slot = null;
+            m.joinAhead();
+            m.fill_seq = &.{};
+            if (try self.begin(.fill_resume)) {
+                try self.wire.int(self.gpa, u32, @intCast(slot));
+                try self.wire.int(self.gpa, u64, base);
+                try self.flush();
+            }
+            try m.fillBegin(slot, base);
+            const f = &self.fills[slot].?;
+            try self.fillImages(f.spans.items, f.rows.items);
+            self.filling_slot = slot;
+        }
+        m.fill_seq = self.seqs[slot].items;
+    }
+
+    /// One unchanged 2048-row chunk. Other prompts and decode rounds can run before its next chunk.
+    fn prefillStep(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
         const self = of(ptr);
-        _ = self.streams.getPtr(s) orelse return error.UnknownStream;
-        if (position != s.prompt_len) return error.PositionMismatch;
-        if (self.first_of != s) return error.NoPromptRow;
-        return self.take(try self.drawAllowed(self.first_row, position, s.sampling, mask));
+        const m = self.m;
+        const gpa = self.gpa;
+        const t0 = m.now();
+        defer if (self.prof) |*p| {
+            p.prefill += m.now() - t0;
+        };
+        errdefer {
+            m.joinAhead();
+            m.fill_seq = &.{};
+        }
+        if (s.isCancelled()) return error.Cancelled;
+        if (!self.streams.contains(s)) try self.startFill(s);
+        const lane = self.streams.get(s).?;
+        try self.selectFill(lane.slot, lane.base);
+        const f = &self.fills[lane.slot].?;
+        const seq = &self.seqs[lane.slot];
+        const len = s.prompt_len;
+            try self.wire.int(gpa, u64, f.start);
+            try self.wire.int(gpa, u32, @intCast(n));
+            try self.wire.int(gpa, u64, f.replay);
+            try self.flush();
+        }
+        if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and
+            (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
+        if (f.start < len) {
+                m.fill_seq = &.{};
+            return false;
+        }
+        m.joinAhead();
+        m.fill_seq = &.{};
+        if (!head) return error.NoPromptLogits;
+        f.deinit(gpa);
+        self.fills[lane.slot] = null;
+        if (self.prof) |*p| p.prefills += 1;
+        return true;
     }
 
-    /// The held drafts as host tokens in window order (a grammar walks them): draft holds them when its pass ends.
-    fn heldFn(ptr: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
-        const self = of(ptr);
-        const l = self.streams.getPtr(s) orelse return error.UnknownStream;
-        if (out.len > l.nheld) return error.HeldMismatch;
-        @memcpy(out, l.held[0..out.len]);
-    }
-
-    /// drawMasked into the backend's row.
-    fn drawAllowed(self: *Lanes, row: []const f32, position: u64, s: ?lanes.Sampling, mask: []const u32) !u32 {
-        self.masked = try self.gpa.realloc(self.masked, row.len);
-        return drawMasked(self.masked, row, position, s, mask);
-    }
-
-    fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
-        _ = .{ ptr, s, feed, position };
-        return error.NotPipelined;
     }
 
     fn readFn(ptr: *anyopaque, handle: u64) anyerror!u32 {
@@ -1227,6 +1247,18 @@ pub const Lanes = struct {
             self.m.joinAhead();
             self.m.fill_seq = &.{};
             self.dropFill(f.slot);
+            const slot = kv.value.slot;
+            if (self.fills[slot]) |*f| {
+                if (self.filling_slot == slot) {
+                    self.m.joinAhead();
+                    self.m.fill_seq = &.{};
+                }
+                f.deinit(self.gpa);
+                self.fills[slot] = null;
+            }
+            if (self.filling_slot == slot) self.filling_slot = null;
+            self.used[slot] = false;
+        }
         surv *= draft.landing(cf);
         o.* = surv;
     }
@@ -1301,7 +1333,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             7 => .snap_drop,
             8 => .fill_images,
             9 => .done,
-            10 => .fill_switch,
+            10 => .fill_resume,
             else => return error.BadFrame,
         };
         if (try r.int(u64) != step) return error.OutOfStep;
@@ -1321,12 +1353,13 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 m.fillBegin(slot, @intCast(base)) catch |err| try refused(m, err);
                 m.fill_seq = seqs[slot].items;
             },
-            .fill_switch => { // another pass's pieces ran: this one's fill state again (rank 0's fillSwitch)
+            .fill_resume => {
                 slot = try r.int(u32);
                 const base = try r.int(u64);
                 if (slot >= max_streams) return error.BadSlot;
                 img_rows.clearRetainingCapacity();
                 m.fillBegin(slot, @intCast(base)) catch |err| try refused(m, err);
+                m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
                 m.fill_seq = seqs[slot].items;
             },
             .fill_chunk => {

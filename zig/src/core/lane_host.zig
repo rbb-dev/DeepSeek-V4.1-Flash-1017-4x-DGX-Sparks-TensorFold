@@ -68,6 +68,7 @@ pub const LaneHost = struct {
     // and frees its extent (its kept state then resumes in place) instead of waiting out every queued pass, as the
     // Python lane's fills leave decoding its share
     finish_until: ?i96 = null,
+    fill_next: usize = 0, // next admitted prompt to advance by one chunk
 
     const Lesson = struct { request: *const api.LearnRequest, sink: api.LearnSink };
     const full_retry_ns: i96 = std.time.ns_per_s;
@@ -275,6 +276,7 @@ pub const LaneHost = struct {
 
     /// Sends a stream's new tokens; true once it has finished and left the lists a status read walks.
     pub fn deliver(h: *LaneHost, job: *Job) bool {
+        if (!job.started or job.prefilled == null) return false;
         h.send(job);
         if (!job.stream.finished) return false;
         h.remove(job);
@@ -355,6 +357,34 @@ pub const LaneHost = struct {
             return true;
         };
         h.unlock();
+        if (h.core.fills()) return true;
+        if (!h.setup(job)) return true;
+        const began = job.began;
+        if (h.loneFits(job)) return h.runLone(job, began);
+        h.core.addStream(&job.stream) catch |e| {
+            if (h.between_failed) |msg| {
+                // a round between this prompt's chunks failed: this job and every admitted one end with its error
+                h.between_failed = null;
+                _ = h.drop(job, msg);
+                h.failAll(msg);
+                return true;
+            }
+            if (e == error.Cancelled) return h.cancel(job);
+            if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
+            return h.drop(job, h.words(e));
+        };
+        h.prefilled(job, began);
+        const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        if (now - began >= long_pass_ns) {
+            h.lock();
+            h.finish_until = now + finish_ns;
+            h.unlock();
+        }
+        return true;
+    }
+
+    /// Look up and consume a kept state in the same engine turn: another prompt may evict it at its next mark.
+    fn setup(h: *LaneHost, job: *Job) bool {
         const r = job.request;
         if (r.background and r.max_tokens == 0 and h.warm_quiet > 0 and !h.quiet(job)) return h.cancel(job); // other work came first: it never ran
         var reuse: lanes.stream.Reuse = .{};
@@ -365,8 +395,10 @@ pub const LaneHost = struct {
             job.marks = l.marks;
             reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
         } else |_| {};
-        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.drop(job, "the drafter could not start");
-        const recall = recalls.reader(h, job);
+        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch {
+            _ = h.drop(job, "the drafter could not start");
+            return false;
+        };
         job.stream = lanes.Stream.init(h.gpa, .{
             .id = "request",
             .prompt = r.prompt,
@@ -404,8 +436,8 @@ pub const LaneHost = struct {
             .lane_images = r.lane_images,
         }) catch {
             job.proposer.deinit();
-            recalls.release(job);
-            return h.drop(job, "out of memory");
+            _ = h.drop(job, "out of memory");
+            return false;
         };
         job.started = true;
         job.fill_on.store(true, .release); // status readers count the fill from here until the pass reports
@@ -437,33 +469,42 @@ pub const LaneHost = struct {
     /// The next filling job's next prompt chunk: the other streams' rounds run between chunks, not after the prompt.
     /// A pass that began waits out Info.fill_rounds of those rounds between two of its steps (none when none decodes).
     fn fillOne(h: *LaneHost) void {
-        if (h.filling.items.len == 0) return;
-        const at = fill.next(h);
-        const job = h.filling.items[at];
-        if (job.fill_began and h.fill_since < h.info_.fill_rounds and h.core.activeCount() > 0) return;
-        h.fill_since = 0;
-        const first = !job.fill_began;
-        job.fill_began = true;
-        const done = h.core.fillStream(&job.stream, first) catch |e| {
-            _ = switch (e) {
-                error.Cancelled => h.cancel(job),
-                error.LaneMemory => blk: {
-                    fill.unfill(h, job);
-                    break :blk h.requeue(job);
-                },
-                // a pass the pool cannot place yet while other streams run waits for one of them, as admitOne's does
-                error.ContextFull => if (first and h.core.activeCount() > 0) blk: {
-                    fill.unfill(h, job);
-                    break :blk h.requeueFull(job);
-                } else h.drop(job, h.words(e)),
-                else => h.drop(job, h.words(e)),
-            };
+        if (!h.core.fills()) return;
             return;
         };
         if (!done) return;
         _ = h.filling.orderedRemove(at);
         h.prefilled(job, job.began);
         _ = h.deliver(job);
+        const job = h.admitted.items[i];
+        h.fill_next = i + 1;
+        const first = !job.started;
+            if (e == error.Cancelled) {
+                _ = h.cancel(job);
+            } else if (e == error.ContextFull and h.admitted.items.len > 1) {
+                _ = h.requeue(job);
+            } else {
+                _ = h.drop(job, h.words(e));
+            }
+            return;
+        };
+        job.reported(); // the first step restored it; no dangling cache entry across another prompt's keep
+        if (done) {
+            h.prefilled(job, job.began);
+        }
+        }
+    }
+
+    fn filling(h: *const LaneHost) bool {
+        if (!h.core.fills()) return false;
+        for (h.admitted.items) |job| if (job.prefilled == null) return true;
+        return false;
+    }
+
+    /// Whether an admitted stream decodes within finish_left tokens of its max_tokens (the lock held).
+    fn nearEnd(h: *LaneHost) bool {
+        for (h.admitted.items) |job| if (job.started and !job.stream.finished and job.stream.budgetLeft() <= finish_left) return true;
+        return false;
     }
 
     /// A reply's grammar from the server's compiler (Info.structures engines get requests that carry one).
@@ -669,6 +710,16 @@ pub const LaneHost = struct {
             while (i < h.admitted.items.len) {
                 const job = h.admitted.items[i];
                 if (h.deliver(job)) continue; // it left the list: the next job slid into slot i
+            if (job.started and !job.stream.finished) h.core.discard(&job.stream);
+            h.finish(job, .failed, message);
+        }
+        h.gpa.free(jobs);
+    }
+
+    fn closeAll(h: *LaneHost) void {
+        h.lock();
+        for (h.queued.items) |job| h.cancels.append(h.gpa, job.id) catch {};
+        for (h.admitted.items) |job| h.cancels.append(h.gpa, job.id) catch {};
                 i += 1;
             }
             lone.reclaim(h);
@@ -690,4 +741,6 @@ fn depthsOf(s: *const lanes.Stream) [api.draft_depths]api.DraftDepth {
 
 test {
     _ = @import("lane_host_test.zig");
+}
+
 }

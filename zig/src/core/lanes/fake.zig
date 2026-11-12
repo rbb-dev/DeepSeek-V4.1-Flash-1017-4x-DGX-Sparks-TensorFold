@@ -78,11 +78,37 @@ pub const Fake = struct {
 
     pub fn backend(x: *Fake) be.Backend {
         return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .alternatives = alternatives, .held = heldDrafts, .reports_fill = true } };
+    /// The same target, advancing four prompt tokens per host visit.
+    pub fn chunkedBackend(x: *Fake) be.Backend {
     }
 
-    /// The same target filling its prompt a chunk a call (`prefill_chunks`), as a backend with `prefill_step`.
-    pub fn stepped(x: *Fake) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .reports_fill = true } };
+    fn prefillStep(ptr: *anyopaque, s: *Stream) anyerror!bool {
+        const x = self(ptr);
+        if (x.refuse_sampled and s.sampling != null) return error.SamplingRefused;
+        if (s.isCancelled()) return error.Cancelled;
+        if (x.refuse_full > 0 and x.lanes.count() > 0 and !x.lanes.contains(s)) {
+            x.refuse_full -= 1;
+            return error.ContextFull;
+        }
+        const got = try x.lanes.getOrPut(x.gpa, s);
+        if (!got.found_existing) {
+            got.value_ptr.* = .{};
+            s.cached = 0;
+            if (s.reuse.saved) |saved| {
+                const kept: *std.ArrayList(u32) = @ptrCast(@alignCast(saved));
+                try got.value_ptr.history.appendSlice(x.gpa, kept.items);
+                s.cached = s.reuse.at;
+            }
+        }
+        const h = &got.value_ptr.history;
+        const begin = h.items.len;
+        x.prefill_count += 1;
+        if (x.prefill_hook) |hook| hook(x.prefill_hook_ctx.?, s, begin / 4);
+        for (s.prompt()[begin..end], begin + 1..) |t, at| {
+            try h.append(x.gpa, t);
+            if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(at));
+        }
+        return end == s.prompt_len;
     }
 
     /// `stepped` as a backend that holds one prompt pass at a time (`prefill_one`).
