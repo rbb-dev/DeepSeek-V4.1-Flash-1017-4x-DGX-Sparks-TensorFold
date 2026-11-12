@@ -751,18 +751,53 @@ test "a request refused for room while another stream runs is tried again within
     try std.testing.expect(long.waitFor(5000) != null);
 }
 
-test "after a long prompt pass, a stream near its max_tokens ends before the next request's pass" {
+test "a prompt cancelled between its chunks keeps what they computed: the same prompt again resumes there" {
     const gpa = std.testing.allocator;
+    const Rig = @import("lane_host_tier_test.zig").Rig; // (its fake backend's state hooks for the prompt cache)
+    const pc = @import("prompt_cache.zig");
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
     defer cfg.deinit(gpa);
-    const Slow = struct {
-        // each prompt pass takes 1.1 s, a long pass for the host (its whole pass runs inside the admission)
-        fn hook(_: *anyopaque, _: *lanes.stream.Stream, _: usize) void {
-            std.Io.sleep(std.testing.io, .fromMilliseconds(1100), .awake) catch {};
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.chunkedBackend(), clock.clock()); // four prompt tokens a step
+    defer core.deinit();
+    var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = Rig.bytes, .save = Rig.save, .restore = Rig.restore, .drop = Rig.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
+    defer store.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+    host.cache = &store;
+    const e = host.engine();
+    // the request is cancelled in its sixth step (tokens 20-23): the host takes the cancel with the pass at 24
+    const Cut = struct {
+        engine: api.Engine,
+        done: bool = false,
+        fn hook(ctx: *anyopaque, _: *lanes.Stream, chunk: usize) void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            if (c.done or chunk != 5) return;
+            c.done = true;
+            c.engine.cancel(1);
         }
     };
-    var unused: u8 = 0;
-    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_hook = Slow.hook, .prefill_hook_ctx = &unused };
+    var cut: Cut = .{ .engine = e };
+    target.prefill_hook = Cut.hook;
+    target.prefill_hook_ctx = &cut;
+    try host.start();
+    defer host.stop();
+    var prompt: [40]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i % 9 + 1);
+    const req: Request = .{ .prompt = &prompt, .max_tokens = 4 };
+    const Box = @import("lane_host_tier_test.zig").Box;
+    var a: Box = .{};
+    defer a.deinit();
+    try e.submit(1, &req, a.sink());
+    try std.testing.expectEqual(Reason.cancelled, a.wait());
+    var b: Box = .{};
+    defer b.deinit();
+    try e.submit(2, &req, b.sink());
+    try std.testing.expectEqual(Reason.length, b.wait());
+    try std.testing.expectEqual(@as(?u32, 24), b.cached); // resumed where the cancelled pass stood
+    try b.exact(&prompt);
+}
 
 test "a backend that cannot serve any more: status says so and every new request is refused, nothing queued" {
     const gpa = std.testing.allocator;

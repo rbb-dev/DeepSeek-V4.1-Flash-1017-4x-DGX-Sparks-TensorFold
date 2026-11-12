@@ -83,6 +83,9 @@ pub const Backend = struct {
         /// 25-128 ms): `work` set, or null to clear it. A backend that has such a wait runs it once a round; null: the host does the work
         /// where it was (after the round).
         overlap: ?*const fn (ptr: *anyopaque, work: ?Overlap) void = null,
+        /// A stream cancelled in its prompt pass, before its release: keep the state its finished chunks reached
+        /// (Stream.keepInterrupted), so the same prompt again resumes there. No prompt work runs; null: nothing kept.
+        cancel_prefill: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!void = null,
         /// Draw the first token from the prompt's last row at `position`; a handle to it.
         first: *const fn (ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64,
         /// Feed one token and queue the draw of the next at `position` (a one-token round); a handle to it.

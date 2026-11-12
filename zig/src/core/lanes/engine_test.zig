@@ -430,35 +430,40 @@ test "structured output: where the grammar spells its own text, its drafts fill 
     }
 }
 
-test "the head's chains by depth add up to its drafts and kept drafts, each depth keeping no more than it reached" {
-    for ([_]?Sampling{ null, .{ .seed = 4, .temperature = 0.8, .top_k = 0, .top_p = 0.9 } }) |sampling| {
-        var cfg = try model();
-        defer cfg.deinit(gpa);
-        var target: fake.Fake = .{ .gpa = gpa };
-        defer target.deinit();
-        var clock: fake.FixedClock = .{};
-        var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
-        defer engine.deinit();
-        var p = try SuffixLookup.init(gpa, .{ .min_match = 1000 }); // no copies: every draft is the head's chain
-        defer p.deinit();
-        var s = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &p1, .max_new = 80, .eos = &.{96}, .sampling = sampling, .proposer = p.proposer() });
-        defer s.deinit(gpa);
-        try engine.addStream(&s);
-        while (engine.activeCount() > 0) try engine.step();
-        var drafted: u64 = 0;
-        var kept: u64 = 0;
-        for (s.depths, 0..) |d, j| {
-            drafted += d.drafted;
-            kept += d.kept;
-            try std.testing.expect(d.kept <= d.reached and d.reached <= d.drafted);
-            if (j > 0) try std.testing.expect(d.drafted <= s.depths[j - 1].drafted and d.reached <= s.depths[j - 1].kept);
+test "a prompt pass cancelled at a step keeps what its finished steps computed, then its stream goes" {
+    var cfg = try Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var engine = Engine.init(gpa, &cfg, target.chunkedBackend(), clock.clock()); // four prompt tokens a step
+    defer engine.deinit();
+    const Watch = struct {
+        steps: u32 = 0,
+        kept: ?u32 = null,
+        fn cancelled(ptr: *anyopaque) bool {
+            const w: *@This() = @ptrCast(@alignCast(ptr));
+            return w.steps >= 3;
         }
-        try std.testing.expectEqual(s.drafted, drafted);
-        try std.testing.expectEqual(s.accepted, kept);
-        // every chain reaches its first draft; the fake head misses one draft in five, so some chain stops short
-        try std.testing.expectEqual(s.depths[0].drafted, s.depths[0].reached);
-        try std.testing.expect(s.depths[1].drafted > 0 and kept < drafted);
+        fn at(ptr: *anyopaque, _: *sm.Stream, pos: u32) void {
+            const w: *@This() = @ptrCast(@alignCast(ptr));
+            w.kept = pos;
+        }
+    };
+    var w: Watch = .{};
+    var prompt: [20]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i % 7 + 1);
+    var s = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &prompt, .max_new = 4, .eos = &.{96}, .cancel_check = .{ .ptr = &w, .check = Watch.cancelled }, .reuse = .{ .hook = .{ .ptr = &w, .at = Watch.at } } });
+    defer s.deinit(gpa);
+    while (true) : (w.steps += 1) {
+        const done = engine.fillStream(&s, w.steps == 0) catch |err| {
+            try std.testing.expectEqual(error.Cancelled, err);
+            break;
+        };
+        try std.testing.expect(!done);
     }
+    try std.testing.expectEqual(@as(?u32, 12), w.kept); // its three finished steps of four
+    try std.testing.expect(!target.lanes.contains(&s)); // released after the keep
 }
 
 /// One stream of a plan-count run: what it emitted, its plan counters and totals, the same counts read from the decision

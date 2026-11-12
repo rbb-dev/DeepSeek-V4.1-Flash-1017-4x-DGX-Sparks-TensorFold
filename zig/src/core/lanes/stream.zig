@@ -454,6 +454,13 @@ pub const Stream = struct {
         s.lanes = null;
     }
 
+    /// A cancelled prompt pass keeps its state at `at` (the end of its finished chunks) through the mark hook, as a
+    /// mark there would: only past where it resumed and short of the prompt's end.
+    pub fn keepInterrupted(s: *Stream, at: u32) void {
+        if (at <= s.cached or at >= s.prompt_len) return;
+        if (s.reuse.hook) |hook| hook.at(hook.ptr, s, at);
+    }
+
     pub fn prompt(s: *const Stream) []const u32 {
         return s.context.items[0..s.prompt_len];
     }

@@ -83,6 +83,12 @@ pub const Engine = struct {
         _ = e.arena.reset(.retain_capacity);
         try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
         e.backend.prefill(s) catch |err| {
+            if (err == error.Cancelled) { // the host finishes a cancelled stream without the core
+                e.keepCancelled(s);
+                e.backend.release(s);
+            }
+            return err;
+        };
         try e.prefilled(s);
     }
 
@@ -110,6 +116,10 @@ pub const Engine = struct {
         _ = e.arena.reset(.retain_capacity);
         if (first) try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
         const done = e.backend.vtable.prefill_step.?(e.backend.ptr, s) catch |err| {
+            if (err == error.Cancelled) {
+                e.keepCancelled(s);
+                e.backend.release(s);
+            }
             return err;
         };
         if (!done) return false;
@@ -175,6 +185,19 @@ pub const Engine = struct {
     }
 
     /// Release a cancelled stream between rounds: no pending draws or drafts.
+    /// A stream its client cancelled: in its prompt pass, what the finished chunks computed is kept first (the same
+    /// prompt again resumes there), then the stream is discarded.
+    pub fn cancelStream(e: *Engine, s: *Stream) void {
+        e.keepCancelled(s);
+        e.discard(s);
+    }
+
+    /// The backend keeps a cancelled prompt pass's finished chunks (Backend.cancel_prefill); a failure keeps nothing.
+    fn keepCancelled(e: *Engine, s: *Stream) void {
+        const keep = e.backend.vtable.cancel_prefill orelse return;
+        keep(e.backend.ptr, s) catch {};
+    }
+
     pub fn discard(e: *Engine, s: *Stream) void {
         s.finished = true;
         s.reason = .cancelled;

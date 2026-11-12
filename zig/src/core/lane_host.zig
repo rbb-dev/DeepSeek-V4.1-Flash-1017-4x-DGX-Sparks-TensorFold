@@ -850,6 +850,10 @@ pub const LaneHost = struct {
         dropped.deinit(h.gpa);
         for (ids) |id| {
             for (h.admitted.items, 0..) |job, i| if (job.id == id) {
+                if (job.started and !job.stream.finished) h.core.cancelStream(&job.stream); // (a pass keeps its chunks)
+                h.lock();
+                _ = h.admitted.orderedRemove(i);
+                h.unlock();
                 h.finish(job, ending.reason, ending.message);
                 break;
             };

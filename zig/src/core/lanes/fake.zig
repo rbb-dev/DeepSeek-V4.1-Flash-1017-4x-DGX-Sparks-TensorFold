@@ -157,9 +157,11 @@ pub const Fake = struct {
         return end == s.prompt_len;
     }
 
-    /// `stepped` as a backend that holds one prompt pass at a time (`prefill_one`).
-    pub fn steppedOne(x: *Fake) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .reports_fill = true, .prefill_one = true } };
+    /// A pass cancelled between its steps keeps its history so far (Backend.cancel_prefill).
+    fn cancelPrefill(ptr: *anyopaque, s: *Stream) anyerror!void {
+        const x = self(ptr);
+        const l = x.lanes.get(s) orelse return;
+        s.keepInterrupted(@intCast(l.history.items.len));
     }
 
     fn self(ptr: *anyopaque) *Fake {

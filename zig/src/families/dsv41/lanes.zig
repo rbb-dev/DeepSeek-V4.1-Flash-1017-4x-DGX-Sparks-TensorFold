@@ -1048,6 +1048,7 @@ pub const Lanes = struct {
 
     const vt_whole: be.Backend.VTable = .{
         .prefill = prefillFn,
+        .cancel_prefill = cancelPrefill,
         .first = firstFn,
         .queue = queueFn,
         .read = readFn,
@@ -1507,6 +1508,23 @@ pub const Lanes = struct {
         self.fills[lane.slot] = null;
         if (self.prof) |*p| p.prefills += 1;
         return true;
+    }
+
+    /// Backend.cancel_prefill: a prompt pass cancelled between its chunks keeps the state its finished chunks reached,
+    /// where a mark could stand (a chunk end at or before the replay cut, past where the pass resumed).
+    fn cancelPrefill(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+        const self = of(ptr);
+        const lane = self.streams.get(s) orelse return;
+        const f = self.fills[lane.slot] orelse return;
+        if (f.start > f.replay) return;
+        s.keepInterrupted(@intCast(f.start));
+    }
+
+    fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
+        const self = of(ptr);
+        const l = self.streams.getPtr(s) orelse return error.UnknownStream;
+        if (position != s.prompt_len) return error.PositionMismatch;
+        return l.first;
     }
 
     /// `first` among a grammar's tokens: the prompt's last row (the prompt pass kept it for the stream) drawn again
