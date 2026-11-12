@@ -36,6 +36,18 @@ extern "C" __global__ void tf_ds_add2_bf16_v4_kernel(const float4* g0, const flo
     }
 }
 
+// The owner sums' widen: dst fp32 [q, 2 w] row r = (float(p0 row r) | float(p1 row r)), p0 and p1 bf16 [q, w]; exact
+// (a bf16 is an fp32 with 16 more zero bits). Grid (ceil(w / blockDim), q): a row a grid row, a column pair a thread.
+extern "C" __global__ void tf_ds_widen_pairs_kernel(const __nv_bfloat16* p0, const __nv_bfloat16* p1, float* dst,
+                                                    unsigned long long w) {
+    const unsigned long long r = blockIdx.y;
+    const unsigned long long c = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (c < w) {
+        dst[r * 2 * w + c] = __bfloat162float(p0[r * w + c]);
+        dst[r * 2 * w + w + c] = __bfloat162float(p1[r * w + c]);
+    }
+}
+
 // Two equal parts of n16 16-byte words copied from s0, s1 to d0, d1 (grid.y picks the part, consecutive threads consecutive
 // words: whole lines): the owner sums' send blocks from device memory into the transport's arena.
 extern "C" __global__ void tf_ds_collect2_kernel(const uint4* s0, uint4* d0, const uint4* s1, uint4* d1, unsigned long long n16) {

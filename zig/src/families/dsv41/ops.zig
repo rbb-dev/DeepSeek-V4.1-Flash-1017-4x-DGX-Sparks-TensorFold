@@ -26,6 +26,7 @@ pub const Ops = struct {
     to_f32: cuda.Function,
     f16_to_f32: cuda.Function,
     add2_bf16: cuda.Function,
+    widen_pairs: cuda.Function,
     collect2_fn: cuda.Function,
     ywiden: cuda.Function,
     topk_i64: cuda.Function,
@@ -74,6 +75,7 @@ pub const Ops = struct {
             .to_f32 = try pw.function("tf_bf16_to_f32_kernel"),
             .f16_to_f32 = try fm.function("tf_ds_f16_to_f32_kernel"),
             .add2_bf16 = try fm.function("tf_ds_add2_bf16_kernel"),
+            .widen_pairs = try fm.function("tf_ds_widen_pairs_kernel"),
             .collect2_fn = try fm.function("tf_ds_collect2_kernel"),
             .ywiden = try fm.function("tf_ds_ywiden_kernel"),
             .topk_i64 = try fm.function("tf_ds_topk_i64_kernel"),
@@ -162,6 +164,19 @@ pub const Ops = struct {
         a.add(n16);
         const bx: u32 = @intCast(@min((n16 + 255) / 256, 384));
         try cuda.launch.launch(o.collect2_fn, .{ .grid = .{ .x = bx, .y = 2 }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    /// dst fp32 [q, 2 w] = (float(p0) | float(p1)) row by row, p0 and p1 bf16 [q, w] (exact): the owner sums' two
+    /// pairs' bf16 sums as one plane of the readers' gathered partials.
+    pub fn widenPairs(o: *const Ops, s: cuda.Stream, p0: u64, p1: u64, dst: u64, q: usize, w: usize) !void {
+        if (q == 0 or w == 0) return;
+        if (q > 65535 or (w + 255) / 256 > 65535) return error.TooLarge;
+        var a: cuda.Args = .{};
+        a.add(p0);
+        a.add(p1);
+        a.add(dst);
+        a.add(@as(u64, w));
+        try cuda.launch.launch(o.widen_pairs, .{ .grid = .{ .x = blocks(w, 256), .y = @intCast(q) }, .block = .{ .x = 256 } }, s, &a);
     }
 
     /// prompt2d ySums: pieces bf16 [4, half, w] -> dst fp32 [n, 2 w], widened exactly (tf_ds_ywiden_kernel).

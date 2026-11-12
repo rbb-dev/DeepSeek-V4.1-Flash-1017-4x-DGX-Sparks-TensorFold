@@ -1827,7 +1827,15 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             if (pt) |t| try t.mark(e.s, .mix_attn);
             try prompt.attention(e, ch, &m.view, &shared, li, m.ring_view[li], floor, kv_done != null and kv_done.? == li);
             if (pt) |t| try t.mark(e.s, .attn);
+            try prompt.gather(e, ch, ch.pa, .attn, li);
+            if (pt) |t| try t.mark(e.s, .gather_a);
+            try prompt.ffnMixes(e, ch, li);
+            if (pt) |t| try t.mark(e.s, .mix_ffn);
+            try prompt.moe(e, ch, li);
+            if (pt) |t| try t.mark(e.s, .moe);
             try prompt.bodyCanary(e, ch, ch.pm, ch.n, li);
+            try prompt.gather(e, ch, ch.pm, .moe, li + 1);
+            if (pt) |t| try t.mark(e.s, .gather_m);
             // The gathers' own output, both sublayers, at every requested layer of the first chunk of at least 64 rows
             // (prompt.dump_layers; dump_done stops it after that chunk, below). The >= 64 guard keeps a smoke test or
             // validate.py's short prompts from spending the one-shot dump on a chunk too short to compare.

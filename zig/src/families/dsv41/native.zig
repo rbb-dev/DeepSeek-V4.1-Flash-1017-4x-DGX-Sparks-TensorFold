@@ -236,12 +236,17 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     // a follower that stops stops this server too, with a line that names it, instead of a wait on it for good
     st.m.watchPeers() catch |err| std.log.warn("dsv41: rank 0 cannot watch its followers: {s}", .{@errorName(err)});
     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .lane_vision = if (st.vision) |v| v.hook() else null, .fill_rounds = if (st.lanes.fill_chunks > 0) fill_rounds else 0 };
+/// The math switches in effect for the SSD tier's store name: the 2D node's agreed flags (all off without one), the
+    return .{
         // the switches that no longer exist keep the values the shipped settings gave them, so a store written before the NCCL
         // removal keeps its name (the numerics are the same bytes): pair sums off, quarter-HC and the owner gather on
         .pair_sum = false,
         .qhc = two != null,
         .owner_gather = two != null,
+        .idx_shard = if (two) |t| t.idx_shard else false,
+        .idx_rb = tri_index.idx_rb,
         .negzero = false,
+        .replay_floor = prompt.replay_floor,
         .owner_yx = two != null,
         .cat_partner = two != null,
         .front_owned = two != null,
@@ -253,6 +258,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .roci = two != null,
         .roci_collect = false,
         .qgate_canary = if (prompt.qgate_canary) 1 else @backingInt(prompt.qgate_body),
+    };
+}
+
     if (world > 1 and !reconciled) abstainBare(st.gpa, st.m);
     if (world > 1) {
     if (world > 1)
@@ -311,6 +319,8 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     try std.testing.expectEqual(@as(u8, 2), tierMath(null, null).qgate_canary);
     prompt.qgate_body = .body_ulp;
     try std.testing.expectEqual(@as(u8, 3), tierMath(null, null).qgate_canary);
+}
+
 test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);

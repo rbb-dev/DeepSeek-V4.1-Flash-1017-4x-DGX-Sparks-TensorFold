@@ -370,8 +370,15 @@ pub const Chunk = struct {
     // the full-cap ch.part assumes a row-major layout that was never established; give it its own buffer, sized
     // tight for q = cap / world rows, exactly as the real engine would size ch.part for a q-row chunk.
     qhc_part: u64 = 0,
+    // the gathers' word to their readers (gatherStep sets it, ownedPartials reads it) and whether plane 1 of qhc_g
+    // holds -0.0 written in this call: host-side, reset by begin (every fillChunk call)
+    ga_how: Gathered = .{},
+    gm_how: Gathered = .{},
+    tight_neg: bool = false,
     /// TF_DS_ROCI_ANY: the boundary layer's owned update and the handoff of the decoder rows are done; the layers after it are not owned
     boundary_done: bool = false,
+    // TF_DS_OWNER_YX in effect: the owner sums' stage (prompt2d.OwnStage for cap / world rows); 0 otherwise
+    own_stage: u64 = 0,
     /// TF_DS_ROCI_COMBINE_FIRST: the MoE's partials' part-1 send was queued inside moe (behind the rows it sends); the gather that follows
     /// takes it as sent, once.
     own1_sent: bool = false,
@@ -485,7 +492,9 @@ pub const Chunk = struct {
             ch.qhc_g = try a.take(e.world * (cap / e.comm.world) * d * 4);
             ch.qhc_part = try a.take((cap / e.comm.world) * tri_basic.hc_blocks * 32 * 4);
         }
+        resetGathers(&ch);
         ch.boundary_done = false;
+        ch.own_stage = 0;
         if (e.two) |t| {
         }
         // compressed layers: the smallest ratio sets the most compressed entries a row can see
@@ -919,9 +928,7 @@ pub const Shared = struct { kv_layer: ?usize = null, kk: ?usize = null, pool: bo
 pub fn begin(e: *const Engine, ch: *Chunk, ids: []const i64, start: usize, host_pos: []i64) !void {
     const n = ids.len;
     if (n > ch.cap or host_pos.len < n) return error.ChunkTooLong;
-    ch.n = n;
-    ch.start = start;
-    ch.pending = false;
+    beginHost(ch, n, start);
     for (host_pos[0..n], 0..) |*p, i| p.* = @intCast(start + i);
     try upload(e, ch.ids, ids.ptr, n * 8);
     ch.pos = ch.pos0;
@@ -952,8 +959,18 @@ fn swapStreams(ch: *Chunk, src: u64) void {
 /// transport off the identical range, so it is named once here rather than as two matching anonymous structs.
 pub const QRows = struct { start: usize, n: usize };
 
+/// Which sublayer's partials a gather assembles: the attention's (into ch.ga) or the MoE's (into ch.gm).
+pub const Sub = enum { attn, moe };
+
+/// What a gather left for its readers: `owned` when it filled the tight buffer ch.qhc_g itself for this node's owned
+/// rows (plane 0 the TP2 ranks' sums, plane 1 -0.0: the readers' G0 + G1 gives the same bits); else the planes of
+/// ga or gm, which a reader at owned rows repacks into the tight buffer first.
 pub const Gathered = struct { owned: bool = false, blocks: bool = false }; // blocks: the sums lie in the transport's two bf16 blocks (TF_DS_ROCI)
+
+/// A gather as gatherStep decided it on the host: its path, the owned rows its readers take, and on the owner path
+/// whether this call's plane 1 of the tight buffer is still to be written (`neg`).
 pub const GatherStep = struct { owned: QRows };
+
 /// WP4 (quarter-HC, docs/prefill-plan.md): this layer's owned row range on this node, when quarter-HC applies --
 /// a full-cap 2D chunk, strictly before the replay-cut boundary layer (c.layers / 2, which needs every row's h /
 /// pre / x globally and is never sharded: replayCut truncates ch.n there for the decoder's own, unchanged path).
@@ -990,15 +1007,56 @@ fn qhcRange(e: *const Engine, ch: *const Chunk, li: usize) ?QRows {
     return anySlab(e, ch);
 }
 
+pub fn ownedRange(e: *const Engine, ch: *const Chunk, li: usize) ?QRows {
     if (li != e.c.layers / 2) return null;
     if (e.two == null) return null;
     // every chunk's boundary is on owned rows (a chunk with decoder rows hands them their rows after it: handoff)
     return if (!ch.boundary_done) anySlab(e, ch) else null;
+}
+
     if (e.two == null) return null;
     if (e.two == null or e.mx == null) return null;
     if (e.two == null) return null;
+/// The gathered planes of `sub` (ga or gm).
+fn fullOf(ch: *const Chunk, sub: Sub) u64 {
+    return switch (sub) {
+        .attn => ch.ga,
+        .moe => ch.gm,
+    };
+}
+
+/// What the last gather of `sub` left for its readers in this call.
+pub fn howOf(ch: *Chunk, sub: Sub) *Gathered {
+    return switch (sub) {
+        .attn => &ch.ga_how,
+        .moe => &ch.gm_how,
+    };
+}
+
+/// begin's host side: a chunk of `n` rows from position `start`, nothing pending, no gather yet in this call.
+pub fn beginHost(ch: *Chunk, n: usize, start: usize) void {
+    ch.n = n;
+    ch.start = start;
+    ch.pending = false;
     ch.boundary_done = false;
+    resetGathers(ch);
+}
+
+/// A fillChunk call's start: no gather yet, plane 1 of the tight buffer not yet written in it.
+pub fn resetGathers(ch: *Chunk) void {
+    ch.ga_how = .{};
+    ch.gm_how = .{};
+    ch.tight_neg = false;
     ch.own1_sent = false;
+}
+
+/// Whether plane 1 of the tight buffer is still to be written in this call (the first owner gather's), marked written.
+pub fn takeTightNeg(ch: *Chunk) bool {
+    if (ch.tight_neg) return false;
+    ch.tight_neg = true;
+    return true;
+}
+
 /// The plan shape of a pass whose gathers ride the transport (TF_DS_ROCI_GATHERS): a whole chunk of a size the transport has
 /// plans for. Null: the chunk has no plan (an error at the call). Every rank decides alike (the chunk and its cap are the same on all).
 pub fn gathersShape(e: *const Engine, ch: *const Chunk) ?roci_engine.Shape {
@@ -1035,6 +1093,14 @@ fn xGathered(e: *const Engine, ch: *const Chunk, li: usize) bool {
     return frontRange(e, ch, li) == null and boundaryRange(e, ch, li) == null;
 }
 
+}
+
+/// What a reader at owned rows repacks into the tight buffer first: `sub`'s gathered planes (ga or gm), or nothing
+/// when the gather filled the tight buffer itself (howOf(sub).owned).
+pub fn repackSource(ch: *Chunk, sub: Sub) ?u64 {
+    return if (howOf(ch, sub).owned) null else fullOf(ch, sub);
+}
+
 /// WP4: `full` (fp32 [e.world, ch.cap, D], i.e. ch.ga or ch.gm) repacked at rows [r.start, r.start + r.n) of every
 /// plane into ch.qhc_g, tightly strided [e.world, r.n, D] -- see ch.qhc_g's own comment for why. A local
 /// device-to-device copy, one per plane.
@@ -1057,6 +1123,7 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
     const c = e.c;
     // TF_DS_ROCI_GATHERS: the layers whose x the transport gathers keep it in the arena, the others in the device buffer
     if (ch.x_g != 0) ch.x = ch.x_dev;
+    if (ownedRange(e, ch, li)) |r| {
         if (ch.x_g != 0 and xGathered(e, ch, li) and gathersShape(e, ch) != null) ch.x = ch.x_g;
         const row_h = c.hc * c.hidden * 2;
         const row_p = c.hc * 4;
@@ -1611,14 +1678,20 @@ pub fn scale(hd: usize) f32 {
 /// the attention gather; li + 1 for the MoE gather, which the next layer reads as its "pending" post). ownedRange(consumer_li) is
 /// exactly the range that reader will pull back out, so it keeps the producer and every consumer locked to the identical row range
 /// by construction. `sub` names the partials (src: ch.pa or ch.pm).
+pub fn gather(e: *const Engine, ch: *Chunk, src: u64, sub: Sub, consumer_li: usize) !void {
     const st = try gatherStep(e, ch, sub, consumer_li);
     const rc = e.two.?.rc orelse return error.RociNoShape;
     try ownerGatherRoci(e, ch, rc, src, st.owned, sub);
+}
+
 /// gather's host side: the owned rows of `sub`'s gather of a chunk of ch.n rows whose readers are layer `consumer_li`'s, recorded for
 /// them (howOf).
 pub fn gatherStep(e: *const Engine, ch: *Chunk, sub: Sub, consumer_li: usize) !GatherStep {
+    const how = howOf(ch, sub);
+    how.* = .{};
     if (e.two == null) return error.NotA2DSplit;
     const r = ownedRange(e, ch, consumer_li) orelse return error.NoOwnedRows;
+    how.owned = true;
     return .{ .owned = r };
 }
 
@@ -1721,6 +1794,7 @@ pub fn ffnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
     const lay = e.w.layers[li];
     const c = e.c;
     if (ch.x_g != 0) ch.x = ch.x_dev; // (TF_DS_ROCI_GATHERS: the MoE reads the device x; attention's was the arena's on a gathered layer)
+    if (ownedRange(e, ch, li)) |r| {
         const row_h = c.hc * c.hidden * 2;
         const row_p = c.hc * 4;
         const row_c = c.hc * c.hc * 4;
@@ -2315,6 +2389,7 @@ pub fn engramPending(e: *const Engine, ch: *Chunk, li: usize) !void {
     const c = e.c;
     const n = ch.n;
     if (ch.pending) {
+        if (ownedRange(e, ch, li)) |r| {
             // WP4: the same row-sharded flush as attnMixes's pending branch (hcPost alone is _hc_mix_pf's "posted"
             // finisher without the RMSNorm finish; same G-buffer stride gotcha, same repack).
             try hcPostOwned(e, ch, .moe, r);
@@ -2449,6 +2524,8 @@ fn cutRows(e: *const Engine, ch: *Chunk, first: usize, handed: bool) !void {
 /// then h.to(fp32).mean(1).to(bf16) into tap j's rows.
 pub fn tap(e: *const Engine, ch: *Chunk, j: usize, li: usize) !void {
     const c = e.c;
+    const r = ownedRange(e, ch, li);
+    if (ch.pending) {
         if (r) |rr| {
             try hcPostOwned(e, ch, .moe, rr);
         } else {
@@ -2628,6 +2705,7 @@ fn notPorted(src: std.builtin.SourceLocation) error{NotPortedYet} {
     std.debug.print("{{\"not_ported\": \"{s}:{d}\"}}\n", .{ src.file, src.line });
     return error.NotPortedYet;
 }
+
 test "the boundary's in-place gathers put every rank's owned groups of the four cache arrays where the whole chunk's update puts them" {
     const n = 16;
     const world = 4;

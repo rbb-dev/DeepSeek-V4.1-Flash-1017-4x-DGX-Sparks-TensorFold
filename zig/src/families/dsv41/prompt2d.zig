@@ -722,7 +722,12 @@ pub const Two = struct {
     pub fn nodesGather(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, rows: usize) !void {
         const rs = t.rings orelse return error.DecodeNeedsRings;
         try rs.nodesGather(e.s, src, dst, rows, t.rank_of);
+    /// This node: 2 p + r.
     pub fn node(t: *const Two) u32 {
+        return @intCast(t.r + 2 * t.p);
+    }
+
+    pub fn catRank(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, w: [2]usize, esize: usize) !void {
         const rs = t.rings orelse return error.DecodeNeedsRings;
         if (!try ringed(rs.catRank(e.s, src, dst, n, w, esize))) return error.RingRefused;
     }
@@ -907,17 +912,61 @@ pub fn catCodesPlan(g: u32, rank_of: [4]u32, n: usize, uw: [2]usize, u: u64, cod
         .peer = rank_of[g ^ 2],
 /// Why the owner sums cannot run (null: they can): widening the two pairs' sums into one row needs equal pair widths.
 pub fn ownerYxOff(ow: [2]usize) ?[]const u8 {
+    if (ow[0] != ow[1]) return "needs equal pair widths";
+    return null;
+}
+
 /// Owner sums of node g under ranks `rank_of` (Two.rank_of), for owned blocks of q rows: rank k owns rows R(k) =
+/// [k q, k q + q). Every field is a first row; each part is q rows of a pair's columns.
+pub const OwnerPlan = struct {
     row_peer: u32, // the row partner's rank (node g ^ 1: the other TP2 rank of this pair)
     col_peer: u32, // the column partner's rank (node g ^ 2: this TP2 rank of the other pair)
+    send1: [2]usize, // to the row partner: its rows, then its column partner's
+    recv1: [2]usize, // from the row partner, into the stage: this node's rows, then its column partner's (the add's rows)
+    send2: usize, // to the column partner: the sums at its rows
+    recv2: usize, // from the column partner: the other pair's sums at this node's rows
+};
+
 pub fn ownerPlan(g: u32, rank_of: [4]u32, q: usize) OwnerPlan {
+    const at = struct {
+        fn rows(k: u32, n: usize) usize {
+            return @as(usize, k) * n;
+        }
+    }.rows;
+    return .{
         .row_peer = rank_of[g ^ 1],
         .col_peer = rank_of[g ^ 2],
         .send1 = .{ at(rank_of[g ^ 1], q), at(rank_of[g ^ 3], q) },
         .recv1 = .{ at(rank_of[g], q), at(rank_of[g ^ 2], q) },
         .send2 = at(rank_of[g ^ 2], q),
         .recv2 = at(rank_of[g], q),
+    };
+}
+
+/// The word plane 1 of the owner sums' tight buffer holds: fp32 -0.0, for which x + (-0.0) == x at every non-NaN x,
+/// signed zeros included, so the readers' y = bf16(G0 + G1) keeps the baseline bits.
+pub const plane1_word: u32 = 0x80000000;
+
+/// The owner sums' stage (Chunk.own_stage) for q owned rows of a pair's width w: `stage` the row partner's fp32
+/// [2, q, w], `sums` this pair's bf16 sums [2, q, w] (this node's rows, then its column partner's), `oth` the other
+/// pair's bf16 sums at this node's rows [q, w].
+pub const OwnStage = struct {
+    stage: u64,
+    sums: u64,
+    oth: u64,
+
+    pub fn bytes(q: usize, w: usize) usize {
+        return q * w * (2 * 4 + 2 * 2 + 2);
+    }
+
+    pub fn at(base: u64, q: usize, w: usize) OwnStage {
+        const sums = base + 2 * q * w * 4;
+        return .{ .stage = base, .sums = sums, .oth = sums + 2 * q * w * 2 };
+    }
+};
+
 const Span = @import("land.zig").Span;
+
 test "a node's split: TP over two, the 2D split over four" {
     try std.testing.expectEqual(plan.Split{ .rank = 1, .world = 2 }, try split(1, 2));
     try std.testing.expectEqual(plan.Split{ .rank = 0, .world = 2, .pair = 1 }, try split(2, 4));
@@ -1026,8 +1075,47 @@ test "rank 0's settings go with NCCL's id: the follower answers, and an older ra
 /// The node that rank `k` serves under `rank_of`.
 fn nodeOfRank(rank_of: [4]u32, k: u32) usize {
     return std.mem.indexOfScalar(u32, &rank_of, k).?;
+}
+
+/// The six node orders rank 0 can serve under (TF_DS_2D_ORDER: rank 0 serves node 0).
+const orders = [_][4]u32{ .{ 0, 1, 2, 3 }, .{ 0, 1, 3, 2 }, .{ 0, 2, 1, 3 }, .{ 0, 2, 3, 1 }, .{ 0, 3, 1, 2 }, .{ 0, 3, 2, 1 } };
+
+test "owner sums: each round is a perfect matching and both ends list the same segments, under every node order" {
+    const q: usize = 512;
+    for (orders) |ord| {
         const nc = rankOf(ord);
+        var owned: [4]bool = @splat(false);
+        for (0..4) |gi| {
+            const g: u32 = @intCast(gi);
+            const pl = ownerPlan(g, nc, q);
             // the partners: node g ^ 1 and node g ^ 2, by their ranks, and mutual
+            try std.testing.expectEqual(nc[g ^ 1], pl.row_peer);
+            try std.testing.expectEqual(nc[g ^ 2], pl.col_peer);
+            try std.testing.expectEqual(nc[g], ownerPlan(g ^ 1, nc, q).row_peer);
+            try std.testing.expectEqual(nc[g], ownerPlan(g ^ 2, nc, q).col_peer);
+            // R(k) = [k q, k q + q): this node's rows, then its column partner's
+            try std.testing.expectEqual([2]usize{ nc[g] * q, nc[g ^ 2] * q }, pl.recv1);
+            try std.testing.expectEqual([2]usize{ nc[g ^ 1] * q, nc[g ^ 3] * q }, pl.send1);
+            try std.testing.expectEqual(nc[g] * q, pl.recv2);
+            try std.testing.expectEqual(nc[g ^ 2] * q, pl.send2);
+            // the k-th send is the partner's k-th receive: the same rows (and q rows of the pair's columns each)
+            try std.testing.expectEqual(pl.send1, ownerPlan(g ^ 1, nc, q).recv1);
+            try std.testing.expectEqual(pl.send2, ownerPlan(g ^ 2, nc, q).recv2);
+            owned[pl.recv1[0] / q] = true;
+        }
+        try std.testing.expectEqual([4]bool{ true, true, true, true }, owned); // the owners' rows cover the chunk
+    }
+}
+
+test "own_stage: the row partner's fp32 [2, q, w], the sums [2, q, w] and the other pair's [q, w], back to back" {
+    try std.testing.expectEqual(@as(usize, 18_350_080), OwnStage.bytes(512, 2560));
+    try std.testing.expectEqual(@as(usize, 36_700_160), OwnStage.bytes(1024, 2560));
+    const st = OwnStage.at(0x10000, 512, 2560);
+    try std.testing.expectEqual(@as(u64, 0x10000), st.stage);
+    try std.testing.expectEqual(@as(u64, 0x10000 + 2 * 512 * 2560 * 4), st.sums);
+    try std.testing.expectEqual(@as(u64, 0x10000 + 2 * 512 * 2560 * 4 + 2 * 512 * 2560 * 2), st.oth);
+}
+
 test "TF_DS_PASS_ROWS takes any whole number of resume units up to the engine's largest pass (unset: one); TF_DS_PASS_FROM any multiple of the unit, 0 included (unset: four)" {
     const top = prompt.max_pass_rows;
     try std.testing.expectEqual(@as(u32, 16384), top);
