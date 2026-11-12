@@ -101,7 +101,7 @@ pub const LaneHost = struct {
         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
             const job: *Job = @ptrCast(@alignCast(ptr));
             job.reported(); // before a keep can evict the entry the pass restored
-            if (job.host.cache) |store| _ = store.keepBorn(job.request.cacheKey(), job.request.bornLen(), at, s, job.request.chunks, job.host.spans(job.request)); // a lane image's rows keyed by its digest
+            if (!cacheable(job.request)) return;
         }
 
         /// The images key of the request's `[0, at)`: its pictures' spans and bytes, hashed. A kept state holds its
@@ -130,6 +130,18 @@ pub const LaneHost = struct {
             if (job.stream.reuse_failed or ok) store.resumed(e, job.request.cacheKey(), ok) else store.release(e);
         }
     };
+
+    /// The ids the prompt cache keys a request by: its prompt, or with images the prompt with each picture's positions made
+    /// from the picture's content (Request.cache_key).
+    /// Whether the cache may serve or keep a request: without images always; with them only when the server keyed their
+    /// positions by content (a kept state is found by tokens, and every picture's positions hold the same placeholder).
+    fn cacheable(r: *const Request) bool {
+        return r.lane_images.len == 0 or r.cache_key.len == r.prompt.len;
+    }
+
+    fn keyOf(r: *const Request) []const u32 {
+        return if (r.cache_key.len == r.prompt.len) r.cache_key else r.prompt;
+    }
 
     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
         var enforced = info_;
@@ -388,8 +400,11 @@ pub const LaneHost = struct {
         const r = job.request;
         if (r.background and r.max_tokens == 0 and h.warm_quiet > 0 and !h.quiet(job)) return h.cancel(job); // other work came first: it never ran
         var reuse: lanes.stream.Reuse = .{};
+        // a prompt with pictures is keyed by the server's ids for them (Request.cache_key), which tell one picture from
+        // another, so the images key stays empty (.none): the pictures are hashed once, by the server
+        job.images = .none;
         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
-        if (keyed(r)) if (h.cache) |store| if (r.prompt_logprobs == null and !r.untaught) if (store.lookupRewind(h.gpa, r.cacheKey(), r.bornLen(), r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
+        if (cacheable(r)) if (h.cache) |store| if (store.lookupKeyed(h.gpa, keyOf(r), r.history_len, r.shared_prefixes, r.chunks, job.images)) |l| {
             job.entry = l.entry;
             job.kept0 = store.counts.kept;
             job.marks = l.marks;

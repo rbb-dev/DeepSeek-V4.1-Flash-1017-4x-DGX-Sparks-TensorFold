@@ -127,7 +127,9 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
     var history_len: usize = 0;
     if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
     if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
-    if (input.lane_images.len > 0) return laneSpans(srv, cx, prompt, history_len, input.lane_images); // no rewind kept, as --vision
+    // lane-vision images: the history's length is counted in the expanded prompt, and the cache keys the pictures by their content
+    if (input.lane_images.len > 0) {
+    }
     // --vision: placeholders expanded to image tokens before the window, chunks and cache see it; no rewind kept
     if (try images.expand(srv.info.vision, if (srv.config.vision_urls) images.Fetch.network(srv.io) else null, srv.text, cx, input.messages, prompt, history_len)) |x| return .{ .ids = x.ids, .history_len = x.history_len, .images = x.images, .cache_key = x.cache_key };
     const count = if (input.messages == .array) input.messages.array.len else 0;
@@ -161,15 +163,19 @@ fn laneSpans(srv: *Server, cx: *Cx, ids: []const u32, history_len: usize, lane_i
     return placeSpans(cx, vision, ids, history_len, lane_images);
 }
 
-/// laneSpans with the engine's vision: the cache key spells each span by its payload's digest, and the history
-/// (`history_len` ids) ends past its images' spans.
-fn placeSpans(cx: *Cx, vision: api.LaneVision, ids: []const u32, history_len: usize, lane_images: []const []const u8) errors.Refused!Rendered {
+/// Each image placeholder of the rendered prompt as its image's span (the lane-vision family's prepare: the span's length and
+/// the payload the engine reads), the images in prompt order. `history_raw`: the history's length in `ids` (0: none), returned
+/// as its length in the expanded prompt. The prompt cache keys a kept state by tokens, and every picture's positions hold
+/// the same placeholder token, so `cache_key` replaces them with ids made from the picture's payload: a conversation that
+/// carries a picture through its turns resumes its kept state, a different picture never does.
+fn spans(srv: *Server, cx: *Cx, ids: []const u32, lane_images: []const []const u8, history_raw: usize) errors.Refused!Rendered {
+    const vision = srv.info.lane_vision orelse return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
     var out: std.ArrayList(u32) = .empty;
     var key: std.ArrayList(u32) = .empty;
     var placed: std.ArrayList(api.LaneImage) = .empty;
-    var history_end: usize = 0;
+    var history_len: usize = 0;
     for (ids, 0..) |id, i| {
-        if (i == history_len) history_end = out.items.len;
+        if (history_raw > 0 and i == history_raw) history_len = out.items.len;
         if (id != vision.token) {
             try out.append(cx.a, id);
             try key.append(cx.a, id);

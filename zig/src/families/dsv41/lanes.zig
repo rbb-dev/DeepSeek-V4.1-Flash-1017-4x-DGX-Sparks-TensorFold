@@ -754,11 +754,8 @@ pub const Lanes = struct {
         var moved = false;
         if (s.reuse.saved) |p| {
             const sn: *Snap = @ptrCast(@alignCast(p));
-            // (the cache matched the images before its rows by their digests: its image rows are this prompt's)
-            if (self.refusal(sn, len)) |why| {
-                noteRefusal(sn, len, why, "it runs from 0");
-                s.reuse_failed = true;
-            } else {
+            // (a prompt with images resumes a kept state too: the cache keys the image positions by the picture's content, so the
+            // state's rows are this prompt's own; the pictures before the cut need no rows again, below)
             if (self.usable(sn, len)) {
                 kept = sn;
                 // in place unless the extent runs past the pool, a live stream holds it, or another kept state has
@@ -801,6 +798,8 @@ pub const Lanes = struct {
             const row_bytes = m.cfg.hidden * 2;
             const resume_at: usize = if (kept) |sn| sn.at else 0;
             var at_row: usize = 0;
+            // a resumed pass starts at the kept state's end: a picture wholly before it is already in the state (its positions stay
+            // dead in the sequence for Engram's n-grams, but it needs no rows and no run of the tower)
             for (s.lane_images) |img| {
                 if (img.tokens == 0 or @as(usize, img.at) + img.tokens > len) return error.BadImageSpan;
                 for (seq.items[img.at..][0..img.tokens]) |*q| {

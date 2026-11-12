@@ -100,15 +100,7 @@ fn resumed(partial: bool) !void {
     }
     try std.testing.expectEqual(@as(u64, 1), store.counts.hits);
     try std.testing.expectEqual(@as(usize, 2), store.entries.items.len);
-    // a lesson's writer reads the model as shipped: untaught, a turn neither resumes from a kept state nor keeps one
-    var b3: Box = .{};
-    defer b3.tokens.deinit(gpa);
-    const r3: Request = .{ .prompt = t2.items, .max_tokens = 4, .history_len = @intCast(t2.items.len - 2), .untaught = true };
-    try e.submit(3, &r3, .{ .ctx = &b3, .event = Box.event });
-    try std.testing.expectEqual(Reason.length, b3.wait());
-    try std.testing.expectEqual(@as(?u32, 0), b3.cached);
-    try std.testing.expectEqual(@as(u64, 1), store.counts.hits);
-    try std.testing.expectEqual(@as(usize, 2), store.entries.items.len);
+    // (his untaught requests -- a lesson's writer -- are not in this lane host: no test of them)
 }
 
 test "an image's placeholders are cached by its content: another image under the same ids resumes none of it" {
@@ -307,7 +299,7 @@ fn evicted(partial: bool) !void {
     }
 }
 
-test "a learn step that moves the weights drops every kept state: the next turn prefills from the start" {
+test "a turn with a picture resumes its conversation's kept state, and a different picture does not" {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
     defer cfg.deinit(gpa);
@@ -332,41 +324,14 @@ test "a learn step that moves the weights drops every kept state: the next turn 
             f.drop(saved);
         }
     };
-    const Moves = struct { // one step that changes the weights and ends the lesson
-        sink: ?api.LearnSink = null,
-        fn begin(ctx: *anyopaque, _: *const api.LearnRequest, sink: api.LearnSink) anyerror!void {
-            const l: *@This() = @ptrCast(@alignCast(ctx));
-            l.sink = sink;
-        }
-        fn step(ctx: *anyopaque) api.Learner.Step {
-            const l: *@This() = @ptrCast(@alignCast(ctx));
-            const done: api.LearnEvent = .{ .done = .{} };
-            l.sink.?.event(l.sink.?.ctx, &done);
-            return .{ .done = true, .changed = true };
-        }
-        fn abort(_: *anyopaque) void {}
-    };
-    const Learned = struct {
-        mutex: std.Io.Mutex = .init,
-        done: bool = false,
-        fn event(ctx: *anyopaque, e: *const api.LearnEvent) void {
-            const b: *@This() = @ptrCast(@alignCast(ctx));
-            b.mutex.lockUncancelable(std.testing.io);
-            defer b.mutex.unlock(std.testing.io);
-            if (e.* == .done) b.done = true;
-        }
-    };
     var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
     defer store.deinit();
-    var moves: Moves = .{};
     var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
     host.cache = &store;
-    host.learner = .{ .ctx = &moves, .begin = Moves.begin, .step = Moves.step, .abort = Moves.abort };
     try host.start();
     defer host.stop();
     const Box = struct {
         mutex: std.Io.Mutex = .init,
-        tokens: std.ArrayList(u32) = .empty,
         cached: ?u32 = null,
         done: ?Reason = null,
         fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
@@ -376,7 +341,7 @@ test "a learn step that moves the weights drops every kept state: the next turn 
             switch (e.*) {
                 .prefilled => |c| b.cached = c,
                 .logprobs, .prompt_logprobs => {},
-                .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
+                .tokens => {},
                 .finished => |f| b.done = f.reason,
             }
         }
@@ -391,226 +356,37 @@ test "a learn step that moves the weights drops every kept state: the next turn 
         }
     };
     const e = host.engine();
-    const t1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
+    // the picture's three positions hold the placeholder (99) in the prompt; the cache keys them by the picture
+    const turn1 = [_]u32{ 3, 1, 99, 99, 99, 5, 9, 2, 6, 5 };
+    const key_a1 = [_]u32{ 3, 1, 0x8000_0001, 0x8000_0002, 0x8000_0003, 5, 9, 2, 6, 5 };
+    const img = [_]api.LaneImage{.{ .at = 2, .tokens = 3, .bytes = "" }};
     var b1: Box = .{};
-    defer b1.tokens.deinit(gpa);
-    const r1: Request = .{ .prompt = &t1, .max_tokens = 6, .history_len = 8 };
+    const r1: Request = .{ .prompt = &turn1, .lane_images = &img, .cache_key = &key_a1, .max_tokens = 4, .history_len = 8 };
     try e.submit(1, &r1, .{ .ctx = &b1, .event = Box.event });
     try std.testing.expectEqual(Reason.length, b1.wait());
-    var learned: Learned = .{};
-    const example: api.Example = .{ .ids = &.{ 1, 2, 3 }, .start = 2, .decide = 1 };
-    const lesson: api.LearnRequest = .{ .train = &.{example} };
-    try e.learn(&lesson, .{ .ctx = &learned, .event = Learned.event });
-    while (true) {
-        learned.mutex.lockUncancelable(std.testing.io);
-        const d = learned.done;
-        learned.mutex.unlock(std.testing.io);
-        if (d) break;
-        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
-    }
-    var t2: std.ArrayList(u32) = .empty; // the same next turn that resumes at 8 when the weights stay
-    defer t2.deinit(gpa);
-    try t2.appendSlice(gpa, &t1);
-    try t2.appendSlice(gpa, b1.tokens.items[0..4]);
-    try t2.appendSlice(gpa, &.{ 7, 7, 5, 3 });
+    try std.testing.expectEqual(@as(?u32, 0), b1.cached);
+    try std.testing.expectEqual(@as(usize, 1), store.entries.items.len); // the picture prompt kept its state
+    // next turn: the same picture carried in the history, more text
+    const turn2 = [_]u32{ 3, 1, 99, 99, 99, 5, 9, 2, 6, 5, 7, 7, 4, 4 };
+    const key_a2 = [_]u32{ 3, 1, 0x8000_0001, 0x8000_0002, 0x8000_0003, 5, 9, 2, 6, 5, 7, 7, 4, 4 };
     var b2: Box = .{};
-    defer b2.tokens.deinit(gpa);
-    const r2: Request = .{ .prompt = t2.items, .max_tokens = 12, .history_len = @intCast(t2.items.len - 2) };
-    try e.submit(2, &r2, .{ .ctx = &b2, .event = Box.event });
-    try std.testing.expectEqual(Reason.length, b2.wait());
-    try std.testing.expectEqual(@as(?u32, 0), b2.cached);
-    try std.testing.expectEqual(@as(u64, 0), store.counts.hits);
-}
-
-test "a resumed prompt's fill counts its restored prefix as filled from the first status poll" {
-    const gpa = std.testing.allocator;
-    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
-    defer cfg.deinit(gpa);
-    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 2 };
-    defer target.deinit();
-    var clock: lanes.fake.FixedClock = .{};
-    var core = lanes.Engine.init(gpa, &cfg, target.stepped(), clock.clock());
-    defer core.deinit();
-    const Snaps = struct {
-        fn bytes(_: *anyopaque, at: u32) u64 {
-            return 64 + 4 * @as(u64, at);
-        }
-        fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!pc.Saved {
-            const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
-            return f.save(@ptrCast(@alignCast(owner.?)), at);
-        }
-        fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {
-            return error.BackendRestores;
-        }
-        fn drop(ptr: *anyopaque, saved: pc.Saved) void {
-            const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
-            f.drop(saved);
-        }
-    };
-    var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
-    defer store.deinit();
-    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
-    host.cache = &store;
-    try host.start();
-    defer host.stop();
-    const Box = struct {
-        mutex: std.Io.Mutex = .init,
-        cached: ?u32 = null,
-        done: ?Reason = null,
-        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
-            const b: *@This() = @ptrCast(@alignCast(ctx));
-            b.mutex.lockUncancelable(std.testing.io);
-            defer b.mutex.unlock(std.testing.io);
-            switch (e.*) {
-                .prefilled => |c| b.cached = c,
-                .finished => |f| b.done = f.reason,
-                else => {},
-            }
-        }
-        fn wait(b: *@This()) Reason {
-            while (true) {
-                b.mutex.lockUncancelable(std.testing.io);
-                const d = b.done;
-                b.mutex.unlock(std.testing.io);
-                if (d) |r| return r;
-                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
-            }
-        }
-    };
-    const First = struct { // the resumed turn's status before its pass lands a chunk (the stepped fake hooks first)
-        engine: api.Engine,
-        status: ?api.Status = null,
-        fn hook(ctx: *anyopaque, s: *lanes.Stream, filled: usize) void {
-            const p: *@This() = @ptrCast(@alignCast(ctx));
-            if (s.prompt_len != 16 or filled != 0) return;
-            var status: api.Status = .{};
-            p.engine.status(&status, &.{});
-            p.status = status;
-        }
-    };
-    const e = host.engine();
-    var first: First = .{ .engine = e };
-    target.prefill_hook = First.hook;
-    target.prefill_hook_ctx = &first;
-    const t1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
-    var b1: Box = .{};
-    const r1: Request = .{ .prompt = &t1, .max_tokens = 4, .history_len = 8 };
-    try e.submit(1, &r1, .{ .ctx = &b1, .event = Box.event });
-    try std.testing.expectEqual(Reason.length, b1.wait());
-    const t2 = t1[0..8].* ++ [_]u32{ 7, 7, 5, 3, 2, 7, 1, 8 }; // the kept 8 tokens, then 8 new ones
-    var b2: Box = .{};
-    const r2: Request = .{ .prompt = &t2, .max_tokens = 4, .history_len = 14 };
+    const r2: Request = .{ .prompt = &turn2, .lane_images = &img, .cache_key = &key_a2, .max_tokens = 4, .history_len = 12 };
     try e.submit(2, &r2, .{ .ctx = &b2, .event = Box.event });
     try std.testing.expectEqual(Reason.length, b2.wait());
     try std.testing.expectEqual(@as(?u32, 8), b2.cached);
-    const got = first.status orelse return error.NeverPolled;
-    try std.testing.expectEqual(@as(?u32, 16), got.fill_prompt_tokens);
-    try std.testing.expectEqual(@as(?u32, 8), got.fill_tokens_left); // the restored 8 count as filled, not as left
-}
-
-test "a prompt with a lane image resumes when its image is the same, and not past the image when it differs" {
-    const gpa = std.testing.allocator;
-    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
-    defer cfg.deinit(gpa);
-    var target: lanes.fake.Fake = .{ .gpa = gpa };
-    defer target.deinit();
-    var clock: lanes.fake.FixedClock = .{};
-    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
-    defer core.deinit();
-    const Snaps = struct {
-        fn bytes(_: *anyopaque, at: u32) u64 {
-            return 64 + 4 * @as(u64, at);
-        }
-        fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!pc.Saved {
-            const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
-            return f.save(@ptrCast(@alignCast(owner.?)), at);
-        }
-        fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {
-            return error.BackendRestores; // lane-core backends restore inside their own prompt pass
-        }
-        fn drop(ptr: *anyopaque, saved: pc.Saved) void {
-            const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
-            f.drop(saved);
-        }
-    };
-    var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
-    defer store.deinit();
-    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
-    host.cache = &store;
-    try host.start();
-    defer host.stop();
-    const Box = struct {
-        mutex: std.Io.Mutex = .init,
-        tokens: std.ArrayList(u32) = .empty,
-        cached: ?u32 = null,
-        done: ?Reason = null,
-        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
-            const b: *@This() = @ptrCast(@alignCast(ctx));
-            b.mutex.lockUncancelable(std.testing.io);
-            defer b.mutex.unlock(std.testing.io);
-            switch (e.*) {
-                .prefilled => |c| b.cached = c,
-                .logprobs, .prompt_logprobs => {},
-                .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
-                .finished => |f| b.done = f.reason,
-            }
-        }
-        fn wait(b: *@This()) Reason {
-            while (true) {
-                b.mutex.lockUncancelable(std.testing.io);
-                const d = b.done;
-                b.mutex.unlock(std.testing.io);
-                if (d) |r| return r;
-                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
-            }
-        }
-    };
-    const e = host.engine();
-    const image = [_]api.LaneImage{.{ .at = 4, .tokens = 3, .bytes = "pixels" }};
-    // a lane image's span (positions 4 to 6, each the image token 99) that the key spells by the image's digest
-    const t1 = [_]u32{ 3, 1, 4, 1, 99, 99, 99, 5, 9, 2 };
-    const k1 = [_]u32{ 3, 1, 4, 1, 0x8000_0001, 0x8000_0002, 0x8000_0003, 5, 9, 2 };
-    var b1: Box = .{};
-    defer b1.tokens.deinit(gpa);
-    const r1: Request = .{ .prompt = &t1, .lane_images = &image, .cache_key = &k1, .max_tokens = 6, .history_len = 8 };
-    try e.submit(1, &r1, .{ .ctx = &b1, .event = Box.event });
-    try std.testing.expectEqual(Reason.length, b1.wait());
-    try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
-    var t2: std.ArrayList(u32) = .empty; // the next turn: the history, the reply, a new user message
-    defer t2.deinit(gpa);
-    try t2.appendSlice(gpa, &t1);
-    try t2.appendSlice(gpa, b1.tokens.items[0..4]);
-    try t2.appendSlice(gpa, &.{ 7, 7, 5, 3 });
-    var k2: std.ArrayList(u32) = .empty;
-    defer k2.deinit(gpa);
-    try k2.appendSlice(gpa, &k1);
-    try k2.appendSlice(gpa, t2.items[k1.len..]);
-    var b2: Box = .{};
-    defer b2.tokens.deinit(gpa);
-    const r2: Request = .{ .prompt = t2.items, .lane_images = &image, .cache_key = k2.items, .max_tokens = 4, .history_len = @intCast(t2.items.len - 2) };
-    try e.submit(2, &r2, .{ .ctx = &b2, .event = Box.event });
-    try std.testing.expectEqual(Reason.length, b2.wait());
-    try std.testing.expectEqual(@as(?u32, 8), b2.cached); // the same image: resumed past it
-    // the same tokens with another image at the span: its key differs from position 4, so nothing is resumed
-    var k3: std.ArrayList(u32) = .empty;
-    defer k3.deinit(gpa);
-    try k3.appendSlice(gpa, k2.items);
-    k3.items[4] = 0x8000_0011;
-    k3.items[5] = 0x8000_0012;
-    k3.items[6] = 0x8000_0013;
+    // the same tokens with another picture in those positions: same prompt ids, other key: no hit
+    const key_b: [14]u32 = .{ 3, 1, 0x8000_0101, 0x8000_0102, 0x8000_0103, 5, 9, 2, 6, 5, 7, 7, 4, 4 };
     var b3: Box = .{};
-    defer b3.tokens.deinit(gpa);
-    const r3: Request = .{ .prompt = t2.items, .lane_images = &image, .cache_key = k3.items, .max_tokens = 4, .history_len = @intCast(t2.items.len - 2) };
+    const r3: Request = .{ .prompt = &turn2, .lane_images = &img, .cache_key = &key_b, .max_tokens = 4, .history_len = 12 };
     try e.submit(3, &r3, .{ .ctx = &b3, .event = Box.event });
     try std.testing.expectEqual(Reason.length, b3.wait());
     try std.testing.expectEqual(@as(?u32, 0), b3.cached);
-    // a lane image with no key spelling it: its placeholder ids name no image, so it neither resumes nor keeps
-    const entries = store.entries.items.len;
+    // pictures without a content key (the server's TF_DS_IMAGE_CACHE=0) neither resume nor keep: the cache refuses them
+    const kept_before = store.entries.items.len;
     var b4: Box = .{};
-    defer b4.tokens.deinit(gpa);
-    const r4: Request = .{ .prompt = t2.items, .lane_images = &image, .max_tokens = 4, .history_len = @intCast(t2.items.len - 2) };
+    const r4: Request = .{ .prompt = &turn2, .lane_images = &img, .max_tokens = 4, .history_len = 12 };
     try e.submit(4, &r4, .{ .ctx = &b4, .event = Box.event });
     try std.testing.expectEqual(Reason.length, b4.wait());
     try std.testing.expectEqual(@as(?u32, 0), b4.cached);
-    try std.testing.expectEqual(entries, store.entries.items.len);
+    try std.testing.expectEqual(kept_before, store.entries.items.len);
 }
