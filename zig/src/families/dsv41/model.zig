@@ -5113,6 +5113,7 @@ test "TF_DS_ATTN_EPI_TWIN picks the fused attention epilogue's kernel on its own
     }
     // Model.open reads the epilogue's own switch and does not hand it the decode twin
     const src = @embedFile("model.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, "useAttnEpiWe(tri_attn." ++ "attn_twin,") == null); // split, or this line finds itself
     try std.testing.expect(std.mem.indexOf(u8, src, "std.c.getenv(\"TF_DS_ATTN_EPI_TWIN\")") != null);
 }
 

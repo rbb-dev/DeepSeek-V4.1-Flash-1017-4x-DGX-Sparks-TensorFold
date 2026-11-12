@@ -202,7 +202,18 @@ pub const Ports = struct {
         if (ips.len > 3) return error.TooManyFollowers;
         var p: Ports = .{};
         errdefer p.close();
+        for (ips, 0..) |ip, i| p.fds[i] = try Link.bound(ip, if (port == 0) 0 else port + @as(u16, @intCast(i)));
         return p;
+    }
+
+    /// The port follower g's socket listens on (g from 1): what the kernel gave it when `open` was asked for port 0.
+    pub fn portOf(p: Ports, g: usize) !u16 {
+        const fd = p.fds[g - 1];
+        if (fd < 0) return error.NoSuchFollower;
+        var a: c.sockaddr.in = undefined;
+        var len: c.socklen_t = @sizeOf(c.sockaddr.in);
+        if (c.getsockname(fd, @ptrCast(&a), &len) != 0) return error.NoSockName;
+        return std.mem.bigToNative(u16, a.port);
     }
 
     /// Follower g's link (g from 1): its connection, waited for if it has not come yet; its port then closes.
@@ -319,8 +330,10 @@ test "addresses parse as four bytes" {
 }
 
 test "frames cross a loopback link in order" {
-    const io = std.testing.io;
-    const port: u16 = 29000 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 500)));
+    const lo: [4]u8 = .{ 127, 0, 0, 1 };
+    var ports = try Ports.open(&.{lo}, 0); // the kernel's port: another copy of this test on the host cannot share it
+    defer ports.close();
+    const port = try ports.portOf(1);
     const Peer = struct {
         fn run(p: u16) void {
             var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;
@@ -332,7 +345,7 @@ test "frames cross a loopback link in order" {
         }
     };
     const t = try std.Thread.spawn(.{}, Peer.run, .{port});
-    var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
+    var l = try ports.accept(1);
     defer l.close();
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("step 1", try l.recv(&buf));
@@ -510,7 +523,7 @@ test "a watch's grace lets this process end first" {
 
 test "a watch names the rank whose link closed, and frames on the link are no close" {
     const io = std.testing.io;
-    const port: u16 = 30000 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 400)));
+    const port: u16 = 29500 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 400)));
     const Peer = struct {
         fn run(p: u16) void {
             var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;

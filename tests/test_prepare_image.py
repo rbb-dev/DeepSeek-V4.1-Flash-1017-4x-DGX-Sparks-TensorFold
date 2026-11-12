@@ -19,7 +19,7 @@ fi
 ''')
         verify.chmod(0o755)
         source = (self.repo / 'scripts/prepare.sh').read_text()
-        checks = source[source.index('kit_out='):source.index('log "Kit:')]
+        checks = source[source.index('kit_out='):source.index('detail "Kit:')]
         for bias in ('0', '1'):
             with self.subTest(bias=bias):
                 record = self.sim / 'kit-images'

@@ -19,8 +19,8 @@ worker 1 true
 
     def test_log_pipeline_closes_start_lock_in_both_children(self):
         # Exercise the actual launch line, not a second copy of the fixed pipeline.
-        pipeline = next(line for line in (self.repo / "start.sh").read_text().splitlines()
-                        if line.startswith('docker logs -f "$CONTAINER_NAME"'))
+        pipeline = next(line.strip() for line in (self.repo / "start.sh").read_text().splitlines()
+                        if line.strip().startswith('docker logs -f "$CONTAINER_NAME"') and "| sed" in line)
         code, out = self.bash(r'''
 probe='if { : >&8; } 2>/dev/null; then echo inherited; else echo closed; fi'
 docker() { "$BASH" -c "$probe" >"$SIM/docker.fd"; }

@@ -400,21 +400,50 @@ fn spawnServer(a: std.mem.Allocator, io: Io, binary: []const u8, fixtures: []con
         .stderr = .inherit,
         .environ_map = &map,
     });
-    // the startup lines until the port
+    // the startup lines until the port, with a deadline: a server that never prints one is killed, which ends the pipe
+    var done = std.atomic.Value(bool).init(false);
+    const dog = try std.Thread.spawn(.{}, portWatchdog, .{ io, child.id.?, &done, port_wait_ms });
+    defer {
+        done.store(true, .release);
+        dog.join();
+    }
     var rbuf: [4096]u8 = undefined;
     var reader = child.stdout.?.reader(io, &rbuf);
+    const port = try portFrom(&reader.interface);
     const drain = try std.Thread.spawn(.{}, drainStdout, .{ io, child.stdout.? });
     child.stdout = null; // the drain owns and closes the pipe
     drain.detach();
     return .{ .child = child, .port = port, .log_path = log_path, .key_path = key_path };
 }
-    while (true) {
-        const line = reader.interface.takeDelimiterExclusive('\n') catch return error.NoPortLine;
-        if (std.mem.startsWith(u8, line, "PORT ")) {
-            const port = try std.fmt.parseInt(u16, std.mem.trim(u8, line[5..], " \r"), 10);
-            return .{ .child = child, .port = port, .log_path = log_path, .key_path = key_path };
-        }
+
+/// How long the server has to print its PORT line (it loads nothing; a second or two is the norm).
+const port_wait_ms: u32 = 30_000;
+
+/// Kills the server `pid` when `done` is not set within `ms`: its stdout then ends and `portFrom` returns NoPortLine.
+fn portWatchdog(io: Io, pid: posix.pid_t, done: *std.atomic.Value(bool), ms: u32) void {
+    var waited: u32 = 0;
+    while (waited < ms) : (waited += 50) {
+        if (done.load(.acquire)) return;
+        std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
     }
+    if (!done.load(.acquire)) posix.kill(pid, posix.SIG.KILL) catch {};
+}
+
+/// The port from the server's startup lines: other lines (a log line before it) are skipped; the stream ending first is NoPortLine.
+/// (takeDelimiterExclusive leaves the delimiter in the stream, so the second call returned an empty line for ever: a spin at
+/// 100 % CPU with the server idle, seen on aarch64 where a log line precedes the PORT line.)
+fn portFrom(r: *Io.Reader) !u16 {
+    while (true) {
+        const line = (r.takeDelimiter('\n') catch return error.NoPortLine) orelse return error.NoPortLine;
+        if (std.mem.startsWith(u8, line, "PORT ")) return std.fmt.parseInt(u16, std.mem.trim(u8, line[5..], " \r"), 10);
+    }
+}
+
+test "portFrom skips the lines before the PORT line and ends at the stream's end" {
+    var r: Io.Reader = .fixed("some log line\n\nanother\nPORT 4321\nafter\n");
+    try std.testing.expectEqual(@as(u16, 4321), try portFrom(&r));
+    var none: Io.Reader = .fixed("log only\n");
+    try std.testing.expectError(error.NoPortLine, portFrom(&none));
 }
 
 pub fn main(init: std.process.Init) !void {

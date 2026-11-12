@@ -7,6 +7,7 @@ weights, Docker or Sparks needed.
 """
 import json
 import os
+import shutil
 import re
 import subprocess
 import sys
@@ -14,7 +15,10 @@ import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib.util
+from pathlib import Path
 
+ROOT = Path(__file__).resolve().parent.parent
 TOOLS = os.environ.get("TOOLS_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools")
 PROMPTS = ["Write a haiku about the sea.", "List the first ten prime numbers.", "Explain TCP in two sentences.",
            "Write a Python function that reverses a string.", "Name five rivers in Europe.",
@@ -35,13 +39,15 @@ def completion(content, **message):
 class Mock:
     """A mock server whose replies come from respond(body) -> (status, json object or str)."""
 
-    def __init__(self, respond):
+    def __init__(self, respond, needs_key=None):
         mock = self
 
         class H(BaseHTTPRequestHandler):
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["content-length"])))
                 status, out = mock.respond(body)
+                if needs_key and self.headers.get("authorization") != f"Bearer {needs_key}":
+                    status, out = 401, {"error": {"message": "A valid API key is required", "code": "invalid_api_key"}}
                 data = (out if isinstance(out, str) else json.dumps(out)).encode()
                 self.send_response(status)
                 self.send_header("content-type", "application/json")
@@ -133,6 +139,28 @@ def feature_answer(body):
     if "item 1234" in c:
         return completion("8638")
     return None
+
+
+class ValidateKey(ToolTest):
+    """--key-file: every request carries "Authorization: Bearer <key>", the file's first key ("label: key" lines or bare
+    keys, # comments), as the engine reads its own key file; a server with API keys refuses requests without one."""
+
+    def setUp(self):
+        self.mock = Mock(validate_server(), needs_key="k-one")
+        self.addCleanup(self.mock.close)
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        self.kf = os.path.join(d, "keys")
+        with open(self.kf, "w") as f:
+            f.write("# the engine's keys\ntools: k-one\ngateway: k-two\n")
+
+    def test_with_the_key_file_the_checks_pass(self):
+        code, out = run_tool("validate.py", [self.mock.url, "--key-file", self.kf])
+        self.assertEqual(code, 0, out)
+
+    def test_without_it_the_server_refuses_them(self):
+        code, out = run_tool("validate.py", [self.mock.url])
+        self.assertNotEqual(code, 0, out)
 
 
 class ValidateCompare(ToolTest):
@@ -420,6 +448,64 @@ def needle_server(mode, calib=(200, None)):
     return respond
 
 
+class MultiNeedle(unittest.TestCase):
+    """tools/multi_needle.py: codes planted at spread depths of one haystack; --needles 10 or 20 planted, --ask N of them
+    asked (spread evenly), --seed S the same codes every run, so two runs with one seed send the same haystack and differ
+    only in the question after it (docs/long-context.md's 4M test: plant 20, ask 10 cold, then ask all 20 again)."""
+
+    def run_multi(self, *extra):
+        prompts = []
+
+        def respond(body):
+            prompt = body["messages"][-1]["content"]
+            if prompt.endswith("Say OK."):
+                return 200, {"choices": [{"message": {"role": "assistant", "content": "OK"}}],
+                             "usage": {"prompt_tokens": 3200, "completion_tokens": 1}}
+            prompts.append(prompt)
+            planted = dict(re.findall(r"The vault code of (\w+) is (\d{6})\. ", prompt))
+            asked = re.search(r"Cities: (.*)\.$", prompt).group(1).split(", ")
+            reply = "\n".join(f"{c}: {planted.get(c, '000000')}" for c in asked)
+            return 200, {"choices": [{"message": {"role": "assistant", "content": reply}}],
+                         "usage": {"prompt_tokens": len(prompt) // 4, "completion_tokens": 9}}
+
+        m = Mock(respond)
+        try:
+            code, out = run_tool("multi_needle.py", ["--url", m.url, *extra, "--lens", "4000"])
+        finally:
+            m.close()
+        return code, out, prompts
+
+    @staticmethod
+    def haystack(prompt):
+        return prompt[:prompt.index("\nList the vault code")]
+
+    def test_ten_planted_and_asked_by_default(self):
+        code, out, prompts = self.run_multi()
+        self.assertEqual(code, 0, out)
+        self.assertIn("right=10/10", out)
+        self.assertEqual(len(re.findall(r"The vault code of \w+ is \d{6}\. ", prompts[0])), 10)
+
+    def test_twenty_planted_ten_asked(self):
+        code, out, prompts = self.run_multi("--needles", "20", "--ask", "10")
+        self.assertEqual(code, 0, out)
+        self.assertIn("right=10/10 of 20 planted", out)
+        self.assertEqual(len(re.findall(r"The vault code of \w+ is \d{6}\. ", prompts[0])), 20)
+        self.assertEqual(len(re.search(r"Cities: (.*)\.$", prompts[0]).group(1).split(", ")), 10)
+
+    def test_one_seed_sends_the_same_haystack_whatever_is_asked(self):
+        _, out1, p1 = self.run_multi("--needles", "20", "--ask", "10", "--seed", "1")
+        _, out2, p2 = self.run_multi("--needles", "20", "--ask", "20", "--seed", "1")
+        self.assertEqual(self.haystack(p1[0]), self.haystack(p2[0]))
+        self.assertNotEqual(p1[0], p2[0])
+        self.assertIn("right=20/20 of 20 planted", out2)
+
+    def test_values_it_cannot_plant_are_refused(self):
+        for extra in (("--needles", "15"), ("--needles", "10", "--ask", "11"), ("--ask", "0")):
+            code, out, _ = self.run_multi(*extra)
+            self.assertNotEqual(code, 0, (extra, out))
+            self.assertIn("--needles takes 10 or 20", out)
+
+
 class Needle(unittest.TestCase):
     def run_needle(self, mode, extra=(), **kw):
         m = Mock(needle_server(mode, **kw))
@@ -552,3 +638,208 @@ class Needle(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EnvSchemaScope(unittest.TestCase):
+    """tools/schema/check_env_schema.py holds every environment name THIS engine reads to a schema row: the scan leaves out
+    the code the DeepSeek engine does not run (the base engine's other models and GPU backends, its run, benchmark and
+    oracle tools, readers nothing here calls), so a name read only there needs no row, while a name read both there and in
+    this engine's code is still found, at its use here. On the repository it passes."""
+    def scan_tree(self, files):
+        tmp = Path(tempfile.mkdtemp(prefix="tf-schema-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for rel, text in files.items():
+            p = tmp / "zig" / "src" / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text)
+        spec = importlib.util.spec_from_file_location("seed_under_test", ROOT / "tools" / "schema" / "seed.py")
+        seed = importlib.util.module_from_spec(spec); spec.loader.exec_module(seed)
+        old = os.getcwd(); os.chdir(tmp)
+        try:
+            return seed.scan()
+        finally:
+            os.chdir(old)
+
+    def test_a_name_this_engine_reads_is_found(self):
+        found = self.scan_tree({"families/dsv41/x.zig": 'const v = std.c.getenv("TF_DS_PLANTED");\n',
+                                "server/serve.zig": 'const w = env(s, "TENSORFOLD_PLANTED");\n'})
+        self.assertEqual(found.get("TF_DS_PLANTED"), ("families/dsv41/x.zig", 1))
+        self.assertIn("TENSORFOLD_PLANTED", found)
+
+    def test_a_name_only_other_models_or_tools_read_needs_no_row(self):
+        found = self.scan_tree({"families/glm/a.zig": 'const v = std.c.getenv("TF_GLM_PLANTED");\n',
+                                "xpu/b.zig": 'const v = std.c.getenv("TF_XPU_PLANTED");\n',
+                                "server/benchmark_host.zig": 'const v = env.get("TF_BENCH_PLANTED");\n',
+                                "families/dsv41/split_bench_main.zig": 'const v = std.c.getenv("TF_SPLIT_PLANTED");\n'})
+        for n in ("TF_GLM_PLANTED", "TF_XPU_PLANTED", "TF_BENCH_PLANTED", "TF_SPLIT_PLANTED"):
+            self.assertNotIn(n, found)
+
+    def test_a_name_read_there_and_here_is_found_here(self):
+        found = self.scan_tree({"families/glm/a.zig": 'const v = std.c.getenv("TF_BOTH_PLANTED");\n',
+                                "families/dsv41/z.zig": '\nconst v = std.c.getenv("TF_BOTH_PLANTED");\n'})
+        self.assertEqual(found.get("TF_BOTH_PLANTED"), ("families/dsv41/z.zig", 2))
+
+    def test_the_repository_passes(self):
+        r = subprocess.run([sys.executable, "-I", "tools/schema/check_env_schema.py"], cwd=ROOT, capture_output=True,
+                           text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+
+# ---------------------------------------------------------------- longbench2.py
+
+def lb2_module():
+    spec = importlib.util.spec_from_file_location("longbench2_under_test", os.path.join(TOOLS, "longbench2.py"))
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    return m
+
+
+LB2_ITEMS = [
+    {"_id": "a1", "domain": "Single-Document QA", "sub_domain": "x", "difficulty": "easy", "length": "long",
+     "question": "Which colour is the door?", "choice_A": "red", "choice_B": "blue", "choice_C": "green",
+     "choice_D": "grey", "answer": "B", "context": "The door is blue. " * 20},
+    {"_id": "a2", "domain": "Multi-Document QA", "sub_domain": "y", "difficulty": "hard", "length": "long",
+     "question": "Who wrote it?", "choice_A": "Ann", "choice_B": "Bo", "choice_C": "Cy", "choice_D": "Di",
+     "answer": "C", "context": "Cy wrote it. " * 20},
+    {"_id": "a3", "domain": "Code Repository Understanding", "sub_domain": "z", "difficulty": "hard", "length": "long",
+     "question": "Which file?", "choice_A": "a.py", "choice_B": "b.py", "choice_C": "c.py", "choice_D": "d.py",
+     "answer": "D", "context": "def f(): pass\n" * 20},
+    {"_id": "s1", "domain": "Single-Document QA", "sub_domain": "x", "difficulty": "easy", "length": "short",
+     "question": "Short one?", "choice_A": "1", "choice_B": "2", "choice_C": "3", "choice_D": "4",
+     "answer": "A", "context": "One."},
+]
+
+
+class LongBench2(ToolTest):
+    """tools/longbench2.py runs LongBench v2 (THUDM) the way its authors' pred.py does: their 0-shot template, temperature
+    0.1, 128 answer tokens, a context longer than the window cut in the middle by the model's own tokens (the first and
+    last halves kept), the answer read from "The correct answer is (X)". Thinking off by default; --thinking EFFORT
+    gives the reasoning room. It writes one line an item as it goes, skips items already written, and sums up."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="tf-lb2-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.data = os.path.join(self.tmp, "data.json")
+        with open(self.data, "w") as f:
+            json.dump(LB2_ITEMS, f)
+        self.out = os.path.join(self.tmp, "out.jsonl")
+        self.bodies = []
+
+    def server(self, answers, key=None):
+        def respond(body):
+            self.bodies.append(body)
+            q = body["messages"][0]["content"]
+            text = next((a for k, a in answers.items() if k in q), "I am not sure.")
+            return completion(text)
+        s = Mock(respond, needs_key=key)
+        self.addCleanup(s.close)
+        return s
+
+    def results(self):
+        with open(self.out) as f:
+            return {json.loads(l)["_id"]: json.loads(l) for l in f if l.strip()}
+
+    def test_the_middle_cut_keeps_the_first_and_last_halves(self):
+        m = lb2_module()
+        self.assertEqual(m.middle_cut(list(range(10)), 4), [0, 1, 8, 9])
+        self.assertEqual(m.middle_cut(list(range(10)), 10), list(range(10)))
+        self.assertEqual(m.middle_cut(list(range(3)), 0), [0, 1, 2])          # 0: no limit
+
+    def test_the_answer_is_read_the_authors_way(self):
+        m = lb2_module()
+        self.assertEqual(m.extract_answer("The correct answer is (B)"), "B")
+        self.assertEqual(m.extract_answer("**The correct answer is C**"), "C")
+        self.assertIsNone(m.extract_answer("Probably the second one."))
+
+    def test_a_run_asks_each_item_with_the_authors_template_and_scores_it(self):
+        s = self.server({"Which colour": "The correct answer is (B)", "Who wrote": "The correct answer is (A)",
+                         "Which file": "It is d.py."})
+        code, out = run_tool("longbench2.py", ["--url", s.url, "--data", self.data, "--length", "long", "--out", self.out,
+                                               "--max-prompt-tokens", "0"])
+        self.assertEqual(code, 0, out)
+        r = self.results()
+        self.assertEqual(sorted(r), ["a1", "a2", "a3"])                         # the long bin only
+        self.assertEqual((r["a1"]["judge"], r["a2"]["judge"], r["a3"]["judge"]), (True, False, False))
+        self.assertIsNone(r["a3"]["pred"])
+        b = self.bodies[0]
+        self.assertEqual((b["temperature"], b["max_tokens"]), (0.1, 128))
+        self.assertEqual(b["chat_template_kwargs"], {"enable_thinking": False})
+        q = b["messages"][0]["content"]
+        self.assertTrue(q.startswith("Please read the following text and answer the question below."), q[:80])
+        self.assertIn("What is the correct answer to this question: Which colour is the door?", q)
+        self.assertIn("(B) blue", q)
+        self.assertIn('Format your response as follows: "The correct answer is (insert answer here)".', q)
+        self.assertIn("accuracy 1 of 3", out)
+
+    def test_items_already_written_are_not_asked_again(self):
+        s = self.server({"Which colour": "The correct answer is (B)"})
+        run_tool("longbench2.py", ["--url", s.url, "--data", self.data, "--length", "long", "--out", self.out, "--max-prompt-tokens", "0"])
+        n = len(self.bodies)
+        code, out = run_tool("longbench2.py", ["--url", s.url, "--data", self.data, "--length", "long", "--out", self.out,
+                                               "--max-prompt-tokens", "0"])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(self.bodies), n)
+        self.assertEqual(len(self.results()), 3)
+
+    def test_thinking_gives_the_reasoning_room(self):
+        s = self.server({"Which colour": "The correct answer is (B)"})
+        code, out = run_tool("longbench2.py", ["--url", s.url, "--data", self.data, "--length", "short", "--out", self.out,
+                                               "--max-prompt-tokens", "0", "--thinking", "high"])
+        self.assertEqual(code, 0, out)
+        b = self.bodies[0]
+        self.assertEqual((b["reasoning_effort"], b["max_tokens"]), ("high", 16384))
+        self.assertNotIn("chat_template_kwargs", b)
+
+    def test_the_key_file_is_sent(self):
+        key = os.path.join(self.tmp, "keys")
+        with open(key, "w") as f:
+            f.write("tools: sk-lb2-test\n")
+        os.chmod(key, 0o600)
+        s = self.server({"Short one": "The correct answer is (A)"}, key="sk-lb2-test")
+        code, out = run_tool("longbench2.py", ["--url", s.url, "--data", self.data, "--length", "short", "--out", self.out,
+                                               "--max-prompt-tokens", "0", "--key-file", key])
+        self.assertEqual(code, 0, out)
+        self.assertTrue(self.results()["s1"]["judge"], out)
+
+
+# ---------------------------------------------------------------- readme_tables.py
+
+class ReadmeTables(unittest.TestCase):
+    """tools/readme_tables.py rebuilds the README's performance tables from the runs' own files: each cell the median of
+    the repetitions, a first token the mean of one repetition's requests then that median, times written as the README
+    writes them (710 ms, 1.70 s, 16.4 s), the column's best prompt speed in bold, Turbo's change as a signed percentage."""
+
+    def write(self, name, obj):
+        p = os.path.join(self.tmp, name)
+        with open(p, "w") as f:
+            if isinstance(obj, list):
+                f.write("".join(json.dumps(r) + "\n" for r in obj))
+            else:
+                json.dump(obj, f)
+        return p
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="tf-tables-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_the_three_tables_from_their_files(self):
+        main = self.write("main.json", {
+            "summary": {"prefill.4096.tok_s": 5559.4, "prefill.4096.ttft_s": 0.7098, "prefill.1000000.tok_s": 6205.5,
+                        "prefill.1000000.ttft_s": 154.38, "multi.1.aggregate_tok_s": 69.87, "multi.1.per_stream_tok_s": 69.87,
+                        "multi.16.aggregate_tok_s": 227.11, "multi.16.per_stream_tok_s": 16.17},
+            "runs": [{"suite": "multi", "streams": 1, "ttft_s": [0.13]}, {"suite": "multi", "streams": 1, "ttft_s": [0.135]},
+                     {"suite": "multi", "streams": 1, "ttft_s": [0.2]},
+                     {"suite": "multi", "streams": 16, "ttft_s": [1.5, 1.6]}, {"suite": "multi", "streams": 16, "ttft_s": [1.54]},
+                     {"suite": "multi", "streams": 16, "ttft_s": [1.6]}]})
+        turbo = self.write("turbo.json", {"summary": {"prefill.4096.tok_s": 5292.0, "prefill.4096.ttft_s": 0.746,
+                                                       "prefill.1000000.tok_s": 6501.0, "prefill.1000000.ttft_s": 147.4}})
+        code = self.write("code.jsonl", [
+            {"mode": "decode", "conc": 1, "wall_tok_s": w, "per_req_tok_s": e, "ttft_s": t}
+            for w, e, t in ((120.2, 123.1, 0.13), (103.0, 105.9, 0.132), (114.9, 117.4, 0.133))])
+        code_, out = run_tool("readme_tables.py", ["--main", main, "--turbo", turbo, "--code", code])
+        self.assertEqual(code_, 0, out)
+        for row in ("| 4K | 5,559 | 710 ms | 5,292 | 746 ms | -4.8 % |",
+                    "| 1M | **6,206** | 154.4 s | 6,501 | 147.4 s | +4.8 % |",
+                    "| 1 | **69.9** | 69.9 | 135 ms |",
+                    "| 16 | **227.1** | 16.2 | 1.55 s |",
+                    "| 1 | **114.9** | 117.4 | 132 ms |"):
+            self.assertIn(row, out)
