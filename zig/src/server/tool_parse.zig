@@ -59,25 +59,26 @@ fn allSpace(s: []const u8) bool {
 /// The first DeepSeek-V4.1 calls opener at or after `from` that opens a block: reply_text's, which the prose hider reads
 /// too.
 const open41 = reply_text.open41;
+/// The text before the first DSML calls block: a ``<tool_call>`` inside one is an argument's text, not a call.
+pub fn beforeDsml(text: []const u8) []const u8 {
+    const v41 = find(text, dsml41_open, 0) orelse text.len;
+    const v4 = find(text, dsml_open, 0) orelse text.len;
+    return text[0..@min(v41, v4)];
+}
 
-/// (start, end, payload) of each tool-call block in order; a block inside an earlier one is part of it. DeepSeek-V4.1's
-/// calls blocks are read first, from their own tags, and the other forms only in the text around them: a <tool_call> in
-/// the prose or in an argument moves no block's bounds. An unclosed one stays text, whole, as V4's does. With marks, a
-/// DSML block whose opener is spelled in ordinary tokens is no block.
-fn envelopes(a: Allocator, text: []const u8, marks: ?*const reply_text.Marks) Allocator.Error![]Envelope {
+/// A reply's call envelopes in order: DeepSeek-V4.1's DSML blocks first, the other forms only in the text around them.
 /// A DSML block ends at its first closer, or with ``extend`` where ``reply_text.blockEnd`` ends it (past a closer
 /// inside a value).
 fn envelopes(a: Allocator, text: []const u8, extend: bool) Allocator.Error![]Envelope {
     var found: std.ArrayList(Envelope) = .empty;
     var gap: usize = 0;
-    while (open41(text, gap, marks)) |s| {
-        try tagged(a, text[gap..s], gap, marks, &found);
-        const e = find(text, dsml41_close, s + dsml41_open.len);
-        const end = if (e) |at| at + dsml41_close.len else text.len;
-        try found.append(a, .{ .start = s, .end = end, .payload = text[s..end], .complete = e != null });
-        gap = end;
+    var at: usize = 0;
+    while (find(text, dsml41_open, at)) |s| {
         const e = (if (extend) reply_text.blockEnd(text, s + dsml41_open.len, dsml41_open, dsml41_close, true) else find(text, dsml41_close, s + dsml41_open.len)) orelse break;
         try tagged(a, text[gap..s], gap, &found, extend);
+        try found.append(a, .{ .start = s, .end = e + dsml41_close.len, .payload = text[s .. e + dsml41_close.len] });
+        at = e + dsml41_close.len;
+        gap = at;
     }
     try tagged(a, text[gap..], gap, &found, extend);
     std.mem.sort(Envelope, found.items, {}, struct {
@@ -92,8 +93,7 @@ fn envelopes(a: Allocator, text: []const u8, extend: bool) Allocator.Error![]Env
     return kept.items;
 }
 
-/// The envelopes other than DeepSeek-V4.1's blocks in ``text``, a stretch of the reply that starts at ``base``.
-fn tagged(a: Allocator, text: []const u8, base: usize, marks: ?*const reply_text.Marks, out: *std.ArrayList(Envelope)) Allocator.Error!void {
+/// The envelopes other than DeepSeek-V4.1's blocks in ``text``, a slice of the reply that starts at ``base``.
 fn tagged(a: Allocator, text: []const u8, base: usize, out: *std.ArrayList(Envelope), extend: bool) Allocator.Error!void {
     var pos: usize = 0;
     while (findCI(text, "<tool_call>", pos)) |s| {
@@ -123,6 +123,8 @@ fn tagged(a: Allocator, text: []const u8, base: usize, out: *std.ArrayList(Envel
     pos = 0;
     while (find(text, dsml_open, pos)) |s| {
         const e = (if (extend) reply_text.blockEnd(text, s + dsml_open.len, dsml_open, dsml_close, true) else find(text, dsml_close, s + dsml_open.len)) orelse break;
+        try out.append(a, .{ .start = base + s, .end = base + e + dsml_close.len, .payload = text[s .. e + dsml_close.len] });
+        pos = e + dsml_close.len;
     }
 }
 
@@ -531,13 +533,8 @@ fn gemmaCall(a: Allocator, block: []const u8) Error!?Call {
     return .{ .name = name, .arguments = try jsonObject(a, .{ .string = text }) };
 }
 
-/// DeepSeek-V4.1's calls block as the served lane reads it (reply_text.py: dsml_to_tool_calls, then parse_tool_calls on
-/// each invoke's ``<tool_call>{"name": .., "arguments": ..}</tool_call>``): every ``invoke name="N"`` up to its closer is a
-/// call of its own, text between them is dropped; its ``parameter name="K"`` values are strings, or JSON with
-/// ``string="false"`` (a string when that JSON does not parse). An offered name, matched stripped as that parse strips
-/// it, is a call (past ``max_calls`` it is dropped; with a limit its arguments must be finite); another name stays as the
-/// lane leaves it, its rewritten block.
-fn dsml41Calls(a: Allocator, block: []const u8, known: *const std.StringArrayHashMapUnmanaged([]const u8), max_calls: ?usize, calls: *std.ArrayList(Value), residue: *std.ArrayList(u8)) Allocator.Error!void {
+/// Each invoke of a DeepSeek-V4.1 calls block as a call; with a limit, only offered tools with finite arguments, up to it.
+fn dsml41Calls(a: Allocator, block: []const u8, known: *const std.StringArrayHashMapUnmanaged([]const u8), max_calls: ?usize, calls: *std.ArrayList(Value)) Allocator.Error!void {
     var pos: usize = 0;
     while (find(block, invoke41_open, pos)) |s| {
         pos = s + 1;
@@ -546,7 +543,7 @@ fn dsml41Calls(a: Allocator, block: []const u8, known: *const std.StringArrayHas
         if (q == name_start or !std.mem.startsWith(u8, block[q..], "\">")) continue;
         const e = find(block, invoke41_close, q + 2) orelse continue;
         pos = e + invoke41_close.len;
-        const name = block[name_start..q];
+        const name = strip(block[name_start..q]);
         const body = block[q + 2 .. e];
         const arguments = try json.newObject(a);
         var p: usize = 0;
@@ -574,21 +571,10 @@ fn dsml41Calls(a: Allocator, block: []const u8, known: *const std.StringArrayHas
             } else .{ .string = value };
             try arguments.put(a, body[ns..nq], v);
         }
-        if (max_calls) |m| if (calls.items.len >= m) continue;
-        const offered = known.get(try std.ascii.allocLowerString(a, strip(name)));
-        if (offered == null or (max_calls != null and !tool_params.finite(.{ .object = arguments }))) {
-            if (max_calls == null) {
-                // the lane's rewrite: <tool_call> + json.dumps({"name": N, "arguments": args}, ensure_ascii=False) + </tool_call>
-                const doc = try json.newObject(a);
-                try doc.put(a, "name", .{ .string = name });
-                try doc.put(a, "arguments", .{ .object = arguments });
-                try residue.appendSlice(a, "<tool_call>");
-                try residue.appendSlice(a, try json.stringify(a, .{ .object = doc }, .{ .ascii = false }));
-                try residue.appendSlice(a, "</tool_call>");
-            }
-            continue;
-        }
-        try calls.append(a, try openaiCall(a, offered.?, .{ .object = arguments }));
+        if (name.len == 0) continue;
+        const offered = known.get(try std.ascii.allocLowerString(a, name));
+        if (max_calls) |m| if (calls.items.len >= m or offered == null or !tool_params.finite(.{ .object = arguments })) continue;
+        try calls.append(a, try openaiCall(a, offered orelse name, .{ .object = arguments }));
     }
 }
 

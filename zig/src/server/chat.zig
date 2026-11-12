@@ -396,7 +396,7 @@ const Generation = struct {
             var out: std.ArrayList(Value) = .empty;
             c.marks = mp;
             defer c.marks = null;
-            try c.feed(answer, &out); // never the reasoning: a call it mentions is not made
+            try c.feed(tool_parse.beforeDsml(answer), &out); // never the reasoning, nor a DSML block's arguments: a call they quote is not made
             for (out.items) |d| try g.emit(sink, d);
         }
     }
