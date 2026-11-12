@@ -20,6 +20,7 @@ const tool_specs = @import("tool_specs.zig");
 const tool_grammar = @import("tool_grammar.zig");
 const chunk_plan = @import("chunk_plan.zig");
 const log = @import("log.zig");
+const prepare_gate = @import("prepare_gate.zig");
 const live = @import("live.zig");
 const slide_graph = @import("slide_graph.zig");
 const slide_lesson = @import("slide_lesson.zig");
@@ -27,6 +28,9 @@ const cortheon = @import("cortheon/cortheon.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
+
+/// A kept-alive connection's arena keeps at most this much between its requests.
+const connection_keep: usize = 1 << 20;
 
 /// Requests so far that drew a random seed (TF_SEED_RANDOM), and the second of the last top_k warning.
 var seed_counter: std.atomic.Value(u64) = .init(0);
@@ -93,6 +97,9 @@ pub const Config = struct {
     /// --learn-conversations: /v1/imprint answers; without it each of its routes refuses and names the flag.
     saved_conversations: bool = false,
     timeouts: http_conn.Timeouts = .{},
+    /// TENSORFOLD_PREPARE_FLOOR_GIB: the MemAvailable a prompt's render and tokenization leave at least while others
+    /// are in flight (prepare_gate); 0: no gate.
+    prepare_floor_gib: f64 = prepare_gate.default_floor_gib,
     /// The open /health names these after its other keys; empty fields are left out.
     identity: Identity = .{},
 };
@@ -128,6 +135,8 @@ pub const Server = struct {
     /// The idle keepalive on the engine's queue, armed by --keep-warm; null when off or not Metal.
     keepalive: ?*api.keepalive.Keepalive = null,
     preparing: std.atomic.Value(i64) = .init(0),
+    /// Concurrent prompt preparations held under the memory floor (prepare_gate).
+    gate: prepare_gate.Gate = .{},
     arena: std.heap.ArenaAllocator,
     /// Structured output's compiler, opened by the first structured request (Python's grammar.compiler).
     grammars: ?*api.grammar.Compiler = null,
@@ -407,7 +416,9 @@ pub const Server = struct {
         var arena: std.heap.ArenaAllocator = .init(srv.gpa);
         defer arena.deinit();
         while (true) {
-            _ = arena.reset(.retain_capacity);
+            // a kept-alive connection keeps at most this much of its last request between requests (a long prompt's
+            // text and ids are tens of MiB, and retain_capacity held them until the connection closed)
+            _ = arena.reset(.{ .retain_with_limit = connection_keep });
             const a = arena.allocator();
             const outcome = conn.readRequest(a, true) catch break;
             switch (outcome) {
@@ -419,6 +430,7 @@ pub const Server = struct {
             if (conn.header("Expect")) |expect| if (std.ascii.eqlIgnoreCase(expect, "100-continue") and std.mem.order(u8, conn.version, "HTTP/1.1") != .lt) conn.sendContinue();
             routes.dispatch(srv, &conn, a);
             if (conn.close or conn.broken) break;
+            _ = arena.reset(.{ .retain_with_limit = connection_keep }); // (before waiting for the next request)
         }
     }
 

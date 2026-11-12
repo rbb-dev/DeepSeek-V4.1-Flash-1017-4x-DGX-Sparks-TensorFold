@@ -45,7 +45,7 @@ pub const Model = struct {
         switch (m.kind) {
             .bpe => try m.bpe(ctx, vocab, word, out),
             .wordpiece => try m.wordpiece(ctx, vocab, word, out),
-            .wordlevel => try out.append(ctx.a, m.id(vocab, word) orelse try m.unk(vocab)),
+            .wordlevel => try out.append(steps.outOf(ctx), m.id(vocab, word) orelse try m.unk(vocab)),
         }
     }
 
@@ -63,7 +63,7 @@ pub const Model = struct {
 
     fn bpe(m: *const Model, ctx: *steps.Context, vocab: *const Vocab, word: []const u8, out: *std.ArrayList(u32)) Error!void {
         const a = ctx.a;
-        if (m.ignore_merges) if (m.id(vocab, word)) |whole| return out.append(a, whole);
+        if (m.ignore_merges) if (m.id(vocab, word)) |whole| return out.append(steps.outOf(ctx), whole);
         // the word's scratch lives in ctx.word when the caller gives one and is emptied for the next word, so an encode
         // of a long text holds one word's symbols and queue instead of every word's; the ids still go to `a`
         const w = if (ctx.word) |scratch| scratch.allocator() else a;
@@ -131,12 +131,12 @@ pub const Model = struct {
             if (s.next >= 0) if (m.pair(s.id, syms[@intCast(s.next)].id)) |hit|
                 try queue.push(w, .{ .rank = hit.rank, .pos = top.pos, .id = hit.id });
         }
-        for (syms) |s| if (s.alive) try out.append(a, s.id);
+        for (syms) |s| if (s.alive) try out.append(steps.outOf(ctx), s.id);
     }
 
     fn wordpiece(m: *const Model, ctx: *steps.Context, vocab: *const Vocab, word: []const u8, out: *std.ArrayList(u32)) Error!void {
         const a = ctx.a;
-        if ((std.unicode.utf8CountCodepoints(word) catch return error.InvalidTokenizer) > m.max_chars) return out.append(a, try m.unk(vocab));
+        if ((std.unicode.utf8CountCodepoints(word) catch return error.InvalidTokenizer) > m.max_chars) return out.append(steps.outOf(ctx), try m.unk(vocab));
         const mark = out.items.len;
         var piece: std.ArrayList(u8) = .empty;
         var start: usize = 0;
@@ -151,9 +151,9 @@ pub const Model = struct {
                 while (word[end] & 0xC0 == 0x80) end -= 1;
             } else {
                 out.shrinkRetainingCapacity(mark);
-                return out.append(a, try m.unk(vocab));
+                return out.append(steps.outOf(ctx), try m.unk(vocab));
             };
-            try out.append(a, found);
+            try out.append(steps.outOf(ctx), found);
             start = end;
         }
     }
