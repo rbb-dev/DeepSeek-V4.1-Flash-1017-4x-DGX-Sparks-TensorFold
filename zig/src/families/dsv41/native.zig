@@ -180,6 +180,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     });
     errdefer st.m.close();
     st.lanes = lanes_mod.Lanes.init(gpa, st.m);
+    errdefer st.lanes.deinit();
     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
     if (getenv("TF_DS_SERVED_K")) |t| st.lanes.served_k = if (std.mem.eql(u8, t, "1") or std.mem.eql(u8, t, "all")) .all else if (std.mem.eql(u8, t, "solo")) .solo else .off;
     if (getenv("TF_FILL_CHUNKS")) |t| st.lanes.fill_chunks = std.fmt.parseInt(usize, t, 10) catch return error.BadFill;
@@ -198,6 +199,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     // the pool is the model's (preallocated): a stream takes no device memory of its own
     const L = lanes_mod.Lanes;
     const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .resumes = L.snapResumesFn, .live = L.snapLiveFn };
+    try st.lanes.idleRdma(); // park even before the first API request
     // a follower that stops stops this server too, with a line that names it, instead of a wait on it for good
     st.m.watchPeers() catch |err| std.log.warn("dsv41: rank 0 cannot watch its followers: {s}", .{@errorName(err)});
     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .lane_vision = if (st.vision) |v| v.hook() else null, .fill_rounds = if (st.lanes.fill_chunks > 0) fill_rounds else 0 };

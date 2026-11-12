@@ -435,6 +435,7 @@ pub const Lanes = struct {
     peer: ?link.Link, // rank 1 (null: one rank); every follower gets each frame (Model.followers)
     vision: ?*@import("vision.zig").Vision = null, // rank 0's tower (a vision checkpoint served with its kit's vision/)
     step: u64 = 0,
+    rdma_idle: bool = false,
     wire: Wire = .{},
     streams: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
     wc: [window_rows]lanes.config.Cost = undefined, // the window costs (init)
@@ -654,7 +655,10 @@ pub const Lanes = struct {
     }
 
     fn begin(self: *Lanes, kind: Kind) !bool {
-        if (self.peer == null) return false;
+        if (usesRdma(kind) and self.rdma_idle) {
+            setRdmaIdle(self.m, false);
+            self.rdma_idle = false;
+        }
         try self.wire.begin(self.gpa, kind, self.step);
         self.step += 1;
         return true;
@@ -672,11 +676,21 @@ pub const Lanes = struct {
         if (!try of(ptr).prefillPart(s, std.math.maxInt(usize))) return error.FillUnfinished;
     }
 
-    /// One step of the prompt pass (opened at its first): fill_first chunks first, then fill_chunks a step; true once
-    /// it reached the head and drew the first token.
-    fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
-        const self = of(ptr);
-        return self.prefillPart(s, if (self.fillOf(s) == null and self.fill_first > 0) self.fill_first else self.fill_chunks);
+    /// Two-phase world-wide idle boundary. No rank parks while another may
+    /// still need it as an RDMA relay. All streams/CUDA graphs finish first.
+    pub fn idleRdma(self: *Lanes) !void {
+        if (self.rdma_idle or self.streams.count() != 0 or !hasRdma(self.m)) return;
+        self.m.joinAhead();
+        try self.m.ctx.synchronize();
+        try self.send(.rdma_idle);
+        var ack: [64]u8 = undefined;
+        for (self.m.followers()) |l| {
+            if (!std.mem.eql(u8, try l.?.recv(&ack), idle_ready)) return error.BadIdleAck;
+        }
+        // Every GPU is quiescent now; only then permit any proxy to park.
+        for (self.m.followers()) |l| try l.?.send(idle_commit);
+        setRdmaIdle(self.m, true);
+        self.rdma_idle = true;
     }
 
     /// A prompt pass's rows at most when it starts at `start`.
@@ -770,6 +784,7 @@ pub const Lanes = struct {
         errdefer {
             _ = self.streams.remove(s);
             self.used[slot] = false;
+            self.idleRdma() catch |err| std.debug.panic("RDMA idle after prefill error: {s}", .{@errorName(err)});
         }
         const seq = &self.seqs[slot];
         try seq.resize(gpa, len);
@@ -1247,6 +1262,7 @@ pub const Lanes = struct {
             self.m.joinAhead();
             self.m.fill_seq = &.{};
             self.dropFill(f.slot);
+        if (self.streams.fetchRemove(s)) |kv| {
             const slot = kv.value.slot;
             if (self.fills[slot]) |*f| {
                 if (self.filling_slot == slot) {
@@ -1259,6 +1275,36 @@ pub const Lanes = struct {
             if (self.filling_slot == slot) self.filling_slot = null;
             self.used[slot] = false;
         }
+        self.idleRdma() catch |err| std.debug.panic("RDMA idle transition failed: {s}", .{@errorName(err)});
+    }
+};
+
+const idle_ready = "rdma-idle-ready-v1";
+const idle_commit = "rdma-idle-commit-v1";
+
+fn usesRdma(kind: Kind) bool {
+    return switch (kind) {
+        else => false,
+    };
+}
+
+fn hasRdma(m: *const Model) bool {
+    return m.ring != null or m.rdma_rings != null;
+}
+
+fn setRdmaIdle(m: *Model, idle: bool) void {
+    if (m.ring) |r| {
+        if (idle) r.park() else r.wake();
+    }
+    if (m.rdma_rings) |rs| {
+            if (idle) r.park() else r.wake();
+    }
+}
+
+/// Prefix survivals: out[j] = the product of sigmoid(conf[i]) for i <= j, in float64 (libm's exp, as chooseK).
+pub fn survivals(conf: []const f32, out: []f64) void {
+    var surv: f64 = 1.0;
+    for (out, conf[0..out.len]) |*o, cf| {
         surv *= draft.landing(cf);
         o.* = surv;
     }
@@ -1310,6 +1356,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     defer for (&win_ids) |*q| q.deinit(gpa);
     var built: Built = .{};
     var step: u64 = 0;
+    var rdma_idle = false;
     var slot: usize = 0;
     var img_rows: std.ArrayList(u8) = .empty; // a prompt's image rows as their pieces come
     defer img_rows.deinit(gpa);
@@ -1334,8 +1381,13 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             8 => .fill_images,
             9 => .done,
             10 => .fill_resume,
+            11 => .rdma_idle,
             else => return error.BadFrame,
         };
+        if (usesRdma(kind) and rdma_idle) {
+            setRdmaIdle(m, false);
+            rdma_idle = false;
+        }
         if (try r.int(u64) != step) return error.OutOfStep;
         step += 1;
         // a chunk's read-ahead of the next is done before anything but that chunk (a prompt's ids may change)
@@ -1455,6 +1507,13 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     var b = kv.value;
                     b.free();
                 }
+            },
+            .rdma_idle => {
+                try m.ctx.synchronize();
+                try peer.send(idle_ready);
+                if (!std.mem.eql(u8, try peer.recv(buf), idle_commit)) return error.BadIdleCommit;
+                setRdmaIdle(m, true);
+                rdma_idle = true;
             },
             .done => {
                 m.unwatch(); // (rank 0 closes its link after done)

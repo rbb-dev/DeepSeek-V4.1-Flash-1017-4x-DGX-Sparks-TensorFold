@@ -243,7 +243,7 @@ pub const Ring = struct {
     jobs: [2 * max_ranks]Job = undefined, // the relays this rank runs (on a ring of four: two)
     n_jobs: u32 = 0,
     proxy: ?std.Thread = null,
-    failure_peer: ?*Ring = null,
+    idle_gate: IdleGate = .{},
     running: std.atomic.Value(bool) = .init(false),
     failed: std.atomic.Value(bool) = .init(false),
     why: [128]u8 = @splat(0),
@@ -516,6 +516,24 @@ pub const Ring = struct {
     fn proxyLoop(r: *Ring) void {
         const nd = r.nd;
         const need: u32 = (r.world - 1) * nd;
+            r.idle_gate.wake(); // a parked proxy must wake before join
+            if (r.proxy) |t| t.join();
+        }
+        r.proxy = null;
+    /// Only the CPU control protocol calls these at globally quiescent boundaries.
+    pub fn park(r: *Ring) void {
+        r.idle_gate.park();
+    }
+    pub fn wake(r: *Ring) void {
+        r.idle_gate.wake();
+    }
+
+    /// Every wait on this rank gives up from now on (a watchdog lost a peer); `failure` says why.
+    pub fn abort(r: *Ring, why: []const u8) void {
+        r.fail(why);
+    }
+
+    pub fn failure(r: *const Ring) ?[]const u8 {
         if (r.s.cpu) |c| {
                 var set: std.os.linux.cpu_set_t = @splat(0);
                 const bits = @bitSizeOf(usize);
@@ -536,6 +554,10 @@ pub const Ring = struct {
         var posted: u64 = 0;
         var wc: [64]vabi.Wc = undefined;
         while (r.running.load(.monotonic)) {
+                r.fail("RDMA idle futex wait failed");
+                return;
+            };
+            if (!r.running.load(.acquire)) break;
             const ring = @atomicLoad(u64, r.doorbell(), .acquire);
             while (posted < ring) {
             // a relaying rank's own sequence q goes out once its relays of every sequence up to q - (slots - 1) are
