@@ -67,6 +67,9 @@ pub const Config = struct {
     /// last (tokens a round, drafts kept, the draft head's chains by depth); 0: none. Replies are the same either way.
     stats_every_s: u32 = 0,
     dashboard: bool = false,
+    /// TENSORFOLD_LOG_POLLS=1: the access lines of the polls' answers (/health, /metrics, the model lists, /stats) are
+    /// printed too; by default a poll answered 200 prints none.
+    log_polls: bool = false,
     /// Sampling when a request names none (generation_config.json and the serve flags), or null for greedy.
     default_sampling: ?Value = null,
     use_drafts: bool = true,

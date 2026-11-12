@@ -282,6 +282,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .plain_specials = plain_specials,
         .reply_ids = reply_ids,
         .dashboard = args.dashboard,
+        .log_polls = if (env(s, "TENSORFOLD_LOG_POLLS")) |v| std.mem.eql(u8, v, "1") else false,
         .compact_at = if (args.compact_auto) .{ .auto = {} } else if (args.compact_fraction) |f| .{ .fraction = f } else null,
         .compact_keep = args.compact_keep,
         .compact_memory = args.compact_memory,

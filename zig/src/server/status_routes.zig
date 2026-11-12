@@ -9,13 +9,18 @@ const Conn = @import("http_conn.zig").Conn;
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
-/// With keys on, health names nothing about the model.
+/// A poll's answer about to go out as 200: no access line unless TENSORFOLD_LOG_POLLS=1 (its error answers keep theirs).
+fn poll(srv: *const Server, conn: *Conn) void {
+    conn.quiet_log = !srv.config.log_polls;
+}
+
 /// With keys on, health names nothing about the model to a request without a valid key; a key holder (a dashboard's
 /// key) gets the whole answer. An engine that cannot serve (a fault it cannot recover from) answers 503, keys on or off.
 pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
     var status: api.Status = .{};
     srv.engine.status(&status, &.{});
     if (!status.healthy) return conn.sendJson(503, "{\"status\": \"unavailable\"}");
+    poll(srv, conn);
     if (srv.keys) |k| if (k.enabled() and conn.key_label == null) return conn.sendJson(200, "{\"status\": \"ok\"}");
     routes.sendValue(conn, a, 200, try healthValue(srv, a, std.mem.indexOf(u8, conn.path, "reset_peak=1") != null));
 }
@@ -146,6 +151,7 @@ pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
     const o = try json.newObject(a);
     try o.put(a, "object", .{ .string = "list" });
     try o.put(a, "data", .{ .array = data });
+    poll(srv, conn);
     routes.sendValue(conn, a, 200, .{ .object = o });
 }
 
@@ -189,6 +195,7 @@ pub fn metrics(srv: *Server, conn: *Conn, a: Allocator) void {
     var out: std.Io.Writer.Allocating = .init(a);
     srv.metrics.render(srv.io, &out.writer, srv.engine, srv.info.context_window) catch return;
     const body = out.written();
+    poll(srv, conn);
     conn.startResponse(200, null) catch return;
     conn.addHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8") catch return;
     var len: [24]u8 = undefined;
@@ -218,7 +225,7 @@ pub fn stats(srv: *Server, conn: *Conn, a: Allocator) void {
     const rounds = srv.metrics.rounds;
     srv.metrics.mutex.unlock(srv.io);
     const body = statsSnapshot(a, status, memory, prompt, generation, drafted, accepted, rounds) catch return;
-    conn.quiet_log = true;
+    poll(srv, conn);
     routes.sendValue(conn, a, 200, body);
 }
 

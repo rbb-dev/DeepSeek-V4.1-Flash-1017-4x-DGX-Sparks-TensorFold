@@ -8,6 +8,7 @@ const model_text = @import("model_text.zig");
 const routes = @import("routes.zig");
 const auth = @import("auth.zig");
 const Conn = @import("http_conn.zig").Conn;
+const log = @import("log.zig");
 
 const NoText = struct {
     fn text(t: *@This()) model_text.Text {
@@ -165,6 +166,61 @@ test "/health names the engine's start and its uptime once the server knows the 
     const up = h.get("uptime_s") orelse return error.NoUptime;
     try std.testing.expect(at == .float and @abs(at.float - (now - 120)) < 0.001);
     try std.testing.expect(up == .float and up.float >= 119 and up.float < 180);
+}
+
+/// The access lines printed while `paths` are fetched in turn.
+fn accessLines(srv: *server.Server, paths: []const []const u8, buf: []u8) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    log.capture = &w;
+    defer log.capture = null;
+    for (paths) |p| std.testing.allocator.free((try get(srv, p)).body);
+    return w.buffered();
+}
+
+test "the polls answered 200 print no access line; other requests and an unhealthy /health print theirs" {
+    var text: NoText = .{};
+    var e: Engine = .{};
+    const srv = try testServer(&e, &text, null);
+    defer srv.deinit();
+    var buf: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings("", try accessLines(srv, &.{ "/health", "/metrics", "/v1/metrics", "/v1/models", "/api/v0/models" }, &buf));
+    try std.testing.expectEqualStrings("[tensorfold] test \"GET /nope HTTP/1.1\" 404 -\n", try accessLines(srv, &.{"/nope"}, &buf));
+    e.healthy = false;
+    try std.testing.expectEqualStrings("[tensorfold] test \"GET /health HTTP/1.1\" 503 -\n", try accessLines(srv, &.{"/health"}, &buf));
+}
+
+test "TENSORFOLD_LOG_POLLS=1: the polls print their access lines" {
+    var text: NoText = .{};
+    var e: Engine = .{};
+    const srv = try server.Server.init(std.testing.allocator, std.testing.io, e.engine(), text.text(), .{
+        .served_name = "m",
+        .model_ids = &.{"m"},
+        .enable_thinking = false,
+        .use_drafts = false,
+        .log_polls = true,
+    }, null);
+    defer srv.deinit();
+    var buf: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings("[tensorfold] test \"GET /health HTTP/1.1\" 200 -\n" ++
+        "[tensorfold] test \"GET /metrics HTTP/1.1\" 200 -\n" ++
+        "[tensorfold] test \"GET /v1/models HTTP/1.1\" 200 -\n", try accessLines(srv, &.{ "/health", "/metrics", "/v1/models" }, &buf));
+}
+
+test "a request starts with its access line on, whatever the request before it on the connection left" {
+    var pair: [2]std.c.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
+    defer _ = std.c.close(pair[0]);
+    defer _ = std.c.close(pair[1]);
+    const head = "GET /health HTTP/1.1\r\nHost: t\r\n\r\n";
+    if (std.c.write(pair[0], head.ptr, head.len) != @as(isize, head.len)) return error.Closed;
+    var conn = try Conn.init(std.testing.allocator, pair[1], "test");
+    defer conn.deinit();
+    conn.timeouts = .{ .idle_ms = 2000, .read_ms = 2000, .write_ms = 2000 };
+    conn.quiet_log = true; // a reply that was never sent
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqual(.ready, try conn.readRequest(arena.allocator(), false));
+    try std.testing.expect(!conn.quiet_log);
 }
 
 test "keys on: /health gives a key holder its whole answer; without a valid key it says ok and nothing more" {

@@ -29,6 +29,9 @@ fn writeOut(bytes: []const u8) void {
     }
 }
 
+/// Tests: where lines go (a test's stdout is the build runner's channel, so without it they go nowhere).
+pub var capture: ?*std.Io.Writer = null;
+
 /// One ``[tensorfold] ...`` line.
 pub fn line(comptime fmt: []const u8, args: anytype) void {
     var buf: [8192]u8 = undefined;
