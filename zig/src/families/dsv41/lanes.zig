@@ -804,7 +804,8 @@ pub const Lanes = struct {
                     if (q.* != @as(i64, image_id)) return error.BadImageSpan;
                     q.* = -1;
                 }
-                if (@as(usize, img.at) + img.tokens <= resume_at) continue;
+                // The keyed snapshot already contains these image rows; only a span crossing its cut needs encoding.
+                if (kept) |sn| if (@as(usize, img.at) + img.tokens <= sn.at) continue;
                 if (img.rows) {
                     if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
                     try rows.appendSlice(gpa, img.bytes);
