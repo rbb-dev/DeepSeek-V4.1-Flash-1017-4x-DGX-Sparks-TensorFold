@@ -388,9 +388,13 @@ pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs
                 const r = role.?.string;
                 if (!std.mem.eql(u8, r, "user") and !std.mem.eql(u8, r, "tool")) for (content.?.array) |part| if (isImagePart(part)) return cx.refuse(image_role_refusal);
                 var text: std.ArrayList(u8) = .empty;
+                var after_image = false;
                 for (content.?.array, 0..) |part, k| {
-                    if (k > 0) try text.appendSlice(cx.a, "\n\n");
-                    if (isImagePart(part)) {
+                    // blank lines only next to a picture: text parts join as they do in a request without one
+                    const image = isImagePart(part);
+                    if (k > 0 and (image or after_image)) try text.appendSlice(cx.a, "\n\n");
+                    after_image = image;
+                    if (image) {
                         try im.list.append(cx.a, try imageBytes(cx, part));
                         try text.appendSlice(cx.a, im.placeholder);
                         continue;
@@ -617,6 +621,24 @@ test "a message's own text holding the image placeholder is escaped" {
     try std.testing.expectEqualStrings("see <|deepseek_image|> above\n\n" ++ ph, text);
     try std.testing.expectEqual(@as(usize, 1), images.list.items.len);
 }
+
+test "a picture changes no other message's text: text parts are joined as without one, blank lines only next to it" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var cx: Cx = .{ .a = arena.allocator() };
+    const ph = "<\u{ff5c}deepseek_image\u{ff5c}>";
+    var images: Images = .{ .placeholder = ph };
+    const pic = "{\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,aGVsbG8=\"}}";
+    const first = "{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"a\"}, {\"type\": \"text\", \"text\": \"b\"}]}";
+    const messages = (try json.parseText(cx.a, "[" ++ first ++ ", {\"role\": \"assistant\", \"content\": \"ok\"}, " ++
+        "{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"c\"}, {\"type\": \"text\", \"text\": \"d\"}, " ++
+        pic ++ ", {\"type\": \"text\", \"text\": \"e\"}, " ++ pic ++ "]}]")).ok;
+    const out = try normalizeImages(&cx, messages, "system", false, &images);
+    const alone = try normalize(&cx, (try json.parseText(cx.a, "[" ++ first ++ "]")).ok, "system", false);
+    try std.testing.expectEqualStrings(alone.array[0].get("content").?.string, out.array[0].get("content").?.string);
+    try std.testing.expectEqualStrings("ab", out.array[0].get("content").?.string);
+    try std.testing.expectEqualStrings("cd\n\n" ++ ph ++ "\n\ne\n\n" ++ ph, out.array[2].get("content").?.string);
+    try std.testing.expectEqual(@as(usize, 2), images.list.items.len);
 }
 
 test "maskControls marks a client's control spellings in every string, and copies nothing when there are none" {
