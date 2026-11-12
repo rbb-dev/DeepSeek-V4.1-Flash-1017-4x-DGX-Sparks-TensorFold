@@ -258,6 +258,29 @@ pub fn place(used: []const [2]usize, size: usize, cap: usize) ?usize {
 
 /// The token a row's logits draw at absolute position `position`: greedy without sampling (or at temperature 0),
 /// else the served sampler with the stream's key.
+/// draw from a row's first candidates (Track B): a greedy row's token is its first candidate (sampling.argmax's: the
+/// first index of the largest value; the GPU's flags send a row with a NaN down draw's path instead); a sampled row's
+/// is sampleRow's choice on its own candidateCount of them.
+pub fn drawCandidates(vals: []const f32, ids: []const i64, n: usize, position: u64, s: ?lanes.Sampling) !u32 {
+    const sm = s orelse return @intCast(ids[0]);
+    if (sm.temperature <= 0) return @intCast(ids[0]);
+    const smp: sampling.Sampling = .{ .seed = sm.seed, .temperature = sm.temperature, .top_k = sm.top_k, .top_p = sm.top_p, .min_p = sm.min_p };
+    const c = sampling.candidateCount(n, smp);
+    if (c > vals.len) return error.TooManyCandidates;
+    return @intCast(try sampling.sampleCandidates(vals[0..c], ids[0..c], position, smp));
+}
+
+/// TF_DS_SAMPLE_CAND=1: Track B's candidates path for sampled rounds. Unset or any other value: the whole logits.
+fn candOn() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v) |x| return x;
+    const x = if (std.c.getenv("TF_DS_SAMPLE_CAND")) |e| std.mem.eql(u8, std.mem.span(e), "1") else false;
+    S.v = x;
+    return x;
+}
+
 pub fn draw(row: []const f32, position: u64, s: ?lanes.Sampling) !u32 {
     const sm = s orelse return @intCast(sampling.argmax(row));
     if (sm.temperature <= 0) return @intCast(sampling.argmax(row));
@@ -900,6 +923,18 @@ pub const Lanes = struct {
             for (w.tokens, 0..) |t, j| ids[k][1 + w.held + j] = @intCast(t);
             wins[k] = .{ .slot = l.slot, .base = l.base, .end = l.end, .start = start, .absorb = m.drafting() and w.stream.drafts, .ids = ids[k][0..rows] };
         }
+        // Track B (TF_DS_SAMPLE_CAND=1): a sampled round's rows as their first candidates from the GPU (the host's
+        // draws read only those; sampling.sampleCandidates), the whole logits only when a row needs them
+        var cand_count: usize = 0;
+            cand_count = 1;
+            for (windows) |w| if (w.stream.sampling) |sm| if (sm.temperature > 0) {
+                if (sm.top_k == 0 or sampling.candidateCount(m.vocab, .{ .seed = sm.seed, .temperature = sm.temperature, .top_k = sm.top_k, .top_p = sm.top_p, .min_p = sm.min_p }) > sampling.max_candidates) {
+                    cand_count = 0;
+                    break;
+                }
+                cand_count = @max(cand_count, sampling.candidateCount(m.vocab, .{ .seed = sm.seed, .temperature = sm.temperature, .top_k = sm.top_k, .top_p = sm.top_p, .min_p = sm.min_p }));
+            };
+        }
         const t0 = m.now();
         if (try self.begin(.verify)) {
             try self.wire.int(gpa, u32, @intCast(windows.len));
@@ -927,6 +962,10 @@ pub const Lanes = struct {
         const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
         const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
         const t3 = m.now();
+        var whole = cand == null;
+        if (cand) |cd| for (cd.flags) |fl| {
+            whole = whole or fl != 0;
+        };
         defer if (self.prof) |*p| {
             p.send += t1 - t0;
             p.enqueue += m.t_enqueue;
@@ -940,8 +979,11 @@ pub const Lanes = struct {
         const V = m.vocab;
         for (windows, out, 0..) |w, *o, k| {
             const row0 = self.built.wins[k].row;
-            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else if (w.masks.len > 0)
+            for (0..w.rows()) |r| o.sampled[r] = if (greedy)
+                tokens[row0 + r]
                 try self.drawAllowed(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling, w.masks[r * words ..][0..words])
+            else if (!whole)
+                try drawCandidates(cand.?.vals[(row0 + r) * cand_count ..][0..cand_count], cand.?.ids[(row0 + r) * cand_count ..][0..cand_count], V, w.positions[r], w.stream.sampling)
             else
                 try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
             const l = self.streams.getPtr(w.stream).?;

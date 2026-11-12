@@ -13,6 +13,7 @@ const weights = @import("weights.zig");
 const prompt = @import("prompt.zig");
 const prompt2d = @import("prompt2d.zig");
 const round = @import("round.zig");
+const sampling = @import("sampling.zig");
 const draft = @import("draft.zig");
 const engram = @import("engram.zig");
 const engram_io = @import("engram_io.zig");
@@ -725,6 +726,12 @@ pub fn startSettings(o: Options) prompt2d.Settings {
     mxk: ?mx.Kernels = null, // Format.native: DeepSeek's own FP8 / MXFP4 checkpoint's kernels (mx.zig)
     rope_buf: cuda.DeviceBuffer,
     arena: prompt.Arena,
+    // Track B (TF_DS_SAMPLE_CAND=1): a round's candidates on the device (vals f32, ids i64, flags i32; max_rows rows of
+    // sampling.max_candidates) and on the host
+    cand: u64 = 0,
+    cand_vals: [round.max_rows * sampling.max_candidates]f32 = undefined,
+    cand_ids: [round.max_rows * sampling.max_candidates]i64 = undefined,
+    cand_flags: [round.max_rows]i32 = undefined,
         readWorkerEnv();
         // WP6 (docs/prefill-plan.md): TF_DS_IDX_RB=2 batches the indexer's prompt-chunk scoring kernel to the
         // kit's own captured RB=2 variant (dequantizing a 64-key tile once for 2 rows instead of 1); the kit
@@ -778,6 +785,7 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         errdefer if (m.mxk) |*x| x.unload();
         logPdlControls(m.comm.rank);
         if (m.mxk) |*x| m.eng.mx = x;
+        m.cand = try m.arena.take(round.max_rows * (sampling.max_candidates * 12 + 4));
         if (c.vision and c.format == .exl3) { // (Format.native: the checkpoint's own gate.bias_vl, loaded with the weights)
             const path = o.vision_bias orelse try std.fs.path.join(a, &.{ o.kit_dir, "vision", "gate_bias_vl.safetensors" });
             m.loadVisionBias(path) catch |err| if (o.vision_bias != null or err != error.FileNotFound) return err;
@@ -989,6 +997,10 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         if (pt) |t| {
             try m.synchronize();
             try t.finish();
+    /// Track B: the round's first `count` candidates a row (sampling.topCandidates' set and order) on the host, from the
+    /// device's logits: vals and ids [R, count], flags [R] (non-zero: that row must be read whole, roundLogits).
+    }
+
 
         }
         return true;
