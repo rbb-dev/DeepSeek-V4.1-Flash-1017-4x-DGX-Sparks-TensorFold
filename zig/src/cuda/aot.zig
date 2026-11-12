@@ -126,9 +126,11 @@ pub const Set = struct {
         self.* = undefined;
     }
 
-    /// The variant of `function` compiled for these constexprs and these arguments' specialization; without one, the
-    /// fitting variant that assumes least less (fits: the same constexprs, each assumption it makes held by the
-    /// launch), named once on stderr.
+    /// The variant of `function` compiled for these constexprs and these arguments' specialization; with none captured
+    /// for it, a variant compiled with fewer of Triton's argument assumptions (an int or pointer it did not assume
+    /// divisible by 16, an int it did not fold as the value 1) and the same constexprs: such a kernel is correct for
+    /// every value its assumptions allow, these included. The first such variant in the set's order, so a launch's
+    /// shape always takes the same kernel.
     pub fn find(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const) !*const Variant {
         if (!self.weakest) for (self.variants) |*v| {
             if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
@@ -255,6 +257,14 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const, fit: Fit) bo
         if (c.int) |x| if (got.int == null or got.int.? != x) return false;
         if (c.f32) |x| if (got.f32 == null or got.f32.? != @as(u32, @bitCast(x))) return false;
     }
+/// A variant's divisibility assumption against an argument's: equal, or (`general`) not assumed where it holds.
+fn assumes(compiled: bool, holds: bool, general: bool) bool {
+    return compiled == holds or (general and !compiled);
+}
+
+/// Whether variant `k` was compiled for these constexprs and arguments: exactly their specialization, or (`general`)
+/// any subset of it (an argument divisible by 16 or equal to 1 may take a variant that did not assume so).
+fn matches(k: KernelJson, args: []const Arg, consts: []const Const, general: bool) bool {
     var runtime: usize = 0;
     for (args) |a| {
         const param = for (k.params) |p| {
@@ -270,22 +280,12 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const, fit: Fit) bo
                 }
                 const p = param.?;
                 if (!std.mem.eql(u8, p.type, "i32")) return false;
-                // Triton folds a 1 into a constexpr, so a variant reading it at runtime was compiled for other values
-                if (!p.nospec and x == 1) return false;
-                const div = !p.nospec and @mod(x, 16) == 0;
-                switch (fit) {
-                    .exact => if (p.div16 != div) return false,
-                    .general => if (p.div16 and !div) return false,
-                }
+                if (!general and !p.nospec and x == 1) return false;
+                if (!assumes(p.div16, !p.nospec and @mod(x, 16) == 0, general)) return false;
             },
             .ptr => |x| {
                 const p = param orelse return false;
-                if (!std.mem.eql(u8, p.type, x.ty)) return false;
-                const div = x.addr % 16 == 0;
-                switch (fit) {
-                    .exact => if (p.div16 != div) return false,
-                    .general => if (p.div16 and !div) return false,
-                }
+                if (!std.mem.eql(u8, p.type, x.ty) or !assumes(p.div16, x.addr % 16 == 0, general)) return false;
             },
             .f32 => {
                 const p = param orelse return false;
@@ -293,12 +293,7 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const, fit: Fit) bo
             },
             .u64 => |x| {
                 const p = param orelse return false;
-                if (!std.mem.eql(u8, p.type, "u64")) return false;
-                const div = x % 16 == 0;
-                switch (fit) {
-                    .exact => if (p.div16 != div) return false,
-                    .general => if (p.div16 and !div) return false,
-                }
+                if (!std.mem.eql(u8, p.type, "u64") or !assumes(p.div16, x % 16 == 0, general)) return false;
             },
         }
         runtime += 1;
