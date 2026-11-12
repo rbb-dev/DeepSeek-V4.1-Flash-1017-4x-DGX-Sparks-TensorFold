@@ -245,6 +245,9 @@ extern "C" __global__ void __launch_bounds__(1024) tf_ds_topk_indices_kernel(con
 // The next kernels' weights touched into L2 ahead of them (the served build's paced l2_prefetch, as its trace shows it:
 // a block of 128 threads on a stream of its own, up to 16 ranges a launch): every 128-byte line of each range, the
 // ranges in order. It writes nothing.
+#ifndef TF_DS_PF_LAST
+#define TF_DS_PF_LAST 1
+#endif
 struct TfDsPrefetch {
     const char* ptr[16];
     unsigned long long bytes[16];
@@ -300,7 +303,16 @@ extern "C" __global__ void __launch_bounds__(128) tf_ds_l2_prefetch_kernel(TfDsP
         const long long off = (c - (r ? end[r - 1] : 0)) * chunk;
         const long long left = (long long)(a.bytes[r] / 16 * 16) - off;
         const unsigned size = (unsigned)(left < chunk ? left : chunk);
+#if TF_DS_PF_LAST
+        {
+            // evict-last: the lines stay until the kernels they were fetched for have run (they read them evict-first)
+            unsigned long long pol;
+            asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;\n" : "=l"(pol));
+            asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], %1, %2;" ::"l"(a.ptr[r] + off), "r"(size), "l"(pol) : "memory");
+        }
+#else
         asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(a.ptr[r] + off), "r"(size) : "memory");
+#endif
     }
 #else
     const unsigned long long step = (unsigned long long)blockDim.x * gridDim.x * 128ull;

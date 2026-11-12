@@ -764,6 +764,42 @@ extern "C" __global__ void __launch_bounds__(128) tf_dsn_dn1_kernel(DnArgs a) { 
 extern "C" __global__ void __launch_bounds__(128) tf_dsn_dn2_kernel(DnArgs a) { dn_kernel<2>(a); }
 extern "C" __global__ void __launch_bounds__(128) tf_dsn_dn4_kernel(DnArgs a) { dn_kernel<4>(a); }
 
+// The routed sum of one output element at the engine's seven slots (six routed experts and the shared one): v plus the row's
+// valid picks' entries (0 <= expert < E) added in ascending expert id, a tie in slot order - the order the insertion sort of the
+// general path below builds - but from registers: the seven picks are read once, each slot's place is the number of valid slots
+// before it in that order (a count, no sort, no local memory), the seven entries are loaded together and added by place. Same
+// additions in the same order, so the same bits. CG: the entries read past L1 (written by other CTAs of the launch).
+template <bool CG>
+__device__ __forceinline__ float routed_sum7(float v, const float* out, int64_t ldo, const int* pick, int r, int E, int n) {
+    int e[7];
+    bool ok[7];
+#pragma unroll
+    for (int s = 0; s < 7; s++) {
+        e[s] = pick[r * 7 + s];
+        ok[s] = e[s] >= 0 && e[s] < E;
+    }
+    int place[7], k = 0;
+    float ov[7];
+#pragma unroll
+    for (int s = 0; s < 7; s++) {
+        int c = 0;
+#pragma unroll
+        for (int q = 0; q < 7; q++) c += (ok[q] && (e[q] < e[s] || (e[q] == e[s] && q < s))) ? 1 : 0;
+        place[s] = c;
+        k += ok[s] ? 1 : 0;
+        const float* src = out + size_t(r * 7 + s) * ldo + n;
+        ov[s] = ok[s] ? (CG ? __ldcg(src) : *src) : 0.f;
+    }
+#pragma unroll
+    for (int j = 0; j < 7; j++) {
+        float x = ov[0];
+#pragma unroll
+        for (int s = 1; s < 7; s++) x = (ok[s] && place[s] == j) ? ov[s] : x;
+        if (j < k) v += x;
+    }
+    return v;
+}
+
 // The routed sum (MoE.forward: y[idx] += expert(x[idx]) in expert id order, fp32): y [R, N] fp32 (row stride ldy) =
 // (accumulate ? y : 0) + the row's picked entries' out [r * S + s, N] in ascending expert id.
 extern "C" __global__ void tf_dsn_combine_kernel(const float* __restrict__ out, int64_t ldo, const int* __restrict__ pick,
@@ -772,6 +808,10 @@ extern "C" __global__ void tf_dsn_combine_kernel(const float* __restrict__ out, 
     const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= int64_t(R) * N) return;
     const int r = int(i / N), n = int(i % N);
+    float v = accumulate ? y[size_t(r) * ldy + n] : 0.f;
+    if (S == 7) {
+        v = routed_sum7<false>(v, out, ldo, pick, r, E, n);
+    } else {
         int order[16];
         int k = 0;
         for (int s = 0; s < S && s < 16; s++) {
@@ -782,6 +822,7 @@ extern "C" __global__ void tf_dsn_combine_kernel(const float* __restrict__ out, 
             order[j] = s;
         }
         for (int j = 0; j < k; j++) v += out[size_t(r * S + order[j]) * ldo + n];
+    }
     y[size_t(r) * ldy + n] = v;
 }
 
@@ -880,6 +921,10 @@ __device__ __forceinline__ void combine_door(const float* __restrict__ out, int6
     const unsigned pb = ((qo.quarters >> (8 * pos)) & 0xffu) * qo.unit + (b - pos * qo.unit);
     const int64_t i = int64_t(pb) * blockDim.x + threadIdx.x;
     const int r = int(i / N), n = int(i % N);
+    float v = accumulate ? y[size_t(r) * ldy + n] : 0.f;
+    if (S == 7) {
+        v = routed_sum7<false>(v, out, ldo, pick, r, E, n);
+    } else {
         int order[16];
         int k = 0;
         for (int s = 0; s < S && s < 16; s++) {
@@ -890,6 +935,7 @@ __device__ __forceinline__ void combine_door(const float* __restrict__ out, int6
             order[j] = s;
         }
         for (int j = 0; j < k; j++) v += out[size_t(r * S + order[j]) * ldo + n];
+    }
     y[size_t(r) * ldy + n] = v;
     if constexpr (!EARLY) {
         if (sent) {
@@ -3323,7 +3369,33 @@ __device__ __forceinline__ void cp16(uint32_t dst, const void* src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src) : "memory");
 }
 // TF_DSN_DEC_EVICT=1 (default; 0 = off): the weights' copies carry an L2 evict-first policy (a decode round reads each weight byte once and
+// the next read of it is a whole round away, so a consumed line is the first to go and the lines the L2 prefetch has
+// brought for kernels still to come stay). The bytes read are the same either way.
+#ifndef TF_DSN_DEC_EVICT
 #define TF_DSN_DEC_EVICT 1
+#endif
+// TF_DSN_DEC_XPF=1 (default): the dense linears at one row group read the next stage's activations ahead (core's XP)
+#ifndef TF_DSN_DEC_XPF
+#define TF_DSN_DEC_XPF 1
+#endif
+// TF_DSN_DEC_XPB=2 (default; 0 = off): gate / up at one row group read the next stage's activation operands ahead (not the
+// scales: 32 registers for the two sets of 8 blocks, within the 128 two CTAs an SM allow)
+#ifndef TF_DSN_DEC_XPB
+#define TF_DSN_DEC_XPB 2
+#endif
+// TF_DSN_DEC_PF_LAST=1 (default; 0 = off): the L2 prefetches (tf_dsn_dec_l2pf) carry an evict-last policy (a prefetch is only worth its bytes if
+// they are still there when the kernel it was for runs)
+#ifndef TF_DSN_DEC_PF_LAST
+#define TF_DSN_DEC_PF_LAST 1
+#endif
+__device__ __forceinline__ uint64_t evict_first_policy() {
+    uint64_t p;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(p));
+    return p;
+}
+__device__ __forceinline__ void cp16h(uint32_t dst, const void* src, uint64_t pol) {
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "l"(pol) : "memory");
+}
 __device__ __forceinline__ void cp4(uint32_t dst, const void* src) {
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(dst), "l"(src) : "memory");
 }
@@ -3381,11 +3453,18 @@ struct NoPro {
 // scales s, lds floats; bf16: xq bf16, ldq elements) in RG groups of 8. acc[m][g][c]: weight row n0 + lane / 4 +
 // 8 (c >> 1), activation row 8 g + 2 (lane % 4) + (c & 1). XS: the activations in shared memory, written by `pro`
 // (every warp of the CTA runs it after the wait, before the loop).
+// XP (TF_DSN_DEC_XPF, one row group only): the next stage's activation operands are read before this stage's wait on its
+// weights, so their latency (the stall that sits on the MMA) overlaps the wait instead of following it.
+template <int RB, int NS, int FMT, int NM, int RG, int XP = 0, typename RowOf = void, bool XS = false, typename Pro = NoPro>
 __device__ __forceinline__ void core(const uint8_t* const (&w)[NM], const uint8_t* const (&ws)[NM], int64_t ldw,
                                      int64_t ldws, int64_t rb, int n0, int st0, int st1, int sst, const void* xq, int64_t ldq,
                                      const float* s, int64_t lds, int cnt, RowOf rows_of, uint8_t* ring,
                                      float (&acc)[NM][RG][4], Pro pro = {}) {
     constexpr int kRowB = RB, kChunks = RB / 16, kTileB = 16 * RB, kSlotB = slotBytes<RB>(), kStages = NS;
+    constexpr int kCp = 16 * kChunks / 32;                // the 16-byte copies a lane makes of one matrix's stage
+    constexpr int NB = FMT == 1 ? kChunks : kChunks / 2;  // K blocks a whole stage (FP8 / FP4)
+    constexpr int64_t kXStep = FMT == 1 ? 2 * RB : RB;    // the bytes of an activation row one stage's K values take
+    constexpr uint32_t kRingB = NM * kSlotB;              // one ring slot (the NM matrices' stages)
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
 #pragma unroll
     for (int m = 0; m < NM; m++)
@@ -3394,39 +3473,135 @@ __device__ __forceinline__ void core(const uint8_t* const (&w)[NM], const uint8_
 #pragma unroll
             for (int c = 0; c < 4; c++) acc[m][r][c] = 0.f;
     const int ng = (cnt + 7) >> 3;  // the row groups in use (warp-uniform)
+    // this thread's activation rows: its B row g and its C rows 2t, 2t + 1 of each group (past cnt: the first row's).
+    // bp: its B operand's bytes at the stage in hand (kXStep a stage); sp0 / sp1: its two scale rows' floats (NB a stage)
+    const uint8_t* bp[RG];
+    const float* sp0[RG];
+    const float* sp1[RG];
 #pragma unroll
     for (int r = 0; r < RG; r++) {
         const int i = r * 8 + g, j0 = r * 8 + 2 * t, j1 = j0 + 1;
         const int64_t esz = FMT == 2 ? 2 : 1;
+        const uint8_t* brow = reinterpret_cast<const uint8_t*>(xq) + (cnt ? int64_t(rows_of(i < cnt ? i : 0)) * ldq * esz : 0);
+        bp[r] = brow + (FMT == 1 ? 8 * t : 4 * t) + int64_t(st0) * kXStep;
+        sp0[r] = s + (cnt ? int64_t(rows_of(j0 < cnt ? j0 : 0)) * lds : 0) + int64_t(st0) * NB;
+        sp1[r] = s + (cnt ? int64_t(rows_of(j1 < cnt ? j1 : 0)) * lds : 0) + int64_t(st0) * NB;
     }
     const uint32_t ring_s = smem_u32(ring);
+    [[maybe_unused]] const uint64_t wpol = TF_DSN_DEC_EVICT ? evict_first_policy() : 0;
     // ldmatrix: matrices (rows 0-7, chunk b), (rows 8-15, chunk b), (rows 0-7, b + 1), (rows 8-15, b + 1)
     const int lrow = (lane & 7) + 8 * ((lane >> 3) & 1), lch = lane >> 4;
+    uint32_t ldoff[kChunks / 2];
 #pragma unroll
+    for (int p = 0; p < kChunks / 2; p++) ldoff[p] = swz<kRowB>(lrow, 2 * p + lch);
+    // this lane's copies of a stage: chunk c = lane + 32 i of the tile (row c / kChunks, chunk c % kChunks) from its
+    // address at stage 0 (+ st * kRowB) to its swizzled place; and the scale words it copies
+    const uint8_t* wsrc[NM][kCp];
+    uint32_t sdst[kCp];
+    int chi[kCp];
 #pragma unroll
+    for (int i = 0; i < kCp; i++) {
         const int c = lane + 32 * i, row = c / kChunks, ch = c % kChunks;
+        sdst[i] = swz<kRowB>(row, ch);
+        chi[i] = ch;
+#pragma unroll
+        for (int m = 0; m < NM; m++) wsrc[m][i] = w[m] + int64_t(n0 + row) * ldw + ch * 16;
     }
+    // FP4: 16 rows x kChunks block scales, kChunks / 4 words a row (a short stage's first only); FP8: the tile's
+    // kChunks / 2 block scales, the word holding them (lane 0)
     constexpr int wpr = kChunks / 4;
+    const bool sone = FMT == 1 ? lane < 16 * wpr : (FMT == 0 && lane == 0);
+    const int srow = FMT == 1 ? lane / wpr : 0, sh4 = FMT == 1 ? (lane % wpr) * 4 : 0;
+    const uint32_t sdst4 = FMT == 1 ? kTileB + srow * kChunks + sh4 : kTileB;
+    const uint8_t* ssrc[NM];
+#pragma unroll
+    for (int m = 0; m < NM; m++)
+        ssrc[m] = FMT == 1 ? ws[m] + int64_t(n0 + srow) * ldws + sh4 : FMT == 0 ? ws[m] + int64_t(n0 >> 5) * ldws : ws[m];
+    // `soff`: the byte offset in the ring of the slot a stage goes to
+    auto issue = [&](int st, uint32_t soff) {
+        if (st < st1) {
+            const int rem = int(rb) - st * kRowB;
+            const int vc = (rem < kRowB ? rem : kRowB) >> 4;  // valid chunks
+            const int64_t so = int64_t(st) * kRowB;
+#pragma unroll
+            for (int m = 0; m < NM; m++) {
+                const uint32_t base = ring_s + soff + m * kSlotB;
+#pragma unroll
+                for (int i = 0; i < kCp; i++)
+                    if (chi[i] < vc) {
+                        if (TF_DSN_DEC_EVICT) cp16h(base + sdst[i], wsrc[m][i] + so, wpol);
+                        else cp16(base + sdst[i], wsrc[m][i] + so);
+                    }
+                if (FMT == 1) {
+                    if (sone && sh4 < vc) cp4(base + sdst4, ssrc[m] + int64_t(st) * kChunks);
+                } else if (FMT == 0 && sone) {
+                    cp4(base + sdst4, ssrc[m] + ((st * (kChunks / 2)) & ~3));
                 }
             }
         }
         cp_commit();
     };
 #pragma unroll
+    for (int i = 0; i < kStages - 1; i++) issue(st0 + i * sst, i * kRingB);
     // the weights' first stages are in flight: now the activations (the predecessor's output) may be read
     pdl_wait();
     pro();
+    constexpr bool kXp = XP != 0 && RG == 1;  // XP 1: operands and scales ahead, 2: the operands only
+    constexpr int NX = FMT == 2 ? kChunks / 2 : NB;  // activation operand sets a stage
+    [[maybe_unused]] uint32_t xc0[RG][NX], xc1[RG][NX], xn0[RG][NX], xn1[RG][NX];
+    [[maybe_unused]] float ac0[RG][NX], ac1[RG][NX], an0[RG][NX], an1[RG][NX];
+    // the operands of the stage `ahead` stages past the one in hand (nblk sets of them: a short last stage has fewer)
+    auto loadX = [&](uint32_t (&b0)[RG][NX], uint32_t (&b1)[RG][NX], float (&a0)[RG][NX], float (&a1)[RG][NX], int nblk,
+                     int64_t ahead) {
+#pragma unroll
+        for (int rg = 0; rg < RG; rg++) {
+            if (rg >= ng) break;
+#pragma unroll
+            for (int j = 0; j < NX; j++) {
+                if (j >= nblk) break;
+                const uint8_t* xp = bp[rg] + ahead * kXStep + j * 32;
+                if (FMT == 1) {
+                    const uint2 v = xld<XS>(reinterpret_cast<const uint2*>(xp));
+                    b0[rg][j] = v.x;
+                    b1[rg][j] = v.y;
+                } else {
+                    b0[rg][j] = xld<XS>(reinterpret_cast<const uint32_t*>(xp));
+                    b1[rg][j] = xld<XS>(reinterpret_cast<const uint32_t*>(xp + 16));
+                }
+                if (FMT != 2 && XP == 1) {
+                    a0[rg][j] = xld<XS>(sp0[rg] + ahead * NB + j);
+                    a1[rg][j] = xld<XS>(sp1[rg] + ahead * NB + j);
+                }
+            }
+        }
+    };
+    auto blocksOf = [&](int stg) {
+        const int rem = int(rb) - stg * kRowB;
+        const int vc = (rem < kRowB ? rem : kRowB) >> 4;
+        return FMT == 1 ? vc : FMT == 0 ? vc / 2 : (vc + 1) / 2;
+    };
+    if constexpr (kXp) {
+        if (st0 < st1) loadX(xc0, xc1, ac0, ac1, blocksOf(st0), 0);
+    }
+    uint32_t cur = 0, prv = (kStages - 1) * kRingB;  // the slot read this iteration, the slot read the one before
     for (int st = st0; st < st1; st += sst) {
+        if constexpr (kXp) {
+            if (st + sst < st1) loadX(xn0, xn1, an0, an1, blocksOf(st + sst), sst);
+        }
         cp_wait<kStages - 2>();
         __syncwarp();
+        issue(st + (kStages - 1) * sst, prv);
         // a whole stage with compile-time counts, a short last stage (64 bytes) apart
         auto consume = [&](auto vcc) {
         constexpr int vc = decltype(vcc)::value;
+        const uint8_t* sbase = ring + cur;
         uint32_t r[NM][kChunks / 2][4];
 #pragma unroll
         for (int m = 0; m < NM; m++) {
+            const uint32_t base = ring_s + cur + m * kSlotB;
 #pragma unroll
             for (int p = 0; p < kChunks / 2; p++)
+                if (2 * p < vc) ldsm4(r[m][p], base + ldoff[p]);
         }
         if (FMT == 2) {
             // 16-value steps: chunks 2p, 2p + 1
@@ -3436,6 +3611,15 @@ __device__ __forceinline__ void core(const uint8_t* const (&w)[NM], const uint8_
 #pragma unroll
                 for (int rg = 0; rg < RG; rg++) {
                     if (rg >= ng) break;
+                    uint32_t b[2];
+                    if constexpr (kXp) {
+                        b[0] = xc0[rg][p];
+                        b[1] = xc1[rg][p];
+                    } else {
+                        const uint8_t* xp = bp[rg] + p * 32;
+                        b[0] = xld<XS>(reinterpret_cast<const uint32_t*>(xp));
+                        b[1] = xld<XS>(reinterpret_cast<const uint32_t*>(xp + 16));
+                    }
 #pragma unroll
                     for (int m = 0; m < NM; m++) mma_bf16(acc[m][rg], r[m][p], b);
                 }
@@ -3488,11 +3672,35 @@ __device__ __forceinline__ void core(const uint8_t* const (&w)[NM], const uint8_
                 for (int rg = 0; rg < RG; rg++) {
                     if (rg >= ng) break;
                     uint32_t b[2];
+                    float sa0, sa1;
+                    if constexpr (kXp) {
                         if (FMT == 1) {
+                            b[0] = prmt(xc0[rg][j], xc1[rg][j], 0x6420);
+                            b[1] = prmt(xc0[rg][j], xc1[rg][j], 0x7531);
+                        } else {
+                            b[0] = xc0[rg][j];
+                            b[1] = xc1[rg][j];
+                        }
+                        if constexpr (XP == 1) {
+                            sa0 = ac0[rg][j];
+                            sa1 = ac1[rg][j];
+                        } else {
+                            sa0 = xld<XS>(sp0[rg] + j);
+                            sa1 = xld<XS>(sp1[rg] + j);
+                        }
+                    } else {
+                        const uint8_t* xp = bp[rg] + j * 32;
+                        if (FMT == 1) {
+                            const uint2 v = xld<XS>(reinterpret_cast<const uint2*>(xp));
                             b[0] = prmt(v.x, v.y, 0x6420);
                             b[1] = prmt(v.x, v.y, 0x7531);
                         } else {
+                            b[0] = xld<XS>(reinterpret_cast<const uint32_t*>(xp));
+                            b[1] = xld<XS>(reinterpret_cast<const uint32_t*>(xp + 16));
                         }
+                        sa0 = xld<XS>(sp0[rg] + j);
+                        sa1 = xld<XS>(sp1[rg] + j);
+                    }
 #pragma unroll
                     for (int m = 0; m < NM; m++) {
                         float d[4];
@@ -3506,8 +3714,31 @@ __device__ __forceinline__ void core(const uint8_t* const (&w)[NM], const uint8_
             }
         }
         };
+        if constexpr (kChunks == 4) {
+            // (a 64-byte row stage is whole or, past the last 64 bytes, absent: one body)
+            consume(std::integral_constant<int, 4>{});
+        } else {
+            const int vc_rt = int(rb - int64_t(st) * kRowB < kRowB ? rb - int64_t(st) * kRowB : kRowB) >> 4;
             if (vc_rt == kChunks) consume(std::integral_constant<int, kChunks>{});
             else consume(std::integral_constant<int, 4>{});
+        }
+        prv = cur;
+        cur = cur + kRingB == kStages * kRingB ? 0 : cur + kRingB;
+        if constexpr (kXp) {
+#pragma unroll
+            for (int j = 0; j < NX; j++) {
+                xc0[0][j] = xn0[0][j];
+                xc1[0][j] = xn1[0][j];
+                ac0[0][j] = an0[0][j];
+                ac1[0][j] = an1[0][j];
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < RG; r++) {
+            bp[r] += int64_t(sst) * kXStep;
+            sp0[r] += int64_t(sst) * NB;
+            sp1[r] += int64_t(sst) * NB;
+        }
     }
     cp_wait<0>();
     __syncwarp();
@@ -3662,6 +3893,7 @@ __device__ __forceinline__ void dec_dense(const DecArgs& a, int bx) {
     const uint8_t* w[1] = {a.w};
     const uint8_t* ws[1] = {a.ws};
     const int grp = a.gn && on ? n0 / a.gn : 0;
+    dec::core<dec::kRbD, dec::kNsD, FMT, 1, RG, TF_DSN_DEC_XPF>(w, ws, a.ldw, a.ldws, rb, on ? n0 : 0, lo, hi, sst, a.q + grp * a.gq, a.ldq,
                           a.s ? a.s + grp * a.gs : a.s, a.lds, a.M,
                           [&](int i) { return a.rows ? a.rows[i] : i; }, dsm + warp * wb, acc);
     const bool lead = dec::reduce<1, RG>(acc, a.ks, dsm, wb);
@@ -3743,6 +3975,7 @@ __device__ __forceinline__ void dec_dense_qx(const DecArgs& a, int bx, const QxA
         __syncthreads();
     };
     auto rows = [](int i) { return i; };
+    dec::core<dec::kRbD, dec::kNsD, 0, 1, 1, 0, decltype(rows), true>(w, ws, a.ldw, a.ldws, rb, on ? n0 : 0, lo, hi, sst, xq, ldq,
                                                                    xs, a.K / kBlk, a.M, rows, dsm + warp * wb, acc, pro);
     if (!dec::reduce<1, 1>(acc, a.ks, dsm, wb) || !on) return;
 #pragma unroll
@@ -3794,10 +4027,12 @@ __device__ __forceinline__ void dec_gu(const GuArgs& a) {
         if (fp8) {
             const int64_t rb = dec::rowBytes<0>(a.D);
             if (on) dec::chunk(int((rb + dec::kRbG - 1) / dec::kRbG), ks, ch, lo, hi, sst);
+            dec::core<dec::kRbG, dec::kNsG, 0, 1, RG, (RG == 1 ? TF_DSN_DEC_XPB : 0)>(w, ws, a.sldw, a.sldws, rb, on ? n0 : 0, lo, hi, sst, a.q, a.ldq, a.s, a.lds, cnt, rows_of,
                                 dsm + warp * wb, acc);
         } else {
             const int64_t rb = dec::rowBytes<1>(a.D);
             if (on) dec::chunk(int((rb + dec::kRbG - 1) / dec::kRbG), ks, ch, lo, hi, sst);
+            dec::core<dec::kRbG, dec::kNsG, 1, 1, RG, (RG == 1 ? TF_DSN_DEC_XPB : 0)>(w, ws, a.ldw, a.ldws, rb, on ? n0 : 0, lo, hi, sst, a.q, a.ldq, a.s, a.lds, cnt, rows_of,
                                 dsm + warp * wb, acc);
         }
         // every warp's partials into its region, then the tile's lead warp (matrix 0, chunk 0) sums each matrix's
@@ -3905,6 +4140,10 @@ __device__ __noinline__ void dec_dn_sum(const float* out, int64_t ldo, const Com
     const int wn = n_hi - n_lo;
     for (int i = threadIdx.x; i < c.R * wn; i += blockDim.x) {
         const int r = i / wn, n = n_lo + i % wn;
+        float v = c.accumulate ? c.y[size_t(r) * c.ldy + n] : 0.f;
+        if (c.S == 7) {
+            v = routed_sum7<true>(v, out, ldo, c.pick, r, c.E, n);
+        } else {
             int order[16];
             int k = 0;
             for (int s = 0; s < c.S && s < 16; s++) {
@@ -3918,6 +4157,7 @@ __device__ __noinline__ void dec_dn_sum(const float* out, int64_t ldo, const Com
                 order[j] = s;
             }
             for (int j = 0; j < k; j++) v += __ldcg(out + size_t(r * c.S + order[j]) * ldo + n);
+        }
         c.y[size_t(r) * c.ldy + n] = v;
     }
 }
@@ -3959,11 +4199,22 @@ __device__ __forceinline__ void dec_multi(const DecMulti& m) {
     dec_dense<FMT, RG>(m.p[p], blockIdx.x - m.cta0[p]);
 }
 
+// (DNB: down at 8 groups must stay within 128 registers: two 256-thread CTAs an SM, as its build before this one had)
+#define DN_LB_1 __launch_bounds__(256)
+#define DN_LB_2 __launch_bounds__(256, 2)
+#define TF_DSN_DEC(RG, DNB)                                                                                            \
     extern "C" __global__ void __launch_bounds__(256) tf_dsn_dec_fp8_r##RG##_kernel(DecMulti a) { dec_multi<0, RG>(a); } \
     extern "C" __global__ void __launch_bounds__(256) tf_dsn_dec_fp4_r##RG##_kernel(DecMulti a) { dec_multi<1, RG>(a); } \
     extern "C" __global__ void __launch_bounds__(256) tf_dsn_dec_bf_r##RG##_kernel(DecMulti a) { dec_multi<2, RG>(a); }  \
     extern "C" __global__ void __launch_bounds__(256) tf_dsn_dec_gu_r##RG##_kernel(GuArgs a) { dec_gu<RG>(a); }         \
+    extern "C" __global__ void DN_LB_##DNB tf_dsn_dec_dn_r##RG##_kernel(DnArgs a) { dec_dn<RG>(a); }
+TF_DSN_DEC(1, 1)
+TF_DSN_DEC(2, 1)
+TF_DSN_DEC(4, 1)
+TF_DSN_DEC(8, 2)
 #undef TF_DSN_DEC
+#undef DN_LB_1
+#undef DN_LB_2
 
 // The quant-into-GEMV prototype (tf-dsv41-quant-gemv-bench; no engine path launches it): tf_dsn_dec_fp8_r1's launch of
 // up to four FP8 linears on one input, each CTA quantizing that input's bf16 rows itself (qx) after its wait instead of
@@ -3984,8 +4235,15 @@ extern "C" __global__ void tf_dsn_bench_rows_kernel(const uint4* __restrict__ sr
 }
 
 // dec_dn with the routed sum in the launch (TF_DS_DECODE_FUSE: dec_dn_cb); grid and dynamic shared memory dec_dn's
+#define TF_DSN_DEC_CB(RG, LB)                                                                                          \
+    extern "C" __global__ void LB tf_dsn_dec_dn_cb_r##RG##_kernel(DnArgs a, CombArgs c) {                             \
         dec_dn_cb<RG>(a, c);                                                                                           \
     }
+// (at 2 groups within 85 registers and at 8 within 128: three and two 256-thread CTAs an SM, as its build before this one had)
+TF_DSN_DEC_CB(1, __launch_bounds__(256))
+TF_DSN_DEC_CB(2, __launch_bounds__(256, 3))
+TF_DSN_DEC_CB(4, __launch_bounds__(256))
+TF_DSN_DEC_CB(8, __launch_bounds__(256, 2))
 #undef TF_DSN_DEC_CB
 
 // act_quant (tf_dsn_act_quant's codes and scales, the same arithmetic) for decode launches: an ordinary launch that
@@ -4090,7 +4348,14 @@ extern "C" __global__ void __launch_bounds__(128) tf_dsn_dec_l2pf_kernel(const i
             const long long left = len - oo;
             const unsigned size = (unsigned)(left < chunk ? left : chunk);
             const char* p = reinterpret_cast<const char*>(w2[act[ii]]) + oo;
+#if TF_DSN_DEC_PF_LAST
+            // the lines stay until the kernel that reads them has (it reads them evict-first, TF_DSN_DEC_EVICT)
+            uint64_t pol;
+            asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;\n" : "=l"(pol));
+            asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], %1, %2;" ::"l"(p), "r"(size), "l"(pol) : "memory");
+#else
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p), "r"(size) : "memory");
+#endif
         }
         // advance (i, off) by a wave
         off += (long long)blockDim.x * chunk;
