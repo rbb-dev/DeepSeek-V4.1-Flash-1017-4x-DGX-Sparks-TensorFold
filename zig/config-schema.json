@@ -1,4 +1,6 @@
    "default": "1",
+   "doc": "Makes a decode round's sparse attention read the packed latent values directly (the same arithmetic the prompt path uses) instead of unpacking them first. On by default (it does not change replies, and the decode half of TF_DS_ATTN_TWIN=z runs only in its calls; alone it measured x0.997 / x1.001, under the noise floor); 0 turns it off. A layer without the matching kernel keeps the normal one, and a kit without the extra set keeps the normal kernel with an 'off' line. Every server process must use the same setting.",
+   "default": "1",
    "doc": "On by default: each ring lane's data goes as a plain RDMA write and a 64-bit generation word is written after it to say it has arrived; the collecting kernel waits on those words. Set 0 for the flag-based arrival (the proxy publishes each lane's flag). The card's wait for the decode rings needs this on, with either arrival signal. Every node must agree.",
    "first_use": "families/dsv41/model.zig:1858",
    "default": "atomic",
@@ -121,8 +123,243 @@
    "seed": "name",
    "first_use": "families/dsv41/model.zig:2006",
    "secret": false
+  },
+  {
+   "id": 933,
+   "name": "tf_ds_pack_epilogue",
+   "env": "TF_DS_PACK_EPILOGUE",
+   "group": "transport",
+   "tab": "Transport",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "1",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Expert pack codes in gate/up",
+   "doc": "Gate/up writes the expert pack's FP8 codes and scales into the transport's send region itself, so the separate quantizing launch does not run (about 5 to 6 ms a 4,096-row pass, estimated, not measured). Needs TF_DS_MMA_SF_EXACT (not beside TF_DS_GEMM_R2 or TF_DS_GEMM_W16) and the pack as codes; where a rank cannot run it the start says why and gate/up and the quantizing launch run as before, on every rank. Replies unchanged by contract.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:1896",
+   "secret": false
+  },
+  {
+   "id": 934,
+   "name": "tf_ds_attn_twin",
+   "env": "TF_DS_ATTN_TWIN",
+   "group": "prompt",
+   "tab": "Advanced",
+   "kind": "enum",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "z",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Sparse attention kernel variant",
+   "doc": "Which build of the packed-latent sparse attention the calls of TF_DS_ATTN_U (prompt chunks) and TF_DS_ATTN_U_DECODE (decode rounds) launch. u is the standard kernel (the FP4 latents unpacked in hardware). w reads the latents' scale bytes in the code bytes' own layout and unpacks the code bytes where they sit in their registers: 136 fewer instructions and 4 fewer barriers a key block. x is w, reading the next block's pick indices a block ahead and, in the fused attention epilogue, prefetching the next block's rows into the GPU's first-level cache (opt-in until a timing shows it faster than z). z is w, and in a decode round it also prefetches the picked rows into the GPU cache before it waits for the kernel before. All of them give the same bytes (the kernels replay compares them); It runs z unless set (a bit-identical speed change is on by default); u, w or x selects another. Needs TF_DS_ATTN_U or TF_DS_ATTN_U_DECODE and the kernel kit's extra set; without them, or with a kit that lacks the kernel, the engine runs u and says so in an 'off' line of the speed report. A value other than u, w, x or z refuses the start by name. The fused attention epilogue (TF_DS_ATTN_EPI_FUSED) has its own switch, TF_DS_ATTN_EPI_TWIN; this one does not move it.",
+   "values": [
+    "u",
+    "w",
+    "x",
+    "z"
+   ],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:2005",
+   "secret": false
+  },
+  {
+   "id": 935,
+   "name": "tf_ds_rope_w",
+   "env": "TF_DS_ROPE_W",
+   "group": "prompt",
+   "tab": "Advanced",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "1",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "RoPE on 32-bit pairs",
+   "doc": "RoPE on the attention heads reads and writes each (even, odd) pair of bf16 values as one 32-bit word, one 128-bit access for four pairs where it made eight 16-bit ones. On by default (a bit-identical speed change); 0 turns it off. The same bytes as the standard kernel (the kernels replay compares them with NaN, infinity and minus zero planted). Needs the kernel kit's extra set; a kit without the kernel keeps the standard RoPE kernel and says so in an 'off' line of the speed report.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:2006",
+   "secret": false
+  },
+  {
+   "id": 936,
+   "name": "tf_ds_dec_group2",
+   "env": "TF_DS_DEC_GROUP2",
+   "group": "decode",
+   "tab": "Generation",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "1",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Faster expert grouping in decode",
+   "doc": "Makes a decode round group its routed rows by expert with a parallel scan instead of one thread block counting entry by entry. A speed option, on unless set to 0; the grouping it writes is byte for byte the same, so replies do not change. Each rank reads its own setting.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/mx.zig:368",
+   "secret": false
+  },
+  {
+   "id": 937,
+   "name": "tf_ds_merge_d",
+   "env": "TF_DS_MERGE_D",
+   "group": "decode",
+   "tab": "Generation",
+   "kind": "int",
+   "unit": "",
+   "min": 0,
+   "max": 3,
+   "default": "3",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Wider decode attention merge",
+   "doc": "Makes a decode round merge its attention's partial results with several thread blocks a row instead of one: 3 (the default) gives each block 16 columns of the head (32 blocks), 1 gives 128, 2 gives 64, 0 keeps the single block. A speed option that needs the kernel kit's extra set (without it the engine says so at the start and keeps the single block; a kit without the 16-column variant runs 128 columns and says so); replies do not change. Each rank reads its own setting.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:1952",
+   "secret": false
+  },
+  {
+   "id": 940,
+   "name": "tf_ds_l2_next_early",
+   "env": "TF_DS_L2_NEXT_EARLY",
+   "group": "other",
+   "tab": "Advanced",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "1",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "L2 prefetch: next layer, earlier",
+   "doc": "Records the next layer's L2 prefetch (its attention mix and input linears) behind the experts' gate / up instead of behind down, so it runs beside the network exchange and down and its weights are in L2 earlier. Measured on the Sparks' decode capture: the dense linears run 2x faster (wq_a + wkv 30 -> 15 us) when their prefetch had 80 us of lead, and 96 % of the standard placement's prefetches are still running when the consumer starts. On by default (the prefetch writes nothing); 2D decode windows on the native kernels only; 0 places it behind down. Replies unchanged.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:2004",
+   "secret": false
+  },
+  {
+   "id": 941,
+   "name": "tf_ds_window_once",
+   "env": "TF_DS_WINDOW_ONCE",
+   "group": "other",
+   "tab": "Advanced",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "1",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Window indices uploaded once per chunk",
+   "doc": "On by default (set to 0 to upload them in every layer): a prompt chunk uploads its window gather indices, window low position and ring-write indices once for the whole chunk instead of in every layer. The bytes the engine computes are unchanged. The gain has not been measured on the Sparks.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:2276",
+   "secret": false
+  },
+  {
+   "id": 942,
+   "name": "tf_ds_attn_epi_fused",
+   "env": "TF_DS_ATTN_EPI_FUSED",
+   "group": "other",
+   "tab": "Advanced",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "1",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Epilogue in the attention kernel",
+   "doc": "A prompt chunk's attention epilogue (the inverse rotary embedding and the quantization for the next projection) runs in the final store of the attention kernel from the kernel kit's extra set, so the attention output is never written; the same codes and scales. Needs the attention epilogue on; layers with packed latents take it only with the hardware-unpack attention. On by default; without the kit's kernel the engine says so at the start and runs the separate epilogue. Every node must agree.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:1950",
+   "secret": false
+  },
+  {
+   "id": 943,
+   "name": "tf_ds_hc_2s",
+   "env": "TF_DS_HC_2S",
+   "group": "other",
+   "tab": "Advanced",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "1",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Four streams in one mix program",
+   "doc": "A prompt chunk's hyper-connection mix on the transport's two bf16 blocks runs one program for the four streams of a column block (from the kernel kit's extra set), so the previous streams and sums are read once for the four; the same bytes. On by default; without the kit's kernel the engine says so at the start and keeps the one-stream program. Every node must agree.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:1951",
+   "secret": false
+  },
+  {
+   "id": 950,
+   "name": "tf_ds_qgate_canary",
+   "env": "TF_DS_QGATE_CANARY",
+   "group": "debug",
+   "tab": "Advanced",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "0",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
    "label": "Quality gate's canary (changes replies)",
    "doc": "Diagnostics for the quality gate only, never a serving setting: 1 the output head reads its rows after one more FP8 rounding step (the gate's ruler); 2 layer 0's MoE partials take one more FP8 step before their gather; 3 they move one fp32 ulp away from zero (a reduction order's size). A known small change the gate must detect; it changes replies. Every node must use the same setting (a start whose nodes differ is refused). Leave unset.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:2130",
+   "secret": false,
+   "hidden": true,
+   "env_override": true
   },
   {
    "id": 981,
@@ -172,6 +409,29 @@
    "secret": false
   },
   {
+   "id": 983,
+   "name": "tf_ds_qkv_plain",
+   "env": "TF_DS_QKV_PLAIN",
+   "group": "decode",
+   "tab": "Generation",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "1",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Q norm and window KV, one launch",
+   "doc": "A decode window's q RMSNorm and the window KV's RMSNorm, RoPE and FP8 quant-dequant (two launches on the native kernels) as one launch of the kit's extra set's _q_kv_norm variant without rotations: each program is the code of the kernel it replaces, so the bytes are the same (replay section qkv_plain). On by default; a kit without the variant prints an 'off:' line at the start and keeps the two launches. 0 keeps the two launches.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:2604",
+   "secret": false
+  },
+  {
    "id": 984,
    "name": "tf_ds_nact_log",
    "env": "TF_DS_NACT_LOG",
@@ -216,6 +476,148 @@
    "values": [],
    "seed": "name",
    "first_use": "families/dsv41/model.zig:974",
+   "secret": false
+  },
+  {
+   "id": 986,
+   "name": "tf_ds_attn_epi_twin",
+   "env": "TF_DS_ATTN_EPI_TWIN",
+   "group": "prompt",
+   "tab": "Advanced",
+   "kind": "enum",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "we",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Fused attention epilogue kernel",
+   "doc": "Which kit kernel the fused prompt attention epilogue (TF_DS_ATTN_EPI_FUSED) launches. ue is the standard kernel (_sparse_attn_part_ue). we runs ue's epilogue after w's mainloop (the latents' scale bytes read in the code bytes' layout, unpacked in place): measured x1.020 on prompts, replies byte-equal. xe is we, reading the next block's pick indices a block ahead and prefetching that block's rows into the GPU's first-level cache: x1.012, below we (its 21 register spills cost more than the prefetch saves). All three give the same bytes (the kernels replay compares them). It runs we unless set (a bit-identical speed change is on by default); a kit without the kernel keeps ue and says so in an 'off' line of the speed report. A value other than ue, we or xe refuses the start by name. Separate from TF_DS_ATTN_TWIN, which picks the decode and unfused calls' kernel.",
+   "values": [
+    "ue",
+    "we",
+    "xe"
+   ],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:2731",
+   "secret": false
+  },
+  {
+   "id": 988,
+   "name": "tf_ds_l2_chunk_kib",
+   "env": "TF_DS_L2_CHUNK_KIB",
+   "group": "decode",
+   "tab": "Generation",
+   "kind": "int",
+   "unit": "KiB",
+   "min": 1,
+   "max": 16,
+   "default": "8",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "L2 prefetch: chunk size",
+   "doc": "The size of each bulk prefetch of the L2 prefetch that runs beside the decode exchanges: 8 (the default, as served), or 1, 2, 4, 16 KiB. A wave is 128 chunks, so the memory queue a wave puts ahead of the network card's reads and the staging copies is 128 x the chunk; a smaller chunk with the same rate (the wave period scales with it) leaves a shallower queue. Bit-identical: it touches no value, only when the same cache lines are fetched; replies do not change. Values other than 1, 2, 4, 8, 16 refuse the start. Each rank reads its own setting.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:2440",
+   "secret": false
+  },
+  {
+   "id": 989,
+   "name": "tf_ds_idx_tpp",
+   "env": "TF_DS_IDX_TPP",
+   "group": "prompt",
+   "tab": "Advanced",
+   "kind": "int",
+   "unit": "tiles",
+   "min": 0,
+   "max": 4,
+   "default": "4",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Key tiles per index program",
+   "doc": "How many 64-key tiles one program of a prompt chunk's index score takes in turn. 0 is the standard kernel. 4 uses the kernel kit's tile-looping build: the program reads its rows' queries, head weights and visible lengths once for the four tiles instead of once a tile, and prefetches the next tile's keys into the first-level cache; the same scores, keys and tile maxima (the kernels replay compares them). On by default (4): the kernel time measured on the Spark was 0.958 to 0.980 of the standard kernel's at the 9 shapes of a 4,096-row pass, the same bytes. 0 runs the standard kernel. Only 0 and 4 are built: another value refuses the start by name; a kit without the kernel leaves it off with a line saying why.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:2315",
+   "secret": false
+  },
+  {
+   "id": 990,
+   "name": "tf_ds_aq_vec",
+   "env": "TF_DS_AQ_VEC",
+   "group": "prompt",
+   "tab": "Advanced",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "1",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Four-lane activation quantizer",
+   "doc": "The activation quantizer (the front's input, wo_b's input, the experts' pack, wo_a's input rows) runs four lanes a 32-value group with 16-byte loads instead of a warp a group with 2-byte loads. The same bytes (every output byte equal to the standard kernel's over the prompt pass's shapes and fills with NaN, infinities, zeros and subnormals, kernels replay act_quant; measured on the Spark: 140 of 140 comparisons identical, the big prompt shapes x0.89 of the standard kernel's time, 1,024 rows x0.27 to x0.64), so it is on unless set to 0, which runs the standard kernel for every call. A call that is not bf16 or whose addresses or strides are not aligned runs the standard kernel either way. Any value but 0 or 1 refuses the start.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:2481",
+   "secret": false
+  },
+  {
+   "id": 991,
+   "name": "tf_ds_woa_merge",
+   "env": "TF_DS_WOA_MERGE",
+   "group": "prompt",
+   "tab": "Advanced",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "1",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Attention output groups in one launch",
+   "doc": "A prompt chunk's wo_a on its FP8 rows (TF_DS_WOA_W8) runs both groups of a layer as one launch of the bf16-from-FP8 tile kernel (grid z = groups) instead of one launch a group. A group's launch is 256 tiles on 48 SMs, 5.33 waves, so 6 with the last one a third full; one launch over both is 10.67 waves, so 11: about one wave a layer by the wave arithmetic. Each tile runs its group's code unchanged, so the bytes are the group launches' (kernels replay woa_merge). On by default because of the kernel time measured on the Spark: a layer's wo_a took 0.945 of the two launches' time (null 0.998), about 2.1 ms of a 4,096-row pass, the same bytes (the wave estimate of 3.7 to 3.9 ms was high: the merge trims the tail wave, it does not remove it); 0 runs one launch a group. Any value but 0 or 1 refuses the start.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:2493",
+   "secret": false
+  },
+  {
+   "id": 992,
+   "name": "tf_ds_split64n",
+   "env": "TF_DS_SPLIT64N",
+   "group": "prompt",
+   "tab": "Advanced",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "1",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Exact split GEMMs on a 64-column tile",
+   "doc": "With the exact-arithmetic matrix multiplies (TF_DS_MMA_SF_EXACT), a prompt chunk's wkv (512 columns) and wq_a (1,280 columns) run their split GEMMs on a 64 x 64 tile of 128 threads, two blocks an SM, instead of the 64 x 128 tile of 256 threads: their grids are 64 and 160 blocks on 48 SMs. A warp's 32 x 32 tile and every output element's K chain are the same, so the bytes are the 128-column tile's (kernels replay split64n); each rank decides for itself. On by default: at a 4,096-row pass's 1,024 owned rows the 64 x 64 tile takes 21.4 % less kernel time for wkv and 17.9 % less for wq_a (null control 0.0 %, measured on the Spark); 0 runs the 128-column tile.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:2409",
    "secret": false
   },
   {
@@ -389,10 +791,26 @@
   },
   {
    "when": "on",
+   "why": "a prompt pass no longer runs in a green context beside the decode rounds"
+  },
+  {
    "when": "set",
+   "why": "it only tuned the removed TF_DS_DECODE_BESIDE split of the GPU between a prompt pass and the decode rounds"
+  },
+  {
    "when": "set",
+   "why": "it only tuned the removed TF_DS_DECODE_BESIDE split of the GPU between a prompt pass and the decode rounds"
+  },
+  {
    "when": "on",
    "when": "on",
+   "why": "the draft planner no longer prices draft rows apart from the streams' own rows; it uses the round table at the round's total rows"
+  },
+  {
    "when": "set",
+   "why": "the Engram worker wait timing print was removed"
+  },
+  {
    "when": "set",
+   "why": "it only priced the removed drafter pre-pass"
   }

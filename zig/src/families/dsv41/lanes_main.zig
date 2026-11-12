@@ -72,6 +72,7 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("{s}", .{usage});
         return 2;
     }
+        dsv41.model.speed_defaults.applyFamily(); // before the CUDA context reads them
     var o: dsv41.model.Options = .{
         .model_dir = args[1],
         .cache_dir = args[2],
@@ -218,6 +219,16 @@ pub fn main(init: std.process.Init) !u8 {
     const text = try std.Io.Dir.cwd().readFileAlloc(io, requests_file orelse return error.NoRequests, a, .limited(1 << 30));
     const Requests = struct { requests: []Request };
     const reqs = (try std.json.parseFromSliceLeaky(Requests, a, text, .{ .ignore_unknown_fields = true })).requests;
+        const mxk: ?*const dsv41.mx.Kernels = if (m.mxk) |*k| k else null; // (the rank's kernels: the two decode defaults read in mx.Kernels.open)
+        const speed = dsv41.logits_log.speedWord(.{
+            .twin = @backingInt(dsv41.tri_attn.attn_twin),
+            .rope_w = dsv41.tri_norm.rope_w,
+            .merge_cols = dsv41.tri_attn.merge_db,
+            .group2 = if (mxk) |k| k.group2 else false,
+            .expert_exit = if (mxk) |k| k.expert_exit else false,
+            .pack_epilogue = dsv41.prompt2d.pack_epilogue_asked,
+            .hc_2s = dsv41.tri_hc.hc_2s,
+        });
     var ln = dsv41.lanes.Lanes.init(gpa, m);
     defer ln.deinit();
     ln.fix_k = fix_k;

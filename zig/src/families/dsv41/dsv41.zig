@@ -42,6 +42,7 @@ pub const rdma = @import("rdma.zig");
 pub const exl3_experts2d = @import("exl3_experts2d.zig");
 pub const exl3_experts2d_rec = @import("exl3_experts2d_rec.zig");
 pub const prompt2d = @import("prompt2d.zig");
+pub const wc_verdict = @import("wc_verdict.zig");
 pub const ring2d = @import("ring2d.zig");
 pub const neighbor = @import("neighbor.zig");
 pub const text = @import("text.zig");
@@ -59,6 +60,7 @@ pub const ring_watch = @import("ring_watch.zig");
 /// Where this rank's host is, for a failure that names it.
 pub const where = @import("where.zig");
 pub const pass_replay = @import("pass_replay.zig");
+pub const qgemv = @import("qgemv.zig");
 /// The owned-rows plan of a chunk of any row count.
 pub const slab_plan = @import("slab_plan.zig");
 pub const any_check = @import("any_check.zig");
@@ -135,6 +137,7 @@ test {
     refAll(ring_watch);
     refAll(where);
     refAll(pass_replay);
+    refAll(qgemv);
     refAll(slab_plan);
     refAll(rocinante);
     refAll(rocinante_verbs);
@@ -146,6 +149,8 @@ test {
     refAll(star);
     refAll(land_writes);
     _ = @import("roci_pair.zig");
+    _ = @import("pack_epilogue.zig");
+    _ = @import("wc_verdict.zig");
     _ = @import("pair_spans.zig");
     _ = @import("pass_meter.zig");
     _ = @import("rocinante_test.zig");

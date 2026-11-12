@@ -26,6 +26,12 @@ const ManifestFinds = struct {
         if (f.reject) |r| if (std.mem.eql(u8, r, name)) return false;
         return f.m.find(name, args, consts) != null;
     }
+
+    /// The base set's manifest alone: no extra set (a runTwin launch is then found as its base fallback, as Tri runs it).
+    pub fn hasExtra(f: ManifestFinds, name: []const u8, args: []const aot.Arg, consts: []const aot.Const) bool {
+        _ = .{ f, name, args, consts };
+        return false;
+    }
 };
 
 /// The kit's base set and its extra set, looked up as a launch finds its variant (Set.find; the two-block readers Set.lookup of the
@@ -99,6 +105,7 @@ fn slabOff(gpa: std.mem.Allocator, finds: anytype, cfg: config_mod.Config, lays:
     defer log.deinit();
     const t: tri.Tri = .{ .log = &log };
     for (lays[0..@min(half, lays.len)]) |lay| try mixes(t, cfg, lay, r);
+    for (log.items.items) |l| if (!l.foundIn(finds)) return l.name;
     return null;
 }
 

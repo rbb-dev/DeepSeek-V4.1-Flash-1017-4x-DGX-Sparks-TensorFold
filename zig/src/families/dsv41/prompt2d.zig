@@ -197,6 +197,7 @@ pub const Settings = extern struct {
     pool: u64, // rank 0's --context (a follower's --pool): a follower's holds rank 0's
     exch: u32 = 0, // the exchange switches asked for, bit i exch_names[i] (exchAsked): the same
     kern: u32 = 0, // the kernel switches asked for, bit i kern_names[i] (kernAsked): the same
+    kern2: u32 = 0, // the kernel switches beyond kern's 32 bits, bit i kern2_names[i] (kern2Asked): the same
     pf_split: u32 = 0, // TF_DS_PF_SPLIT asked for (mx.PfSplit): the same
     pass_rows: u32 = 2048, // TF_DS_PASS_ROWS (pass_rows_asked: a pass's rows at most, the chunk's allocation): the same
     pf_raster: u32 = 0, // TF_DS_PF_RASTER's group of row tiles (pf_raster_asked; 0: off): the same (this word was the layout's padding, always 0)
@@ -205,6 +206,7 @@ pub const Settings = extern struct {
     // the fields or of the follower's answer bumps the last letter, so a follower refuses a rank 0 of another layout.
     // A new exchange or kernel switch takes the next bit of exch or kern and keeps the letter: differ refuses every bit
     // that differs, one this build has no name for included
+    pub const tag: u32 = 0x62355344; // "DS5b"
 
     /// What follower `rank` (its Settings `mine`) would have to change to follow rank 0's `lead`, in words ("": none).
     pub fn differ(mine: Settings, lead: Settings, rank: u32, buf: []u8) []const u8 {
@@ -236,6 +238,7 @@ pub const Settings = extern struct {
             w.print("{s}rank {d} has TF_DS_PASS_ROWS={d} and rank 0 {d}: set the same on every rank", .{ sepIf(&w, sep), rank, mine.pass_rows, lead.pass_rows }) catch {};
         if (mine.exch != lead.exch) bitsDiffer(&w, sep, &exch_names, "exchange", mine.exch, lead.exch, rank);
         if (mine.kern != lead.kern) bitsDiffer(&w, sep, &kern_names, "kernel", mine.kern, lead.kern, rank);
+        if (mine.kern2 != lead.kern2) bitsDiffer(&w, sep, &kern2_names, "kernel (second word)", mine.kern2, lead.kern2, rank);
         if (mine.pf_raster != lead.pf_raster)
             w.print("{s}rank {d} has TF_DS_PF_RASTER={d} and rank 0 {d} (0: unset): set the same on every rank", .{ sepIf(&w, sep), rank, mine.pf_raster, lead.pf_raster }) catch {};
         if (mine.pf_split != lead.pf_split) {
@@ -267,6 +270,7 @@ pub const Settings = extern struct {
     }
 /// The exchange switches the start-up settings carry (Settings.exch): bit i is exch_names[i], set when asked for. Each
 /// is read once by Model.open, before the settings and its agreement.
+pub const exch_names = [_][]const u8{ "", "", "", "", "", "", "", "", "TF_DS_ROCI_P2_FIRST", "TF_DS_ROCI_ENGRAM_AHEAD", "", "TF_DS_ROCI_SENT_FIRST", "", "", "", "", "", "", "TF_DS_ROCI_COMBINE_DOOR", "", "", "TF_DS_ROCI_STAGGER", "TF_DS_ENGRAM_PARTNER", "TF_DS_RING_WC", "TF_DS_RING_INPLACE", "TF_DS_RING_WORD", "TF_DS_RING_WORD_SIGNAL", "TF_DS_RING_WAIT", "TF_DS_ROCI_STAGGER_LANES", "TF_DS_PACK_EPILOGUE", "", "" };
 pub const exch_roci_p2_first: u32 = 1 << 8;
 pub const exch_roci_engram_ahead: u32 = 1 << 9;
 pub const exch_roci_sent_first: u32 = 1 << 11;
@@ -277,6 +281,7 @@ pub const exch_ring_inplace: u32 = 1 << 24;
 pub const exch_ring_word: u32 = 1 << 25;
 pub const exch_ring_word_atomic: u32 = 1 << 26; // the switch's signal is the atomic fetch-and-add (unset: the inline word)
 pub const exch_ring_wait: u32 = 1 << 27; // TF_DS_RING_WAIT: the rings' queue pairs wait in the card (no proxy threads)
+pub const exch_pack_epilogue: u32 = 1 << 29; // TF_DS_PACK_EPILOGUE: gate/up's twin writes the expert pack's codes (every rank alike)
 pub const exch_roci_stagger_lanes: u32 = 1 << 28; // TF_DS_ROCI_STAGGER_LANES=3 (unset or 2: clear): three passes in flight, a third lane on every rank
 /// An exchange switch's text: "1" asks for it; unset or any other text does not.
 /// A switch that is on unless set otherwise (TF_DS_ROCI_WAIT, TF_DS_RING_WAIT): unset or "1" is on; any other text, "0" included, is off (a typo
@@ -321,6 +326,10 @@ pub var roci_stagger_lanes: usize = 2;
 pub var roci_stagger3_asked: bool = false;
 pub var roci_stagger_lanes_set: bool = false;
 
+/// TF_DS_PACK_EPILOGUE as Model.open read it (switchAsked), once (Settings.exch): the expert pack's codes are written by gate/up's twin kernel
+/// (tf_dsn_sf_gu_exact_q_kernel) and packQuant does not run. Bit-identical by contract (pack_epilogue.zig); default off.
+pub var pack_epilogue_asked: bool = false;
+
 /// Settings.exch of the switches Model.open read.
 pub fn exchAsked() u32 {
     var x: u32 = 0;
@@ -330,6 +339,7 @@ pub fn exchAsked() u32 {
     if (roci_combine_door_asked) x |= exch_roci_combine_door;
     if (roci_stagger_asked) x |= exch_roci_stagger;
     if (roci_stagger3_asked) x |= exch_roci_stagger_lanes;
+    if (pack_epilogue_asked) x |= exch_pack_epilogue;
     if (ring_wc_asked) x |= exch_ring_wc;
     if (ring_inplace_asked) x |= exch_ring_inplace;
     if (ring_word_asked) x |= exch_ring_word;
@@ -341,6 +351,7 @@ pub fn exchAsked() u32 {
 /// The kernel switches the start-up settings carry (Settings.kern): bit i is kern_names[i], set when asked for (the
 /// text "1", switchAsked; TF_DS_QGATE_CANARY's "1", "2" or "3", qgateAsked); an empty name is a reserved bit (kern_reserved). Each is read once by Model.open, before the
 /// settings.
+pub const kern_names = [_][]const u8{ "TF_DS_WOA_W8", "TF_DS_QUANT_ONCE", "TF_DS_PF_GEMM5", "TF_DS_GROUP_TILES", "TF_DS_TOPK_TILES", "TF_DS_IDX_PROJ_OWNED", "TF_DS_BF16_ROWS", "TF_DS_PF_RUN128", "TF_DS_DECODE_FUSE", "TF_DS_DRAFT_4WAY", "TF_DS_HEAD_PACK12", "TF_DS_HC_LATE_FORK", "TF_DS_ATTN_U", "TF_DS_IDX_U", "TF_DS_ATTN_U_DECODE", "TF_DS_ASSEMBLE_QUANT", "TF_DS_ATTN_EPILOGUE", "TF_DS_DRAFT_MAIN_4WAY", "TF_DS_MMA_SF", "TF_DS_IDX_V", "TF_DS_HC_STRIDE", "TF_DS_HC_FUSED", "TF_DS_MMA_SF_EXACT", "TF_DS_PASS_TAIL", "TF_DS_HEAD_CAND", "TF_DS_HEAD_KEY", "TF_DS_DECODE_KSPLIT", "TF_DS_ATTN_EPI_FUSED", "TF_DS_GEMM_W16", "TF_DS_GEMM_R2", "TF_DS_GEMM_HALVES", "TF_DS_QGATE_CANARY" };
 pub const kern_woa_w8: u32 = 1 << 0;
 pub const kern_quant_once: u32 = 1 << 1;
 pub const kern_pf_gemm5: u32 = 1 << 2;
@@ -351,13 +362,22 @@ pub const kern_bf16_rows: u32 = 1 << 6;
 pub const kern_pf_run128: u32 = 1 << 7;
 pub const kern_attn_u: u32 = 1 << 12;
 pub const kern_idx_u: u32 = 1 << 13;
+pub const kern_idx_v: u32 = 1 << 19;
 pub const kern_attn_u_decode: u32 = 1 << 14;
 pub const kern_assemble_quant: u32 = 1 << 15;
+pub const kern_hc_stride: u32 = 1 << 20;
 pub const kern_mma_sf: u32 = 1 << 18;
+pub const kern_attn_epilogue: u32 = 1 << 16;
 pub const kern_mma_sf_exact: u32 = 1 << 22;
 pub const kern_pass_tail: u32 = 1 << 23;
 pub const kern_gemm_w16: u32 = 1 << 28;
+pub const kern_hc_fused: u32 = 1 << 21;
+pub const kern_attn_epi_fused: u32 = 1 << 27;
 pub const kern_gemm_r2: u32 = 1 << 29;
+
+/// The kernel switches beyond kern's 32 bits (Settings.kern2): bit i is kern2_names[i], set when asked for. Same rules as
+/// kern_names: read once by Model.open, differ refuses every bit that differs, one this build has no name for included.
+pub const kern2_hc_2s: u32 = 1 << 0;
 
 /// The kernel word's reserved bits: an empty name in kern_names, a bit kept for a switch this build does not carry,
 /// never asked for here.
@@ -393,17 +413,47 @@ pub var bf16_rows_asked: bool = false;
 /// TF_DS_PF_RUN128 as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useRun128).
 pub var pf_run128_asked: bool = false;
 
+/// TF_DS_ATTN_EPI_FUSED as Model.open read it (switchAsked), once (Settings.kern, tri_attn.attn_epi_fused): a prompt chunk's
+/// attention epilogue (inverse RoPE and wo_a's quant) in the final store of the part kernel from the kit's extra set.
+pub var attn_epi_fused_asked: bool = false;
+
+/// TF_DS_HC_2S as Model.open read it (switchAsked), once (Settings.kern, tri_hc.hc_2s): the two-block mHC mix with the four streams of a
+/// K block in one program (the kernel kit's extra set).
+pub var hc_2s_asked: bool = false;
+
+/// TF_DS_HC_FUSED as Model.open read it (switchAsked), once (Settings.kern, tri_hc.hc_fused): a prompt chunk's mHC
+/// mixes and their finish in one launch from the kit's extra set.
+pub var hc_fused_asked: bool = false;
+
 /// TF_DS_ATTN_U as Model.open read it (switchAsked), once (Settings.kern, tri_attn.attn_u).
 pub var attn_u_asked: bool = false;
 
 /// TF_DS_IDX_U as Model.open read it (switchAsked), once (Settings.kern, tri_index.idx_u).
 pub var idx_u_asked: bool = false;
 
+/// TF_DS_IDX_V as Model.open read it (switchAsked), once (Settings.kern, tri_index.idx_v).
+pub var idx_v_asked: bool = false;
+
 /// TF_DS_ATTN_U_DECODE as Model.open read it (switchAsked), once (Settings.kern, tri_attn.attn_u_decode).
 pub var attn_u_decode_asked: bool = false;
+/// TF_DS_ATTN_TWIN as Model.open read it (u, w or z; null: unset = u), once (tri_attn.attn_twin). Not in Settings.kern:
+/// the twins' bytes are _sparse_attn_part_u's (the kernels replay's attn_w / attn_z sections compare them).
+pub var attn_twin_text: ?[]const u8 = null;
+/// TF_DS_ROPE_W as Model.open read it (switchAsked), once (tri_norm.rope_w). Not in Settings.kern: the twin's bytes are
+/// _rope_heads's (the kernels replay's rope_w section compares them).
+pub var rope_w_asked: bool = false;
+/// TF_DS_IDX_TPP as Model.open read it (the text of the env; null / unset = 4, the default), once (tri_index.idx_tpp). Not in Settings.kern: the twin's
+/// bytes are _index_score_rows_u's (the kernels replay's idx_t section compares them).
+pub var idx_tpp_text: ?[]const u8 = null;
 
 /// TF_DS_ASSEMBLE_QUANT as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.assemble_quant).
 pub var assemble_quant_asked: bool = false;
+
+/// TF_DS_ATTN_EPILOGUE as Model.open read it (switchAsked), once (Settings.kern, prompt.attn_epilogue).
+pub var attn_epilogue_asked: bool = false;
+
+/// TF_DS_HC_STRIDE as Model.open read it (switchAsked), once (Settings.kern, prompt.hc_stride).
+pub var hc_stride_asked: bool = false;
 
 /// TF_DS_MMA_SF as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useMmaSf).
 pub var mma_sf_asked: bool = false;
@@ -413,6 +463,10 @@ pub var mma_sf_exact_asked: bool = false;
 
 /// TF_DS_GEMM_W16 as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useGemmW16).
 pub var gemm_w16_asked: bool = false;
+
+/// TF_DS_SPLIT64N as Model.open read it (switchAsked), once (mx.Kernels.split64n; not in Settings: the 64-column tile's bytes are the 128-column
+/// tile's, so ranks may differ): the exact arithmetic's split64 GEMMs of wkv and wq_a on a 64 x 64 tile.
+pub var split64n_asked: bool = false;
 
 /// TF_DS_PF_T64 as Model.open read it (switchAsked), once (mx.Kernels.usePfT64; not in Settings: the 64 x 64 tile's bytes are the 128 x 128
 /// tile's, so ranks may differ): the router's bf16 GEMM of a prompt chunk on a 64 x 64 tile.
@@ -498,14 +552,26 @@ pub fn kernAsked() u32 {
     if (pf_run128_asked) x |= kern_pf_run128;
     if (attn_u_asked) x |= kern_attn_u;
     if (idx_u_asked) x |= kern_idx_u;
+    if (idx_v_asked) x |= kern_idx_v;
     if (attn_u_decode_asked) x |= kern_attn_u_decode;
     if (assemble_quant_asked) x |= kern_assemble_quant;
+    if (attn_epilogue_asked) x |= kern_attn_epilogue;
+    if (hc_stride_asked) x |= kern_hc_stride;
     if (mma_sf_asked) x |= kern_mma_sf;
     if (mma_sf_exact_asked) x |= kern_mma_sf_exact;
     if (pass_tail_asked) x |= kern_pass_tail;
     if (gemm_w16_asked) x |= kern_gemm_w16;
+    if (hc_fused_asked) x |= kern_hc_fused;
+    if (attn_epi_fused_asked) x |= kern_attn_epi_fused;
     if (gemm_r2_asked) x |= kern_gemm_r2;
     if (qgate_canary_asked != .off) x |= kern_qgate_canary;
+    return x;
+}
+
+/// Settings.kern2 from the switches Model.open read.
+pub fn kern2Asked() u32 {
+    var x: u32 = 0;
+    if (hc_2s_asked) x |= kern2_hc_2s;
     return x;
 }
 
@@ -1120,6 +1186,15 @@ pub const Two = struct {
         const pc = try packCodesPlan(rows * ch.mxe.slots, t.gu[t.p], t.ir);
         const mine = t.rc.?.addr(.pack_send);
         const theirs = t.rc.?.addr(.pack_land);
+        if (pack_epilogue_asked) {
+            // TF_DS_PACK_EPILOGUE: gate/up's twin writes the pack's codes and scales into the send region itself (packSlot's places), so
+            // packQuant does not run; where the twin cannot run this is an error, never the baseline two launches
+            try mx.gateUpPack(k, e.s, e.d, ex, ch.mxe, x, ldx, pick, wts, rows, e.c.swiglu_limit, xd, ex.width, x_codes, .{ .codes = mine, .scales = mine + pc.scales, .ig = @intCast(pc.ig), .ir = @intCast(pc.ir), .P = @intCast(pc.p) });
+        } else if (x_codes) try mx.gateUpCodes(k, e.s, e.d, ex, ch.mxe, pick, wts, rows, e.c.swiglu_limit, xd, ex.width) else try mx.gateUp(k, e.s, e.d, ex, ch.mxe, x, ldx, pick, wts, rows, e.c.swiglu_limit, xd, ex.width, false);
+        if (prompt.ptimer) |pt| pt.mark(e.s, .m_gu) catch {};
+        // the pack is quantized into the arena's send region and the column partner's lands in its land region, over the transport
+        const shape = prompt.codesShape(e, ch) orelse return error.RociNoShape;
+        if (!pack_epilogue_asked) try packQuant(k, e.s, xd, mine, pc);
         try t.rc.?.send(e.s, .pack, shape);
         try t.rc.?.wait(e.s, .pack);
         if (prompt.ptimer) |pt| pt.mark(e.s, .m_x) catch {};
@@ -1943,9 +2018,12 @@ test "a follower runs rank 0's indexer score rows, or says to set the same on ev
     var all = rb;
     all.replay_floor = 0;
     try std.testing.expectEqualStrings("rank 3 has TF_DS_REPLAY_FLOOR=0 and rank 0 1: set the same on every rank; rank 3 has TF_DS_IDX_RB=1 and rank 0 2: set the same on every rank", all.differ(lead, 3, &buf));
+    // the layout carries no padding: every byte of the frame is a field's, and the tag names this layout ("DS5b")
     comptime var sum: usize = 0;
     inline for (@typeInfo(Settings).@"struct".field_names) |name| sum += @sizeOf(@FieldType(Settings, name));
     try std.testing.expectEqual(sum, @sizeOf(Settings));
+    try std.testing.expectEqual(@as(u32, 0x62355344), Settings.tag);
+    try std.testing.expectEqualSlices(u8, "DS5b", std.mem.asBytes(&Settings.tag));
     try std.testing.expectEqual(@as(u32, 11), frame_protocol);
 }
 
@@ -1960,6 +2038,7 @@ test "a follower runs rank 0's TF_DS_PASS_ROWS, or says to set the same on every
     try std.testing.expectEqualStrings("rank 1 has TF_DS_PASS_ROWS=2048 and rank 0 4096: set the same on every rank", mine.differ(lead, 1, &buf));
     try std.testing.expectEqualStrings("rank 3 has TF_DS_PASS_ROWS=4096 and rank 0 2048: set the same on every rank", lead.differ(mine, 3, &buf));
     // every field whole 4- or 8-byte words: no padding travels
+    try std.testing.expectEqual(@as(usize, 96), @sizeOf(Settings));
 }
 
     const lead: Settings = .{ .world = 4, .streams = 8, .round_rows = 16, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 20, .replay_floor = 0, .idx_rb = 1, .land_slots = 2 };
@@ -2025,6 +2104,7 @@ test "the exchange switches that remain: a named bit each in Settings.exch, aske
         .{ .name = "TF_DS_ROCI_COMBINE_DOOR", .bit = exch_roci_combine_door, .var_ptr = &roci_combine_door_asked },
         .{ .name = "TF_DS_ROCI_STAGGER", .bit = exch_roci_stagger, .var_ptr = &roci_stagger_asked },
         .{ .name = "TF_DS_ROCI_STAGGER_LANES", .bit = exch_roci_stagger_lanes, .var_ptr = &roci_stagger3_asked },
+        .{ .name = "TF_DS_PACK_EPILOGUE", .bit = exch_pack_epilogue, .var_ptr = &pack_epilogue_asked },
         .{ .name = "TF_DS_ENGRAM_PARTNER", .bit = exch_engram_partner, .var_ptr = &engram_partner_asked },
     };
     var buf: [1024]u8 = undefined;
@@ -2061,6 +2141,38 @@ test "a default-on switch (TF_DS_ROCI_WAIT, TF_DS_RING_WAIT): unset and 1 are on
     try std.testing.expect(!switchAsked(null));
     try std.testing.expect(switchAsked("1"));
 }
+test "the second kernel word: a follower differing only in kern2 is refused, and the switch named" {
+    const lead: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 2 };
+    var buf: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings("", lead.differ(lead, 1, &buf));
+    var hc = lead;
+    hc.kern2 = kern2_hc_2s;
+    try std.testing.expectEqualStrings("rank 3 has TF_DS_HC_2S=1 and rank 0 0: set the same on every rank", hc.differ(lead, 3, &buf));
+    try std.testing.expectEqualStrings("rank 2 has TF_DS_HC_2S=0 and rank 0 1: set the same on every rank", lead.differ(hc, 2, &buf));
+    // a bit this build has no name for is refused too
+    var other = lead;
+    other.kern2 = 1 << 5;
+    try std.testing.expectEqualStrings("rank 1 and rank 0 differ in kernel (second word) switches this build has no name for (bits 0x20): run every rank from the same image", other.differ(lead, 1, &buf));
+    // kern2 is its own word: kern's bit 31 (the canary) and HC_2S never meet
+    try std.testing.expectEqual(@as(u32, 1), kern2_hc_2s);
+    try std.testing.expectEqualStrings("TF_DS_HC_2S", kern2_names[@ctz(kern2_hc_2s)]);
+    try std.testing.expectEqual(@as(u32, 0), kernAsked() & kern2_hc_2s & 0); // (kernAsked has no HC_2S bit)
+    const was = hc_2s_asked;
+    defer hc_2s_asked = was;
+    hc_2s_asked = true;
+    try std.testing.expectEqual(kern2_hc_2s, kern2Asked());
+    hc_2s_asked = false;
+    try std.testing.expectEqual(@as(u32, 0), kern2Asked());
+    // no two switches of kern2 share a bit, and every bit kern2_names names is one of them
+    var seen2: u32 = 0;
+    for (all2) |v| {
+        try std.testing.expect(@popCount(v) == 1 and seen2 & v == 0);
+        seen2 |= v;
+    }
+    for (kern2_names, 0..) |n, i| if (n.len > 0) try std.testing.expect(seen2 & (@as(u32, 1) << @intCast(i)) != 0);
+}
+
+    const all = [_]u32{ kern_woa_w8, kern_quant_once, kern_pf_gemm5, kern_group_tiles, kern_topk_tiles, kern_idx_proj_owned, kern_bf16_rows, kern_pf_run128, kern_decode_fuse, kern_draft_4way, kern_head_pack12, kern_hc_late_fork, kern_attn_u, kern_idx_u, kern_idx_v, kern_attn_u_decode, kern_assemble_quant, kern_hc_stride, kern_draft_main_4way, kern_mma_sf, kern_attn_epilogue, kern_mma_sf_exact, kern_pass_tail, kern_head_cand, kern_head_key, kern_decode_ksplit, kern_attn_epi_fused, kern_gemm_w16, kern_hc_fused, kern_gemm_r2, kern_gemm_halves, kern_qgate_canary };
 
 test "TF_DS_QGATE_CANARY's text: 1 the head, 2 and 3 the body; unset or other text none; any canary is kern bit 31" {
     try std.testing.expectEqual(Qgate.off, qgateAsked(null));

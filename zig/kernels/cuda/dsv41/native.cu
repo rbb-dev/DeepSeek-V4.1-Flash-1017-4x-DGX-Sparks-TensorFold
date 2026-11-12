@@ -113,6 +113,69 @@ extern "C" __global__ void tf_dsn_act_quant_kernel(const void* __restrict__ x, i
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// act_quant on four lanes a 32-group (TF_DS_AQ_VEC, on unless 0; mx.zig aqVecFits says when a call may take it): the bytes of tf_dsn_act_quant_kernel above,
+// from 16-byte loads instead of 2-byte ones. A lane takes 8 consecutive bf16 values (one uint4 load), the group's amax is the max over the lane's eight |v|
+// and two xor shuffles (fmaxf ignores NaN, so any order gives base's value: all-NaN gives NaN as base), the scale round_scale(max(amax, 1e-4)), the codes
+// to_e4m3(v * (1 / sc)) written as one 8-byte store, lane 0 of the group the scale. The reciprocal is built from the scale's bits (0x7f000000 - bits) only when
+// sc is a normal power of two whose reciprocal is normal (exponent field 1 .. 253): then v * (1 / sc) and v / sc are the same real number correctly rounded
+// (a power-of-two scale), so the same float; any other scale (zero, subnormal, 2^127, inf) takes base's division. `fake` (non-null) gets the dequantized
+// rows as 16-byte stores, from_e4m3(c) * sc rounded to bf16 as base. Calls: bf16 x only, K a multiple of 32, ldx % 8 == 0 and x 16-byte aligned, ldq % 8 == 0
+// and q 8-byte aligned (fake: ldf % 8 == 0 and 16-byte aligned): the host (mx.zig aqVecFits) sends anything else to the kernel above. Launch: 4 threads a
+// group, 256 threads a block. The kernels replay's act_quant section compares every output byte with the kernel above's.
+extern "C" __global__ void __launch_bounds__(256) tf_dsn_act_quant_vec_kernel(const void* __restrict__ x, int x_dtype, int64_t ldx, int M, int K,
+                                                                              uint8_t* __restrict__ q, int64_t ldq, float* __restrict__ s,
+                                                                              int64_t lds, __nv_bfloat16* __restrict__ fake, int64_t ldf) {
+    (void)x_dtype;  // (bf16: aqVecFits)
+    const int groups = K / kBlk;
+    const int64_t unit = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t grp = unit >> 2;
+    const int sub = int(unit & 3);
+    const bool live = grp < int64_t(M) * groups;  // (no early return before the shuffles: they take the whole warp)
+    const int m = live ? int(grp / groups) : 0, g = live ? int(grp % groups) : 0;
+    float f[8];
+    if (live) {
+        const uint4 u = *reinterpret_cast<const uint4*>(reinterpret_cast<const __nv_bfloat16*>(x) + int64_t(m) * ldx + int64_t(g) * kBlk + sub * 8);
+        const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&u);
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const float2 p = __bfloat1622float2(h[j]);
+            f[2 * j] = bf16r(p.x);
+            f[2 * j + 1] = bf16r(p.y);
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < 8; j++) f[j] = 0.f;
+    }
+    float amax = fabsf(f[0]);
+#pragma unroll
+    for (int j = 1; j < 8; j++) amax = fmaxf(amax, fabsf(f[j]));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    if (!live) return;
+    const float sc = round_scale(fmaxf(amax, 1e-4f));
+    const uint32_t sb = __float_as_uint(sc);
+    const uint32_t se = (sb >> 23) & 0xffu;
+    const bool rcp_ok = (sb & 0x7fffffu) == 0 && (sb >> 31) == 0 && se >= 1 && se <= 253;
+    const float inv = rcp_ok ? __uint_as_float(0x7f000000u - sb) : 0.f;
+    uint8_t c[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) c[j] = to_e4m3(rcp_ok ? f[j] * inv : f[j] / sc);
+    if (fake) {
+        uint4 o;
+        __nv_bfloat162* oh = reinterpret_cast<__nv_bfloat162*>(&o);
+#pragma unroll
+        for (int j = 0; j < 4; j++) oh[j] = __floats2bfloat162_rn(from_e4m3(c[2 * j]) * sc, from_e4m3(c[2 * j + 1]) * sc);
+        *reinterpret_cast<uint4*>(fake + int64_t(m) * ldf + int64_t(g) * kBlk + sub * 8) = o;
+    } else {
+        uint2 o;
+        o.x = uint32_t(c[0]) | uint32_t(c[1]) << 8 | uint32_t(c[2]) << 16 | uint32_t(c[3]) << 24;
+        o.y = uint32_t(c[4]) | uint32_t(c[5]) << 8 | uint32_t(c[6]) << 16 | uint32_t(c[7]) << 24;
+        *reinterpret_cast<uint2*>(q + int64_t(m) * ldq + int64_t(g) * kBlk + sub * 8) = o;
+        if (sub == 0) s[int64_t(m) * lds + g] = sc;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // A quality gate's body canary (TF_DS_QGATE_CANARY 2 / 3, never a serving setting): x [n] fp32 perturbed in place on
 // purpose, n whole 32-value groups. mode 2: one more FP8 step, act_quant's quant-dequant of each group (the value rounded
 // to bf16, its E4M3 code at the group's power-of-two scale, back: exact in fp32, what fake writes); mode 3: each
@@ -133,6 +196,89 @@ extern "C" __global__ void tf_dsn_qgate_body_kernel(float* __restrict__ x, int64
         const uint32_t u = __float_as_uint(v);
         const uint32_t mag = u & 0x7fffffffu;
         if (mag != 0u && mag < 0x7f7fffffu) x[i] = __uint_as_float(u + 1u);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The attention epilogue (TF_DS_ATTN_EPILOGUE): rope_heads' inverse RoPE of each head's last RD columns, in place,
+// and act_quant's codes and scales of the roped bf16 values (or its fake rows), in one pass. A thread takes eight
+// consecutive values of a row (a 32-value group is four lanes), so a RoPE pair never leaves its thread and a lane has
+// 16 bytes of o in flight; the RoPE is rope_heads' compiled contraction on the same bf16 inputs (re = fma(xe, cs,
+// -(xo sn)), im = fma(xe, sn, xo cs), sn negated for INV) and the same bf16 rounding. RD and HD - RD are multiples of
+// the scale block, so a group is wholly inside or outside the roped columns. `store_o` 0 leaves the roped columns out
+// of o (its readers are the codes or fake rows). Grid (M, ceil(H * HD / 8 / 256)), 256 threads. The group's scale is a
+// power of two, so v / sc is v times its exact reciprocal (the same correctly rounded value); a scale outside the
+// range where that reciprocal is a normal float (an infinite or NaN group) divides.
+extern "C" __global__ void __launch_bounds__(256) tf_dsn_attn_epilogue_kernel(
+    __nv_bfloat16* __restrict__ o, const float* __restrict__ cos, const float* __restrict__ sin,
+    const int64_t* __restrict__ pos, int M, int H, int HD, int RD, uint8_t* __restrict__ q, int64_t ldq,
+    float* __restrict__ s, int64_t lds, __nv_bfloat16* __restrict__ fake, int64_t ldf, int store_o) {
+    const int K = H * HD;
+    const int m = blockIdx.x;
+    const int k0 = (blockIdx.y * blockDim.x + threadIdx.x) * 8;
+    const bool live = m < M && k0 < K;  // K is a multiple of 32: a group is all live or all not
+    float v[8];
+    uint4 raw = make_uint4(0, 0, 0, 0);
+    if (live) raw = *reinterpret_cast<const uint4*>(o + size_t(m) * K + k0);
+    const uint32_t rw[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        v[2 * i] = __uint_as_float(rw[i] << 16);
+        v[2 * i + 1] = __uint_as_float(rw[i] & 0xffff0000u);
+    }
+    const int col = live ? k0 % HD : 0;
+    if (live && col >= HD - RD) {
+        const int j = (col - (HD - RD)) >> 1;
+        const int64_t p = pos[m];
+        const float4 c4 = *reinterpret_cast<const float4*>(cos + p * (RD / 2) + j);
+        const float4 s4 = *reinterpret_cast<const float4*>(sin + p * (RD / 2) + j);
+        const float cs[4] = {c4.x, c4.y, c4.z, c4.w};
+        const float sv[4] = {s4.x, s4.y, s4.z, s4.w};
+        uint32_t ow[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const float xe = v[2 * i], xo = v[2 * i + 1], c = cs[i], sn = -sv[i];
+            const __nv_bfloat16 re = __float2bfloat16_rn(__fmaf_rn(xe, c, -(xo * sn)));
+            const __nv_bfloat16 im = __float2bfloat16_rn(__fmaf_rn(xe, sn, xo * c));
+            v[2 * i] = __bfloat162float(re);
+            v[2 * i + 1] = __bfloat162float(im);
+            ow[i] = uint32_t(__bfloat16_as_ushort(re)) | uint32_t(__bfloat16_as_ushort(im)) << 16;
+        }
+        if (store_o) *reinterpret_cast<uint4*>(o + size_t(m) * K + k0) = make_uint4(ow[0], ow[1], ow[2], ow[3]);
+    }
+    float amax = fabsf(v[0]);
+#pragma unroll
+    for (int i = 1; i < 8; i++) amax = fmaxf(amax, fabsf(v[i]));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    if (!live) return;
+    const float sc = round_scale(fmaxf(amax, 1e-4f));
+    const uint32_t sb = __float_as_uint(sc);
+    const bool recip = sb - 0x00800000u < 0x7f000000u - 0x00800000u;  // sc = 2^e, e in [-126, 126]
+    const float rc = __uint_as_float(0x7f000000u - sb);
+    uint8_t c8[8];
+    if (recip) {
+#pragma unroll
+        for (int i = 0; i < 8; i++) c8[i] = to_e4m3(v[i] * rc);
+    } else {
+#pragma unroll
+        for (int i = 0; i < 8; i++) c8[i] = to_e4m3(v[i] / sc);
+    }
+    if (fake) {
+        uint32_t fw[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const uint32_t a = __bfloat16_as_ushort(__float2bfloat16_rn(from_e4m3(c8[2 * i]) * sc));
+            const uint32_t b = __bfloat16_as_ushort(__float2bfloat16_rn(from_e4m3(c8[2 * i + 1]) * sc));
+            fw[i] = a | b << 16;
+        }
+        *reinterpret_cast<uint4*>(fake + size_t(m) * ldf + k0) = make_uint4(fw[0], fw[1], fw[2], fw[3]);
+    } else {
+        uint32_t qw[2];
+#pragma unroll
+        for (int i = 0; i < 2; i++) qw[i] = uint32_t(c8[4 * i]) | uint32_t(c8[4 * i + 1]) << 8 | uint32_t(c8[4 * i + 2]) << 16 | uint32_t(c8[4 * i + 3]) << 24;
+        *reinterpret_cast<uint2*>(q + size_t(m) * ldq + k0) = make_uint2(qw[0], qw[1]);
+        if ((threadIdx.x & 3) == 0) s[size_t(m) * lds + (k0 >> 5)] = sc;
     }
 }
 
@@ -1443,6 +1589,18 @@ __device__ __forceinline__ ABase abase(const Ops& o, int kb0) {
     return b;
 }
 
+// f(c) for c = tid, tid + T, ... below N (a thread's share of N staging copies): unrolled when the block divides N,
+// so the copies' addresses are the thread's first plus constants
+template <int N, int T, class F>
+__device__ __forceinline__ void for_copies(int tid, F f) {
+    if constexpr (N % T == 0) {
+#pragma unroll
+        for (int k = 0; k < N / T; k++) f(tid + k * T);
+    } else {
+        for (int c = tid; c < N; c += T) f(c);
+    }
+}
+
 template <class C, bool TWO = false, bool THREE = false>
 __device__ __forceinline__ void load_stage(char* st, const int* srow, const Ops& o, int kb0) {
     const int tid = threadIdx.x;
@@ -1456,6 +1614,7 @@ __device__ __forceinline__ void load_stage(char* st, const int* srow, const Ops&
     char* WS = AS + C::AS_BYTES;
     const uint64_t pa = o.stream ? evict_last() : 0, pw = o.stream ? evict_first() : 0;
     constexpr int CPA = C::KBS * 2;  // 16-byte pieces of an activation row's stage
+    for_copies<C::BM * CPA, C::THREADS>(tid, [&](int c) {
         const int r = c / CPA, cc = c % CPA;
         const int row = srow[r];
         const bool ok = row >= 0;
@@ -1463,21 +1622,28 @@ __device__ __forceinline__ void load_stage(char* st, const int* srow, const Ops&
         const uint8_t* src = qa + size_t(ok ? row : 0) * ab.ldq + kba * 32 + cc * 16;
         if (o.stream) cp16h(dst, src, ok, pa);
         else cp16(dst, src, ok);
+    });
+    for_copies<C::BM, C::THREADS>(tid, [&](int r) {
         const int row = srow[r];
         const bool ok = row >= 0;
         const float* src = sa + size_t(ok ? row : 0) * ab.lds + kba;
         if (C::KBS == 4) cp16(AS + r * 16, src, ok);
         else cp8(AS + r * 8, src, ok);
+    });
     constexpr int CPB = C::FMT ? C::KBS : C::KBS * 2;
+    for_copies<C::NWT * C::BN * CPB, C::THREADS>(tid, [&](int c) {
         const int r = c / CPB, cc = c % CPB;
         const int wi = r / C::BN, col = o.n0 + r % C::BN;
         void* dst = B + r * C::SB + C::pb(r, cc) * 16;
         const uint8_t* src = o.w(wi) + size_t(col) * o.ldw + kb0 * (C::FMT ? 16 : 32) + cc * 16;
         if (o.stream) cp16h(dst, src, true, pw);
         else cp16(dst, src, true);
+    });
     if (C::FMT)
+        for_copies<C::NWT * C::BN, C::THREADS>(tid, [&](int r) {
             const int wi = r / C::BN, col = o.n0 + r % C::BN;
             cp4(WS + r * 4, o.ws(wi) + size_t(col) * o.ldws + kb0, true);
+        });
 }
 
 // The tile's K loop over nkb K blocks: acc[wi][i][j][c] (mx_tile's C fragments) for weight wi, this warp's m16 tile i
@@ -1849,6 +2015,7 @@ __device__ __forceinline__ void load_a(char* st, const int* srow, const Ops& o, 
     char* AS = A + C::A_BYTES;
     const uint64_t pa = o.stream ? evict_last() : 0;
     constexpr int CPA = C::KBS * 2;  // 16-byte pieces of an activation row's stage
+    for_copies<C::BM * CPA, C::THREADS>(tid, [&](int c) {
         const int r = c / CPA, cc = c % CPA;
         const int row = srow[r];
         const bool ok = row >= 0;
@@ -1856,9 +2023,12 @@ __device__ __forceinline__ void load_a(char* st, const int* srow, const Ops& o, 
         const uint8_t* src = ab.q + size_t(ok ? row : 0) * ab.ldq + ab.kb * 32 + cc * 16;
         if (o.stream) cp16h(dst, src, ok, pa);
         else cp16(dst, src, ok);
+    });
+    for_copies<C::BM, C::THREADS>(tid, [&](int r) {
         const int row = srow[r];
         const bool ok = row >= 0;
         cp16(AS + r * 16, ab.s + size_t(ok ? row : 0) * ab.lds + ab.kb, ok);
+    });
 }
 
 // the weights of K blocks kb0 .. kb0 + 7 (those below nkb) and their scales into a weight slot: a row's 128 bytes from
@@ -1870,16 +2040,21 @@ __device__ __forceinline__ void load_b2(char* slot, const Ops& o, int kb0, int n
     char* B = slot;
     char* WS = B + P::B_BYTES;
     const uint64_t pw = o.stream ? evict_first() : 0;
+    for_copies<C::NWT * C::BN * 8, C::THREADS>(tid, [&](int c) {
         const int r = c >> 3, q = c & 7;
+        if (kb0 + q >= nkb) return;  // a last pair of one stage
         const int wi = r / C::BN, col = o.n0 + r % C::BN;
         void* dst = B + r * P::ROW + P::piece(r, q) * 16;
         const uint8_t* src = o.w(wi) + size_t(col) * o.ldw + (kb0 + q) * 16;
         if (o.stream) cp16h(dst, src, true, pw);
         else cp16(dst, src, true);
+    });
+    for_copies<C::NWT * C::BN, C::THREADS>(tid, [&](int r) {
         const int wi = r / C::BN, col = o.n0 + r % C::BN;
         const uint8_t* src = o.ws(wi) + size_t(col) * o.ldws + kb0;
         cp4(WS + r * 8, src, true);
         if (kb0 + C::KBS < nkb) cp4(WS + r * 8 + 4, src + C::KBS, true);
+    });
 }
 
 // run_tile1<C, false, FULL, false> of MXFP4 weights staged by W2: each stage's K blocks, MMAs, conversions, scales and
@@ -2756,7 +2931,20 @@ struct W8Args {
     int y_dtype;
     void* y;
     int64_t ldy;
+    // TF_DS_WOA_MERGE: the groups of a layer in ONE launch (grid.z = groups): group z's operands are the base pointers above plus z times these byte strides (q's codes, s's scales, w's codes, ws's
+    // scales, y's output); 0 in a one-group launch (grid.z 1), so the per-group launches are as they were. Each CTA is one group's tile and runs that group's code unchanged: the bytes are the two launches'.
+    int64_t gq, gs, gw, gws, gy;
 };
+
+// W8Args of the group this CTA serves (blockIdx.z): the base operands moved by the group strides (zero strides: unchanged).
+__device__ __forceinline__ void w8_group(W8Args& a) {
+    const size_t z = blockIdx.z;
+    a.q += z * size_t(a.gq);
+    a.s = reinterpret_cast<const float*>(reinterpret_cast<const char*>(a.s) + z * size_t(a.gs));
+    a.w += z * size_t(a.gw);
+    a.ws += z * size_t(a.gws);
+    a.y = static_cast<char*>(a.y) + z * size_t(a.gy);
+}
 
 namespace pf {
 constexpr int kW8Stages = 5;
@@ -2773,6 +2961,7 @@ constexpr int kW8MaxK = kWss / (kBfBN / kBlk) * kBfKS;  // the largest K: a tile
 // stages do not move, so its shared memory (pf::kW8Smem, mx.zig pf_w8_smem) is unchanged.
 extern "C" __global__ void __launch_bounds__(512, 1) tf_dsn_pf_bf16w8_w16_kernel(W8Args a) {
     using namespace pf;
+    w8_group(a);  // (TF_DS_WOA_MERGE: this CTA's group; a one-group launch moves nothing)
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     const int wm = warp / 4, wn = warp % 4;  // warp tile 32 rows x 32 columns (pf_bf16's, two m16 tiles)
     const int nst = a.K / kBfKS;  // one 32-column K block a stage
@@ -2911,6 +3100,7 @@ extern "C" __global__ void __launch_bounds__(512, 1) tf_dsn_pf_bf16w8_w16_kernel
 }
 extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_pf_bf16w8_kernel(W8Args a) {
     using namespace pf;
+    w8_group(a);  // (TF_DS_WOA_MERGE: this CTA's group; a one-group launch moves nothing)
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     const int wm = warp / 4, wn = warp % 4;  // warp tile 64 rows x 32 columns (pf_bf16's)
     const int nst = a.K / kBfKS;  // one 32-column K block a stage
@@ -3056,6 +3246,7 @@ static_assert(pf::kW8Stage == 8704 && pf::kW8Smem == 84480, "the FP8 wo_a kernel
 static_assert(pf::GemmFiveCfg::SMEM == 87040, "the 5-stage GEMM's shared memory");
 #endif
 static_assert(pf::kGuR128Smem == 97280 && pf::kDnR128Smem == 62464, "the 128-byte-run MoE tiles' shared memory");
+static_assert(sizeof(W8Args) == 144 && offsetof(W8Args, M) == 64 && offsetof(W8Args, y) == 80 && offsetof(W8Args, raster) == 96 && offsetof(W8Args, gq) == 104 && offsetof(W8Args, gy) == 136, "W8Args layout");
 static_assert(pf::kW8MaxK == 16384, "the FP8 wo_a kernel's largest K (weights.zig w8_max_k)");
 
 // Decode tensor-core kernels ("dec"): a decode round's few rows on the MMA with the operands swapped (the m16 side 16
@@ -3124,6 +3315,8 @@ __device__ __forceinline__ uint32_t smem_u32(const void* p) { return uint32_t(__
 __device__ __forceinline__ void cp16(uint32_t dst, const void* src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src) : "memory");
 }
+// TF_DSN_DEC_EVICT=1 (default; 0 = off): the weights' copies carry an L2 evict-first policy (a decode round reads each weight byte once and
+#define TF_DSN_DEC_EVICT 1
 __device__ __forceinline__ void cp4(uint32_t dst, const void* src) {
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(dst), "l"(src) : "memory");
 }
@@ -3161,13 +3354,30 @@ __device__ __forceinline__ float wscale(uint32_t e) {
 template <int FMT>
 __host__ __device__ constexpr int64_t rowBytes(int64_t k) { return FMT == 1 ? k / 2 : FMT == 0 ? k : 2 * k; }
 
+// An activation load of the tile loop: read-only global memory (DEC_LD), or (XS) the CTA's shared memory, where a
+// kernel that quantizes its own activations put their codes and scales.
+template <bool XS, typename T>
+__device__ __forceinline__ T xld(const T* p) {
+    if constexpr (XS) return *p;
+    else return DEC_LD(p);
+}
+
+// core's step between the weights' first stages and the tile loop, after the wait: none, or (a kernel that quantizes
+// its own activations) the CTA's quant of them.
+struct NoPro {
+    __device__ __forceinline__ void operator()() const {}
+};
+
 // One warp: weight rows n0 .. n0 + 15 of NM matrices (w[m], row stride ldw bytes; scales ws[m], row stride ldws
 // bytes), stages st0 .. st1 - 1 of a row of rb bytes (the last stage may hold 64 bytes: K a multiple of 64 values for
 // FP4, 64 bytes FP8 / bf16), activation rows i < cnt (row rows_of(i); FP8 / FP4: codes xq, row stride ldq bytes, and
 // scales s, lds floats; bf16: xq bf16, ldq elements) in RG groups of 8. acc[m][g][c]: weight row n0 + lane / 4 +
+// 8 (c >> 1), activation row 8 g + 2 (lane % 4) + (c & 1). XS: the activations in shared memory, written by `pro`
+// (every warp of the CTA runs it after the wait, before the loop).
 __device__ __forceinline__ void core(const uint8_t* const (&w)[NM], const uint8_t* const (&ws)[NM], int64_t ldw,
                                      int64_t ldws, int64_t rb, int n0, int st0, int st1, int sst, const void* xq, int64_t ldq,
                                      const float* s, int64_t lds, int cnt, RowOf rows_of, uint8_t* ring,
+                                     float (&acc)[NM][RG][4], Pro pro = {}) {
     constexpr int kRowB = RB, kChunks = RB / 16, kTileB = 16 * RB, kSlotB = slotBytes<RB>(), kStages = NS;
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
 #pragma unroll
@@ -3198,6 +3408,7 @@ __device__ __forceinline__ void core(const uint8_t* const (&w)[NM], const uint8_
 #pragma unroll
     // the weights' first stages are in flight: now the activations (the predecessor's output) may be read
     pdl_wait();
+    pro();
     for (int st = st0; st < st1; st += sst) {
         cp_wait<kStages - 2>();
         __syncwarp();
@@ -3379,6 +3590,52 @@ struct DecArgs {
     int64_t gq, gs;
 };
 
+// The quant-into-GEMV prototype's input (tf-dsv41-quant-gemv-bench; no engine path launches it): the bf16 rows x (row
+// stride ldx elements; a block-diagonal launch's group g at x + g * gk elements) that a kernel quantizes itself.
+struct QxArgs {
+    const __nv_bfloat16* x;
+    int64_t ldx;
+    int64_t gk;
+};
+
+// tf_dsn_dec_quant's codes and scales of bf16 rows [M, K] (row stride ldx elements) by the whole CTA, into q (row stride
+// ldq bytes) and s (lds floats): a thread a 32-value group (its 64 bytes in four 16-byte reads: ldx and the rows' first
+// element multiples of 8), the same arithmetic: each value rounded to bf16 (exact for bf16 rows), the group's largest
+// magnitude (a maximum: any order gives the same), its scale and each code.
+__device__ __forceinline__ void quant_rows(const __nv_bfloat16* __restrict__ x, int64_t ldx, int M, int K, uint8_t* q,
+                                           int64_t ldq, float* s, int lds) {
+    const int groups = K / kBlk;
+    for (int i = threadIdx.x; i < M * groups; i += blockDim.x) {
+        const int m = i / groups, g = i % groups;
+        const uint4* src = reinterpret_cast<const uint4*>(x + int64_t(m) * ldx + g * kBlk);
+        float v[kBlk];
+#pragma unroll
+        for (int c = 0; c < 4; c++) {
+            const uint4 u = src[c];
+            const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&u);
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const float2 f = __bfloat1622float2(h[j]);
+                v[c * 8 + 2 * j] = bf16r(f.x);
+                v[c * 8 + 2 * j + 1] = bf16r(f.y);
+            }
+        }
+        float amax = fabsf(v[0]);
+#pragma unroll
+        for (int j = 1; j < kBlk; j++) amax = fmaxf(amax, fabsf(v[j]));
+        const float sc = round_scale(fmaxf(amax, 1e-4f));
+        uint32_t word[8];
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+            word[j] = uint32_t(to_e4m3(v[4 * j] / sc)) | uint32_t(to_e4m3(v[4 * j + 1] / sc)) << 8 |
+                      uint32_t(to_e4m3(v[4 * j + 2] / sc)) << 16 | uint32_t(to_e4m3(v[4 * j + 3] / sc)) << 24;
+        uint4* dst = reinterpret_cast<uint4*>(q + int64_t(m) * ldq + g * kBlk);
+        dst[0] = make_uint4(word[0], word[1], word[2], word[3]);
+        dst[1] = make_uint4(word[4], word[5], word[6], word[7]);
+        s[int64_t(m) * lds + g] = sc;
+    }
+}
+
 template <int FMT, int RG>
 __device__ __forceinline__ void dec_dense(const DecArgs& a, int bx) {
     // (no launch_dependents: the next kernel may be any of the round's, programmatic or not, and some of those
@@ -3450,6 +3707,45 @@ __device__ __forceinline__ void dec_dense(const DecArgs& a, int bx) {
             if (a.accumulate) reinterpret_cast<float*>(a.y)[size_t(m) * a.ldy + n] += v;
             else store_y(a.y, a.y_dtype, size_t(m) * a.ldy + n, v);
         }
+}
+
+// The quant-into-GEMV prototype (FP8, at most 8 rows): dec_dense whose CTA quantizes its own activation rows after the
+// wait (qx: their bf16 rows; quant_rows) into shared memory past the warps' rings (codes M rows of K + 16 bytes, then
+// scales M rows of K / 32 floats), which the tile loop reads there; a.q, a.s and a.rows unread. Decode linears never
+// split K over CTAs (cs 1), so every warp of a tile reads all of its group's K values; a CTA's tiles lie in one group.
+__device__ __forceinline__ void dec_dense_qx(const DecArgs& a, int bx, const QxArgs& qx) {
+    extern __shared__ __align__(16) uint8_t dsm[];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int wb = dec::warpBytes<dec::kRbD, dec::kNsD>(1, 1);
+    const int tiles_cta = (blockDim.x >> 5) / a.ks;
+    const int n0 = (bx * tiles_cta + warp / a.ks) * 16;
+    const bool on = n0 < a.N;
+    int lo = 0, hi = 0, sst = 1;
+    const int64_t rb = dec::rowBytes<0>(a.K);
+    if (on) dec::chunk(int((rb + dec::kRbD - 1) / dec::kRbD), a.ks, warp % a.ks, lo, hi, sst);
+    float acc[1][1][4];
+    const uint8_t* w[1] = {a.w};
+    const uint8_t* ws[1] = {a.ws};
+    // (16 bytes a row more than K: the 8 rows' 4-byte reads of one K block take 8 bank groups)
+    uint8_t* xq = dsm + (blockDim.x >> 5) * wb;
+    const int64_t ldq = a.K + 16;
+    float* xs = reinterpret_cast<float*>(xq + int64_t(a.M) * ldq);
+    const int grp = a.gn ? bx * tiles_cta * 16 / a.gn : 0;
+    auto pro = [&]() {
+        quant_rows(qx.x + grp * qx.gk, qx.ldx, a.M, a.K, xq, ldq, xs, a.K / kBlk);
+        __syncthreads();
+    };
+    auto rows = [](int i) { return i; };
+                                                                   xs, a.K / kBlk, a.M, rows, dsm + warp * wb, acc, pro);
+    if (!dec::reduce<1, 1>(acc, a.ks, dsm, wb) || !on) return;
+#pragma unroll
+    for (int c = 0; c < 4; c++) {
+        const int m = 2 * t + (c & 1), n = n0 + g + 8 * (c >> 1);
+        if (m >= a.M) continue;
+        const float v = acc[0][0][c];
+        if (a.accumulate) reinterpret_cast<float*>(a.y)[size_t(m) * a.ldy + n] += v;
+        else store_y(a.y, a.y_dtype, size_t(m) * a.ldy + n, v);
+    }
 }
 
 // gate / up (GuArgs; splits: the warps a tile and matrix): the pack's 16-column tiles of expert act[blockIdx.y], each
@@ -3606,6 +3902,24 @@ __device__ __forceinline__ void dec_multi(const DecMulti& m) {
     extern "C" __global__ void __launch_bounds__(256) tf_dsn_dec_gu_r##RG##_kernel(GuArgs a) { dec_gu<RG>(a); }         \
 #undef TF_DSN_DEC
 
+// The quant-into-GEMV prototype (tf-dsv41-quant-gemv-bench; no engine path launches it): tf_dsn_dec_fp8_r1's launch of
+// up to four FP8 linears on one input, each CTA quantizing that input's bf16 rows itself (qx) after its wait instead of
+// reading tf_dsn_dec_quant's codes; the grid, the split and the dynamic shared memory tf_dsn_dec_fp8_r1's, plus the
+// codes and scales (M (K + 16) bytes and M K / 8 bytes).
+extern "C" __global__ void __launch_bounds__(256) tf_dsn_dec_fp8x_r1_kernel(DecMulti m, QxArgs qx) {
+    int p = 0;
+    while (p + 1 < m.n && int(blockIdx.x) >= m.cta0[p + 1]) p++;
+    dec_dense_qx(m.p[p], blockIdx.x - m.cta0[p], qx);
+}
+
+// tf-dsv41-quant-gemv-bench's producer of a decode linear's input rows (as _kv_norm_rope is to wq_b's quant): n 16-byte
+// words from src to dst, waiting for its predecessor and then letting its successor start, as the kit's kernels do.
+extern "C" __global__ void tf_dsn_bench_rows_kernel(const uint4* __restrict__ src, uint4* __restrict__ dst, int n) {
+    dec::pdl_wait();
+    dec::pdl_launch();
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) dst[i] = src[i];
+}
+
 // act_quant (tf_dsn_act_quant's codes and scales, the same arithmetic) for decode launches: an ordinary launch that
 // lets the next kernel (a decode tensor-core kernel, launched as a programmatic dependent launch) start its weights'
 // prologue while this runs. (Itself not a dependent launch: a predecessor of another kind may let it start early yet
@@ -3632,12 +3946,15 @@ extern "C" __global__ void tf_dsn_dec_quant_kernel(const void* __restrict__ x, i
 
 // The active experts' down weights touched into L2 while the 2D exchange of the intermediate runs (it leaves DRAM
 // idle), in down's CTA order (act[] ascending), up to `budget` bytes: 8 KiB bulk L2 prefetches, one block of 128
+// threads, a wave of 128 every wave_ns (DRAM's queue about a wave deep; chunk_bytes: the bulk prefetch's size, 0 = 8 KiB). w2 [E] pointers, the routed experts' down
 // `bytes`, the shared expert's (id `shared`) `sbytes`. Writes nothing.
 extern "C" __global__ void __launch_bounds__(128) tf_dsn_dec_l2pf_kernel(const int* __restrict__ act,
                                                                          const int* __restrict__ nact,
                                                                          const uint64_t* __restrict__ w2, long long bytes,
                                                                          long long sbytes, int shared, long long budget,
+                                                                         long long wave_ns, long long chunk_bytes) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    const long long chunk = chunk_bytes > 0 ? chunk_bytes : (8 << 10);  // (TF_DS_L2_CHUNK_KIB; 0: the served 8 KiB)
     const int n = nact[0];
     unsigned long long t0;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
@@ -3739,6 +4056,93 @@ extern "C" __global__ void __launch_bounds__(1024) tf_dsn_dec_group_kernel(const
         const int at = so[e] + before;
         ent[at] = i;
         erow[at] = i / S;
+    }
+}
+
+// tf_dsn_dec_group_kernel's outputs by a scan of one expert a thread and a ranked placement (TF_DS_DEC_GROUP2): the same
+// off, act, nact, ent and erow for the same picks (blockDim 1024, E <= 1024, RS <= 4096). The picks are read from global
+// memory once, into shared memory. The counts are shared-memory atomics (their sums do not depend on the order). The
+// exclusive prefix of the counts, and the compaction of the experts with a pick (act in id order), take one warp scan of
+// the 32 experts each thread holds and one scan of the 32 warp totals. The entries are then placed by warp 0 in steps of
+// 32 entries: __match_any_sync gives each entry the entries of its warp step that share its expert, the rank among them
+// is the count of lower lanes, and the expert's running count carries across steps, so an entry's place is the number
+// of entries before it with its expert, as the one-CTA kernel's loop over every earlier entry counts it.
+extern "C" __global__ void __launch_bounds__(1024) tf_dsn_dec_group2_kernel(const int* __restrict__ pick, int RS, int S,
+                                                                            int E, int* __restrict__ off,
+                                                                            int* __restrict__ act, int* __restrict__ nact,
+                                                                            int* __restrict__ ent, int* __restrict__ erow) {
+    extern __shared__ int sh[];  // cnt [E] (then each expert's running count), so [E + 1]
+    int* cnt = sh;
+    int* so = sh + E;
+    __shared__ int sp[4096];
+    __shared__ int wtot[32], wact[32];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    for (int e = tid; e < E; e += blockDim.x) cnt[e] = 0;
+    for (int i = tid; i < RS; i += blockDim.x) sp[i] = pick[i];
+    __syncthreads();
+    for (int i = tid; i < RS; i += blockDim.x) {
+        const int e = sp[i];
+        if (e >= 0 && e < E) atomicAdd(cnt + e, 1);
+    }
+    __syncthreads();
+    const int c = tid < E ? cnt[tid] : 0;
+    int x = c;  // inclusive scan of the warp's counts
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int y = __shfl_up_sync(0xffffffffu, x, o);
+        if (lane >= o) x += y;
+    }
+    const unsigned m = __ballot_sync(0xffffffffu, c != 0);
+    if (lane == 31) {
+        wtot[warp] = x;
+        wact[warp] = __popc(m);
+    }
+    __syncthreads();
+    if (warp == 0) {
+        // the 32 warp totals' exclusive scans; lane 31 also holds the totals
+        int t = wtot[lane], a = wact[lane];
+        int xt = t, xa = a;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int yt = __shfl_up_sync(0xffffffffu, xt, o);
+            const int ya = __shfl_up_sync(0xffffffffu, xa, o);
+            if (lane >= o) {
+                xt += yt;
+                xa += ya;
+            }
+        }
+        wtot[lane] = xt - t;
+        wact[lane] = xa - a;
+        if (lane == 31) {
+            off[E] = xt;
+            nact[0] = xa;
+        }
+    }
+    __syncthreads();
+    if (tid < E) {
+        const int at = x - c + wtot[warp];
+        so[tid] = at;
+        off[tid] = at;
+        cnt[tid] = 0;  // the running count of the placement
+        if (c != 0) act[wact[warp] + __popc(m & ((1u << lane) - 1))] = tid;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        for (int i0 = 0; i0 < RS; i0 += 32) {
+            const int i = i0 + lane;
+            const int e = i < RS ? sp[i] : -1;
+            const bool v = e >= 0 && e < E;
+            const unsigned peers = __match_any_sync(0xffffffffu, v ? e : -1);
+            const int before = v ? cnt[e] + __popc(peers & ((1u << lane) - 1)) : 0;
+            __syncwarp();
+            if (v && lane == __ffs(peers) - 1) cnt[e] += __popc(peers);
+            if (v) {
+                const int at = so[e] + before;
+                ent[at] = i;
+                erow[at] = i / S;
+            }
+            __syncwarp();
+        }
     }
 }
 

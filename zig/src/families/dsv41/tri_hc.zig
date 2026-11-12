@@ -7,7 +7,26 @@ const aot = cuda.aot;
 const Tri = tri.Tri;
 const u = tri.u;
 const p = aot.ptr;
-const hc_blocks = @import("tri_basic.zig").hc_blocks;
+const tri_basic = @import("tri_basic.zig");
+const hc_blocks = tri_basic.hc_blocks;
+
+/// TF_DS_HC_FUSED in effect: a prompt chunk's mHC mixes and their finish in one launch from the kit's extra set
+/// (its _hc_pre_pf_fused). Read once at start (prompt2d.hc_fused_asked) and set by useHcFused.
+pub var hc_fused: bool = false;
+
+/// TF_DS_HC_2S in effect: the two-block mix (_hc_mix_pf_2b) as the kit's _hc_mix_pf_2s, one program for the four streams of a
+/// K block (the previous streams and sums read once for the four). Read once at start (prompt2d.hc_2s_asked), set by Model.open.
+pub var hc_2s: bool = false;
+
+/// Rows a program of _hc_mix_pf_2s takes: the largest with no spilled register in the kit's build (RB 4 spills 8
+/// instructions, RB 8 80).
+pub const hc_2s_rb = 2;
+
+/// Launches TF_DS_HC_2S sent to _hc_mix_pf_2b because the extra set holds no variant of _hc_mix_pf_2s for them.
+pub var hc_2s_misses: std.atomic.Value(u64) = .init(0);
+
+/// Launches the switch sent to the baseline two kernels because the extra set holds no variant of the fused one for them.
+pub var hc_fused_misses: std.atomic.Value(u64) = .init(0);
 
 /// kernels.HC_PF_RB: hc_mix_pf's rows a program (TF_DS_HC_PF_RB is unset in the served build).
 pub const hc_pf_rb = 8;
@@ -48,8 +67,12 @@ pub fn hcPf2Ok(d: usize) bool {
 }
 
 /// The previous sublayer's post to fuse in (Python's gathered, h_out): partials [world, R, D] fp32, into h_out (not h).
-/// `rs`: the gather's rank stride in elements, 0 for rows * d (prompt.gather's return: TF_DS_2D_YX's sums give cap * d).
-pub const Posted = struct { gathered: u64, world: usize, h_out: u64, rs: usize = 0 };
+/// The previous sublayer's sums a mix posts into the streams: `gathered` the fp32 planes [world, rows, D], or with `blk_rs`
+/// the two bf16 blocks [2, Q, D / 2] the transport landed (block stride `blk_rs` elements), which only the two-block readers
+/// of the kit's extra set take. `rs`: the planes' stride in the partials' elements (rows apart); null is the launch's own rows
+/// (`rows * D`), the tight buffer every reader repacks into. A reader of the chunk's own planes passes the chunk's stride here,
+/// so the planes are read where they lie.
+pub const Posted = struct { gathered: u64, world: usize, h_out: u64, blk_rs: usize = 0, rs: ?usize = null };
 
 /// hc_pre2's `sink` (only if hcDeferOn(d)): a side stream and the event forking it; the caller joins it (rounds.py).
 pub const Sink = struct { s: cuda.Stream, fork: cuda.Event };
@@ -101,7 +124,7 @@ fn mixPart(t: Tri, x: u64, posted: ?Posted, post: u64, comb: u64, fn_w: u64, par
     const consts = [_]aot.Const{ ci("WIDE", 4 * d), ci("D", d), ci("NB", hc_blocks), ci("SUB", 128), ci("MB", 8), ci("RB", rb), t.pdlConst() };
     // with the post, XPF: switch "hc_xpf" on in the served build
     if (posted) |ps| return runRows(t, "_hc_mix_part", grid, &.{
-        p("X", "*bf16", x),       p("XO", "*bf16", ps.h_out), p("G", "*fp32", ps.gathered), aot.int("RS", @intCast(rows * d)),
+        p("X", "*bf16", x),       p("XO", "*bf16", ps.h_out), p("G", "*fp32", ps.gathered), aot.int("RS", @intCast(ps.rs orelse rows * d)),
         p("POST", "*fp32", post), p("COMB", "*fp32", comb),   p("FN", "*fp32", fn_w),       p("PART", "*fp32", part),
     }, &(consts ++ [_]aot.Const{ ci("WORLD", ps.world), ci("POSTED", 1), ci("XPF", 1) }), rows);
     try runRows(t, "_hc_mix_part", grid, &.{
@@ -135,7 +158,7 @@ pub fn hcPre2(t: Tri, h: u64, fn_w: u64, scale: u64, base: u64, pre_in: u64, nor
         // hc_dots: the post alone and the finish here, the mixes of the stored streams and the Sinkhorn on the side one
         const ps = posted.?;
         try t.run("_hc_post_only", .{ u(rows), hc_blocks, 1 }, &.{
-            p("X", "*bf16", h),       p("XO", "*bf16", ps.h_out), p("G", "*fp32", ps.gathered), aot.int("RS", @intCast(rows * d)),
+            p("X", "*bf16", h),       p("XO", "*bf16", ps.h_out), p("G", "*fp32", ps.gathered), aot.int("RS", @intCast(ps.rs orelse rows * d)),
             p("POST", "*fp32", post), p("COMB", "*fp32", comb),
         }, &.{ ci("WIDE", 4 * d), ci("D", d), ci("KB", 4 * d / hc_blocks), ci("WORLD", ps.world), t.pdlConst() });
         try finishSplit(t, ps.h_out, part, base, scale, pre_in, norm_w, out, pre_out, post, comb, eps, hc_eps, iters, true, rows, d);
@@ -156,6 +179,31 @@ pub fn hcPre2(t: Tri, h: u64, fn_w: u64, scale: u64, base: u64, pre_in: u64, nor
     return src;
 }
 
+/// _hc_mix_pf_2s (the kit's extra set): _hc_mix_pf_2b with the four streams of a K block in one program, a stream at a time; the
+/// same bytes in h_out and part. False when the set holds no variant of this launch (counted in hc_2s_misses): the caller runs 2b.
+fn mixPf2s(t: Tri, h: u64, fn_w: u64, part: u64, ps: Posted, post: u64, comb: u64, rows: usize, d: usize) !bool {
+    if (ps.world != 2) return false;
+    const grid: [3]u32 = .{ tri.cdiv(rows, hc_2s_rb) * (hc_blocks / 4), 1, 1 };
+    const consts = [_]aot.Const{ ci("WIDE", 4 * d), ci("D", d), ci("NB", hc_blocks), ci("SUB", 128), ci("MB", 8), ci("RB", hc_2s_rb), ci("WORLD", ps.world), ci("POSTED", 1) };
+    const args = [_]aot.Arg{
+        p("X", "*bf16", h),              p("XO", "*bf16", ps.h_out), p("G", "*bf16", ps.gathered), aot.int("RS", @intCast(ps.blk_rs)),
+        p("POST", "*fp32", post),        p("COMB", "*fp32", comb),   p("FN", "*fp32", fn_w),       p("PART", "*fp32", part),
+        aot.int("rows", @intCast(rows)), aot.float("NZ", -0.0),
+    };
+    if (t.log == null) {
+        const set = t.extra orelse {
+            _ = hc_2s_misses.fetchAdd(1, .monotonic);
+            return false;
+        };
+        if (set.lookup("_hc_mix_pf_2s", &args, &consts) == null) {
+            _ = hc_2s_misses.fetchAdd(1, .monotonic);
+            return false;
+        }
+    }
+    try t.runExtra("_hc_mix_pf_2s", grid, &args, &consts);
+    return true;
+}
+
 /// hc_mix_pf: a prompt chunk's mixes' partial dots of h, or of the post written to h_out if `posted`; returns the src.
 pub fn hcMixPf(t: Tri, h: u64, fn_w: u64, part: u64, posted: ?Posted, post: u64, comb: u64, rows: usize, d: usize) !u64 {
     const rb = @max(1, @min(hc_pf_rb, rows));
@@ -165,6 +213,7 @@ pub fn hcMixPf(t: Tri, h: u64, fn_w: u64, part: u64, posted: ?Posted, post: u64,
         std.debug.assert(ps.h_out != h);
         if (ps.blk_rs != 0) {
             std.debug.assert(ps.world == 2);
+            if (hc_2s and try mixPf2s(t, h, fn_w, part, ps, post, comb, rows, d)) return ps.h_out;
             try runRowsExtra(t, "_hc_mix_pf_2b", grid, &.{
                 p("X", "*bf16", h),       p("XO", "*bf16", ps.h_out), p("G", "*bf16", ps.gathered), aot.int("RS", @intCast(ps.blk_rs)),
                 p("POST", "*fp32", post), p("COMB", "*fp32", comb),   p("FN", "*fp32", fn_w),       p("PART", "*fp32", part),
@@ -172,7 +221,7 @@ pub fn hcMixPf(t: Tri, h: u64, fn_w: u64, part: u64, posted: ?Posted, post: u64,
             return ps.h_out;
         }
         try runRows(t, "_hc_mix_pf", grid, &.{
-            p("X", "*bf16", h),       p("XO", "*bf16", ps.h_out), p("G", "*fp32", ps.gathered), aot.int("RS", @intCast(if (ps.rs != 0) ps.rs else rows * d)),
+            p("X", "*bf16", h),       p("XO", "*bf16", ps.h_out), p("G", "*fp32", ps.gathered), aot.int("RS", @intCast(ps.rs orelse rows * d)),
             p("POST", "*fp32", post), p("COMB", "*fp32", comb),   p("FN", "*fp32", fn_w),       p("PART", "*fp32", part),
         }, &(consts ++ [_]aot.Const{ ci("WORLD", ps.world), ci("POSTED", 1) }), rows);
         return ps.h_out;
@@ -185,11 +234,107 @@ pub fn hcMixPf(t: Tri, h: u64, fn_w: u64, part: u64, posted: ?Posted, post: u64,
     return h;
 }
 
-/// hc_pre_pf: hc_pre's outputs for a prompt chunk (the same bits): hcMixPf, then hc_pre's finish of what it returns.
+/// hc_pre_pf: hc_pre's outputs for a prompt chunk (the same bits): hcMixPf, then hc_pre's finish of what it returns;
+/// with TF_DS_HC_FUSED in effect and the kit's extra set holding the fused kernel's variant, the one launch that is
+/// both (hcPrePfFused). A post that lies in the transport's two bf16 blocks (blk_rs) keeps the two-block reader's mix.
 pub fn hcPrePf(t: Tri, h: u64, fn_w: u64, scale: u64, base: u64, pre_in: u64, norm_w: u64, eps: f32, hc_eps: f32, iters: usize, out: u64, pre_out: u64, post: u64, comb: u64, part: u64, posted: ?Posted, rows: usize, d: usize) !u64 {
+    if (hc_fused and hcFusedOk(d, iters) and (posted == null or posted.?.blk_rs == 0)) {
+        if (try hcPrePfFused(t, h, fn_w, scale, base, pre_in, norm_w, eps, hc_eps, iters, out, pre_out, post, comb, part, posted, rows, d)) {
+            return if (posted) |ps| ps.h_out else h;
+        }
+    } else if (hc_fused and hcFusedOk(d, iters)) {
+        // the owner sums' two bf16 blocks (blk_rs): the same fused launch reading them in place (_hc_pre_pf_fused_2b)
+        if (try hcPrePfFused2b(t, h, fn_w, scale, base, pre_in, norm_w, eps, hc_eps, iters, out, pre_out, post, comb, part, posted.?, rows, d)) return posted.?.h_out;
+    }
     const src = try hcMixPf(t, h, fn_w, part, posted, post, comb, rows, d);
     try t.run("_hc_finish", .{ u(rows), 1, 1 }, &finishArgs(src, part, base, scale, pre_in, norm_w, out, pre_out, post, comb, eps, hc_eps), &.{ ci("D", d), ci("NB", hc_blocks), ci("ITERS", iters), ci("BLOCK", 1024) });
     return src;
+}
+
+/// hc_pre for a prompt chunk: the fused launch when TF_DS_HC_FUSED is in effect and the extra set has its variant;
+/// else tri_basic.hcPre's two launches (the same outputs either way).
+pub fn hcPre(t: Tri, h: u64, fn_w: u64, scale: u64, base: u64, pre_in: u64, norm_w: u64, eps: f32, hc_eps: f32, iters: usize, out: u64, pre_out: u64, post: u64, comb: u64, part: u64, rows: usize, d: usize) !void {
+    if (hc_fused and hcFusedOk(d, iters)) {
+        if (try hcPrePfFused(t, h, fn_w, scale, base, pre_in, norm_w, eps, hc_eps, iters, out, pre_out, post, comb, part, null, rows, d)) return;
+    }
+    try tri_basic.hcPre(t, h, fn_w, scale, base, pre_in, norm_w, eps, hc_eps, iters, out, pre_out, post, comb, part, rows, d);
+}
+
+/// Whether the extra set can take a prompt chunk of width d and `iters` Sinkhorn rounds: its fused variants are
+/// compiled for the served hidden width and round count (a shape of its own takes the baseline two kernels).
+pub fn hcFusedOk(d: usize, iters: usize) bool {
+    return d == 5120 and iters == 20 and hcPf2Ok(d);
+}
+
+/// _hc_pre_pf_fused (the kit's extra set): the mixes' partial dots and the finish of one row, the previous
+/// sublayer's post fused in if `posted`, all in one program a row. False when the set holds no variant of this launch:
+/// the caller keeps the baseline two kernels (counted in hc_fused_misses).
+fn hcPrePfFused(t: Tri, h: u64, fn_w: u64, scale: u64, base: u64, pre_in: u64, norm_w: u64, eps: f32, hc_eps: f32, iters: usize, out: u64, pre_out: u64, post: u64, comb: u64, part: u64, posted: ?Posted, rows: usize, d: usize) !bool {
+    const grid: [3]u32 = .{ u(rows), 1, 1 };
+    const consts = [_]aot.Const{
+        ci("D", d),                                    ci("NB", hc_blocks),                        ci("SUB", 128), ci("ITERS", iters), ci("BLOCK", 1024),
+        ci("WORLD", if (posted) |ps| ps.world else 1), ci("POSTED", @intFromBool(posted != null)),
+    };
+    if (posted) |ps| {
+        return runFusedHc(t, grid, &.{
+            p("X", "*bf16", h),                             p("XO", "*bf16", ps.h_out), p("G", "*fp32", ps.gathered),
+            aot.int("RS", @intCast(ps.rs orelse rows * d)), p("POST", "*fp32", post),   p("COMB", "*fp32", comb),
+            p("FN", "*fp32", fn_w),                         p("BASE", "*fp32", base),   p("SCALE", "*fp32", scale),
+            p("PRE_IN", "*fp32", pre_in),                   p("NW", "*bf16", norm_w),   p("OUT", "*bf16", out),
+            p("PRE_OUT", "*fp32", pre_out),                 aot.float("eps", eps),      aot.float("hc_eps", hc_eps),
+        }, &consts);
+    }
+    // no post: G and XO are unread; part stands in for them (a fp32 buffer of any size)
+    return runFusedHc(t, grid, &.{
+        p("X", "*bf16", h),             p("XO", "*bf16", h),          p("G", "*fp32", part),       aot.int("RS", 0),
+        p("POST", "*fp32", post),       p("COMB", "*fp32", comb),     p("FN", "*fp32", fn_w),      p("BASE", "*fp32", base),
+        p("SCALE", "*fp32", scale),     p("PRE_IN", "*fp32", pre_in), p("NW", "*bf16", norm_w),    p("OUT", "*bf16", out),
+        p("PRE_OUT", "*fp32", pre_out), aot.float("eps", eps),        aot.float("hc_eps", hc_eps),
+    }, &consts);
+}
+
+/// The extra set's _hc_pre_pf_fused for this launch, false without the set or a variant of it.
+fn runFusedHc(t: Tri, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !bool {
+    // the rolled form (8 block bodies instead of 160, the same arithmetic in the same order) when the set holds it
+    if (t.log == null) if (t.extra) |set| {
+        if (set.lookup("_hc_pre_pf_fused_r", args, consts) != null) {
+            try t.runExtra("_hc_pre_pf_fused_r", grid, args, consts);
+            return true;
+        }
+    };
+    return runFusedNamed(t, "_hc_pre_pf_fused", grid, args, consts);
+}
+
+fn runFusedNamed(t: Tri, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !bool {
+    if (t.log != null) {
+        try t.runExtra(name, grid, args, consts);
+        return true;
+    }
+    const set = t.extra orelse return false;
+    if (set.lookup(name, args, consts) == null) {
+        _ = hc_fused_misses.fetchAdd(1, .monotonic);
+        return false;
+    }
+    try t.runExtra(name, grid, args, consts);
+    return true;
+}
+
+/// _hc_pre_pf_fused_2b (the kit's extra set): _hc_pre_pf_fused with the previous sublayer's sums read from the two bf16
+/// blocks the transport lands them in (ps.gathered, block stride ps.blk_rs), NZ the -0.0 plane 1 held (as _hc_mix_pf_2b).
+/// False when the set holds no variant of this launch: the caller keeps the two-block mix and the finish.
+fn hcPrePfFused2b(t: Tri, h: u64, fn_w: u64, scale: u64, base: u64, pre_in: u64, norm_w: u64, eps: f32, hc_eps: f32, iters: usize, out: u64, pre_out: u64, post: u64, comb: u64, part: u64, ps: Posted, rows: usize, d: usize) !bool {
+    _ = part;
+    if (ps.world != 2) return false;
+    const grid: [3]u32 = .{ u(rows), 1, 1 };
+    const consts = [_]aot.Const{
+        ci("D", d), ci("NB", hc_blocks), ci("SUB", 128), ci("ITERS", iters), ci("BLOCK", 1024), ci("WORLD", 2), ci("POSTED", 1),
+    };
+    return runFusedNamed(t, "_hc_pre_pf_fused_2b", grid, &.{
+        p("X", "*bf16", h),             p("XO", "*bf16", ps.h_out),   p("G", "*bf16", ps.gathered), aot.int("RS", @intCast(ps.blk_rs)),
+        p("POST", "*fp32", post),       p("COMB", "*fp32", comb),     p("FN", "*fp32", fn_w),       p("BASE", "*fp32", base),
+        p("SCALE", "*fp32", scale),     p("PRE_IN", "*fp32", pre_in), p("NW", "*bf16", norm_w),     p("OUT", "*bf16", out),
+        p("PRE_OUT", "*fp32", pre_out), aot.float("eps", eps),        aot.float("hc_eps", hc_eps),  aot.float("NZ", -0.0),
+    }, &consts);
 }
 
 // -- conformance with the recorded launches ----------------------------------------------------------------------
@@ -328,6 +473,22 @@ test "expectLog reads a logged argument by its kind, a pointer or an integer" {
     });
 }
 
+test "a posted mix reads the gathered planes at the stride it is given, the launch's own rows by default" {
+    var log: tri.Log = .{ .gpa = std.testing.allocator };
+    defer log.deinit();
+    const t: Tri = .{ .log = &log };
+    const rows: usize = 1024;
+    const d: usize = 5120;
+    // the chunk's planes: cap rows apart (a cap other than this launch's rows)
+    const cap: usize = 4096;
+    const ps: Posted = .{ .gathered = stand(3), .world = 2, .h_out = stand(4), .rs = cap * d };
+    _ = try hcMixPf(t, stand(1), stand(5), stand(2), ps, stand(6), stand(7), rows, d);
+    try expectLog(&log, &.{"_hc_mix_pf"}, &.{.{ 0, "RS", cap * d }});
+    // no stride given: the tight buffer's, the launch's rows apart
+    _ = try hcMixPf(t, stand(1), stand(5), stand(2), .{ .gathered = stand(3), .world = 2, .h_out = stand(4) }, stand(6), stand(7), rows, d);
+    try expectLog(&log, &.{"_hc_mix_pf"}, &.{.{ 0, "RS", rows * d }});
+}
+
 test "hc_pre2 and hc_pre_pf launch in kernels.py's order, each kernel on the streams kernels.py gives it" {
     var log: tri.Log = .{ .gpa = std.testing.allocator };
     defer log.deinit();
@@ -353,4 +514,56 @@ test "hc_pre2 and hc_pre_pf launch in kernels.py's order, each kernel on the str
     // hc_pre_pf with the post: hc_mix_pf's posted dots, then hc_pre's finish of h_out
     try std.testing.expectEqual(ps.h_out, try hcPrePf(t, h, stand(5), stand(6), stand(7), stand(8), stand(9), 1e-20, 1e-6, 20, stand(10), stand(11), stand(12), stand(13), part, ps, 2048, 5120));
     try expectLog(&log, &.{ "_hc_mix_pf", "_hc_finish" }, &(posted ++ [_]Wire{.{ 1, "X", ps.h_out }}));
+}
+
+/// A logged launch's integer constexpr, if it has it.
+fn constInt(k: tri.Log.Kept, name: []const u8) ?i64 {
+    for (k.consts) |c| if (std.mem.eql(u8, c.name, name)) return c.int;
+    return null;
+}
+
+test "TF_DS_HC_FUSED: a prompt chunk's mixes and finish launch as one kernel of the extra set, else as the baseline two" {
+    const was = hc_fused;
+    defer hc_fused = was;
+    var log: tri.Log = .{ .gpa = std.testing.allocator };
+    defer log.deinit();
+    const t: Tri = .{ .log = &log };
+    const h = stand(1);
+    const ps: Posted = .{ .gathered = stand(3), .world = 2, .h_out = stand(4) };
+    hc_fused = true;
+    try std.testing.expectEqual(ps.h_out, try hcPrePf(t, h, stand(5), stand(6), stand(7), stand(8), stand(9), 1e-20, 1e-6, 20, stand(10), stand(11), stand(12), stand(13), stand(14), ps, 1024, 5120));
+    {
+        const one = log.items.items[0];
+        try std.testing.expect(one.extra);
+        try std.testing.expectEqualSlices(u32, &.{ 1024, 1, 1 }, &one.grid);
+        try std.testing.expectEqual(@as(?i64, 1), constInt(one, "POSTED"));
+        try std.testing.expectEqual(@as(?i64, 2), constInt(one, "WORLD"));
+        try std.testing.expectEqual(@as(?i64, 5120), constInt(one, "D"));
+        try std.testing.expectEqual(@as(?i64, 40), constInt(one, "NB"));
+        try std.testing.expectEqual(@as(?i64, 20), constInt(one, "ITERS"));
+        try std.testing.expectEqual(@as(?i64, 1024), constInt(one, "BLOCK"));
+    }
+    try expectLog(&log, &.{"_hc_pre_pf_fused"}, &.{ .{ 0, "X", h }, .{ 0, "XO", ps.h_out }, .{ 0, "G", ps.gathered }, .{ 0, "POST", stand(12) } });
+    // a chunk with no post: the same kernel, the plain variant
+    try hcPre(t, h, stand(5), stand(6), stand(7), stand(8), stand(9), 1e-20, 1e-6, 20, stand(10), stand(11), stand(12), stand(13), stand(14), 512, 5120);
+    {
+        const one = log.items.items[0];
+        try std.testing.expect(one.extra);
+        try std.testing.expectEqual(@as(?i64, 0), constInt(one, "POSTED"));
+        try std.testing.expectEqual(@as(?i64, 1), constInt(one, "WORLD"));
+    }
+    try expectLog(&log, &.{"_hc_pre_pf_fused"}, &.{ .{ 0, "X", h }, .{ 0, "XO", h }, .{ 0, "G", stand(14) } });
+    // off: the baseline two launches, whatever the shapes
+    hc_fused = false;
+    _ = try hcPrePf(t, h, stand(5), stand(6), stand(7), stand(8), stand(9), 1e-20, 1e-6, 20, stand(10), stand(11), stand(12), stand(13), stand(14), ps, 1024, 5120);
+    try expectLog(&log, &.{ "_hc_mix_pf", "_hc_finish" }, &.{.{ 0, "X", h }});
+    try hcPre(t, h, stand(5), stand(6), stand(7), stand(8), stand(9), 1e-20, 1e-6, 20, stand(10), stand(11), stand(12), stand(13), stand(14), 1024, 5120);
+    try expectLog(&log, &.{ "_hc_partial", "_hc_finish" }, &.{.{ 0, "X", h }});
+}
+
+test "TF_DS_HC_FUSED takes the served width and round count only" {
+    try std.testing.expect(hcFusedOk(5120, 20));
+    try std.testing.expect(!hcFusedOk(5120, 19));
+    try std.testing.expect(!hcFusedOk(2560, 20));
+    try std.testing.expect(!hcFusedOk(0, 20));
 }

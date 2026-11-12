@@ -621,8 +621,16 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
     if (e.mx != null) {
         // Format.native: q's RMSNorm and the window KV (RMSNorm, RoPE, FP8 quant-dequant into the ring) as plain rows,
         // then wq_b (and the indexer's wq_b) on them and q's RoPE (Attention.forward)
+        // (TF_DS_QKV_PLAIN: the two launches as one when the kit's extra set has the variant; else the baseline two)
+        const fused = qkv_plain and try tri_norm.qKvNormPlain(t, rd.qa, lay.wq_a.n, lay.q_norm, c.eps, rd.ykv, lay.kv_norm, rope.cos, rope.sin, pos, ring, ring_rows, rd.g(.wslot), true, rd_dim, rd.qr, rd.kout, R, lay.wq_a.n, hd);
+        if (!fused) {
+            if (qkv_plain and !qkv_plain_said) {
+                qkv_plain_said = true;
+                std.log.warn("TF_DS_QKV_PLAIN: off: the kit's extra set has no _q_kv_norm variant without rotations (NROT 0, SPLIT 0): the q norm and the window KV stay two launches", .{});
+            }
             try tri_basic.rmsnorm(t, rd.qa, lay.wq_a.n, lay.q_norm, rd.qr, lay.wq_a.n, c.eps, R, lay.wq_a.n);
             try tri_norm.kvNormRope(t, rd.ykv, lay.kv_norm, rope.cos, rope.sin, pos, ring, ring_rows, rd.g(.wslot), c.eps, true, rd_dim, rd.kout, R, hd);
+        }
         if (need_iq) {
             try prompt.groupedDecode(e, ch, R, &.{ lay.wq_b, lay.idx_wq_b.? }, &.{ rd.qr, rd.qr }, &.{ lay.wq_a.n, lay.wq_a.n }, &.{ rd.q, rd.iq }, &.{ lay.wq_b.n, lay.idx_wq_b.?.n }, &.{ .bf16, .bf16 });
         } else try prompt.groupedDecode(e, ch, R, &.{lay.wq_b}, &.{rd.qr}, &.{lay.wq_a.n}, &.{rd.q}, &.{lay.wq_b.n}, &.{.bf16});
@@ -845,12 +853,14 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
             try mx.gateUp(k, e.s, e.d, ex, ch.mxe, rd.x, c.hidden, rd.pick, rd.mw, R, c.swiglu_limit, ch.xsd.xd, ex.width, true);
             try rd.mark(e, .m_gu);
             if (k.dec_on and l2_skip & 8 == 0) try rd.prefetchDown(e, k, ex, ch.mxe, l2_dn_mb << 20);
+            if (l2_next_early) try prefetchNext(e, rd, li);
             try rd.mark(e, .m_x);
         } else {
             try mx.gateUp(k, e.s, e.d, lay.experts, ch.mxe, rd.x, c.hidden, rd.pick, rd.mw, R, c.swiglu_limit, ch.xsd.xd, lay.experts.width, true);
             try mx.down(k, e.s, lay.experts, ch.mxe, ch.xsd.xd, lay.experts.width, rd.pick, R, rd.pm, c.hidden, false, true);
         }
         try rd.mark(e, .m_gu);
+        if (l2_next_early and e.two != null) return; // (recorded behind gate / up)
         return prefetchNext(e, rd, li);
     }
     const kc = try tri_norm.rowmmGate(e.t, rd.x, c.hidden, lay.gate_w, rd.gl, R, c.hidden, c.experts);
@@ -915,6 +925,12 @@ pub var l2_mb: [4]u64 = .{ 16, 8, 16, 4 };
 pub var l2_dec_mb: u64 = 8;
 /// The MiB of the active experts' down weights prefetched beside the 2D exchange (TF_DS_L2_DN_MB; 0: none).
 pub var l2_dn_mb: u64 = 8;
+/// TF_DS_L2_NEXT_EARLY (on; 0 puts it behind down again): the next layer's fork (prefetchNext) is recorded behind gate / up, beside the exchange and down, not
+/// behind down: its linears' weights get the exchange's DRAM-idle time as lead (a 2D decode window on the native kernels only).
+pub var l2_next_early: bool = true;
+/// TF_DS_QKV_PLAIN (on; 0 off): a decode window's q RMSNorm and window-KV norm / RoPE / quant as one launch (the kit's extra set's _q_kv_norm with NROT 0).
+pub var qkv_plain: bool = true;
+var qkv_plain_said: bool = false;
 
 /// An mHC mix's weights hc_*_fn: fp32 [24, hc * d].
 fn hcFnBytes(c: anytype) u64 {

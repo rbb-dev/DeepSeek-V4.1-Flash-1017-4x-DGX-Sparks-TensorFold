@@ -22,10 +22,29 @@ fn blocks(count: usize, threads: usize) u32 {
 /// The paced prefetch's settings (TF_EXL3_L2_DELAY_NS, TF_EXL3_L2_RATE_GBPS at Model.open; 0 GB/s: every chunk at once).
 pub var l2_delay_ns: c_longlong = 3000;
 pub var l2_rate_gbps: f64 = 230;
+/// TF_DS_L2_CHUNK_KIB in effect (Model.open): the bulk prefetch's chunk in bytes, 8 KiB served. A wave is 128 chunks, so the DRAM queue a wave puts ahead of a NIC
+/// read or a staging copy is 128 x chunk; the wave period scales with it (waveNs) and the rate and the bytes touched are the same: it changes no value.
+pub var l2_chunk_bytes: u64 = 8192;
+/// TF_DS_L2_CHUNK_KIB as asked (KiB): unset or empty is the served 8; 1, 2, 4, 8 or 16; null for any other text (Model.open refuses the start with it).
+pub fn l2ChunkWanted(v: ?[]const u8) ?u64 {
+    const t = v orelse return 8192;
+    if (t.len == 0) return 8192;
+    for ([_]u64{ 1, 2, 4, 8, 16 }) |kib| {
+        var b: [4]u8 = undefined;
+        if (std.mem.eql(u8, t, std.fmt.bufPrint(&b, "{d}", .{kib}) catch unreachable)) return kib * 1024;
+    }
+    return null;
+}
 
 /// tf_ds_l2_prefetch_kernel's argument: up to 16 device ranges (their first byte and length).
 pub const Prefetch = extern struct { ptr: [16]u64 = @splat(0), bytes: [16]u64 = @splat(0), n: c_int = 0 };
 
+    return waveNs(gbps, 8192);
+}
+
+/// A wave's period at `gbps` for chunks of `chunk` bytes: 128 chunks a wave (0 gbps: no pacing).
+pub fn waveNs(gbps: f64, chunk: u64) c_longlong {
+    return if (gbps > 0) @intFromFloat(128.0 * @as(f64, @floatFromInt(chunk)) / gbps) else 0;
 pub const Ops = struct {
     pointwise: cuda.Module,
     movement: cuda.Module,
@@ -264,11 +283,12 @@ pub const Ops = struct {
         // the served decode settings (exl3/prefetch.py): 3 us before the first wave, waves of 128 chunks of 8 KiB
         // at 230 GB/s (TF_EXL3_L2_DELAY_NS, TF_EXL3_L2_RATE_GBPS), one block
         const delay_ns: c_longlong = l2_delay_ns;
-        const wave_ns: c_longlong = if (l2_rate_gbps > 0) @intFromFloat(128.0 * 8192.0 / l2_rate_gbps) else 0;
+        const wave_ns: c_longlong = waveNs(l2_rate_gbps, l2_chunk_bytes);
         var a: cuda.Args = .{};
         a.add(pf);
         a.add(delay_ns);
         a.add(wave_ns);
+        a.add(@as(c_longlong, @intCast(l2_chunk_bytes)));
         try cuda.launch.launch(o.l2_prefetch, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, s, &a);
     }
 
@@ -483,6 +503,26 @@ test "launch geometry of the development launchers" {
     try std.testing.expectEqual(@as(u32, 2), blocks(257, 256));
     try std.testing.expectEqual(@as(u32, 65535), blocks(1 << 40, 256));
 }
+    // TF_DS_L2_CHUNK_KIB: the wave's period scales with the chunk so the rate (and every byte touched) stays: 128 x chunk / period = 230 GB/s within the rounding
+    try std.testing.expectEqual(@as(c_longlong, 4559), waveNs(230, 8192));
+    try std.testing.expectEqual(@as(c_longlong, 2279), waveNs(230, 4096));
+    try std.testing.expectEqual(@as(c_longlong, 1139), waveNs(230, 2048));
+    try std.testing.expectEqual(@as(c_longlong, 0), waveNs(0, 2048));
+    for ([_]u64{ 1024, 2048, 4096, 8192, 16384 }) |c| {
+        const rate = 128.0 * @as(f64, @floatFromInt(c)) / @as(f64, @floatFromInt(waveNs(230, c)));
+        try std.testing.expect(rate > 229.0 and rate < 231.0);
+    }
+}
+
+test "TF_DS_L2_CHUNK_KIB: unset or empty is 8 KiB, 1 / 2 / 4 / 8 / 16 are KiB, any other text is null (the start is refused at its call site)" {
+    try std.testing.expectEqual(@as(?u64, 8192), l2ChunkWanted(null));
+    try std.testing.expectEqual(@as(?u64, 8192), l2ChunkWanted(""));
+    try std.testing.expectEqual(@as(?u64, 1024), l2ChunkWanted("1"));
+    try std.testing.expectEqual(@as(?u64, 2048), l2ChunkWanted("2"));
+    try std.testing.expectEqual(@as(?u64, 4096), l2ChunkWanted("4"));
+    try std.testing.expectEqual(@as(?u64, 8192), l2ChunkWanted("8"));
+    try std.testing.expectEqual(@as(?u64, 16384), l2ChunkWanted("16"));
+    for ([_][]const u8{ "0", "3", "32", "2048", "-2", " 2", "02", "two", "2k" }) |bad| try std.testing.expectEqual(@as(?u64, null), l2ChunkWanted(bad));
 
 test "TF_DS_ADD2_VEC: the four-wide add takes whole fours at 16-byte operands and an 8-byte output, anything else the scalar kernel; off unless asked" {
     const O = Ops;

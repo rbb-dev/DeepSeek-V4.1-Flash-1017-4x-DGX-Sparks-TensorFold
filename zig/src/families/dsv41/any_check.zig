@@ -58,6 +58,7 @@ pub fn mixes(t: tri.Tri, cfg: config_mod.Config, lay: weights.Layer, r: QRows, q
 /// (the two-block readers). Every lookup declares both, publicly (a lookup of the main set alone says what its hasExtra answers); there is
 /// no dispatch on whether one exists (@hasDecl does not see a private method, and would skip it silently).
 fn found(finds: anytype, l: tri.Log.Kept) bool {
+    return l.foundIn(finds);
 }
 
 /// Every launch of one slab `r` (of a plan of stride `q` rows) on layers `lays[0..half]`, as a reason (null: all found). `encoder`: the
@@ -257,4 +258,34 @@ test "TF_DS_ROCI_ANY's start check refuses a kit whose extra set lacks a two-blo
     try std.testing.expect(std.mem.indexOf(u8, w, "at a slab of 232 rows") != null);
     // control: every reader there, nothing refused
     try std.testing.expectEqual(@as(?[]const u8, null), try anyOwnedOff(gpa, a, Reject{}, cfg, &lays, 20, true, 4096));
+}
+
+test "a twin launch (runTwin) is found when the extra set has the twin OR the base set has its fallback, as runTwin runs it; a runExtra launch only in the extra set" {
+    const gpa = std.testing.allocator;
+    var log: tri.Log = .{ .gpa = gpa };
+    defer log.deinit();
+    const t: tri.Tri = .{ .log = &log };
+    try t.runTwin("_rope_heads_w", "_rope_heads", .{ 1, 1, 1 }, &.{}, &.{});
+    try t.runExtra("_hc_mix_pf_2b", .{ 1, 1, 1 }, &.{}, &.{});
+    const Only = struct {
+        main: bool,
+        extra: bool,
+        pub fn has(f: @This(), name: []const u8, args: anytype, consts: anytype) bool {
+            _ = .{ name, args, consts };
+            return f.main;
+        }
+        pub fn hasExtra(f: @This(), name: []const u8, args: anytype, consts: anytype) bool {
+            _ = .{ name, args, consts };
+            return f.extra;
+        }
+    };
+    const twin = log.items.items[0];
+    const extra = log.items.items[1];
+    // the kit lacks the twin's variant but the base set has _rope_heads: runTwin launches the base kernel, so it is found
+    try std.testing.expect(found(Only{ .main = true, .extra = false }, twin));
+    try std.testing.expect(found(Only{ .main = false, .extra = true }, twin));
+    try std.testing.expect(!found(Only{ .main = false, .extra = false }, twin));
+    // a runExtra launch has no fallback: only the extra set counts
+    try std.testing.expect(!found(Only{ .main = true, .extra = false }, extra));
+    try std.testing.expect(found(Only{ .main = false, .extra = true }, extra));
 }

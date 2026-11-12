@@ -6,7 +6,14 @@ pub const Math = struct { pair_sum: bool, qhc: bool, owner_gather: bool, idx_sha
 /// The math switches in effect as the store name's text (`m`'s every field, its name=value in Math's order).
 pub fn mathText(buf: []u8, m: Math) ![]const u8 {
     const base = try mathBase(buf, m);
+    // the switches below name themselves only when they are on: the names of states stored without them stay as they were
+    var n = base.len;
+    inline for (optional) |o| {
+        if (@field(m, o[1])) {
+            const x = try std.fmt.bufPrint(buf[n..], " {s}=1", .{o[0]});
+            n += x.len;
         }
+    }
     // the canary in effect (TF_DS_QGATE_CANARY: the head's 1, the body's 2 or 3), after the other optional switches, as the
     // head's 1 always was: a state kept under one canary is never restored under another
     if (m.qgate_canary != 0) {
@@ -17,9 +24,23 @@ pub fn mathText(buf: []u8, m: Math) ![]const u8 {
         const x = try std.fmt.bufPrint(buf[n..], " pf_raster={d}", .{m.pf_raster});
         n += x.len;
     }
+    return buf[0..n];
+}
+
+/// The switches whose text joins the math's only when they are on: (the text's name, Math's field), in the order they join.
+const optional = [_][2][]const u8{
+    .{ "roci", "roci" },
+    .{ "roci_collect", "roci_collect" },
+    .{ "idx_v", "idx_v" },
     .{ "gemm_w16", "gemm_w16" },
     .{ "assemble_quant", "assemble_quant" },
+    .{ "attn_epilogue", "attn_epilogue" },
+    .{ "hc_stride", "hc_stride" },
+    .{ "hc_fused", "hc_fused" },
+    .{ "attn_epi_fused", "attn_epi_fused" },
+    .{ "hc_2s", "hc_2s" },
     .{ "gemm_r2", "gemm_r2" },
+};
 
 fn mathBase(buf: []u8, m: Math) ![]const u8 {
     return std.fmt.bufPrint(buf, "pair_sum={d} qhc={d} owner_gather={d} idx_shard={d} idx_rb={d} negzero={d} replay_floor={d} owner_yx={d} cat_partner={d} front_owned={d} ffn_codes={d} pack_codes={d} engram_owner_sum={d} boundary_owned={d} cat_codes={d} pf_split={s} woa_w8={d} quant_once={d} pf_gemm5={d} group_tiles={d} topk_tiles={d} idx_proj_owned={d} bf16_rows={d} pf_run128={d} pass_rows={d} pass_from={d} pass_tail={d} decode_fuse={d} attn_u={d} idx_u={d} mma_sf={d} mma_sf_exact={d}", .{

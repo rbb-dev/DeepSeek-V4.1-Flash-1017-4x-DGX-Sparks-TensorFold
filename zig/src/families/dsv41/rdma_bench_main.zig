@@ -263,6 +263,8 @@ fn mixedReplay(gpa: std.mem.Allocator, driver: *const cuda.Driver, r: *ring.Ring
     return bad;
 }
 
+        args.add(dsv41.ops.waveNs(p.gbps, dsv41.ops.l2_chunk_bytes));
+        args.add(@as(c_longlong, @intCast(dsv41.ops.l2_chunk_bytes)));
 /// The float rank `q` sends at index `j`: exact in f32 (below 2^24).
 fn value(q: u32, j: usize) f32 {
     return @floatFromInt(@as(u32, q) * 1_000_000 + @as(u32, @intCast(j % 1_000_000)));

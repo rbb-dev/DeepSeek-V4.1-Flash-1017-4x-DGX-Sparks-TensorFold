@@ -55,6 +55,20 @@ pub fn qKvNorm(t: Tri, x: u64, xs: usize, w: u64, eps: f32, rot: []const Rot, y:
     }, &.{ cb("QUANT", quant), ci("D", d), ci("BLOCK", tri.pow2(d)), ci("NROT", rot.len), ci("DK", dk), ci("RD", rd), t.pdlConst(), cb("SPLIT", split) });
 }
 
+/// q_kv_norm_plain (TF_DS_QKV_PLAIN): tri_basic.rmsnorm of x [R, d] (row stride xs) into out [R, d] and kv_norm_rope of y [R, dk] into kout, in one
+/// launch: the kit's extra set's _q_kv_norm with no rotation and no split (the same code of the two kernels it replaces, each program the one
+/// kernel's). True when it launched; false when the extra set lacks the variant (a kit without it): nothing launched, the caller makes both launches.
+/// The unused rotation arguments carry the template's types (*fp16 for S0 / H0, *bf16 for S1 / H1) and `out`'s address.
+pub fn qKvNormPlain(t: Tri, x: u64, xs: usize, w: u64, eps: f32, y: u64, wk: u64, cos: u64, sin: u64, pos: u64, ring: u64, ring_rows: usize, slots: u64, quant: bool, rd: usize, out: u64, kout: u64, rows: usize, d: usize, dk: usize) !bool {
+    if (d > 2048) return false;
+    return t.tryExtra("_q_kv_norm", .{ u(rows), 2, 1 }, &.{
+        p("X", "*bf16", x),       aot.int("xs", @intCast(xs)), p("W", "*bf16", w),          p("OUT", "*bf16", out),                    aot.int("os_", @intCast(d)),
+        aot.float("eps", eps),    p("S0", "*fp16", out),       p("H0", "*fp16", out),       p("S1", "*bf16", out),                     p("H1", "*bf16", out),
+        p("Y", "*bf16", y),       p("WK", "*bf16", wk),        p("COS", "*fp32", cos),      p("SIN", "*fp32", sin),                    p("POS", "*i64", pos),
+        p("KOUT", "*bf16", kout), p("RING", "*bf16", ring),    p("SLOT_OF", "*i64", slots), aot.int("ring_size", @intCast(ring_rows)),
+    }, &.{ cb("QUANT", quant), ci("D", d), ci("BLOCK", tri.pow2(d)), ci("NROT", 0), ci("DK", dk), ci("RD", rd), t.pdlConst(), cb("SPLIT", false) });
+}
+
 /// rmsnorm_rot: out [R, D] (row stride os) = RMSNorm(x) bf16 and, from its rows, each rotation's h (rot_many's bits).
 pub fn rmsnormRot(t: Tri, x: u64, xs: usize, w: u64, eps: f32, rot: []const Rot, out: u64, os: usize, rows: usize, d: usize) !void {
     const st = try rotArgs(rot, out);
@@ -73,9 +87,17 @@ pub fn kvNormRope(t: Tri, y: u64, w: u64, cos: u64, sin: u64, pos: u64, ring: u6
 }
 
 /// rope_heads: RoPE (inverse: the inverse rotation) on the last rd dims of every head of x [R, H, HD] bf16, in place.
+/// TF_DS_ROPE_W in effect (Model.open): rope_heads asks for the kit's twin _rope_heads_w (each (even, odd) bf16 pair read
+/// and written as one 32-bit word: the same bits); a variant without its twin takes _rope_heads (Tri.runTwin).
+pub var rope_w: bool = false;
+
 pub fn ropeHeads(t: Tri, x: u64, cos: u64, sin: u64, pos: u64, rd: usize, inverse: bool, rows: usize, h: usize, hd: usize) !void {
     const hb = @min(h, 16);
-    try t.run("_rope_heads", .{ u(rows), u(h / hb), 1 }, &.{ p("X", "*bf16", x), p("COS", "*fp32", cos), p("SIN", "*fp32", sin), p("POS", "*i64", pos) }, &.{ ci("H", h), ci("HD", hd), ci("RD", rd), cb("INV", inverse), ci("HB", hb), t.pdlConst() });
+    const args = [_]aot.Arg{ p("X", "*bf16", x), p("COS", "*fp32", cos), p("SIN", "*fp32", sin), p("POS", "*i64", pos) };
+    const consts = [_]aot.Const{ ci("H", h), ci("HD", hd), ci("RD", rd), cb("INV", inverse), ci("HB", hb), t.pdlConst() };
+    const grid: [3]u32 = .{ u(rows), u(h / hb), 1 };
+    if (rope_w) return t.runTwin("_rope_heads_w", "_rope_heads", grid, &args, &consts);
+    try t.run("_rope_heads", grid, &args, &consts);
 }
 
 /// rowmm2: x [R, K] bf16 (row stride xs) @ w [N, K]^T fp16 -> out [R, N] fp32, rowmm's bits: _rowmm2, _rowmm2r past 2 rows, or rowmm.
@@ -240,4 +262,63 @@ test "route (logits) launches _route as recorded" {
 
 test "route (rowmm_gate's chunk sums) launches _route_parts as recorded" {
     try tri.conform("_route_parts", callRoute);
+}
+
+test "TF_DS_ROPE_W: rope_heads asks for _rope_heads_w with _rope_heads's arguments and constexprs; _rope_heads by default" {
+    const keep = rope_w;
+    defer rope_w = keep;
+    var logs: [2]tri.Log = .{ .{ .gpa = std.testing.allocator }, .{ .gpa = std.testing.allocator } };
+    defer for (&logs) |*l| l.deinit();
+    for ([_]bool{ false, true }, 0..) |w, i| {
+        rope_w = w;
+        try ropeHeads(.{ .log = &logs[i] }, 0x100, 0x200, 0x300, 0x400, 64, true, 4096, 16, 512);
+    }
+    try std.testing.expectEqualStrings("_rope_heads", logs[0].items.items[0].name);
+    try std.testing.expectEqualStrings("_rope_heads_w", logs[1].items.items[0].name);
+    try std.testing.expect(!logs[0].items.items[0].extra and logs[1].items.items[0].extra);
+    const p0 = logs[0].items.items[0];
+    const p1 = logs[1].items.items[0];
+    try std.testing.expectEqual(p0.grid, p1.grid);
+    for (p0.args, p1.args) |q0, q1| try std.testing.expect(std.mem.eql(u8, q0.name, q1.name) and std.meta.eql(q0.value, q1.value));
+    for (p0.consts, p1.consts) |q0, q1| try std.testing.expect(std.mem.eql(u8, q0.name, q1.name) and std.meta.eql(q0.int, q1.int));
+}
+
+test "TF_DS_QKV_PLAIN: the fused launch is the two launches' arguments in one _q_kv_norm (NROT 0, SPLIT 0), a grid of rows x 2" {
+    const gpa = std.testing.allocator;
+    var fused: tri.Log = .{ .gpa = gpa };
+    defer fused.deinit();
+    var split: tri.Log = .{ .gpa = gpa };
+    defer split.deinit();
+    const R = 7;
+    try std.testing.expect(try qKvNormPlain(.{ .log = &fused }, 0x1000, 1280, 0x2000, 1e-6, 0x3000, 0x4000, 0x5000, 0x6000, 0x7000, 0x8000, 64, 0x9000, true, 64, 0xA000, 0xB000, R, 1280, 512));
+    try @import("tri_basic.zig").rmsnorm(.{ .log = &split }, 0x1000, 1280, 0x2000, 0xA000, 1280, 1e-6, R, 1280);
+    try kvNormRope(.{ .log = &split }, 0x3000, 0x4000, 0x5000, 0x6000, 0x7000, 0x8000, 64, 0x9000, 1e-6, true, 64, 0xB000, R, 512);
+    const f = fused.items.items[0];
+    try std.testing.expectEqualStrings("_q_kv_norm", f.name);
+    try std.testing.expectEqual([3]u32{ R, 2, 1 }, f.grid);
+    try std.testing.expect(f.extra);
+    // every argument of either replaced launch appears in the fused one with the same value (the rotation slots carry the template's types)
+    // (_kv_norm_rope's W and OUT are _q_kv_norm's WK and KOUT: the fused kernel has q's own W and OUT)
+    for (split.items.items, 0..) |l, li| for (l.args) |a| {
+        const name = if (li == 1 and std.mem.eql(u8, a.name, "W")) "WK" else if (li == 1 and std.mem.eql(u8, a.name, "OUT")) "KOUT" else a.name;
+        var found = false;
+        for (f.args) |b| {
+            if (std.mem.eql(u8, name, b.name) and std.meta.eql(a.value, b.value)) found = true;
+        }
+        try std.testing.expect(found);
+    };
+    var s0_ty: []const u8 = "";
+    for (f.args) |b| {
+        if (std.mem.eql(u8, b.name, "S0")) s0_ty = b.value.ptr.ty;
+    }
+    try std.testing.expectEqualStrings("*fp16", s0_ty);
+    // the constexprs the replaced kernels share: D / BLOCK as _rmsnorm's, DK / RD / QUANT as _kv_norm_rope's, none rotating
+    var nrot: i64 = -1;
+    var split_on = true;
+    for (f.consts) |c| {
+        if (std.mem.eql(u8, c.name, "NROT")) nrot = c.int.?;
+        if (std.mem.eql(u8, c.name, "SPLIT")) split_on = c.int.? != 0;
+    }
+    try std.testing.expectEqual(@as(i64, 0), nrot);
+    try std.testing.expect(!split_on);
 }

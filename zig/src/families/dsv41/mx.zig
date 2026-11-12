@@ -9,6 +9,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const weights = @import("weights.zig");
 const exl3_linear = @import("exl3_linear.zig");
+const ops_chunk = @import("ops.zig"); // (l2_chunk_bytes: TF_DS_L2_CHUNK_KIB)
 
 pub const DType = exl3_linear.DType;
 
@@ -142,6 +143,11 @@ pub const W8Args = extern struct {
     y_dtype: c_int = 0,
     y: u64 = 0,
     ldy: i64 = 0,
+    gq: i64 = 0, // TF_DS_WOA_MERGE: group z's operands are the base ones + z times these byte strides (woaGroupStrides); 0: a one-group launch
+    gs: i64 = 0,
+    gw: i64 = 0,
+    gws: i64 = 0,
+    gy: i64 = 0,
 };
 
 /// native.cu's DecArgs (the decode tensor-core kernels' dense linears).
@@ -212,12 +218,17 @@ comptime {
     std.debug.assert(@offsetOf(GuArgs, "sldw") == 136 and @offsetOf(GuArgs, "owner") == 152 and @offsetOf(GuArgs, "z") == 216 and @offsetOf(GuArgs, "early_exit") == 224 and @sizeOf(GuArgs) == 232);
     std.debug.assert(@offsetOf(DnArgs, "sldw") == 104 and @offsetOf(DnArgs, "out") == 136 and @offsetOf(DnArgs, "z") == 160 and @offsetOf(DnArgs, "early_exit") == 172 and @sizeOf(DnArgs) == 176);
     std.debug.assert(@offsetOf(BfArgs, "y") == 64 and @offsetOf(BfArgs, "z") == 112 and @offsetOf(BfArgs, "raster") == 120 and @sizeOf(BfArgs) == 128);
+    std.debug.assert(@sizeOf(W8Args) == 144 and @offsetOf(W8Args, "M") == 64 and @offsetOf(W8Args, "y") == 80 and @offsetOf(W8Args, "raster") == 96 and @offsetOf(W8Args, "gq") == 104 and @offsetOf(W8Args, "gy") == 136);
 }
 
 /// The kernels of cuda.kernels.dsv41_native.
 pub const Kernels = struct {
     module: cuda.Module,
     act_quant: cuda.Function,
+    /// tf_dsn_act_quant_vec_kernel (TF_DS_AQ_VEC): act_quant on four lanes a 32-group, 16-byte loads; null when the image lacks it (an older image: the baseline kernel runs).
+    act_quant_vec: ?cuda.Function = null,
+    // TF_DS_ATTN_EPILOGUE: the attention output's inverse RoPE and wo_a's quant in one launch
+    attn_epilogue: cuda.Function,
     gemm: [4]cuda.Function, // row tiles of 1, 2, 4, 8 m16 tiles
     reduce: cuda.Function,
     count: cuda.Function,
@@ -240,6 +251,8 @@ pub const Kernels = struct {
     dec: [5][4]cuda.Function,
     dec_group: cuda.Function, // a decode launch's grouping in one CTA
     nact_log: ?cuda.Function, // TF_DS_NACT_LOG's record kernel (a kit built before it: none)
+    dec_group2: cuda.Function, // the same grouping by a scan of one expert a thread and a ranked placement (TF_DS_DEC_GROUP2)
+    group2: bool, // TF_DS_DEC_GROUP2 (on unless 0): a decode launch's grouping runs dec_group2 (the same bytes; each rank reads its own)
     dec_quant: cuda.Function, // act_quant for decode launches (a programmatic dependent launch)
     dec_l2pf: cuda.Function, // the active experts' down weights into L2 (beside the 2D exchange)
     dec_on: bool, // TF_DS_DECODE_DEC=0: the GEMV kernels instead (the reference path, measured slower)
@@ -273,6 +286,8 @@ pub const Kernels = struct {
     // (512 threads); the kernels are loaded with the others (SfKernels.w16, pf_bf16w8_w16) and this one chooses them
     gemm_w16: bool = false,
     pf_bf16w8_w16: ?cuda.Function = null,
+    // TF_DS_SPLIT64N in effect (useSplit64n): the exact arithmetic's 64-row split tile at 64 columns for N of 512 and 1,280
+    split64n: bool = false,
     // TF_DS_PF_GEMM5 in effect (useGemm5): the dense FP8 GEMM without a K split at 5 stages; its kernel
     gemm5: bool = false,
     pf_gemm5: ?cuda.Function = null,
@@ -297,6 +312,8 @@ pub const Kernels = struct {
     // row (pfExpertsLaunch); their kernels
     run128: bool = false,
     pf_gu_r128: ?cuda.Function = null,
+    /// TF_DS_PACK_EPILOGUE in effect: tf_dsn_sf_gu_exact_q_kernel, gate/up's launch that also writes the expert pack's codes and scales.
+    gu_q: ?cuda.Function = null,
     pf_dn_r128: ?cuda.Function = null,
     // TF_DS_QGATE_CANARY 2 or 3 in effect (useQgateBody): the body canary's kernel (qgateBody); null until then
     qgate_body_fn: ?cuda.Function = null,
@@ -334,7 +351,9 @@ pub const Kernels = struct {
         return .{
             .dec = dec,
             .dec_group = try m.function("tf_dsn_dec_group_kernel"),
+            .dec_group2 = try m.function("tf_dsn_dec_group2_kernel"),
             .nact_log = m.function("tf_dsn_nact_log_kernel") catch null,
+            .group2 = if (std.c.getenv("TF_DS_DEC_GROUP2")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true,
             .dec_quant = try m.function("tf_dsn_dec_quant_kernel"),
             .dec_l2pf = try m.function("tf_dsn_dec_l2pf_kernel"),
             .dec_on = decOnEnv(),
@@ -343,6 +362,8 @@ pub const Kernels = struct {
             .counters = counters,
             .module = m,
             .act_quant = try m.function("tf_dsn_act_quant_kernel"),
+            .act_quant_vec = m.function("tf_dsn_act_quant_vec_kernel") catch null,
+            .attn_epilogue = try m.function("tf_dsn_attn_epilogue_kernel"),
             .gemm = .{ try m.function("tf_dsn_mx_gemm1_kernel"), try m.function("tf_dsn_mx_gemm2_kernel"), try m.function("tf_dsn_mx_gemm4_kernel"), try m.function("tf_dsn_mx_gemm8_kernel") },
             .reduce = try m.function("tf_dsn_reduce_kernel"),
             .count = try m.function("tf_dsn_group_count_kernel"),
@@ -463,6 +484,13 @@ pub const Kernels = struct {
         if (asked and k.pf_bf16_t64 == null) k.pf_bf16_t64 = pfFunction(k.module, "tf_dsn_pf_bf16_t64_kernel", pf_bf16_t64_smem) catch null;
         k.pf_t64 = asked and k.pf_bf16_t64 != null;
         return k.pf_t64;
+    }
+
+    /// TF_DS_SPLIT64N `asked` in effect: the exact arithmetic's 64-column split tile (SfKernels.split64n) is in this image and loaded.
+    /// Nothing loads here: an image built without it leaves the switch off.
+    pub fn useSplit64n(k: *Kernels, asked: bool) bool {
+        k.split64n = asked and (if (k.sfk) |x| x.split64n != null else false);
+        return k.split64n;
     }
 
     /// TF_DS_PF_SPLIT `sw` in effect (off: nothing changes, nothing loaded): the four configurations' kernels, then
@@ -721,6 +749,8 @@ pub const SfKernels = struct {
     split64: [2]cuda.Function,
     split128: [2]cuda.Function,
     zsplit: cuda.Function,
+    // the exact arithmetic's split64 at a 64-column tile (TF_DS_SPLIT64N); null in an image built without it
+    split64n: ?cuda.Function = null,
     gu: [2]cuda.Function,
     dn: [2]cuda.Function,
     // the exact arithmetic's kernels on 16 warps a block (TF_DS_GEMM_W16); null each in an image built without it
@@ -766,6 +796,15 @@ pub const SfKernels = struct {
         };
     }
 
+    /// The kernel a split64 launch of N columns takes under TF_DS_SPLIT64N (`on`): the 64-column tile's, for the exact arithmetic (`x` 1)
+    /// at N of 512 (wkv) and 1,280 (wq_a), when the output is not the whole-line twin's and the 16-warp twin is not taken; else null
+    /// (the baseline launch). Its grid is (cdiv(m, 64), n / 64) at 128 threads.
+    pub fn split64nOf(sk: *const SfKernels, on: bool, x: usize, n: usize, stage: bool, w16: bool) ?cuda.Function {
+        if (!on or x != 1 or stage or w16) return null;
+        if (n != 512 and n != 1280) return null;
+        return sk.split64n;
+    }
+
     fn useStaged(sk: *SfKernels) !void {
         // the GPU-scope release with the last arrival's system fence (door_arrive_cta<2>), as combine's door: the per-thread system fence of the
         // twin before it held every sent CTA's slot until its stores drained (LEDGER: 1.300 ms a launch against the plain launch's 1.143)
@@ -804,6 +843,7 @@ pub const SfKernels = struct {
             },
             .ranges = try m.function("tf_dsn_sf_ranges_kernel"),
         };
+        sk.split64n = pf(m, "tf_dsn_sf_split64n_exact_kernel", sf_split64n_smem) catch null;
         sk.dn_three = pf(m, "tf_dsn_sf_dn_exact_three_kernel", pf_dn_r128_smem) catch null;
         sk.ch_dn_three = pf(m, "tf_dsn_sf_dn_three_kernel", pf_dn_r128_smem) catch null;
         return sk;
@@ -874,6 +914,8 @@ pub const R2 = struct {
 pub const sf_gemm_smem: u32 = 52224;
 pub const sf_split64_smem: u32 = 76800;
 pub const sf_split128_smem: u32 = 87040;
+/// tf_dsn_sf_split64n (native_sf.cu sf::Split64NCfg: 5 stages of 8,704 bytes): two blocks fit an SM's 100 KiB with their static bytes.
+pub const sf_split64n_smem: u32 = 43520;
 /// TF_DS_GEMM_R2's kernels' dynamic shared memory (native_sf.cu asserts its tiles'): the experts' down at 128 rows
 /// (90,112 bytes); gate / up takes the tile above.
 pub const r2_dn_smem: u32 = 90112;
@@ -938,6 +980,7 @@ fn sfGemm(k: *const Kernels, s: cuda.Stream, kind: SfGemm, l: weights.Linear, q:
     const w = if (k.gemm_w16 and x == 1) sk.w16 else W16{};
     switch (kind) {
         .gemm => try launchShared(if (stage) sk.st_gemm[x].? else sk.gemm[x], s, .{ cdiv(m, 128), l.n / 128, 1 }, sf_gemm_smem, &args),
+        .split64 => if (sk.split64nOf(k.split64n, x, l.n, stage, w.split64 != null)) |f| try launchSharedT(f, s, .{ cdiv(m, 64), l.n / 64, 1 }, sf_split64n_smem, 128, &args) else if (stage) try launchShared(sk.st_split64[x].?, s, .{ cdiv(m, 64), l.n / 128, 1 }, sf_split64_smem, &args) else if (w.split64) |f| try launchSharedT(f, s, .{ cdiv(m, 64), l.n / 128, 1 }, sf_split64_smem, 512, &args) else try launchShared(sk.split64[x], s, .{ cdiv(m, 64), l.n / 128, 1 }, sf_split64_smem, &args),
         .split128 => if (stage) try launchShared(sk.st_split128[x].?, s, .{ cdiv(m, 128), l.n / 128, 1 }, sf_split128_smem, &args) else if (w.split128) |f| try launchSharedT(f, s, .{ cdiv(m, 128), l.n / 128, 1 }, sf_split128_smem, 512, &args) else try launchShared(sk.split128[x], s, .{ cdiv(m, 128), l.n / 128, 1 }, sf_split128_smem, &args),
         .zsplit => {
             try launchShared(sk.zsplit, s, .{ cdiv(m, 64), l.n / 128, sp }, sf_split64_smem, &args);
@@ -1428,6 +1471,66 @@ pub fn zFloats(l: weights.Linear, rows: usize) usize {
     return if (s > 1) s * @min(rows, slab_rows) * l.n else 0;
 }
 
+/// TF_DS_ATTN_EPILOGUE: the attention output o [m, H * HD] bf16, in place: rope_heads' inverse RoPE of each head's
+/// last rd columns, then act_quant's codes and scales of the roped rows into q / sc (dense rows), or its fake rows
+/// into `fake` (the other two 0 then). The roped columns and the rest are whole 32-value groups. `store_o`: the roped
+/// columns are written back into o (else o is left as the attention wrote it: its readers are the codes or fake rows).
+pub fn attnEpilogue(k: *const Kernels, s: cuda.Stream, o: u64, cos: u64, sin: u64, pos: u64, m: usize, h: usize, hd: usize, rd: usize, q: u64, sc: u64, fake_rows: u64, store_o: bool) !void {
+    const kk = h * hd;
+    if (kk % 32 != 0 or hd % 32 != 0 or rd == 0 or rd > hd or rd % 32 != 0 or (hd - rd) % 32 != 0) return error.UnsupportedShape;
+    var a: cuda.Args = .{};
+    a.add(o);
+    a.add(cos);
+    a.add(sin);
+    a.add(pos);
+    a.add(@as(c_int, @intCast(m)));
+    a.add(@as(c_int, @intCast(h)));
+    a.add(@as(c_int, @intCast(hd)));
+    a.add(@as(c_int, @intCast(rd)));
+    a.add(q);
+    a.add(@as(i64, @intCast(kk)));
+    a.add(sc);
+    a.add(@as(i64, @intCast(kk / 32)));
+    a.add(fake_rows);
+    a.add(@as(i64, @intCast(kk)));
+    a.add(@as(c_int, @intFromBool(store_o)));
+    try launch(k.attn_epilogue, s, .{ m, cdiv(kk / 8, 256), 1 }, 256, &a);
+}
+
+/// TF_DS_AQ_VEC in effect (Model.open; the replay's act_quant section toggles it): act_quant runs the four-lane twin tf_dsn_act_quant_vec_kernel where the call fits
+/// (aqVecFits) and the image has it; false runs tf_dsn_act_quant_kernel (a warp a 32-group) for every call. The twin writes the same bytes (the replay compares every one).
+pub var aq_vec_on: bool = true;
+
+/// TF_DS_AQ_VEC as asked: unset or empty and "1" are on, "0" is off, null for any other text (Model.open refuses the start with it, at its call site; this parse is pure and logs nothing).
+pub fn aqVecWanted(v: ?[]const u8) ?bool {
+    const t = v orelse return true;
+    if (t.len == 0 or std.mem.eql(u8, t, "1")) return true;
+    if (std.mem.eql(u8, t, "0")) return false;
+    return null;
+}
+
+/// Whether an act_quant call may take the twin: bf16 x, K a multiple of 32, x's row stride a multiple of 8 elements and x 16-byte aligned (its 16-byte loads), the codes' row
+/// stride a multiple of 8 and q 8-byte aligned (its 8-byte stores); with `fake` (non-zero: the dequantized rows into it) fake's row stride a multiple of 8 and fake 16-byte
+/// aligned (its 16-byte stores). Any other call runs the baseline kernel, which has no such condition.
+pub fn aqVecFits(x_dtype: DType, x: u64, ldx: usize, kdim: usize, q: u64, ldq: usize, fake_ptr: u64, ldf: usize) bool {
+    if (x_dtype != .bf16 or kdim == 0 or kdim % 32 != 0 or ldx % 8 != 0 or x % 16 != 0) return false;
+    if (fake_ptr != 0) return ldf % 8 == 0 and fake_ptr % 16 == 0;
+    return ldq % 8 == 0 and q % 8 == 0;
+}
+
+/// Whether this act_quant call runs the twin: the switch on, the image has it, the call fits.
+fn aqVecTakes(k: *const Kernels, x_dtype: DType, x: u64, ldx: usize, kdim: usize, q: u64, ldq: usize, fake_ptr: u64, ldf: usize) bool {
+    return aq_vec_on and k.act_quant_vec != null and aqVecFits(x_dtype, x, ldx, kdim, q, ldq, fake_ptr, ldf);
+}
+
+/// The one launch of act_quant (quant's and fake's): the twin at 4 threads a 32-group, else the baseline kernel at a warp a group. The same arguments either way.
+fn aqLaunch(k: *const Kernels, s: cuda.Stream, a: *cuda.Args, x_dtype: DType, x: u64, ldx: usize, m: usize, kdim: usize, q: u64, ldq: usize, fake_ptr: u64, ldf: usize) !void {
+    if (aqVecTakes(k, x_dtype, x, ldx, kdim, q, ldq, fake_ptr, ldf)) return launch(k.act_quant_vec.?, s, .{ cdiv(m * (kdim / 32) * 4, 256), 1, 1 }, 256, a);
+    try launch(k.act_quant, s, .{ cdiv(m * (kdim / 32) * 32, 256), 1, 1 }, 256, a);
+}
+
+/// act_quant: x [M, K] (row stride ldx, dtype x_dtype) -> q [M, K] E4M3 (row stride ldq) and s [M, K / 32] fp32 (row
+/// stride lds).
 pub fn quant(k: *const Kernels, s: cuda.Stream, x: u64, x_dtype: DType, ldx: usize, m: usize, kdim: usize, q: u64, ldq: usize, sc: u64, lds: usize) !void {
     var a: cuda.Args = .{};
     a.add(x);
@@ -1441,6 +1544,7 @@ pub fn quant(k: *const Kernels, s: cuda.Stream, x: u64, x_dtype: DType, ldx: usi
     a.add(@as(i64, @intCast(lds)));
     a.add(@as(u64, 0));
     a.add(@as(i64, 0));
+    try aqLaunch(k, s, &a, x_dtype, x, ldx, m, kdim, q, ldq, 0, 0);
 }
 
 /// quant for a decode launch (the same codes and scales): with dec_on tf_dsn_dec_quant, an ordinary launch (every
@@ -1491,6 +1595,7 @@ pub fn fake(k: *const Kernels, s: cuda.Stream, x: u64, x_dtype: DType, ldx: usiz
     a.add(@as(i64, 0));
     a.add(out);
     a.add(@as(i64, @intCast(ldo)));
+    try aqLaunch(k, s, &a, x_dtype, x, ldx, m, kdim, 0, 0, out, ldo);
 }
 
 /// The MX GEMM of a quantized activation (q, sc: row strides ldq, lds) with a native FP8 / FP4 linear: y [m, n]
@@ -1793,6 +1898,20 @@ pub fn woA(k: *const Kernels, s: cuda.Stream, sc: Scratch, wo: []const weights.L
     const kk = gk * wo.len;
     if (m > sc.rows or kk > sc.max_k) return error.ScratchTooSmall;
     try fake(k, s, o, .bf16, ldo, m, kk, sc.fake, kk);
+    try woAGemm(k, s, sc, wo, m, kk, u, ldu, z);
+}
+
+/// woA's groups on sc.fake already holding its quant-dequant rows (TF_DS_ATTN_EPILOGUE wrote them): the same launches
+/// as woA, without the fake quant's read of o.
+pub fn woAFromFake(k: *const Kernels, s: cuda.Stream, sc: Scratch, wo: []const weights.Linear, m: usize, u: u64, ldu: usize, z: ?Z) !void {
+    const gk: usize = wo[0].k;
+    const kk = gk * wo.len;
+    if (m > sc.rows or kk > sc.max_k) return error.ScratchTooSmall;
+    try woAGemm(k, s, sc, wo, m, kk, u, ldu, z);
+}
+
+fn woAGemm(k: *const Kernels, s: cuda.Stream, sc: Scratch, wo: []const weights.Linear, m: usize, kk: usize, u: u64, ldu: usize, z: ?Z) !void {
+    const gk: usize = wo[0].k;
     var col: usize = 0;
     for (wo, 0..) |l, g| {
         if (l.fmt != .bf16 or l.k != gk) return error.NotANativeLinear;
@@ -1807,12 +1926,61 @@ pub fn woA(k: *const Kernels, s: cuda.Stream, sc: Scratch, wo: []const weights.L
 /// tf_dsn_pf_bf16w8 into u's column block (row stride ldu, bf16). The kernel multiplies the values woA multiplies (each
 /// code times its scale rounded to bf16; each weight's E4M3 value times its block scale cut to bf16, the loader's rows)
 pub fn woA8Prefill(k: *const Kernels, s: cuda.Stream, sc: Scratch, w8: weights.Linear, groups: usize, o: u64, ldo: usize, m: usize, u: u64, ldu: usize) !void {
+    const gk: usize = w8.k;
+    const kk = gk * groups;
+    if (m > sc.rows or kk > sc.max_k) return error.ScratchTooSmall;
+    if (!w8Shape(w8, groups)) return error.UnsupportedShape;
+    try quant(k, s, o, .bf16, ldo, m, kk, sc.q, kk, sc.s, kk / 32);
+    try woA8Groups(k, s, sc, w8, groups, m, u, ldu);
+}
+
+/// woA8Prefill's group launches on sc.q / sc.s already holding o's codes and scales (TF_DS_ATTN_EPILOGUE wrote them):
+/// the same launches, without the quant's read of o.
+pub fn woA8PrefillCodes(k: *const Kernels, s: cuda.Stream, sc: Scratch, w8: weights.Linear, groups: usize, m: usize, u: u64, ldu: usize) !void {
+    const gk: usize = w8.k;
+    const kk = gk * groups;
+    if (m > sc.rows or kk > sc.max_k) return error.ScratchTooSmall;
+    if (!w8Shape(w8, groups)) return error.UnsupportedShape;
+    try woA8Groups(k, s, sc, w8, groups, m, u, ldu);
+}
+
+/// TF_DS_WOA_MERGE in effect (Model.open; the replay's woa_merge section toggles it): a prompt chunk's wo_a groups on their FP8 rows (woA8Groups) run as ONE launch of tf_dsn_pf_bf16w8 with grid.z =
+/// groups instead of one launch a group: a layer's two 5.33-wave launches (256 CTAs on 48 SMs, 6 waves each) become one of 10.67 waves (11), the last wave of the first no longer idle. Each CTA runs its
+/// group's code unchanged: the bytes are the group launches'.
+pub var woa_merge: bool = true;
+
+/// TF_DS_WOA_MERGE as asked: unset, empty and "1" on (the default since #417: x0.945 a layer on the Sparks, the same bytes), "0" off (the operator's choice), null for any other text (Model.open refuses
+/// the start with it at its call site; this parse is pure and logs nothing).
+pub fn woaMergeWanted(text: ?[]const u8) ?bool {
+    const t = text orelse return true;
+    if (t.len == 0 or std.mem.eql(u8, t, "1")) return true;
+    if (std.mem.eql(u8, t, "0")) return false;
+    return null;
+}
+
+/// The byte strides between wo_a's groups for group width `gn` (output columns) and group depth `gk` (K): the codes' columns, the activation scales, the weight codes, the weight scales (32 x 32 blocks) and
+/// the bf16 output columns: the merged launch's per-group offsets; a test holds them to the per-group launches' (g * gn * gk, g * (gn / 32) * (gk / 32), ...).
+pub const GroupStrides = struct { gq: i64, gs: i64, gw: i64, gws: i64, gy: i64 };
+pub fn woaGroupStrides(gk: usize, gn: usize) GroupStrides {
+    return .{
+        .gq = @intCast(gk),
+        .gs = @intCast(gk / 32 * 4),
+        .gw = @intCast(gn * gk),
+        .gws = @intCast(gn / 32 * (gk / 32)),
+        .gy = @intCast(gn * 2),
+    };
+}
+
+fn woA8Groups(k: *const Kernels, s: cuda.Stream, sc: Scratch, w8: weights.Linear, groups: usize, m: usize, u: u64, ldu: usize) !void {
     // TF_DS_GEMM_W16: the 16-warp twin (the same tile, stages and bytes, a warp's 32 rows of it)
     const w16 = if (k.gemm_w16) k.pf_bf16w8_w16 else null;
     const f = w16 orelse k.pf_bf16w8 orelse return error.NoW8Kernel;
     const gk: usize = w8.k;
     const kk = gk * groups;
     const gn = w8.n / groups;
+    const st = woaGroupStrides(gk, gn);
+        const merged = woa_merge and groups > 1;
+        for (0..if (merged) 1 else groups) |g| {
             const a: W8Args = .{
                 .ldq = @intCast(kk),
                 .lds = @intCast(kk / 32),
@@ -1824,9 +1992,15 @@ pub fn woA8Prefill(k: *const Kernels, s: cuda.Stream, sc: Scratch, w8: weights.L
                 .K = @intCast(gk),
                 .y_dtype = @backingInt(DType.bf16),
                 .ldy = @intCast(ldu),
+                .gq = if (merged) st.gq else 0,
+                .gs = if (merged) st.gs else 0,
+                .gw = if (merged) st.gw else 0,
+                .gws = if (merged) st.gws else 0,
+                .gy = if (merged) st.gy else 0,
             };
             var args: cuda.Args = .{};
             args.add(a);
+            try launchSharedT(f, s, .{ cdiv(b.n, 128), gn / 128, if (merged) groups else 1 }, pf_w8_smem, if (w16 != null) 512 else 256, &args);
     }
 }
 
@@ -1946,8 +2120,12 @@ pub fn nactRender(gpa: std.mem.Allocator, rank: u32, world: u32, recs: []NactRec
     return out.toOwnedSlice(gpa);
 }
 
+/// A decode launch's grouping (r rows of sc.slots picks, r * slots <= 4096) in one CTA: sc.off, act, nact, ent and erow.
+/// k.group2 (TF_DS_DEC_GROUP2, on unless set to 0): the scan-and-rank kernel, the same bytes, for up to 1,024 experts; else the one-CTA loop.
+pub fn decodeGrouping(k: *const Kernels, s: cuda.Stream, e: usize, sc: ExpertScratch, pick: u64, r: usize) !void {
     var g: cuda.Args = .{};
     g.add(pick);
+    g.add(@as(c_int, @intCast(r * sc.slots)));
     g.add(@as(c_int, @intCast(sc.slots)));
     g.add(@as(c_int, @intCast(e)));
     g.add(sc.off);
@@ -1955,6 +2133,10 @@ pub fn nactRender(gpa: std.mem.Allocator, rank: u32, world: u32, recs: []NactRec
     g.add(sc.nact);
     g.add(sc.ent);
     g.add(sc.erow);
+    const f = if (k.group2 and e <= 1024) k.dec_group2 else k.dec_group;
+    try cuda.launch.launch(f, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 1024 }, .shared = @intCast((2 * e + 1) * 4) }, s, &g);
+}
+
 /// TF_DS_NACT_LOG: this decode launch's grouping into the log (after decodeGrouping, on the same stream); only called with the log on.
 fn nactLog(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScratch, r: usize) !void {
     const f = k.nact_log orelse return;
@@ -1968,6 +2150,15 @@ fn nactLog(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScr
     try cuda.launch.launch(f, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &g);
 }
 
+/// The routed rows grouped by expert (picks pick [r, slots]; ids past the experts are another node's), and x's rows
+/// quantized: what gate / up and down read. `coded`: x's codes and scales are in sc.q / sc.s already (a prompt
+/// chunk's, not one_cta), the quant skipped.
+fn group(k: *const Kernels, s: cuda.Stream, d: *const cuda.Driver, ex: weights.Experts, sc: ExpertScratch, x: u64, ldx: usize, pick: u64, r: usize, one_cta: bool, coded: bool) !void {
+    const e: usize = ex.count;
+    const rs = r * sc.slots;
+    if (one_cta and rs <= 4096) {
+        // a decode launch: the count, prefix and places in one CTA (the same groups, entries in entry order)
+        try decodeGrouping(k, s, e, sc, pick, r);
         if (nact_ring != 0) try nactLog(k, s, ex, sc, r);
         // x's codes last: gate / up (a programmatic dependent launch) reads the groups before it waits for them
         return quantDec(k, s, x, .bf16, ldx, r, ex.dims, sc.q, ex.dims, sc.s, ex.dims / 32);
@@ -2063,6 +2254,8 @@ pub fn prefetchDown(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: 
     a.add(@as(c_longlong, @intCast(n * i)));
     a.add(@as(c_int, @intCast(ex.count - 1)));
     a.add(@as(c_longlong, @intCast(budget)));
+    a.add(@as(c_longlong, @intFromFloat(128.0 * @as(f64, @floatFromInt(ops_chunk.l2_chunk_bytes)) / 230.0))); // (the served 230 GB/s, a wave of 128 chunks)
+    a.add(@as(c_longlong, @intCast(ops_chunk.l2_chunk_bytes)));
     try cuda.launch.launch(k.dec_l2pf, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 128 } }, s, &a);
 }
 
@@ -2071,6 +2264,17 @@ pub fn prefetchDown(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: 
 pub const dec_gu_ks = 4;
 pub const dec_dn_ks = 2;
 
+/// The expert pack's codes and scales as gate/up's epilogue writes them (TF_DS_PACK_EPILOGUE): extern, the twin kernel's `sf::QOut`
+/// (two pointers, then the pair's main width, the rest width and the pack's slot rows).
+pub const PackQ = extern struct { codes: u64, scales: u64, ig: i32, ir: i32, P: i32 };
+
+/// TF_DS_PACK_EPILOGUE's start: the twin kernel must be in this build's module, else the start ends by name (never a silent fallback to
+/// gate/up and packQuant).
+pub fn usePackEpilogue(k: *Kernels) !void {
+    const sk = k.sfk orelse return error.NoPackEpilogueKernel;
+    k.gu_q = Kernels.pfFunction(sk.module, "tf_dsn_sf_gu_exact_q_kernel", pf_gu_r128_smem) catch return error.NoPackEpilogueKernel;
+}
+
 /// Gate / up of a native layer's experts on r rows: x [r, D] bf16 (row stride ldx) routed by pick / wts [r, slots]
 /// (the shared expert the last id, every row's last slot), each slot's h = bf16(silu(min(g, limit)) * clamp(u) * w)
 /// into the pack h as the 2D exchange carries it: every slot's main columns [r * slots, ldh] (ldh: the main blocks'
@@ -2078,15 +2282,26 @@ pub const dec_dn_ks = 2;
 /// split: a decode launch, the GEMV kernels (a warp a column, each row its own arithmetic: its bits at any row count);
 /// prompt chunks: false, the MMA tiles.
 pub fn gateUp(k: *const Kernels, s: cuda.Stream, d: *const cuda.Driver, ex: weights.Experts, sc: ExpertScratch, x: u64, ldx: usize, pick: u64, wts: u64, r: usize, limit: f32, h: u64, ldh: usize, split: bool) !void {
+    return gateUpOf(k, s, d, ex, sc, x, ldx, pick, wts, r, limit, h, ldh, split, false, null);
+}
+
+/// gateUp of a prompt chunk's r rows whose pack codes the launch writes itself into `pq` (TF_DS_PACK_EPILOGUE): the twin kernel in place of
+/// the block-scaled gate/up, the bf16 pack `h` still written. Only the exact block-scaled prompt path has the twin: any other shape is an
+/// error, never the baseline launch.
+pub fn gateUpPack(k: *const Kernels, s: cuda.Stream, d: *const cuda.Driver, ex: weights.Experts, sc: ExpertScratch, x: u64, ldx: usize, pick: u64, wts: u64, r: usize, limit: f32, h: u64, ldh: usize, coded: bool, pq: PackQ) !void {
+    return gateUpOf(k, s, d, ex, sc, x, ldx, pick, wts, r, limit, h, ldh, false, coded, pq);
 }
 
 /// gateUp of a prompt chunk's r rows whose codes and scales are in sc.q / sc.s already (act_quant of x's rows [r, D],
 /// the bytes group() would write): the same grouping and launches, without the quant.
 pub fn gateUpCodes(k: *const Kernels, s: cuda.Stream, d: *const cuda.Driver, ex: weights.Experts, sc: ExpertScratch, pick: u64, wts: u64, r: usize, limit: f32, h: u64, ldh: usize) !void {
+    return gateUpOf(k, s, d, ex, sc, 0, ex.dims, pick, wts, r, limit, h, ldh, false, true, null);
 }
 
+fn gateUpOf(k: *const Kernels, s: cuda.Stream, d: *const cuda.Driver, ex: weights.Experts, sc: ExpertScratch, x: u64, ldx: usize, pick: u64, wts: u64, r: usize, limit: f32, h: u64, ldh: usize, split: bool, coded: bool, pq: ?PackQ) !void {
     const nx = ex.native orelse return error.NotNativeExperts;
     if (r > sc.rows) return error.ScratchTooSmall;
+    if (pq != null and (split or k.gu_q == null)) return error.PackEpilogueNotApplicable;
     try group(k, s, d, ex, sc, x, ldx, pick, r, split and k.dec_on, coded);
     const dd: usize = ex.dims;
     const a: GuArgs = .{
@@ -2144,6 +2359,13 @@ pub fn gateUpCodes(k: *const Kernels, s: cuda.Stream, d: *const cuda.Driver, ex:
         if (!tilesOnce(k.group_tiles, sc)) try tileList(k, s, sc);
         args.add(sc.tiles);
         args.add(sc.ntiles);
+        if (pq) |q| {
+            // the twin runs where the exact block-scaled gate/up does and nowhere else
+            _ = sfExperts(k, nx.s1, false) orelse return error.PackEpilogueNotApplicable;
+            if (k.sf != .exact or k.gemm_r2 or k.gemm_w16) return error.PackEpilogueNotApplicable;
+            args.add(q);
+            return launchSharedT(k.gu_q.?, s, .{ nx.tiles * 32 / 128, p / pf_bm + ex.count, 1 }, pf_gu_r128_smem, 256, &args);
+        }
         if (sfExperts(k, nx.s1, false)) |fsf| return launchSharedT(fsf.f, s, .{ nx.tiles * 32 / 128, p / pf_bm + ex.count, 1 }, fsf.smem, fsf.threads, &args);
         const el = pfExpertsLaunch(k.run128);
         const f = if (el.r128) k.pf_gu_r128 orelse return error.NoRun128Kernel else k.pf_gu;
@@ -2868,9 +3090,46 @@ test "TF_DS_GEMM_W16's launches: the twins on the tiles' own shared memory, 512 
     // the twins are the exact form's alone: the switch is read with the arithmetic
     try std.testing.expect(std.mem.indexOf(u8, code, "const w = if (k.gemm_w16 and x == 1) sk.w16 else W16{};") != null);
     // wo_a's rows: the twin at 512, else the baseline at 256, on the kernel's dynamic bytes
+    try std.testing.expect(std.mem.indexOf(u8, code, "try launchSharedT(f, s, .{ cdiv(b.n, 128), gn / 128, if (merged) groups else 1 }, pf_w8_smem, if (w16 != null) 512 else 256, &args);") != null);
     // the expert tiles launch the block sfExperts names (512 for a twin, 256 for the baseline)
     try std.testing.expect(std.mem.indexOf(u8, code, "return launchSharedT(fsf.f, s, .{ nx.tiles * 32 / 128, p / pf_bm + ex.count, 1 }, fsf.smem, fsf.threads, &args);") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "try launchSharedT(fsf.f, s, .{ n / 128, p / pf_bm + ex.count, 1 }, fsf.smem, fsf.threads, &args) else {") != null);
+}
+
+test "TF_DS_SPLIT64N takes the 64-column split tile for the exact arithmetic at N of 512 and 1,280 alone, and nothing else changes" {
+    const f = struct {
+        fn of(i: usize) cuda.Function {
+            return .{ .d = undefined, .handle = @ptrFromInt(0x3000 + i * 16) };
+        }
+    }.of;
+    var k: Kernels = undefined;
+    k.sf = .exact;
+    k.split64n = false;
+    k.sfk = .{ .module = undefined, .gemm = .{ f(0), f(1) }, .split64 = .{ f(2), f(3) }, .split128 = .{ f(4), f(5) }, .zsplit = f(6), .gu = .{ f(7), f(8) }, .dn = .{ f(9), f(10) } };
+    // an image without the kernel keeps the switch off
+    try std.testing.expect(!k.useSplit64n(true));
+    k.sfk.?.split64n = f(30);
+    try std.testing.expect(!k.useSplit64n(false));
+    try std.testing.expect(k.useSplit64n(true));
+    const sk = k.sfk.?;
+    // wkv (512) and wq_a (1,280) in the exact arithmetic: the 64-column kernel
+    try std.testing.expectEqual(f(30).handle, sk.split64nOf(k.split64n, 1, 512, false, false).?.handle);
+    try std.testing.expectEqual(f(30).handle, sk.split64nOf(k.split64n, 1, 1280, false, false).?.handle);
+    // every other N, the chained arithmetic, the whole-line twin's output and the 16-warp twin keep the baseline launch
+    for ([_]usize{ 128, 256, 1024, 2560, 4096, 8192, 12800 }) |n| try std.testing.expect(sk.split64nOf(k.split64n, 1, n, false, false) == null);
+    try std.testing.expect(sk.split64nOf(k.split64n, 0, 512, false, false) == null);
+    try std.testing.expect(sk.split64nOf(k.split64n, 1, 512, true, false) == null);
+    try std.testing.expect(sk.split64nOf(k.split64n, 1, 1280, false, true) == null);
+    // the switch off: none
+    try std.testing.expect(sk.split64nOf(false, 1, 512, false, false) == null);
+    // the launch: the 64-column grid at 128 threads on the kernel's own dynamic bytes, ahead of every other split64 launch
+    const src = @embedFile("mx.zig");
+    const code = src[0..std.mem.indexOf(u8, src, "\ntest \"").?];
+    const at = std.mem.indexOf(u8, code, "." ++ "split64 => if (sk.split64nOf(k.split64n, x, l.n, stage, w.split64 != null)) |f| try launchSharedT(f, s, .{ cdiv(m, 64), l.n / 64, 1 }, sf_split64n_smem, 128, &args) else if (stage)") orelse return error.TestUnexpectedResult;
+    _ = at;
+    // two blocks an SM: the dynamic bytes (native_sf.cu asserts the same) and the kernel's static 2,304 and 1 KiB each within 100 KiB
+    try std.testing.expectEqual(@as(u32, 5 * (64 * 64 + 64 * 64 + 64 * 2 * 4)), sf_split64n_smem);
+    try std.testing.expect(2 * (sf_split64n_smem + 2304 + 1024) <= 100 * 1024);
 }
 
 test "TF_DS_PF_T64 takes the 64 x 64 bf16 tile for the router's 384 columns of one group alone, and nothing else changes" {
@@ -3254,6 +3513,9 @@ test "TF_DS_PF_RASTER's launches: the tile GEMMs get the group, the argument str
     // (each count includes the literal in this test)
     try std.testing.expectEqual(@as(usize, 2 + 1), std.mem.count(u8, src, ".raster = rasterOf(pf_raster, m, l.k) }"));
     try std.testing.expectEqual(@as(usize, 1 + 1), std.mem.count(u8, src, ".raster = rasterOf(pf_raster, m, kdim * 2) }"));
+    try std.testing.expectEqual(@as(usize, 144), @sizeOf(W8Args));
+    try std.testing.expectEqual(@as(usize, 104), @offsetOf(W8Args, "gq"));
+    try std.testing.expectEqual(@as(usize, 136), @offsetOf(W8Args, "gy"));
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(MxArgs, "raster") % 4);
     try std.testing.expectEqual(@offsetOf(MxArgs, "accumulate") + 4, @offsetOf(MxArgs, "raster"));
     try std.testing.expectEqual(@offsetOf(BfArgs, "z") + 8, @offsetOf(BfArgs, "raster"));
@@ -3292,4 +3554,86 @@ test "wo_b's door GEMM is the twin whose CTAs release the count at GPU scope (th
     try std.testing.expect(std.mem.indexOf(u8, body, "tf_dsn_sf_split128_exact_st_door_kernel") == null);
     // and combine's door is the same release
     try std.testing.expect(std.mem.indexOf(u8, src, "k.combine_door = try k.module.function(\"tf_dsn_combine_door_g_kernel\")") != null);
+}
+
+test "TF_DS_AQ_VEC: unset, empty and 1 are on, 0 is off, any other text is null (the start is refused at its call site)" {
+    try std.testing.expectEqual(@as(?bool, true), aqVecWanted(null));
+    try std.testing.expectEqual(@as(?bool, true), aqVecWanted(""));
+    try std.testing.expectEqual(@as(?bool, true), aqVecWanted("1"));
+    try std.testing.expectEqual(@as(?bool, false), aqVecWanted("0"));
+    for ([_][]const u8{ "2", "on", "off", "true", " 1", "01", "-1", "10" }) |bad| try std.testing.expectEqual(@as(?bool, null), aqVecWanted(bad));
+}
+
+test "TF_DS_AQ_VEC: act_quant takes the four-lane twin for bf16 x, K a multiple of 32, 16-byte x with ldx a multiple of 8 and 8-byte q with ldq a multiple of 8 (fake rows: 16-byte, ldf a multiple of 8); anything else keeps the baseline kernel" {
+    // the prompt pass's calls: the front and wo_b's input, the experts' pack rows, the pack quant's 32-wide groups
+    try std.testing.expect(aqVecFits(.bf16, 0x1000, 5120, 5120, 0x2000, 5120, 0, 0));
+    try std.testing.expect(aqVecFits(.bf16, 0x1000, 8192, 8192, 0x2000, 8192, 0, 0));
+    try std.testing.expect(aqVecFits(.bf16, 0x1000, 640, 640, 0x2000, 640, 0, 0));
+    try std.testing.expect(aqVecFits(.bf16, 0x1000, 32, 32, 0x2008, 32, 0, 0));
+    // fake rows (wo_a's input): q is not read, fake's alignment and stride are
+    try std.testing.expect(aqVecFits(.bf16, 0x1000, 640, 640, 0x2001, 641, 0x4000, 640));
+    // x: another dtype, K not a multiple of 32 (or zero), a row stride off 8 elements, an address off 16 bytes
+    try std.testing.expect(!aqVecFits(.f32, 0x1000, 640, 640, 0x2000, 640, 0, 0));
+    try std.testing.expect(!aqVecFits(.f16, 0x1000, 640, 640, 0x2000, 640, 0, 0));
+    try std.testing.expect(!aqVecFits(.bf16, 0x1000, 640, 100, 0x2000, 640, 0, 0));
+    try std.testing.expect(!aqVecFits(.bf16, 0x1000, 640, 0, 0x2000, 640, 0, 0));
+    try std.testing.expect(!aqVecFits(.bf16, 0x1000, 644, 640, 0x2000, 640, 0, 0));
+    try std.testing.expect(!aqVecFits(.bf16, 0x1008, 640, 640, 0x2000, 640, 0, 0));
+    // q: a row stride off 8, an address off 8 bytes
+    try std.testing.expect(!aqVecFits(.bf16, 0x1000, 640, 640, 0x2000, 644, 0, 0));
+    try std.testing.expect(!aqVecFits(.bf16, 0x1000, 640, 640, 0x2004, 640, 0, 0));
+    // fake: a row stride off 8, an address off 16 bytes
+    try std.testing.expect(!aqVecFits(.bf16, 0x1000, 640, 640, 0, 0, 0x4000, 644));
+    try std.testing.expect(!aqVecFits(.bf16, 0x1000, 640, 640, 0, 0, 0x4008, 640));
+}
+
+test "TF_DS_AQ_VEC: quant's and fake's launches go through aqLaunch, the one place that names an act_quant kernel; the twin's grid is 4 threads a group, the baseline a warp" {
+    const src = @embedFile("mx.zig");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "try aqLaunch(k, s, &a, x_dtype, x, ldx, m, kdim, q, ldq, 0, " ++ "0);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "try aqLaunch(k, s, &a, x_dtype, x, ldx, m, kdim, 0, 0, out, " ++ "ldo);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "try launch(k.act_" ++ "quant, s, .{ cdiv(m * (kdim / 32) * 32, 256), 1, 1 }, 256, a);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "launch(k.act_quant_" ++ "vec.?, s, .{ cdiv(m * (kdim / 32) * 4, 256), 1, 1 }, 256, a);"));
+    // no other launch of either kernel
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "launch(k.act_" ++ "quant,"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "launch(k.act_quant_" ++ "vec"));
+}
+
+test "TF_DS_WOA_MERGE: unset, empty and 1 are on, 0 is off, any other text is null (the start is refused at its call site)" {
+    try std.testing.expectEqual(@as(?bool, true), woaMergeWanted(null));
+    try std.testing.expectEqual(@as(?bool, true), woaMergeWanted(""));
+    try std.testing.expectEqual(@as(?bool, true), woaMergeWanted("1"));
+    try std.testing.expectEqual(@as(?bool, false), woaMergeWanted("0"));
+    for ([_][]const u8{ "2", "on", "true", " 1", "01", "-1", "10" }) |bad| try std.testing.expectEqual(@as(?bool, null), woaMergeWanted(bad));
+}
+
+test "TF_DS_WOA_MERGE: the merged launch's group strides are the per-group launches' offsets (wo_a's 2 groups of 1,024 outputs x 4,096 K, and a 4-group shape)" {
+    for ([_][2]usize{ .{ 4096, 1024 }, .{ 2048, 512 }, .{ 4096, 128 } }) |sh| {
+        const gk = sh[0];
+        const gn = sh[1];
+        const st = woaGroupStrides(gk, gn);
+        try std.testing.expectEqual(@as(i64, @intCast(gk)), st.gq);
+        try std.testing.expectEqual(@as(i64, @intCast((gk / 32) * 4)), st.gs);
+        try std.testing.expectEqual(@as(i64, @intCast(1 * gn * gk)), st.gw);
+        try std.testing.expectEqual(@as(i64, @intCast(1 * (gn / 32) * (gk / 32))), st.gws);
+        try std.testing.expectEqual(@as(i64, @intCast(1 * gn * 2)), st.gy);
+    }
+    const st = woaGroupStrides(4096, 1024);
+    try std.testing.expectEqual(@as(i64, 4096), st.gq);
+    try std.testing.expectEqual(@as(i64, 512), st.gs);
+    try std.testing.expectEqual(@as(i64, 4194304), st.gw);
+    try std.testing.expectEqual(@as(i64, 4096), st.gws);
+    try std.testing.expectEqual(@as(i64, 2048), st.gy);
+}
+
+test "TF_DS_WOA_MERGE: woA8Groups launches one grid.z = groups launch a row block when it is on and a launch a group otherwise; the offsets are the strides' (every needle split: a literal of this file is the file's text)" {
+    const src = @embedFile("mx.zig");
+    const at = std.mem.indexOf(u8, src, "fn woA8" ++ "Groups(").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n}\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, ".{ cdiv(b.n, 128), gn / 128, if (merged) " ++ "groups else 1 }"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "const merged = woa_merge and groups " ++ "> 1;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "for (0..if (merged) 1 else " ++ "groups) |g|"));
+    // no strides on the per-group launches: every one is zero unless merged
+    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, body, "= if (merged) st."));
+    // the kernel side takes them (native.cu's W8Args carries the five strides; mx.zig's W8Args mirrors it field for field)
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "gq: i64 = 0, // TF_DS_WOA_MERGE" ++ ": group z's operands"));
 }

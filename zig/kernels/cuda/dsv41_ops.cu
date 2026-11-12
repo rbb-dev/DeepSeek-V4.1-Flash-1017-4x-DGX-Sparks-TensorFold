@@ -254,10 +254,12 @@ struct TfDsPrefetch {
 // launched beside it first runs undisturbed), one block issues a wave of blockDim 8 KiB bulk L2 prefetches every
 // wave_ns, the ranges in order, so DRAM's queue holds about a wave and the latency-bound kernels running beside keep
 // most of their load latency. Each range starts on a chunk of its own; its bytes are cut to whole 16-byte units.
-// wave_ns 0: every chunk at once from the grid's blocks. Writes nothing.
-extern "C" __global__ void __launch_bounds__(128) tf_ds_l2_prefetch_kernel(TfDsPrefetch a, long long delay_ns, long long wave_ns) {
+// wave_ns 0: every chunk at once from the grid's blocks. chunk_bytes (TF_DS_L2_CHUNK_KIB; 0: 8 KiB, the served chunk): the bulk prefetch's size, so a wave is
+// blockDim chunks and the queue a wave puts ahead of other DRAM traffic (a NIC's DMA, a staging copy) is blockDim x chunk_bytes; the caller scales wave_ns with it to
+// keep the rate. The same lines are touched whatever the chunk (a range is cut into chunks, the last one short). Writes nothing.
+extern "C" __global__ void __launch_bounds__(128) tf_ds_l2_prefetch_kernel(TfDsPrefetch a, long long delay_ns, long long wave_ns, long long chunk_bytes) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    const long long chunk = 8 << 10;
+    const long long chunk = chunk_bytes > 0 ? chunk_bytes : (8 << 10);
     if (delay_ns > 0) {
         unsigned long long t0;
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));

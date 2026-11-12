@@ -53,12 +53,15 @@ const ring2d = @import("ring2d.zig");
 const roci_engine = @import("roci_engine.zig");
 const roci_pair = @import("roci_pair.zig");
 const pair_spans = @import("pair_spans.zig");
+const pack_epilogue = @import("pack_epilogue.zig");
 const pass_meter = @import("pass_meter.zig");
 const pair_nap = @import("rdma_nap.zig");
 const any_check = @import("any_check.zig");
 const rdma = @import("rdma.zig");
 const tri_index = @import("tri_index.zig");
 const tri_attn = @import("tri_attn.zig");
+const tri_norm = @import("tri_norm.zig");
+const tri_hc = @import("tri_hc.zig");
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK), the resume grid: a prompt's passes start at its multiples, and every
 /// kept state, mark and frame of the grid stands on one. A pass runs one unit, or with TF_DS_PASS_ROWS up to
 /// pass_rows_max rows of whole units (lanes.passLen), where the facts allow (lanes.stream.passRows); with
@@ -458,8 +461,16 @@ fn useGemmW16(d: *const cuda.Driver, comm: *const comm_mod.Comm, stream: cuda.St
     std.log.info("{s}", .{gemmW16Line(&buf, cannot, why, if (k) |x| x.sf == .exact else false)});
 }
 
-    pub fn drafting(m: *const Model) bool {
-        return m.dr != null;
+/// TF_DS_SPLIT64N `asked` in effect (mx.Kernels.useSplit64n): one line when asked, on, or off and why. wkv's and wq_a's exact split64 GEMMs
+/// then run on a 64-column tile, two blocks an SM; each output element's K chain is the 128-column tile's, so the replies' bits without it.
+/// A rank's own launches: ranks may differ.
+fn useSplit64n(k: ?*mx.Kernels, asked: bool) void {
+    if (!asked) return;
+    const x = k orelse return std.log.info("TF_DS_SPLIT64N=1: off: needs the checkpoint's own FP8 / MXFP4 weights", .{});
+    if (!x.useSplit64n(true)) return std.log.info("TF_DS_SPLIT64N=1: off: the 64-column tile is not in this image or did not load on this GPU", .{});
+    std.log.info("TF_DS_SPLIT64N=1: wkv's (N 512) and wq_a's (N 1,280) exact split GEMMs of a prompt chunk on a 64 x 64 tile (128 threads, two blocks an SM), the 128-column tile's bytes{s}", .{if (x.sf == .exact) "" else " (they take it with TF_DS_MMA_SF_EXACT)"});
+}
+
 /// TF_DS_PF_T64 `asked` in effect (mx.Kernels.usePfT64): one line when asked, on, or off and why. The router's bf16 GEMM of a prompt chunk
 /// (384 columns) then runs on a 64 x 64 tile, two CTAs an SM; each output element's K chain is the 128 x 128 tile's, so the replies' bits
 /// without it. A rank's own launches: ranks may differ.
@@ -480,7 +491,14 @@ fn gemmW16Line(buf: []u8, cannot: u32, why: ?[]const u8, sf_exact: bool) []const
     return std.fmt.bufPrint(buf, "TF_DS_GEMM_W16=1: a prompt chunk's {s} on 16 warps a block (512 threads), the 8-warp kernels' tiles, stages and shared memory, on every rank", .{if (sf_exact) "exact GEMMs and wo_a's bf16 rows" else "wo_a's bf16 rows alone (the exact GEMMs need TF_DS_MMA_SF_EXACT)"}) catch buf[0..0];
 }
 
-    // -- the primitives (both ranks, in the same order) ----------------------------------------------------------
+/// TF_DS_AQ_VEC in effect (read at Model.open into mx.aq_vec_on, on unless 0): one line, on, or off and why. act_quant's bytes are the baseline either way (the kernels replay's
+/// act_quant section compares every one); a call whose x or q is not aligned, or not bf16, runs the baseline kernel in either case.
+fn useAqVec(k: ?*mx.Kernels) void {
+    if (!mx.aq_vec_on) return std.log.info("TF_DS_AQ_VEC=0: act_quant runs the baseline kernel, a warp a 32-value group (the operator's choice)", .{});
+    const x = k orelse return;
+    if (x.act_quant_vec == null) return std.log.warn("TF_DS_AQ_VEC: off: this image has no tf_dsn_act_quant_vec_kernel; the baseline act_quant kernel", .{});
+    std.log.info("TF_DS_AQ_VEC: on: act_quant on four lanes a 32-value group with 16-byte loads (a call that is not bf16 or not aligned runs the baseline kernel)", .{});
+}
 
 /// TF_DS_PF_RUN128 `asked` in effect on this rank's kernels, one line when asked: on, or off and why (the checkpoint's
 /// own weights and the tile kernels). Its bits are the baseline tiles' either way.
@@ -737,6 +755,162 @@ pub fn sfGuard(gpa: std.mem.Allocator, d: *const cuda.Driver, s: cuda.Stream, k:
         if (n == 0 or n > chunk_rows or seq.len != start + n) return error.BadChunk;
         if (m.waves and n > wave_rows) return m.fillPair(seq, start, n, replay);
         const e = &m.eng;
+/// TF_DS_HC_FUSED `asked` in effect: a prompt chunk's mHC mixes and their finish in one launch from the kit's extra set
+/// (_hc_pre_pf_fused), one line saying so. A launch the set has no variant for keeps the baseline two kernels (tri_hc.hcPrePf
+/// counts it). A kit whose extra set (aot-extra/) did not load (`why`) or holds no _hc_pre_pf_fused (`variants`,
+/// extraVariants) ends the start by name: asking for the kernel and running the baseline two under its name would measure nothing.
+fn useHcFused(asked: bool, loaded: bool, why: ?[]const u8, variants: usize) !void {
+    tri_hc.hc_fused = false;
+    if (!asked) return;
+    var buf: [192]u8 = undefined;
+    if (hcFusedRefusal(&buf, loaded, why, variants)) |text| {
+        std.log.err("{s}", .{text});
+        return error.KitLacksKernel;
+    }
+    tri_hc.hc_fused = true;
+    std.log.info("TF_DS_HC_FUSED=1: a prompt chunk's mHC mixes and their finish in one launch (the same block partials in their order, the posted streams kept in the kernel), {d} variants in the kit; a shape the set has no variant for keeps the baseline two launches", .{variants});
+}
+
+/// TF_DS_ATTN_EPI_FUSED `asked` in effect: a prompt chunk's attention epilogue (inverse RoPE and wo_a's quant) in the final
+/// store of the part kernel, the kit's _sparse_attn_part_ue (o is never written). It needs TF_DS_ATTN_EPILOGUE in effect
+/// (Model.open checks it where that is put into effect; packed latents take the fusion only with TF_DS_ATTN_U); a launch the set has no variant for keeps
+/// the baseline part kernel and epilogue (tri_attn counts it). A kit whose extra set did not load (`why`) or holds no
+/// _sparse_attn_part_ue (`variants`) keeps the baseline two kernels, said in a warning line the speed report prints (the switch is on by default).
+fn useAttnEpiFused(asked: bool, loaded: bool, why: ?[]const u8, variants: usize) !void {
+    tri_attn.attn_epi_fused = false;
+    if (!asked) return;
+    var buf: [192]u8 = undefined;
+    if (attnEpiFusedRefusal(&buf, loaded, why, variants)) |text| {
+        // on by default: a kit without the kernel is a loud fallback (the speed report prints this line), never a refused start
+        std.log.warn("TF_DS_ATTN_EPI_FUSED=1: off: {s}", .{text});
+        return;
+    }
+    tri_attn.attn_epi_fused = true;
+    std.log.info("TF_DS_ATTN_EPI_FUSED=1: a prompt chunk's attention epilogue (inverse RoPE, wo_a's quant) in the part kernel's final store, {d} variants in the kit; a shape the set has no variant for keeps the baseline part kernel and epilogue", .{variants});
+}
+
+/// TF_DS_ATTN_EPI_TWIN (`epi`: ue, we or xe; we unless set) beside TF_DS_ATTN_EPI_FUSED: the epilogue-fused part kernel from the kit's
+/// _sparse_attn_part_we or _xe (the same bytes as _ue). A kit without it (`variants` 0) keeps _ue, said in a warning line the speed report
+/// prints; a launch the set has no variant for keeps _ue (tri_attn counts it). TF_DS_ATTN_TWIN (the decode and unfused calls) does not move it.
+fn useAttnEpiWe(epi: tri_attn.EpiTwin, fused: bool, variants_we: usize, variants_xe: usize) void {
+    tri_attn.attn_epi_we = false;
+    tri_attn.attn_epi_xe = false;
+    if (!fused or epi == .ue) return;
+    const xe = epi == .xe;
+    const variants = if (xe) variants_xe else variants_we;
+    const name: []const u8 = if (xe) "_sparse_attn_part_xe" else "_sparse_attn_part_we";
+    if (variants == 0) return std.log.warn("TF_DS_ATTN_EPI_TWIN={s}: off: the kit's extra set (aot-extra/aot.json) holds no {s}; the fused attention epilogue keeps _sparse_attn_part_ue", .{ @tagName(epi), name });
+    if (xe) tri_attn.attn_epi_xe = true else tri_attn.attn_epi_we = true;
+    std.log.info("TF_DS_ATTN_EPI_TWIN={s}: the fused attention epilogue from {s} ({d} variants in the kit; _ue's bytes); a launch the set has no variant for keeps _ue", .{ @tagName(epi), name, variants });
+}
+
+/// TF_DS_IDX_TPP as asked (`text`): key tiles a program of a prompt chunk's index score. Unset or empty is the default, 4 (the kit's twin _index_score_rows_t); "4" is 4; "0" is the baseline
+/// kernel; null for any other text (Model.open refuses the start with it at its call site; this parse is pure and logs nothing).
+fn idxTppWanted(text: ?[]const u8) ?usize {
+    const t = text orelse return 4;
+    if (t.len == 0 or std.mem.eql(u8, t, "4")) return 4;
+    if (std.mem.eql(u8, t, "0")) return 0;
+    return null;
+}
+
+/// TF_DS_IDX_TPP's value (`text`) where a refused one cannot have got (Model.open): 4 or 0.
+fn idxTpp(text: ?[]const u8) usize {
+    return idxTppWanted(text) orelse 0;
+}
+
+/// TF_DS_IDX_TPP (`text`) in effect: a prompt chunk's index score from the kit's twin _index_score_rows_t (a program takes 4 key tiles in
+/// turn: queries, weights and visible lengths read once, the next tile's rows prefetched into L1; the same scores, keys and maxima), one
+/// line saying so with the variants the kit holds. On unless 0 (the default since S9's kernel time: t/u 0.958-0.980 at the 9 production shapes). An extra set that did not load (`why`)
+/// or one that holds no _index_score_rows_t (`variants`) leaves it off, said in a line that says "off:" (never a refused start: the baseline kernel runs). 0 is the operator's choice, said
+/// without "off:" (the speed report would read it as "cannot run").
+fn useIdxTpp(text: ?[]const u8, loaded: bool, why: ?[]const u8, variants: usize) void {
+    tri_index.idx_tpp = 0;
+    const v = idxTppWanted(text) orelse return; // (a bad value never gets here: Model.open refused it)
+    if (v == 0) return std.log.info("TF_DS_IDX_TPP=0: a prompt chunk's index score runs the baseline kernel (the operator's choice)", .{});
+    if (!loaded) return std.log.warn("TF_DS_IDX_TPP=4: off: the kit's extra set (aot-extra/) did not load ({s})", .{why orelse "none"});
+    if (variants == 0) return std.log.warn("TF_DS_IDX_TPP=4: off: the kit's extra set (aot-extra/aot.json) holds no _index_score_rows_t", .{});
+    tri_index.idx_tpp = 4;
+    std.log.info("TF_DS_IDX_TPP=4: a prompt chunk's index score from _index_score_rows_t (4 key tiles a program, the next tile's rows prefetched into L1; the same scores and keys), {d} variants in the kit; a variant without its twin keeps the baseline kernel", .{variants});
+}
+
+/// TF_DS_HC_2S `asked` in effect: the two-block mHC mix as the kit's _hc_mix_pf_2s (the four streams of a K block in one program, the
+/// same bytes). On by default: a kit without the kernel keeps _hc_mix_pf_2b, said in a warning line the speed report prints; a
+/// launch the set has no variant for keeps 2b (tri_hc counts it).
+fn useHc2s(asked: bool, loaded: bool, why: ?[]const u8, variants: usize) void {
+    tri_hc.hc_2s = false;
+    if (!asked) return;
+    if (!loaded) return std.log.warn("TF_DS_HC_2S=1: off: the kit's extra set (aot-extra/) did not load ({s}); the two-block mix stays _hc_mix_pf_2b", .{why orelse "none"});
+    if (variants == 0) return std.log.warn("TF_DS_HC_2S=1: off: the kit's extra set (aot-extra/aot.json) holds no _hc_mix_pf_2s; the two-block mix stays _hc_mix_pf_2b", .{});
+    tri_hc.hc_2s = true;
+    std.log.info("TF_DS_HC_2S=1: the two-block mHC mix with the four streams of a K block in one program (_hc_mix_pf_2s, {d} rows a program), {d} variants in the kit; a shape the set has no variant for keeps _hc_mix_pf_2b", .{ tri_hc.hc_2s_rb, variants });
+}
+
+/// What ends a start that asked for TF_DS_ATTN_EPI_FUSED: the kit's extra set did not load, or holds no _sparse_attn_part_ue.
+fn attnEpiFusedRefusal(buf: []u8, loaded: bool, why: ?[]const u8, variants: usize) ?[]const u8 {
+    if (!loaded) return std.fmt.bufPrint(buf, "the kit's extra set (aot-extra/) did not load ({s}); the epilogue stays its own launch", .{why orelse "none"}) catch "the kit's extra set did not load; the epilogue stays its own launch";
+    if (variants == 0) return "the kit's extra set (aot-extra/aot.json) holds no _sparse_attn_part_ue; the epilogue stays its own launch";
+    return null;
+}
+
+/// What ends a start that asked for TF_DS_HC_FUSED: the kit's extra set did not load, or holds no _hc_pre_pf_fused.
+fn hcFusedRefusal(buf: []u8, loaded: bool, why: ?[]const u8, variants: usize) ?[]const u8 {
+    if (!loaded) return std.fmt.bufPrint(buf, "TF_DS_HC_FUSED=1: the kit's extra set (aot-extra/) did not load ({s}); not started", .{why orelse "none"}) catch "TF_DS_HC_FUSED=1: the kit's extra set did not load; not started";
+    if (variants == 0) return "TF_DS_HC_FUSED=1: the kit's extra set (aot-extra/aot.json) holds no _hc_pre_pf_fused; not started";
+    return null;
+}
+
+/// TF_DS_ATTN_TWIN (`text`: u, w, x or z; z unless set, speed_defaults) in effect: which of the kit's twins of _sparse_attn_part the calls of
+/// TF_DS_ATTN_U and TF_DS_ATTN_U_DECODE launch (tri_attn.attn_twin): w the scale bytes read in the code bytes' layout and the
+/// code bytes unpacked where they sit in their registers, x w with the picks' index rows read one block ahead, z w with a
+/// decode round's picks rows prefetched into L2 before the PDL wait; all three give u's bytes. One line saying which and how many of the kit's variants have it. Another
+/// value ends the start by name. The switch without TF_DS_ATTN_U / TF_DS_ATTN_U_DECODE (`any_attn_u`), an extra set that did
+/// not load (`why`) or one that holds no twin of that name keep u, said in an "off" line the speed report prints (the switch
+/// is on by default).
+fn useAttnTwin(a: std.mem.Allocator, io: std.Io, text: ?[]const u8, any_attn_u: bool, loaded: bool, why: ?[]const u8, extra_dir: []const u8) !void {
+    tri_attn.attn_twin = .u;
+    const t = text orelse return;
+    if (t.len == 0) return;
+    const twin = tri_attn.Twin.parse(t) orelse {
+        std.log.err("TF_DS_ATTN_TWIN={s}: not one of u, w, x, z; not started", .{t});
+        return error.BadSetting;
+    };
+    if (twin == .u) return;
+    // on by default (z): what keeps it from running is a loud fallback to u (the speed report prints the line), never a refused start
+    if (!any_attn_u) return std.log.warn("TF_DS_ATTN_TWIN={s}: off: neither TF_DS_ATTN_U nor TF_DS_ATTN_U_DECODE is on, so no call would ask for it; the baseline kernel (u)", .{t});
+    if (!loaded) return std.log.warn("TF_DS_ATTN_TWIN={s}: off: the kit's extra set (aot-extra/) did not load ({s}); the baseline kernel (u)", .{ t, why orelse "none" });
+    const n = extraVariants(a, io, extra_dir, twin.kernel());
+    if (n == 0) return std.log.warn("TF_DS_ATTN_TWIN={s}: off: the kit's extra set (aot-extra/aot.json) holds no {s}; the baseline kernel (u)", .{ t, twin.kernel() });
+    tri_attn.attn_twin = twin;
+    std.log.info("TF_DS_ATTN_TWIN={s}: the sparse attention calls of TF_DS_ATTN_U / TF_DS_ATTN_U_DECODE launch {s} ({d} variants in the kit; u's bytes); a launch of a variant without it takes the baseline kernel", .{ t, twin.kernel(), n });
+}
+
+/// TF_DS_ROPE_W `asked` in effect: rope_heads from the kit's twin _rope_heads_w (each (even, odd) bf16 pair read and written
+/// as one 32-bit word: _rope_heads's bytes), one line saying so; a launch of a variant without its twin takes the baseline
+/// kernel (Tri.runTwin). An extra set that did not load (`why`) or holds no _rope_heads_w (`variants`) keeps _rope_heads, said
+/// in an "off" line the speed report prints (the switch is on by default).
+fn useRopeW(asked: bool, loaded: bool, why: ?[]const u8, variants: usize) !void {
+    tri_norm.rope_w = false;
+    if (!asked) return;
+    // on by default: a kit without the twin is a loud fallback (the speed report prints the line), never a refused start
+    if (!loaded) return std.log.warn("TF_DS_ROPE_W=1: off: the kit's extra set (aot-extra/) did not load ({s}); the baseline _rope_heads", .{why orelse "none"});
+    if (variants == 0) return std.log.warn("TF_DS_ROPE_W=1: off: the kit's extra set (aot-extra/aot.json) holds no _rope_heads_w; the baseline _rope_heads", .{});
+    tri_norm.rope_w = true;
+    std.log.info("TF_DS_ROPE_W=1: RoPE on the heads from _rope_heads_w (the bf16 pairs as 32-bit words: _rope_heads's bytes), {d} variants in the kit; a launch of a variant without its twin takes the baseline kernel", .{variants});
+}
+
+/// TF_DS_QKV_PLAIN `asked` in effect: a decode window's q RMSNorm and window-KV norm / RoPE / quant as one launch of the kit's extra set's
+/// _q_kv_norm without rotations (`variants`: how many of the extra set's _q_kv_norm variants there are; the base set has that function only
+/// with rotations). An extra set that did not load (`why`) or holds no such variant keeps the two launches, said in an "off" line the speed
+/// report prints (the switch is on by default): never a refused start.
+fn useQkvPlain(asked: bool, loaded: bool, why: ?[]const u8, variants: usize) void {
+    round.qkv_plain = false;
+    if (!asked) return;
+    if (!loaded) return std.log.warn("TF_DS_QKV_PLAIN=1: off: the kit's extra set (aot-extra/) did not load ({s}); the q norm and the window KV stay two launches", .{why orelse "none"});
+    if (variants == 0) return std.log.warn("TF_DS_QKV_PLAIN=1: off: the kit's extra set (aot-extra/aot.json) holds no _q_kv_norm variant without rotations (NROT 0, SPLIT 0); the q norm and the window KV stay two launches", .{});
+    round.qkv_plain = true;
+    std.log.info("TF_DS_QKV_PLAIN=1: a decode window's q RMSNorm and window KV as one launch of the kit's _q_kv_norm ({d} variants in the extra set; the two kernels' bytes); a launch of a shape without the variant makes the two", .{variants});
+}
+
 /// TF_DS_NACT_LOG=1 (log only, off by default): the device ring the decode groupings append to (mx.nact_ring; none when off: no launch, no copy),
 /// written by flushDiag to nact-rank<R>.txt in TF_DS_NACT_DIR (default the folder's log directory): per decode launch, the rows, the distinct
 /// experts, how many of them this node owns and whether the shared expert is among them: what a launch's gate / up and down weight bytes are.
@@ -837,6 +1011,96 @@ fn useIdxU(a: std.mem.Allocator, io: std.Io, asked: bool, loaded: bool, why: ?[]
     } else std.log.info("TF_DS_IDX_U=1: a prompt chunk's indexer scores from _index_score_rows_u (the keys unpacked in hardware); a variant without its twin keeps the baseline kernel", .{});
 }
 
+/// TF_DS_IDX_V `asked` in effect: a prompt chunk's index score from the kit's twin _index_score_rows_v (the key tile
+/// dequantized once a program, each of the program's rows dotted in turn, its head sum written out, at four warps: the
+/// same scores and keys), one line saying so; it replaces _index_score_rows_u where both are on, and a launch of a variant
+/// without its twin falls back to the u twin and then the baseline kernel (tri_index.scoreRows). A kit whose extra set
+/// (aot-extra/) did not load (`why`) or holds no _index_score_rows_v (`variants`, extraVariants) ends the start by name:
+/// asking for the twin and running the baseline kernel under its name would measure nothing.
+fn useIdxV(asked: bool, loaded: bool, why: ?[]const u8, variants: usize) !void {
+    tri_index.idx_v = false;
+    if (!asked) return;
+    var buf: [192]u8 = undefined;
+    if (idxVRefusal(&buf, loaded, why, variants)) |text| {
+        std.log.err("{s}", .{text});
+        return error.KitLacksTwin;
+    }
+    tri_index.idx_v = true;
+    std.log.info("TF_DS_IDX_V=1: a prompt chunk's indexer scores from _index_score_rows_v (the key tile dequantized once a program, a row's dots at a time, four warps: the same scores and keys), {d} variants in the kit; a launch of a variant without its twin falls back to the u twin and then the baseline kernel", .{variants});
+}
+
+/// What ends a start that asked for TF_DS_IDX_V: the kit's extra set did not load, or holds no _index_score_rows_v.
+fn idxVRefusal(buf: []u8, loaded: bool, why: ?[]const u8, variants: usize) ?[]const u8 {
+    if (!loaded) return std.fmt.bufPrint(buf, "TF_DS_IDX_V=1: the kit's extra set (aot-extra/) did not load ({s}); not started", .{why orelse "none"}) catch "TF_DS_IDX_V=1: the kit's extra set did not load; not started";
+    if (variants == 0) return "TF_DS_IDX_V=1: the kit's extra set (aot-extra/aot.json) holds no _index_score_rows_v; not started";
+    return null;
+}
+
+/// How many variants of `function` the kit's extra set at `extra_dir` holds (0 when its aot.json does not read).
+fn extraVariants(a: std.mem.Allocator, io: std.Io, extra_dir: []const u8, function: []const u8) usize {
+    var m = cuda.aot.Manifest.read(a, io, extra_dir) catch return 0;
+    defer m.deinit();
+    return m.variants(function);
+}
+
+/// TF_DS_MERGE_D as asked: unset, empty or 3 (16 columns a program: 32 programs a row and head group, measured the fastest of
+/// the kit's widths), 1 (128), 2 (64), 0 (off); null for any other text (Model.open refuses the start with it: a typo must not
+/// run the default unseen). Pure: the refusal is logged at the call site.
+var merge_d_asked: usize = 0;
+fn mergeDWanted(v: ?[]const u8) ?usize {
+    const t = v orelse return 16;
+    if (t.len == 0 or std.mem.eql(u8, t, "3")) return 16;
+    if (std.mem.eql(u8, t, "0")) return 0;
+    if (std.mem.eql(u8, t, "1")) return 128;
+    if (std.mem.eql(u8, t, "2")) return 64;
+    return null;
+}
+
+/// Which widths the loaded kit's extra set holds a _sparse_attn_merge_d for (a variant compiled with that DB).
+const MergeHave = struct { c16: bool = false, c64: bool = false, c128: bool = false };
+fn mergeDHave(a: std.mem.Allocator, io: std.Io, extra_dir: []const u8) MergeHave {
+    var m = cuda.aot.Manifest.read(a, io, extra_dir) catch return .{};
+    defer m.deinit();
+    const f = "_sparse_attn_merge_d";
+    return .{
+        .c16 = m.has(f, &.{cuda.aot.ci("DB", 16)}),
+        .c64 = m.has(f, &.{cuda.aot.ci("DB", 64)}),
+        .c128 = m.has(f, &.{cuda.aot.ci("DB", 128)}),
+    };
+}
+
+/// The width a kit that holds `have` runs for `asked`: the asked width when its extra set has it, else 128 (the first kits'
+/// width), else 64, else null (none: the single-program merge).
+fn mergeDResolve(asked: usize, have: MergeHave) ?usize {
+    if (asked == 0) return null;
+    const ok = switch (asked) {
+        16 => have.c16,
+        64 => have.c64,
+        128 => have.c128,
+        else => false,
+    };
+    if (ok) return asked;
+    if (have.c128) return 128;
+    if (have.c64) return 64;
+    return null;
+}
+
+/// TF_DS_MERGE_D `asked` (the columns a program) in effect on this rank: a decode round's split merge from the kit's
+/// twin _sparse_attn_merge_d when the extra set loaded (`loaded`; else `why` it did not), `variants` of its twins there
+/// (the kit's two merge variants at each width), `have` the widths it holds. A kit without the asked width runs the next one
+/// it has (128, then 64) and says so; one line either way; a launch without its twin keeps the baseline kernel.
+fn useMergeD(asked: usize, loaded: bool, why: ?[]const u8, variants: usize, have: MergeHave) void {
+    tri_attn.merge_db = 0;
+    if (asked == 0) return;
+    if (!loaded) return std.log.info("TF_DS_MERGE_D: off: the kit's extra set (aot-extra/) did not load ({s})", .{why orelse "none"});
+    if (variants == 0) return std.log.info("TF_DS_MERGE_D: off: the loaded kit's extra set has no _sparse_attn_merge_d: kit a02466e or later", .{});
+    const got = mergeDResolve(asked, have) orelse return std.log.info("TF_DS_MERGE_D: off: the loaded kit's extra set has no _sparse_attn_merge_d at 128, 64 or {d} columns a program", .{asked});
+    // ("instead: " is the speed report's marker: the feature still runs, the report says which width)
+    if (got != asked) std.log.warn("TF_DS_MERGE_D: instead: runs {d} columns a program, not {d}: the loaded kit's extra set has no _sparse_attn_merge_d at {d} columns (it needs the kit regenerated with that width)", .{ got, asked, asked });
+    tri_attn.merge_db = got;
+    std.log.info("TF_DS_MERGE_D: a decode round's split merge in programs of {d} columns (_sparse_attn_merge_d, the same bits); the extra set holds {d} twins in all widths", .{ got, variants });
+}
+
 fn useAttnUDecode(a: std.mem.Allocator, io: std.Io, asked: bool, loaded: bool, why: ?[]const u8, aot_dir: []const u8, extra_dir: []const u8) void {
     tri_attn.attn_u_decode = false;
     if (!asked) return;
@@ -934,6 +1198,7 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         .replay_floor = @intFromBool(prompt.replay_floor),
         .exch = prompt2d.exchAsked(),
         .kern = prompt2d.kernAsked(),
+        .kern2 = prompt2d.kern2Asked(),
         .pf_split = @backingInt(prompt2d.pf_split_asked),
         .pf_raster = prompt2d.pf_raster_asked,
         .pass_rows = prompt2d.pass_rows_asked,
@@ -1087,6 +1352,11 @@ fn openPair(m: *Model, gpa: std.mem.Allocator, d: *const cuda.Driver, o: Options
     std.log.info("TF_DS_ROCI_STAGGER=1: rank {d}: {d} whole passes of {d} rows in flight (TF_DS_ROCI_STAGGER_LANES), the later's layer L after the earlier's layer L caches, issue gap {d} layers (TF_DS_ROCI_STAGGER_GAP), stream priorities A {d} and B {d} (TF_DS_ROCI_STAGGER_PRIO={d}; a lower number is more urgent), the Engram worker's order {s} (TF_DS_ROCI_WORKER_PAIR_MAJOR); the second pass's chunk and node take {d} bytes of the device arena, its transport's arena {d} bytes and control block {d} bytes; {d} bytes free before, {d} after; the Engram worker's ring holds {d} chunk slots of {d} rows, a pass takes {d}; the KV pool holds {d} positions ({d:.2} GiB on this Spark, POOL) and the floor kept free is {d:.1} GiB", .{ m.comm.rank, m.pair_lanes, m.pass_rows, m.pair_gap, m.stream.priority() catch -99, m.stream_b.?.priority() catch -99, @backingInt(m.pair_prio), if (m.pair_major) "pair-major (both passes' layer 0, then both layer 1)" else "pass-major (each pass's layers in turn)", m.pair_bytes, lay.total, @sizeOf(@import("rocinante.zig").Control), free, after.free, m.workerSlots(), chunk_rows, m.pass_rows / chunk_rows, m.pool_cap, @as(f64, @floatFromInt(poolView(m, c).bytes(m.pool_cap))) / (1 << 30), @as(f64, @floatFromInt(pair_guard_bytes)) / (1 << 30) });
 }
 
+    /// The next nap in microseconds (0: the setting's slice); `backoff` doubles it each empty wake up to issue_lead.backoff_cap_us.
+    cur_us: u32 = 0,
+        if (c.cur_us == 0) c.cur_us = c.m.ilead_slice_us;
+        const ts: std.c.timespec = .{ .sec = 0, .nsec = @as(isize, c.cur_us) * std.time.ns_per_us };
+        if (c.m.ilead_wait == .backoff) c.cur_us = issue_lead.backoffNext(c.cur_us, issue_lead.backoff_cap_us);
     return where.report(buf);
 /// One line of TF_DS_ROCI_PAIR_LOG: to the log, and appended to the file the variable names when its value is a path.
 fn pairLog(comptime fmt: []const u8, args: anytype) void {
@@ -1192,6 +1462,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         prompt2d.roci_sent_first_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ROCI_SENT_FIRST")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.roci_combine_door_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ROCI_COMBINE_DOOR")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.roci_stagger_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ROCI_STAGGER")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.pack_epilogue_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_PACK_EPILOGUE")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         {
             const text: ?[]const u8 = if (std.c.getenv("TF_DS_ROCI_STAGGER_LANES")) |v| std.mem.span(v) else null;
             prompt2d.roci_stagger_lanes = roci_pair.lanesOf(text) orelse {
@@ -1225,12 +1496,31 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         prompt2d.mma_sf_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_MMA_SF")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.mma_sf_exact_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_MMA_SF_EXACT")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.gemm_w16_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_GEMM_W16")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.split64n_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_SPLIT64N")) |v| std.mem.span(v) else null); // this rank's launches alone: its bytes are the 128-column tile's
         prompt2d.pf_t64_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_PF_T64")) |v| std.mem.span(v) else null); // this rank's launches alone: its bytes are the 128 x 128 tile's
         prompt2d.gemm_r2_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_GEMM_R2")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.attn_u_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ATTN_U")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.hc_fused_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_HC_FUSED")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.attn_epi_fused_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ATTN_EPI_FUSED")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.hc_2s_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_HC_2S")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.idx_u_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_IDX_U")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.idx_v_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_IDX_V")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.attn_u_decode_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ATTN_U_DECODE")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        const merge_text: ?[]const u8 = if (std.c.getenv("TF_DS_MERGE_D")) |v| std.mem.span(v) else null; // each rank its own: the bytes are the same
+        merge_d_asked = mergeDWanted(merge_text) orelse {
+            std.log.err("TF_DS_MERGE_D={s}: not one of 0 (off), 1 (128 columns a program), 2 (64), 3 (16, the default); not started", .{merge_text.?});
+            return error.BadSetting;
+        };
+        prompt2d.attn_twin_text = if (std.c.getenv("TF_DS_ATTN_TWIN")) |v| std.mem.span(v) else null;
+        prompt2d.rope_w_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ROPE_W")) |v| std.mem.span(v) else null);
+        prompt2d.idx_tpp_text = if (std.c.getenv("TF_DS_IDX_TPP")) |v| std.mem.span(v) else null;
+        if (idxTppWanted(prompt2d.idx_tpp_text) == null) {
+            std.log.err("TF_DS_IDX_TPP={s}: not 0 or 4; not started", .{prompt2d.idx_tpp_text.?});
+            return error.BadSetting;
+        }
         prompt2d.assemble_quant_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ASSEMBLE_QUANT")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.attn_epilogue_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ATTN_EPILOGUE")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.hc_stride_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_HC_STRIDE")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.ring_wc_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_RING_WC")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.ring_inplace_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_RING_INPLACE")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         const ring_word_text: ?[]const u8 = if (std.c.getenv("TF_DS_RING_WORD")) |v| std.mem.span(v) else null;
@@ -1274,11 +1564,31 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         prompt2d.ring_wait_explicit = ring_wait_text != null;
         prompt2d.qgate_canary_asked = readQgate(); // every rank alike (Settings: any canary; the canary itself, agreeQgateCanary)
         if (std.c.getenv("TF_DS_ROCI_XLOG")) |v| rdma.xlog = std.mem.eql(u8, std.mem.span(v), "1");
+        if (std.c.getenv("TF_DS_L2_NEXT_EARLY")) |v| round.l2_next_early = !std.mem.eql(u8, std.mem.span(v), "0");
         if (std.c.getenv("TF_DS_L2_DN_MB")) |v| round.l2_dn_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dn_mb;
         if (std.c.getenv("TF_DS_L2_DEC_MB")) |v| round.l2_dec_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dec_mb;
         ops_mod.Ops.add2_vec_on = prompt2d.switchDefaultOn(if (std.c.getenv("TF_DS_ADD2_VEC")) |v| std.mem.span(v) else null); // the bytes are the scalar kernel's: a rank may differ
         if (std.c.getenv("TF_EXL3_L2_DELAY_NS")) |v| ops_mod.l2_delay_ns = std.fmt.parseInt(c_longlong, std.mem.span(v), 10) catch ops_mod.l2_delay_ns;
         if (std.c.getenv("TF_EXL3_L2_RATE_GBPS")) |v| ops_mod.l2_rate_gbps = std.fmt.parseFloat(f64, std.mem.span(v)) catch ops_mod.l2_rate_gbps;
+        const chunk_text: ?[]const u8 = if (std.c.getenv("TF_DS_L2_CHUNK_KIB")) |v| std.mem.span(v) else null;
+        ops_mod.l2_chunk_bytes = ops_mod.l2ChunkWanted(chunk_text) orelse {
+            std.log.err("TF_DS_L2_CHUNK_KIB={s}: not one of 1, 2, 4, 8, 16 (KiB); not started", .{chunk_text.?});
+            return error.BadSetting;
+        };
+        const aq_text: ?[]const u8 = if (std.c.getenv("TF_DS_AQ_VEC")) |v| std.mem.span(v) else null;
+        mx.aq_vec_on = mx.aqVecWanted(aq_text) orelse {
+            std.log.err("TF_DS_AQ_VEC={s}: not 0 or 1; not started", .{aq_text.?});
+            return error.BadSetting;
+        };
+        const woam_text: ?[]const u8 = if (std.c.getenv("TF_DS_WOA_MERGE")) |v| std.mem.span(v) else null;
+        mx.woa_merge = mx.woaMergeWanted(woam_text) orelse {
+            std.log.err("TF_DS_WOA_MERGE={s}: not 0 or 1; not started", .{woam_text.?});
+            return error.BadSetting;
+        };
+        if (mx.woa_merge) std.log.info("TF_DS_WOA_MERGE=1: wo_a's FP8 groups of a prompt chunk run as one launch (grid.z = groups) instead of one a group: the same bytes (kernels replay woa_merge)", .{}) else std.log.info("TF_DS_WOA_MERGE=0: wo_a's FP8 groups of a prompt chunk run one launch a group (the operator's choice)", .{});
+        if (ops_mod.l2_chunk_bytes != 8192) std.log.info("TF_DS_L2_CHUNK_KIB={d}: the L2 prefetch's waves are {d} KiB chunks x 128 every {d} ns (the served: 8 KiB, same rate, same bytes)", .{ ops_mod.l2_chunk_bytes / 1024, ops_mod.l2_chunk_bytes / 1024, ops_mod.waveNs(ops_mod.l2_rate_gbps, ops_mod.l2_chunk_bytes) });
+        m.round_ms = o.round_ms orelse &draft.round_ms;
+        if (m.round_ms.len == 0) return error.BadRoundMs;
         m.pass_rows = prompt2d.pass_rows_asked; // (every rank alike: the start-up exchange refuses a follower that differs)
         if (prompt2d.pass_tail_asked) std.log.info("TF_DS_PASS_TAIL=1: a prompt's final pass runs up to {d} rows, the remainder after whole {d}-row units merged into it; every other pass stays whole units on the grid", .{ m.pass_rows, chunk_rows });
         m.fill_slot = 0;
@@ -1343,6 +1653,12 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             break :blk try cuda.Stream.initPriority(d, roci_pair.prioritiesOf(m.pair_prio, range.least, range.greatest)[0]);
         } else try cuda.Stream.init(d, true);
         errdefer m.stream.deinit();
+        // TF_DS_WINDOW_ONCE (on unless 0): a chunk uploads its window indices and low position once, not in every layer. Bytes unchanged.
+        prompt.window_once = prompt.windowOnceWanted(if (std.c.getenv("TF_DS_WINDOW_ONCE")) |v| std.mem.span(v) else null);
+        std.log.info("TF_DS_WINDOW_ONCE={s}: rank {d}: a prompt chunk's window gather indices, window low position and ring-write indices are uploaded {s}", .{ if (prompt.window_once) "1" else "0", o.rank, if (prompt.window_once) "once per chunk, into buffers of their own" else "in every layer, as before" });
+                    std.log.warn("TF_DS_ISSUE_LEAD_WAIT={s}: not a mode (poll, block or backoff): poll", .{wait_text.?});
+                else if (m.ilead_wait == .backoff)
+                    std.fmt.bufPrint(&how_buf, "naps that start at {d} us and double each empty wake up to {d} us (TF_DS_ISSUE_LEAD_WAIT=backoff), the transport checked and the Engram worker's slots returned every wake, a wait over {d} ms logged every 5 s (TF_DS_ISSUE_LEAD_WARN_MS, 0: never)", .{ m.ilead_slice_us, issue_lead.backoff_cap_us, m.ilead_warn_ms })
         // rank 0's ports for its followers listen before its weights load: a follower that loads first connects and
         // waits in its port's backlog instead of retrying until rank 0 and the followers before it are in
         m.fan = try prompt2d.Fan.listenAt(o.master, o.listen, o.port, o.rank, o.world);
@@ -1406,14 +1722,33 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         errdefer m.comm.deinit();
         m.comm.host = .{ .star = .{ .links = &m.vfan.links, .rank = o.rank, .world = o.world, .busy = &m.star_busy } };
         // the kit's extra set (aot-extra/), which only the call sites of TF_DS_DRAFT_4WAY's stages, TF_DS_ATTN_U's prompt
+        // attention, TF_DS_IDX_U's and TF_DS_IDX_V's prompt index scores and TF_DS_ATTN_U_DECODE's round attention search;
+        // then every rank's drafter compared
+        const qkv_plain_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_QKV_PLAIN")) |v| std.mem.span(v) else null);
+        if (weights.draft_4way or prompt2d.attn_u_asked or prompt2d.idx_u_asked or prompt2d.idx_v_asked or prompt2d.attn_u_decode_asked or prompt2d.hc_fused_asked or merge_d_asked != 0 or prompt2d.rope_w_asked or qkv_plain_asked or prompt2d.attn_epi_fused_asked or prompt2d.hc_2s_asked or idxTpp(prompt2d.idx_tpp_text) != 0) {
         const load_why = extra_why;
         if (weights.draft_4way) if (m.extra) |*x| {
             extra_why = try draft.fourWayKitOff(gpa, SetLookups{ .set = x }, c, sp.headSpan(c.*)[1]);
         };
+        try useAttnTwin(a, io, prompt2d.attn_twin_text, prompt2d.attn_u_asked or prompt2d.attn_u_decode_asked, m.extra != null, load_why, try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }));
+        useQkvPlain(qkv_plain_asked, m.extra != null, load_why, if (qkv_plain_asked and m.extra != null) extraVariants(a, io, try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }), "_q_kv_norm") else 0);
+        try useRopeW(prompt2d.rope_w_asked, m.extra != null, load_why, if (prompt2d.rope_w_asked and m.extra != null) extraVariants(a, io, try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }), "_rope_heads_w") else 0);
+        useIdxTpp(prompt2d.idx_tpp_text, m.extra != null, load_why, if (idxTpp(prompt2d.idx_tpp_text) != 0 and m.extra != null) extraVariants(a, io, try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }), "_index_score_rows_t") else 0);
         useAttnU(a, io, prompt2d.attn_u_asked, m.extra != null, load_why, o.aot_dir orelse try std.fs.path.join(a, &.{ o.kit_dir, "aot" }), try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }));
         try agreeTwin(d, &m.comm, m.stream, "TF_DS_ATTN_U", prompt2d.attn_u_asked, &tri_attn.attn_u);
         useIdxU(a, io, prompt2d.idx_u_asked, m.extra != null, load_why, o.aot_dir orelse try std.fs.path.join(a, &.{ o.kit_dir, "aot" }), try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }));
         try agreeTwin(d, &m.comm, m.stream, "TF_DS_IDX_U", prompt2d.idx_u_asked, &tri_index.idx_u);
+        try useIdxV(prompt2d.idx_v_asked, m.extra != null, load_why, if (prompt2d.idx_v_asked and m.extra != null) extraVariants(a, io, try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }), "_index_score_rows_v") else 0);
+        try useHcFused(prompt2d.hc_fused_asked, m.extra != null, load_why, if (prompt2d.hc_fused_asked and m.extra != null) extraVariants(a, io, try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }), "_hc_pre_pf_fused") else 0);
+        useMergeD(merge_d_asked, m.extra != null, load_why, if (merge_d_asked != 0 and m.extra != null) extraVariants(a, io, try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }), "_sparse_attn_merge_d") else 0, if (merge_d_asked != 0 and m.extra != null) mergeDHave(a, io, try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" })) else .{});
+        try useAttnEpiFused(prompt2d.attn_epi_fused_asked, m.extra != null, load_why, if (prompt2d.attn_epi_fused_asked and m.extra != null) extraVariants(a, io, try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }), "_sparse_attn_part_ue") else 0);
+        const epi_text: ?[]const u8 = if (std.c.getenv("TF_DS_ATTN_EPI_TWIN")) |v| std.mem.span(v) else null;
+        const epi_twin = tri_attn.epiTwinWanted(epi_text) orelse {
+            std.log.err("TF_DS_ATTN_EPI_TWIN={s}: not one of ue, we, xe; not started", .{epi_text.?});
+            return error.BadSetting;
+        };
+        useAttnEpiWe(epi_twin, tri_attn.attn_epi_fused, if (tri_attn.attn_epi_fused and m.extra != null) extraVariants(a, io, try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }), "_sparse_attn_part_we") else 0, if (tri_attn.attn_epi_fused and m.extra != null) extraVariants(a, io, try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }), "_sparse_attn_part_xe") else 0);
+        useHc2s(prompt2d.hc_2s_asked, m.extra != null, load_why, if (prompt2d.hc_2s_asked and m.extra != null) extraVariants(a, io, try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }), "_hc_mix_pf_2s") else 0);
         useAttnUDecode(a, io, prompt2d.attn_u_decode_asked, m.extra != null, load_why, o.aot_dir orelse try std.fs.path.join(a, &.{ o.kit_dir, "aot" }), try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }));
         try agreeTwin(d, &m.comm, m.stream, "TF_DS_ATTN_U_DECODE", prompt2d.attn_u_decode_asked, &tri_attn.attn_u_decode);
         m.pf = try exl3_prefill.Kernels.load(d, try readKit(a, io, o.kit_dir, "linear.cubin"));
@@ -1437,6 +1772,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         useGroupTiles(if (m.mxk) |*x| x else null, prompt2d.group_tiles_asked);
         useTopkTiles(if (m.mxk) |*x| x else null, prompt2d.topk_tiles_asked, c.index_topk);
         useRun128(if (m.mxk) |*x| x else null, prompt2d.pf_run128_asked);
+        useAqVec(if (m.mxk) |*x| x else null);
         mx.pf_raster = if (m.mxk != null) prompt2d.pf_raster_asked else 0;
         if (prompt2d.pf_raster_asked != 0) {
             if (mx.pf_raster != 0) std.log.info("TF_DS_PF_RASTER={d}: a prompt GEMM whose activation slab is {d} MiB or more (the tile FP8 GEMMs, the block-scaled MMA's and the bf16 tile GEMM) walks its tiles {d} row tiles at a time across all the column tiles; the output bytes are the default order's", .{ mx.pf_raster, mx.raster_slab_bytes >> 20, mx.pf_raster }) else std.log.info("TF_DS_PF_RASTER={d}: off: needs the checkpoint's own FP8 / MXFP4 weights (the EXL3 GEMMs are cuBLAS's)", .{prompt2d.pf_raster_asked});
@@ -1445,6 +1781,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         try useMmaSf(d, &m.comm, m.stream, if (m.mxk) |*x| x else null, prompt2d.mma_sf_asked, sfCovers(m.w.layers, false, &sf_buf));
         try useMmaSfExact(gpa, d, &m.comm, m.stream, if (m.mxk) |*x| x else null, prompt2d.mma_sf_exact_asked, m.w.layers, sfCovers(m.w.layers, true, &sf_buf));
         try useGemmW16(d, &m.comm, m.stream, if (m.mxk) |*x| x else null, prompt2d.gemm_w16_asked);
+        useSplit64n(if (m.mxk) |*x| x else null, prompt2d.split64n_asked);
         usePfT64(if (m.mxk) |*x| x else null, prompt2d.pf_t64_asked);
         useGemmR2(if (m.mxk) |*x| x else null, prompt2d.gemm_r2_asked);
         if (prompt2d.bf16_rows_asked) {
@@ -1485,6 +1822,24 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             try Two.require(d, &m.comm, m.stream, "the front on owned rows (qr and y gathered)", try prompt.frontOwnedOff(gpa, SetFinds{ .set = &m.set }, m.mxk != null, m.w.layers, c.layers / 2, c.eps, &rows4, m.comm.world));
             try Two.require(d, &m.comm, m.stream, "the routing on owned rows (codes, picks and weights gathered)", try prompt.ffnCodesOff(gpa, SetFinds{ .set = &m.set }, m.mxk != null, m.w.layers, c.layers / 2, c.experts, c.top_k, c.routed_scaling, c.top_k + 1, &rows4, m.comm.world));
             try Two.require(d, &m.comm, m.stream, "the expert pack as codes", prompt2d.packCodesOff(m.mxk != null, m.two.?.gu[m.two.?.p], m.two.?.ir));
+            if (prompt2d.pack_epilogue_asked) {
+                // TF_DS_PACK_EPILOGUE: every rank's own check, then on every rank or the start ends naming the rank and its reason (never a silent fallback)
+                const nx = m.w.layers[c.layers / 2].experts.native;
+                const why: ?[]const u8 = if (m.mxk == null) "needs the checkpoint's own FP8 / MXFP4 weights" else if (m.mxk.?.sf != .exact) "needs TF_DS_MMA_SF_EXACT=1 (the twin is the exact block-scaled gate/up's)" else if (m.mxk.?.gemm_r2 or m.mxk.?.gemm_w16) "gate/up runs the R2 / 16-warp kernels (TF_DS_GEMM_R2 / TF_DS_GEMM_W16), which have no quantising epilogue" else if (nx == null) "needs native experts" else blk: {
+                    mx.usePackEpilogue(&m.mxk.?) catch break :blk "TF_DS_PACK_EPILOGUE=1 needs tf_dsn_sf_gu_exact_q_kernel, which this build lacks";
+                    break :blk pack_epilogue.packEpilogueOff(true, m.two.?.gu[m.two.?.p], m.two.?.ir, m.w.layers[c.layers / 2].experts.width, (nx.?.tiles - nx.?.rest_tiles) * 32, nx.?.rest_tiles * 32);
+                };
+                // on every rank or off on every rank, said: the epilogue is a speed change with the same bytes, so a build, kit or setting that cannot
+                // run it leaves the baseline two launches (gate/up, then packQuant) and the start line says why
+                const cannot = try prompt2d.ranksThatCannot(d, &m.comm, m.stream, why == null);
+                if (cannot != 0) {
+                    var rb: [64]u8 = undefined;
+                    prompt2d.pack_epilogue_asked = false;
+                    std.log.info("TF_DS_PACK_EPILOGUE=1: off: {s} cannot run it (this rank: {s}); gate/up and packQuant run as two launches", .{ prompt2d.rankList(cannot, &rb), why orelse "can" });
+                } else {
+                    std.log.info("TF_DS_PACK_EPILOGUE=1: gate/up's twin kernel writes the expert pack's codes and scales into the send region and packQuant does not run, on every rank", .{});
+                }
+            }
             try Two.require(d, &m.comm, m.stream, "the Engram sums at owned rows", try prompt.engramOwnerSumOff(gpa, SetFinds{ .set = &m.set }, m.two.?.ew, m.w.layers, c.layers / 2, c.eps, c.hidden, c.hc, &rows4, m.comm.world));
             try Two.require(d, &m.comm, m.stream, "the boundary layer on owned rows", prompt.boundaryOwnedOff(m.w.layers[c.layers / 2]));
             try Two.require(d, &m.comm, m.stream, "wo_b's input as codes", prompt2d.catCodesOff(m.mxk != null, m.w.layers, m.two.?.uw));
@@ -1567,7 +1922,20 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
                 } else std.log.info("TF_DS_ASSEMBLE_QUANT=1: off: needs the four-node 2D split's parity experts (the rest block)", .{});
             } else std.log.info("TF_DS_ASSEMBLE_QUANT=1: off: needs the checkpoint's own FP8 / MXFP4 weights", .{});
         }
+        // TF_DS_ATTN_EPILOGUE: the attention output's inverse RoPE and wo_a's quant in one launch
+        prompt.attn_epilogue = prompt2d.attn_epilogue_asked and m.mxk != null;
+        if (tri_attn.attn_epi_fused and !prompt.attn_epilogue) {
+            tri_attn.attn_epi_fused = false;
+            std.log.info("TF_DS_ATTN_EPI_FUSED=1: off: needs TF_DS_ATTN_EPILOGUE=1 (in effect)", .{});
+        }
+        if (prompt2d.attn_epilogue_asked) {
+            if (prompt.attn_epilogue) std.log.info("TF_DS_ATTN_EPILOGUE=1: a prompt chunk's attention output takes its inverse RoPE and wo_a's quant in one launch (the quant's read of o goes)", .{}) else std.log.info("TF_DS_ATTN_EPILOGUE=1: off: needs the checkpoint's own FP8 / MXFP4 weights", .{});
+        }
+        // TF_DS_HC_STRIDE: a quarter-HC layer's mixes read the chunk's own gathered planes; the tight repack goes
         prompt.hc_stride = prompt2d.hc_stride_asked and m.two != null;
+        if (prompt2d.hc_stride_asked) {
+            if (prompt.hc_stride) std.log.info("TF_DS_HC_STRIDE=1: a quarter-HC layer's mixes read the gathered planes at the chunk's stride (no repack copy)", .{}) else std.log.info("TF_DS_HC_STRIDE=1: off: needs TF_DS_QUARTER_HC=1 and the four-node 2D split", .{});
+        }
         logPdlControls(m.comm.rank);
         std.log.info("transport: Rocinante carries every exchange between the Sparks; no NCCL is loaded or made (rank {d})", .{o.rank});
         if (m.mxk) |*x| m.eng.mx = x;
@@ -2175,6 +2543,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         return true;
     }
 
+                    .poll, .backoff => slices = try issue_lead.pollWait(gate, &w),
                 }
                 if (eh.ahead_err) |err| return err;
                 try prompt.engramApply(e, ch, eh, li, seq);
@@ -2635,6 +3004,11 @@ test "the start-up settings carry TF_DS_PF_SPLIT and the kernel switches as Mode
     prompt2d.idx_u_asked = true;
     try std.testing.expectEqual(prompt2d.kern_idx_u, startSettings(o).kern);
     prompt2d.idx_u_asked = false;
+    const was_iv = prompt2d.idx_v_asked;
+    defer prompt2d.idx_v_asked = was_iv;
+    prompt2d.idx_v_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_idx_v, startSettings(o).kern);
+    prompt2d.idx_v_asked = false;
     const was_aud = prompt2d.attn_u_decode_asked;
     defer prompt2d.attn_u_decode_asked = was_aud;
     prompt2d.attn_u_decode_asked = true;
@@ -2659,6 +3033,14 @@ test "the start-up settings carry TF_DS_PF_SPLIT and the kernel switches as Mode
         prompt2d.qgate_canary_asked = q;
     }
     prompt2d.qgate_canary_asked = .off;
+    // the second kernel word: TF_DS_HC_2S travels in kern2, never in kern
+    const was_h2 = prompt2d.hc_2s_asked;
+    defer prompt2d.hc_2s_asked = was_h2;
+    prompt2d.hc_2s_asked = true;
+    try std.testing.expectEqual(prompt2d.kern2_hc_2s, startSettings(o).kern2);
+    try std.testing.expectEqual(@as(u32, 0), startSettings(o).kern & ~(prompt2d.kern_attn_epi_fused));
+    prompt2d.hc_2s_asked = false;
+    try std.testing.expectEqual(@as(u32, 0), startSettings(o).kern2);
     for ([_]mx.PfSplit{ .table, .a, .b, .c6, .c7 }) |sw| {
         prompt2d.pf_split_asked = sw;
         try std.testing.expectEqual(@backingInt(sw), startSettings(o).pf_split);
@@ -2695,6 +3077,76 @@ test "Model.open reads TF_DS_PF_RASTER before the kernels load, refuses text tha
     try std.testing.expect(std.mem.indexOf(u8, src, ".pf_raster = prompt2d.pf_raster_asked,") != null);
 }
 
+test "TF_DS_IDX_TPP: unset or 4 takes _index_score_rows_t when the kit holds it; 0, a kit that did not load and one without the twin leave the baseline kernel" {
+    const keep = tri_index.idx_tpp;
+    defer tri_index.idx_tpp = keep;
+    const Case = struct { text: ?[]const u8, loaded: bool, variants: usize, want: usize };
+    for ([_]Case{
+        .{ .text = null, .loaded = true, .variants = 102, .want = 4 },
+        .{ .text = "", .loaded = true, .variants = 102, .want = 4 },
+        .{ .text = "0", .loaded = true, .variants = 102, .want = 0 },
+        .{ .text = "4", .loaded = true, .variants = 102, .want = 4 },
+        .{ .text = null, .loaded = false, .variants = 0, .want = 0 },
+        .{ .text = null, .loaded = true, .variants = 0, .want = 0 },
+        .{ .text = "4", .loaded = false, .variants = 0, .want = 0 },
+        .{ .text = "4", .loaded = true, .variants = 0, .want = 0 },
+    }) |c| {
+        tri_index.idx_tpp = 7;
+        useIdxTpp(c.text, c.loaded, "no such folder", c.variants);
+        try std.testing.expectEqual(c.want, tri_index.idx_tpp);
+    }
+    try std.testing.expectEqual(@as(usize, 4), idxTpp(null));
+    try std.testing.expectEqual(@as(usize, 4), idxTpp("4"));
+    try std.testing.expectEqual(@as(usize, 0), idxTpp("0"));
+}
+
+test "TF_DS_IDX_TPP: unset, empty and 4 are 4, 0 is the baseline kernel, any other text is null (the start is refused at its call site, the parse is pure)" {
+    try std.testing.expectEqual(@as(?usize, 4), idxTppWanted(null));
+    try std.testing.expectEqual(@as(?usize, 4), idxTppWanted(""));
+    try std.testing.expectEqual(@as(?usize, 4), idxTppWanted("4"));
+    try std.testing.expectEqual(@as(?usize, 0), idxTppWanted("0"));
+    for ([_][]const u8{ "2", "8", "x", " 4", "04", "-4", "four", "1" }) |bad| try std.testing.expectEqual(@as(?usize, null), idxTppWanted(bad));
+    // Model.open refuses by name where it reads the setting; every needle split: a literal of this file counts as the file's own text
+    const src = @embedFile("model.zig");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "if (idxTpp" ++ "Wanted(prompt2d.idx_tpp_text) == null) {"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "TF_DS_IDX_TPP={s}: not 0 or " ++ "4; not started"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "TF_DS_IDX_TPP=0: a prompt chunk's index score runs the baseline " ++ "kernel (the operator's choice)"));
+}
+
+test "TF_DS_ATTN_EPI_TWIN picks the fused attention epilogue's kernel on its own: unset is we, ue keeps _ue, xe takes _xe; a kit without the kernel keeps _ue; a bad value is refused; TF_DS_ATTN_TWIN does not move it" {
+    // prompt arms measured _we x1.020 / _xe x1.012 on T6 with byte-equal replies, but through TF_DS_ATTN_TWIN, which also
+    // picks the decode twin: the epilogue gets its own switch so decode keeps z and the prompt takes _we by default (bit-identical rule)
+    try std.testing.expectEqual(tri_attn.EpiTwin.we, tri_attn.epiTwinWanted(null).?);
+    try std.testing.expectEqual(tri_attn.EpiTwin.we, tri_attn.epiTwinWanted("").?);
+    try std.testing.expectEqual(tri_attn.EpiTwin.ue, tri_attn.epiTwinWanted("ue").?);
+    try std.testing.expectEqual(tri_attn.EpiTwin.xe, tri_attn.epiTwinWanted("xe").?);
+    try std.testing.expect(tri_attn.epiTwinWanted("w") == null);
+    const keep_we = tri_attn.attn_epi_we;
+    const keep_xe = tri_attn.attn_epi_xe;
+    defer {
+        tri_attn.attn_epi_we = keep_we;
+        tri_attn.attn_epi_xe = keep_xe;
+    }
+    const Case = struct { epi: tri_attn.EpiTwin, fused: bool, we: usize, xe: usize, want_we: bool, want_xe: bool };
+    for ([_]Case{
+        .{ .epi = .we, .fused = true, .we = 16, .xe = 16, .want_we = true, .want_xe = false }, // (the default)
+        .{ .epi = .ue, .fused = true, .we = 16, .xe = 16, .want_we = false, .want_xe = false },
+        .{ .epi = .xe, .fused = true, .we = 16, .xe = 16, .want_we = false, .want_xe = true },
+        .{ .epi = .we, .fused = true, .we = 0, .xe = 16, .want_we = false, .want_xe = false }, // a kit without _we
+        .{ .epi = .xe, .fused = true, .we = 16, .xe = 0, .want_we = false, .want_xe = false }, // a kit without _xe
+        .{ .epi = .we, .fused = false, .we = 16, .xe = 16, .want_we = false, .want_xe = false }, // no fused epilogue to take it
+    }) |c| {
+        tri_attn.attn_epi_we = true;
+        tri_attn.attn_epi_xe = true;
+        useAttnEpiWe(c.epi, c.fused, c.we, c.xe);
+        try std.testing.expectEqual(c.want_we, tri_attn.attn_epi_we);
+        try std.testing.expectEqual(c.want_xe, tri_attn.attn_epi_xe);
+    }
+    // Model.open reads the epilogue's own switch and does not hand it the decode twin
+    const src = @embedFile("model.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, "std.c.getenv(\"TF_DS_ATTN_EPI_TWIN\")") != null);
+}
+
 test "TF_DS_ATTN_U takes effect with the kit's extra set loaded, else stays off; unset, never" {
     const keep = tri_attn.attn_u;
     defer tri_attn.attn_u = keep;
@@ -2707,6 +3159,33 @@ test "TF_DS_ATTN_U takes effect with the kit's extra set loaded, else stays off;
     try std.testing.expect(!tri_attn.attn_u); // no extra set
     useAttnU(a, io, true, true, null, "/nonexistent/aot", "/nonexistent/aot-extra");
     try std.testing.expect(tri_attn.attn_u); // (its coverage unread: the line says so)
+}
+
+test "TF_DS_HC_FUSED takes effect with the kit's kernel loaded; asked of a kit without it, the start ends by name; unset, never" {
+    const keep = tri_hc.hc_fused;
+    defer tri_hc.hc_fused = keep;
+    tri_hc.hc_fused = true;
+    try useHcFused(false, true, null, 2);
+    try std.testing.expect(!tri_hc.hc_fused); // not asked
+    var buf: [192]u8 = undefined;
+    try std.testing.expectEqualStrings("TF_DS_HC_FUSED=1: the kit's extra set (aot-extra/) did not load (FileNotFound); not started", hcFusedRefusal(&buf, false, "FileNotFound", 0).?); // no extra set
+    try std.testing.expectEqualStrings("TF_DS_HC_FUSED=1: the kit's extra set (aot-extra/aot.json) holds no _hc_pre_pf_fused; not started", hcFusedRefusal(&buf, true, null, 0).?); // an extra set without the kernel
+    try std.testing.expect(hcFusedRefusal(&buf, true, null, 2) == null);
+    try useHcFused(true, true, null, 2);
+    try std.testing.expect(tri_hc.hc_fused);
+    var m = try cuda.aot.Manifest.parse(std.testing.allocator, @embedFile("fixtures/kit-drafter-extra.json"));
+    defer m.deinit();
+    try std.testing.expectEqual(@as(usize, 0), m.variants("_hc_pre_pf_fused"));
+    // Model.open: the switch read, the extra set loaded when it is asked for, then the switch put into effect
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    const read = std.mem.indexOf(u8, body, "prompt2d.hc_fused_asked = prompt2d.switchAsked(if (std.c.getenv(\"TF_DS_HC_FUSED\")) |v| std.mem.span(v) else null);").?;
+    const load = std.mem.indexOf(u8, body, "        if (weights.draft_4way or ").?;
+    const cond = body[load .. load + std.mem.indexOfScalar(u8, body[load..], '{').?];
+    try std.testing.expect(std.mem.indexOf(u8, cond, "prompt2d.hc_fused_asked") != null);
+    const use = std.mem.indexOf(u8, body, "try useHcFused(prompt2d.hc_fused_asked, m.extra != null, load_why,").?;
+    try std.testing.expect(read < load and load < use);
 }
 
 test "TF_DS_IDX_U takes effect with the kit's extra set loaded, else stays off; unset, never" {
@@ -2730,6 +3209,36 @@ test "TF_DS_IDX_U takes effect with the kit's extra set loaded, else stays off; 
     const cond = body[load .. load + std.mem.indexOfScalar(u8, body[load..], '{').?];
     try std.testing.expect(std.mem.indexOf(u8, cond, "prompt2d.idx_u_asked") != null);
     const use = std.mem.indexOf(u8, body, "useIdxU(a, io, prompt2d.idx_u_asked, m.extra != null, load_why,").?;
+    try std.testing.expect(read < load and load < use);
+}
+
+test "TF_DS_IDX_V takes effect with the kit's twin loaded; asked of a kit without it, the start ends by name; unset, never" {
+    const keep = tri_index.idx_v;
+    defer tri_index.idx_v = keep;
+    tri_index.idx_v = true;
+    try useIdxV(false, true, null, 102);
+    try std.testing.expect(!tri_index.idx_v); // not asked
+    var buf: [192]u8 = undefined;
+    try std.testing.expectEqualStrings("TF_DS_IDX_V=1: the kit's extra set (aot-extra/) did not load (FileNotFound); not started", idxVRefusal(&buf, false, "FileNotFound", 0).?); // no extra set
+    try std.testing.expectEqualStrings("TF_DS_IDX_V=1: the kit's extra set (aot-extra/aot.json) holds no _index_score_rows_v; not started", idxVRefusal(&buf, true, null, 0).?); // an extra set without the twin
+    try std.testing.expect(idxVRefusal(&buf, true, null, 102) == null);
+    try useIdxV(true, true, null, 102);
+    try std.testing.expect(tri_index.idx_v);
+    // the count: an unreadable set holds none, a manifest's twin variants are counted by name
+    try std.testing.expectEqual(@as(usize, 0), extraVariants(std.testing.allocator, std.testing.io, "/nonexistent/aot-extra", "_index_score_rows_v"));
+    var m = try cuda.aot.Manifest.parse(std.testing.allocator, @embedFile("fixtures/kit-drafter-extra.json"));
+    defer m.deinit();
+    try std.testing.expectEqual(@as(usize, 0), m.variants("_index_score_rows_v"));
+    try std.testing.expect(m.variants("_index_score_rows_u") > 0);
+    // Model.open: the switch read, the extra set loaded when it is asked for, then the switch put into effect
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    const read = std.mem.indexOf(u8, body, "prompt2d.idx_v_asked = prompt2d.switchAsked(if (std.c.getenv(\"TF_DS_IDX_V\")) |v| std.mem.span(v) else null);").?;
+    const load = std.mem.indexOf(u8, body, "        if (weights.draft_4way or ").?;
+    const cond = body[load .. load + std.mem.indexOfScalar(u8, body[load..], '{').?];
+    try std.testing.expect(std.mem.indexOf(u8, cond, "prompt2d.idx_v_asked") != null);
+    const use = std.mem.indexOf(u8, body, "try useIdxV(prompt2d.idx_v_asked, m.extra != null, load_why,").?;
     try std.testing.expect(read < load and load < use);
 }
 
@@ -3040,6 +3549,8 @@ test "TF_DS_ROCI_PAIR_LOG: the pair line names the engine thread's CPU time, the
     const pair = code[std.mem.indexOf(u8, code, "pub fn fillGroup(").?..];
     const g_at = std.mem.indexOf(u8, steps, "try m.issueLead(m.passStreamOf(l.pass));").?;
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, steps[0..std.mem.indexOf(u8, steps, "// everything the group queued").?], "issueLead("));
+    for ([_][]const u8{ "slices of {d} us, the transport checked and the Engram worker's slots returned every slice (TF_DS_ISSUE_LEAD_WAIT=poll, TF_DS_ISSUE_LEAD_SLICE_US), a wait over {d} ms logged every 5 s (TF_DS_ISSUE_LEAD_WARN_MS, 0: never)", "one blocking-sync wait (TF_DS_ISSUE_LEAD_WAIT=block; the transport is checked and the Engram worker's slots returned before and after it, not during)", "TF_DS_ISSUE_LEAD_WARN_MS={s}: not a setting (0, or 1 to 3600000 milliseconds): {d}", "TF_DS_ISSUE_LEAD_WAIT={s}: not a mode (poll, block or backoff): poll", "TF_DS_ISSUE_LEAD_SLICE_US={s}: not a setting (1 to 100000 microseconds): {d}" }) |w|
+    try std.testing.expect(std.mem.indexOf(u8, body, ".poll, .backoff => slices = try issue_lead.pollWait(gate, &w),") != null);
     try std.testing.expect(std.mem.indexOf(u8, lcb, "if (m.two_c) |*t| if (t.rc) |rc| try rc.t.check();") != null);
 
 test "Model.open: a refusal or failure after partial setup unwinds what already runs (the transport lanes' proxy threads, the Engram readers, the round's side state, the pair), before the arena and the context go" {
@@ -3365,6 +3876,132 @@ test "TF_DS_RING_WORD_SIGNAL's decision: unset is the atomic where the cards can
     try std.testing.expect(Model.ringWordSignalMode("atomics", null) == null);
 }
 
+test "TF_DS_MERGE_D says in the speed report's words why it does not run: a kit without the twins, or without its extra set" {
+    // (the lines start "TF_DS_MERGE_D: off: ": core/speed_report.zig keeps them as the feature's reason)
+    const src = @embedFile("model.zig");
+    const lead = "TF_DS_MERGE_D: " ++ "off: ";
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, lead ++ "the loaded kit's extra set has no _sparse_attn_merge_d: " ++ "kit a02466e or later\""));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, lead ++ "the kit's extra set (aot-extra/) did not load ({s})\""));
+}
+
+test "TF_DS_WOA_MERGE: Model.open refuses a bad value by name at its call site (the parse is pure), and says so when it is on" {
+    const src = @embedFile("model.zig");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "mx.woa_merge = mx.woaMerge" ++ "Wanted(woam_text) orelse {"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "TF_DS_WOA_MERGE={s}: not 0 or " ++ "1; not started"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "TF_DS_WOA_MERGE=1: wo_a's FP8 groups of a prompt chunk run as one launch (grid.z = " ++ "groups)"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "TF_DS_WOA_MERGE=0: wo_a's FP8 groups of a prompt chunk run one launch a " ++ "group (the operator's choice)"));
+}
+
+test "TF_DS_AQ_VEC: Model.open refuses a bad value by name at its call site (the parse itself is pure and logs nothing), and says on or off once the kernels load" {
+    const src = @embedFile("model.zig");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "mx.aq_vec_on = mx.aqVec" ++ "Wanted(aq_text) orelse {"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "TF_DS_AQ_VEC={s}: not 0 or " ++ "1; not started"));
+    const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    const load = std.mem.indexOf(u8, body, "m.mxk = if (c.format == .native) try mx.Kernels.load(d, cuda.kernels.dsv41_native) else null;").?;
+    const use = std.mem.indexOf(u8, body, "useAqVec(if (m.mxk) |*x| x else null);").?;
+    try std.testing.expect(parse < load and load < use);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "useAqVec("));
+    // the start lines: on, off by the switch, off for an image without the twin
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "TF_DS_AQ_VEC: on: act_quant on four " ++ "lanes"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "TF_DS_AQ_VEC=0: act_quant runs the baseline " ++ "kernel"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "TF_DS_AQ_VEC: off: this image has no tf_dsn_act_quant_" ++ "vec_kernel"));
+}
+
+test "TF_DS_L2_CHUNK_KIB: Model.open refuses a bad value by name at its call site (the parse itself is pure and logs nothing)" {
+    const src = @embedFile("model.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, "ops_mod.l2_chunk_bytes = ops_mod.l2ChunkWanted(chunk_text) orelse {") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "TF_DS_L2_CHUNK_KIB={s}: not one of 1, 2, 4, " ++ "8, 16 (KiB); not started"));
+}
+
+test "TF_DS_MERGE_D: unset or empty is 16 columns a program; 3 is 16, 1 is 128, 2 is 64, 0 is off; any other text refuses the start" {
+    try std.testing.expectEqual(@as(?usize, 16), mergeDWanted(null));
+    try std.testing.expectEqual(@as(?usize, 16), mergeDWanted(""));
+    try std.testing.expectEqual(@as(?usize, 16), mergeDWanted("3"));
+    try std.testing.expectEqual(@as(?usize, 128), mergeDWanted("1"));
+    try std.testing.expectEqual(@as(?usize, 64), mergeDWanted("2"));
+    try std.testing.expectEqual(@as(?usize, 0), mergeDWanted("0"));
+    // a typo, a column count (the allowed values are codes, not widths), a number past the table and a sign are refused
+    for ([_][]const u8{ "nonsense", "16", "128", "4", "-1", " 1", "01", "true" }) |bad|
+        try std.testing.expectEqual(@as(?usize, null), mergeDWanted(bad)); // (pure: it logs nothing; Model.open logs the refusal and returns error.BadSetting)
+    // the call site names the allowed values, once, and returns the error
+    const src = @embedFile("model.zig");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "TF_DS_MERGE_D={s}: not one of 0 (off), 1 (128 columns a program), " ++ "2 (64), 3 (16, the default); not started"));
+    try std.testing.expect(std.mem.indexOf(u8, src, "merge_d_asked = mergeDWanted(merge_text) orelse {") != null);
+}
+
+test "TF_DS_MERGE_D: a kit without the asked width runs 128, else 64, else none, and the start line says it ran another width" {
+    const keep = tri_attn.merge_db;
+    defer tri_attn.merge_db = keep;
+    const all: MergeHave = .{ .c16 = true, .c64 = true, .c128 = true };
+    const old_kit: MergeHave = .{ .c64 = true, .c128 = true }; // ec8b9ed: the kit before the 16-column variant
+    try std.testing.expectEqual(@as(?usize, 16), mergeDResolve(16, all));
+    try std.testing.expectEqual(@as(?usize, 128), mergeDResolve(16, old_kit)); // the fallback
+    try std.testing.expectEqual(@as(?usize, 64), mergeDResolve(64, old_kit));
+    try std.testing.expectEqual(@as(?usize, 64), mergeDResolve(16, .{ .c64 = true }));
+    try std.testing.expectEqual(@as(?usize, null), mergeDResolve(16, .{}));
+    try std.testing.expectEqual(@as(?usize, null), mergeDResolve(0, all));
+    useMergeD(16, true, null, 4, all);
+    try std.testing.expectEqual(@as(usize, 16), tri_attn.merge_db);
+    useMergeD(16, true, null, 4, old_kit);
+    try std.testing.expectEqual(@as(usize, 128), tri_attn.merge_db); // 128, not off, not 16
+    useMergeD(16, true, null, 4, .{});
+    try std.testing.expectEqual(@as(usize, 0), tri_attn.merge_db);
+    useMergeD(16, false, "x", 4, all);
+    try std.testing.expectEqual(@as(usize, 0), tri_attn.merge_db);
+    useMergeD(16, true, null, 0, all);
+    try std.testing.expectEqual(@as(usize, 0), tri_attn.merge_db);
+    // the warn line exists once and names the fallback
+    const src = @embedFile("model.zig");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "TF_DS_MERGE_D: instead: runs {d} columns a program, not {d}: " ++ "the loaded kit's extra set has no _sparse_attn_merge_d at {d} columns (it needs the kit regenerated with that width)"));
+}
+
+test "TF_DS_ATTN_TWIN and TF_DS_ROPE_W are on by default: no packed-latent call, an extra set that did not load or one without the twin keeps the baseline kernel with an 'off' line, never a refused start" {
+    const keep_t = tri_attn.attn_twin;
+    defer tri_attn.attn_twin = keep_t;
+    const keep_r = tri_norm.rope_w;
+    defer tri_norm.rope_w = keep_r;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    tri_attn.attn_twin = .z;
+    try useAttnTwin(a, io, "z", false, true, null, "/nonexistent/aot-extra");
+    try std.testing.expectEqual(tri_attn.Twin.u, tri_attn.attn_twin); // no TF_DS_ATTN_U / _DECODE call would ask for it
+    try useAttnTwin(a, io, "z", true, false, "FileNotFound", "/nonexistent/aot-extra");
+    try std.testing.expectEqual(tri_attn.Twin.u, tri_attn.attn_twin); // the extra set did not load
+    try useAttnTwin(a, io, "w", true, true, null, "/nonexistent/aot-extra");
+    try std.testing.expectEqual(tri_attn.Twin.u, tri_attn.attn_twin); // the set holds no twin of that name
+    tri_norm.rope_w = true;
+    try useRopeW(true, false, "FileNotFound", 0);
+    try std.testing.expect(!tri_norm.rope_w);
+    try useRopeW(true, true, null, 0);
+    try std.testing.expect(!tri_norm.rope_w);
+    try useRopeW(true, true, null, 3);
+    try std.testing.expect(tri_norm.rope_w);
+    try useRopeW(false, true, null, 3);
+    try std.testing.expect(!tri_norm.rope_w); // TF_DS_ROPE_W=0
+    // the speed report prints each fallback: the lines say "off"
+    const src = @embedFile("model.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, "\"TF_DS_ATTN_TWIN={s}: " ++ "off: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "\"TF_DS_ROPE_W=1: " ++ "off: ") != null);
+}
+
+test "TF_DS_QKV_PLAIN is on by default: an extra set that did not load or one without the _q_kv_norm variant keeps the two launches with an 'off' line, never a refused start" {
+    const keep = round.qkv_plain;
+    defer round.qkv_plain = keep;
+    round.qkv_plain = true;
+    useQkvPlain(true, false, "FileNotFound", 0);
+    try std.testing.expect(!round.qkv_plain); // the extra set did not load
+    round.qkv_plain = true;
+    useQkvPlain(true, true, null, 0);
+    try std.testing.expect(!round.qkv_plain); // a kit without the variant (batch 4: aab01c1)
+    useQkvPlain(true, true, null, 1);
+    try std.testing.expect(round.qkv_plain);
+    useQkvPlain(false, true, null, 1);
+    try std.testing.expect(!round.qkv_plain); // TF_DS_QKV_PLAIN=0
+    const src = @embedFile("model.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, "\"TF_DS_QKV_PLAIN=1: " ++ "off: ") != null);
+}
+
 test "a kit twin's off line names the ranks that cannot run it and this rank's own state" {
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("TF_DS_ATTN_U=1: off: rank 2 cannot run it (this rank: can); every rank runs the baseline kernel", twinOffLine(&buf, "TF_DS_ATTN_U", 1 << 2, true));
@@ -3415,7 +4052,18 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
     const loop = lanes[f..std.mem.indexOfPos(u8, lanes, f, "\n}\n").?];
     try std.testing.expect(std.mem.indexOf(u8, loop, "defer m.flushDiag(false);") != null);
 }
+
+    const ll = @import("logits_log.zig");
+        }
+    for (speed_defaults.table) |d| {
+        }
     }
+    for (ll.speed_names) |n| {
+        var found = false;
+        for (speed_defaults.table) |d| found = found or std.mem.eql(u8, d.env, n);
+        try std.testing.expect(found);
+    }
+}
 
     /// The drafter's batched pass for N streams: each one's pending token at position q0 in its slot (its rings hold
     /// its positions below q0), `steps` drafts each (the drafter's drafts and confidences on the host).
@@ -3427,6 +4075,7 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
         try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
     // the partner split: the refusal is the operator's branch, the warning and the cleared flag the default's, and no lane is opened before either
     const v = std.mem.indexOf(u8, body, "speed_defaults.verdict(why orelse").?;
+    const refuse = std.mem.indexOf(u8, body[v..], ".refuse => {").?;
     const refused = std.mem.indexOf(u8, body[v..], "return error.PartnerRefused;").?;
     const warn = std.mem.indexOf(u8, body[v..], "std.log.warn(\"TF_DS_ENGRAM_PARTNER: off:").?;
     try std.testing.expect(refuse < refused and refused < warn and warn < cleared);
@@ -3445,6 +4094,7 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
 }
 
     const v = std.mem.indexOf(u8, body, "speed_defaults.verdict(why orelse").?;
+    const refuse = std.mem.indexOf(u8, body[v..], ".refuse => {").?;
     const refused = std.mem.indexOf(u8, body[v..], "return error.StaggerRefused;").?;
     const warn = std.mem.indexOf(u8, body[v..], "std.log.warn(\"TF_DS_ROCI_STAGGER: off:").?;
     try std.testing.expect(refuse < refused and refused < warn and warn < off); // the refusal is the operator's branch, the fallback the other

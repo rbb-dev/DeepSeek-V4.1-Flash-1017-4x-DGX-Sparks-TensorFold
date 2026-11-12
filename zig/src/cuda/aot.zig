@@ -14,14 +14,14 @@ pub const Pick = union(enum) { native, captured: []const u8, missing: []const u8
 pub fn pick(a: std.mem.Allocator, io: std.Io, explicit: ?[]const u8, capability: u32) !Pick {
     if (explicit) |dir| {
         if (std.mem.eql(u8, dir, "native")) return .native;
-        return if (has(a, io, dir)) .{ .captured = dir } else .{ .missing = dir };
+        return if (hasSet(a, io, dir)) .{ .captured = dir } else .{ .missing = dir };
     }
     const exe = try std.process.executableDirPathAlloc(io, a);
     const dir = try std.fs.path.join(a, &.{ exe, "..", "share", "tensorfold", "cuda", try std.fmt.allocPrint(a, "sm{d}", .{capability}) });
-    return if (has(a, io, dir)) .{ .captured = dir } else .native;
+    return if (hasSet(a, io, dir)) .{ .captured = dir } else .native;
 }
 
-fn has(a: std.mem.Allocator, io: std.Io, dir: []const u8) bool {
+fn hasSet(a: std.mem.Allocator, io: std.Io, dir: []const u8) bool {
     const path = std.fs.path.join(a, &.{ dir, "aot.json" }) catch return false;
     std.Io.Dir.cwd().access(io, path, .{}) catch return false;
     return true;
@@ -75,19 +75,12 @@ pub fn cf(name: []const u8, v: f32) Const {
     return .{ .name = name, .f32 = v };
 }
 
-const Variant = struct {
-    spec: KernelJson,
-    kernel: triton.Kernel,
-    /// Said once on stderr when a launch first takes this variant in place of its own specialization.
-    told: std.atomic.Value(bool) = .init(false),
-};
+const Variant = struct { spec: KernelJson, kernel: triton.Kernel };
 
 pub const Set = struct {
     parsed: std.json.Parsed(SetJson),
     variants: []Variant,
     gpa: std.mem.Allocator,
-    /// TF_AOT_WEAKEST=1: every launch takes its most general fitting variant (a gate of the fallback's exactness).
-    weakest: bool = false,
 
     /// Loads every cubin listed in `dir`/aot.json into its own module.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, device: abi.Device, dir: []const u8) !Set {
@@ -115,8 +108,7 @@ pub const Set = struct {
             variants[n] = .{ .spec = k, .kernel = try triton.Kernel.load(d, device, cubin, meta, name_z) };
             n += 1;
         }
-        const weakest = if (std.c.getenv("TF_AOT_WEAKEST")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
-        return .{ .parsed = parsed, .variants = variants, .gpa = gpa, .weakest = weakest };
+        return .{ .parsed = parsed, .variants = variants, .gpa = gpa };
     }
 
     pub fn deinit(self: *Set) void {
@@ -132,25 +124,7 @@ pub const Set = struct {
     /// every value its assumptions allow, these included. The first such variant in the set's order, so a launch's
     /// shape always takes the same kernel.
     pub fn find(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const) !*const Variant {
-        if (!self.weakest) for (self.variants) |*v| {
-            if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
-            if (matches(v.spec, args, consts, .exact)) return v;
-        };
-        var best: ?*Variant = null;
-        var best_held: usize = 0;
-        for (self.variants) |*v| {
-            if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
-            const held = fits(v.spec, args, consts) orelse continue;
-            const better = if (self.weakest) held < best_held else held > best_held;
-            if (best == null or better) {
-                best = v;
-                best_held = held;
-            }
-        }
-        if (best) |v| {
-            if (!v.told.swap(true, .monotonic)) std.log.warn("{s}: a launch whose specialization no captured variant has runs variant {s} (assumes less)", .{ function, v.spec.hash[0..@min(12, v.spec.hash.len)] });
-            return v;
-        }
+        if (self.lookup(function, args, consts)) |v| return v;
         std.log.err("no captured Triton variant of {s} for this launch:", .{function});
         for (args) |a| switch (a.value) {
             .ptr => |p| std.log.err("  {s}: {s} at {x} (16-aligned {})", .{ a.name, p.ty, p.addr, p.addr % 16 == 0 }),
@@ -159,6 +133,19 @@ pub const Set = struct {
             .u64 => |x| std.log.err("  {s}: u64 {d}", .{ a.name, x }),
         };
         return error.MissingTritonVariant;
+    }
+
+    /// find's variant, or null without a word in the log (a caller with a way on of its own: another set, a switch off).
+    pub fn lookup(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const) ?*const Variant {
+        for (self.variants) |*v| {
+            if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
+            if (matches(v.spec, args, consts, false)) return v;
+        }
+        for (self.variants) |*v| {
+            if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
+            if (matches(v.spec, args, consts, true)) return v;
+        }
+        return null;
     }
 
     /// The smallest value of constexpr `name` at or above `at_least` among `function`'s variants.
@@ -174,10 +161,14 @@ pub const Set = struct {
 
     /// Launches `function` on `grid` as Triton's launcher would: runtime arguments in the variant's order, scratch null.
     pub fn run(self: *const Set, stream: Stream, function: []const u8, grid: [3]u32, args: []const Arg, consts: []const Const) !void {
-        const v = try self.find(function, args, consts);
+        return launchVariant(try self.find(function, args, consts), stream, grid, args);
+    }
+
+    /// Launches variant `v` (a find's or a lookup's) on `grid`, runtime arguments in its order.
+    pub fn launchVariant(v: *const Variant, stream: Stream, grid: [3]u32, args: []const Arg) !void {
         var packed_args: launch.Args = .{};
         for (v.spec.params) |p| {
-            const a = lookup(args, p.name).?;
+            const a = argNamed(args, p.name).?;
             switch (a.value) {
                 .ptr => |x| packed_args.add(x.addr),
                 .i32 => |x| packed_args.add(x),
@@ -189,33 +180,52 @@ pub const Set = struct {
     }
 };
 
-fn lookup(args: []const Arg, name: []const u8) ?Arg {
-    for (args) |a| if (std.mem.eql(u8, a.name, name)) return a;
-    return null;
-}
+/// A set's aot.json read without its cubins (no GPU): which variants it holds, matched as Set.find matches them.
+pub const Manifest = struct {
+    parsed: std.json.Parsed(SetJson),
 
-/// Whether variant `k` may run this launch though compiled for a narrower one: the same constexprs, and every
-/// assumption it makes held by the launch (an argument it takes as 16-divisible is; an int it folded to 1 is 1). Null
-/// when it may not, else how many of the launch's own specializations it shares.
-fn fits(k: KernelJson, args: []const Arg, consts: []const Const) ?usize {
-    for (consts) |c| {
-        const got = k.consts.map.get(c.name) orelse return null;
-        if (c.int) |x| if (got.int == null or got.int.? != x) return null;
-        if (c.f32) |x| if (got.f32 == null or got.f32.? != @as(u32, @bitCast(x))) return null;
+    pub fn parse(gpa: std.mem.Allocator, text: []const u8) !Manifest {
+        return .{ .parsed = try std.json.parseFromSlice(SetJson, gpa, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) };
     }
-    var held: usize = 0;
-    var runtime: usize = 0;
-    for (args) |a| {
-        const param = for (k.params) |p| {
-            if (std.mem.eql(u8, p.name, a.name)) break p;
-        } else null;
-        switch (a.value) {
-            .i32 => |x| {
-                if (param == null) {
-                    const got = k.consts.map.get(a.name) orelse return null;
-                    if (x != 1 or got.int == null or got.int.? != 1) return null;
-                    held += 1;
-                    continue;
+
+    /// `dir`/aot.json.
+    pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Manifest {
+        const path = try std.fs.path.join(gpa, &.{ dir, "aot.json" });
+        defer gpa.free(path);
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
+        defer gpa.free(text);
+        return parse(gpa, text);
+    }
+
+    pub fn deinit(m: *Manifest) void {
+        m.parsed.deinit();
+        m.* = undefined;
+    }
+
+    /// The index of the entry Set.find would take for this launch, else null.
+    pub fn find(m: *const Manifest, function: []const u8, args: []const Arg, consts: []const Const) ?usize {
+        for ([_]bool{ false, true }) |general| for (m.parsed.value.kernels, 0..) |k, i| {
+            if (std.mem.eql(u8, k.@"fn", function) and matches(k, args, consts, general)) return i;
+        };
+        return null;
+    }
+
+    /// How many entries `function` has.
+    pub fn variants(m: *const Manifest, function: []const u8) usize {
+        var n: usize = 0;
+        for (m.parsed.value.kernels) |k| {
+            if (std.mem.eql(u8, k.@"fn", function)) n += 1;
+        }
+        return n;
+    }
+
+    /// Whether some entry of `function` was compiled with these constexprs (whatever its arguments' specialization).
+    pub fn has(m: *const Manifest, function: []const u8, consts: []const Const) bool {
+        for (m.parsed.value.kernels) |k| {
+            if (std.mem.eql(u8, k.@"fn", function) and constsMatch(k, consts)) return true;
+        }
+        return false;
+    }
 
     /// `function`'s variants in `m`, and how many of them `twins` holds a variant of under the name `twin` compiled
     /// the same way: the same parameters (name, type, specialization), constexprs, warps, CTAs and PDL. A launch of a
@@ -234,9 +244,7 @@ fn fits(k: KernelJson, args: []const Arg, consts: []const Const) ?usize {
         }
         return n;
     }
-    if (runtime != k.params.len) return null;
-    return held;
-}
+};
 
 /// Two entries compiled alike: parameters (name, type, specialization), constexprs, warps, CTAs and PDL.
 fn sameBuild(a: KernelJson, b: KernelJson) bool {
@@ -253,20 +261,29 @@ fn sameBuild(a: KernelJson, b: KernelJson) bool {
     return true;
 }
 
-fn matches(k: KernelJson, args: []const Arg, consts: []const Const, fit: Fit) bool {
+fn constsMatch(k: KernelJson, consts: []const Const) bool {
     for (consts) |c| {
         const got = k.consts.map.get(c.name) orelse return false;
         if (c.int) |x| if (got.int == null or got.int.? != x) return false;
         if (c.f32) |x| if (got.f32 == null or got.f32.? != @as(u32, @bitCast(x))) return false;
     }
+    return true;
+}
+
 /// A variant's divisibility assumption against an argument's: equal, or (`general`) not assumed where it holds.
 fn assumes(compiled: bool, holds: bool, general: bool) bool {
     return compiled == holds or (general and !compiled);
 }
 
+fn argNamed(args: []const Arg, name: []const u8) ?Arg {
+    for (args) |a| if (std.mem.eql(u8, a.name, name)) return a;
+    return null;
+}
+
 /// Whether variant `k` was compiled for these constexprs and arguments: exactly their specialization, or (`general`)
 /// any subset of it (an argument divisible by 16 or equal to 1 may take a variant that did not assume so).
 fn matches(k: KernelJson, args: []const Arg, consts: []const Const, general: bool) bool {
+    if (!constsMatch(k, consts)) return false;
     var runtime: usize = 0;
     for (args) |a| {
         const param = for (k.params) |p| {
@@ -301,77 +318,4 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const, general: boo
         runtime += 1;
     }
     return runtime == k.params.len;
-}
-
-/// A set parsed from aot.json text whose variants carry no loaded cubin, so find can be tested without a GPU.
-fn testSet(gpa: std.mem.Allocator, text: []const u8) !Set {
-    const parsed = try std.json.parseFromSlice(SetJson, gpa, text, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
-    });
-    errdefer parsed.deinit();
-    const variants = try gpa.alloc(Variant, parsed.value.kernels.len);
-    for (parsed.value.kernels, variants) |k, *v| v.* = .{ .spec = k, .kernel = undefined };
-    return .{ .parsed = parsed, .variants = variants, .gpa = gpa };
-}
-
-/// Frees a set from testSet: its variants never loaded a cubin, so no module is unloaded.
-fn freeTestSet(gpa: std.mem.Allocator, set: *Set) void {
-    gpa.free(set.variants);
-    set.parsed.deinit();
-}
-
-test "a variant captured without div16 serves a 16-aligned pointer" {
-    const gpa = std.testing.allocator;
-    var set = try testSet(gpa,
-        \\{"kernels":[{"fn":"k","hash":"a","name":"k","num_warps":4,
-        \\ "params":[{"name":"P","type":"*i8","div16":false,"nospec":false}],"consts":{}}]}
-    );
-    defer freeTestSet(gpa, &set);
-    const v = try set.find("k", &.{ptr("P", "*i8", 0x1000)}, &.{});
-    try std.testing.expectEqualStrings("a", v.spec.hash);
-}
-
-test "a variant captured with div16 refuses an unaligned pointer" {
-    var params = [_]ParamJson{.{ .name = "P", .type = "*i8", .div16 = true, .nospec = false }};
-    const k: KernelJson = .{
-        .@"fn" = "k",
-        .hash = "a",
-        .name = "k",
-        .num_warps = 4,
-        .params = &params,
-        .consts = .{},
-    };
-    const unaligned = &[_]Arg{ptr("P", "*i8", 0x1008)};
-    try std.testing.expect(!matches(k, unaligned, &.{}, .exact));
-    try std.testing.expect(!matches(k, unaligned, &.{}, .general));
-}
-
-test "an aligned pointer takes the div16 variant when the set holds both" {
-    const gpa = std.testing.allocator;
-    var set = try testSet(gpa,
-        \\{"kernels":[{"fn":"k","hash":"a","name":"k","num_warps":4,
-        \\ "params":[{"name":"P","type":"*i8","div16":false,"nospec":false}],"consts":{}},
-        \\ {"fn":"k","hash":"b","name":"k","num_warps":4,
-        \\ "params":[{"name":"P","type":"*i8","div16":true,"nospec":false}],"consts":{}}]}
-    );
-    defer freeTestSet(gpa, &set);
-    const v = try set.find("k", &.{ptr("P", "*i8", 0x1000)}, &.{});
-    try std.testing.expectEqualStrings("b", v.spec.hash);
-}
-
-test "a launch of 1 takes only the variant Triton folded it into, in either pass" {
-    const gpa = std.testing.allocator;
-    var set = try testSet(gpa,
-        \\{"kernels":[{"fn":"k","hash":"a","name":"k","num_warps":4,
-        \\ "params":[{"name":"R","type":"i32","div16":false,"nospec":false}],"consts":{}},
-        \\ {"fn":"k","hash":"b","name":"k","num_warps":4,"params":[],"consts":{"R":{"int":1}}}]}
-    );
-    defer freeTestSet(gpa, &set);
-    const runtime = set.variants[0].spec;
-    for ([_]Fit{ .exact, .general }) |fit| try std.testing.expect(!matches(runtime, &.{int("R", 1)}, &.{}, fit));
-    try std.testing.expectEqualStrings("b", (try set.find("k", &.{int("R", 1)}, &.{})).spec.hash);
-    try std.testing.expect(matches(runtime, &.{int("R", 5)}, &.{}, .exact));
-    try std.testing.expect(!matches(runtime, &.{int("R", 32)}, &.{}, .exact));
-    try std.testing.expectEqualStrings("a", (try set.find("k", &.{int("R", 32)}, &.{})).spec.hash);
 }

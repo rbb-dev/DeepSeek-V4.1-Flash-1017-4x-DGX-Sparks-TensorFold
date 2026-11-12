@@ -540,8 +540,99 @@ __device__ __forceinline__ void tile_fp4_skip(char* smem, const int* srow, const
     else tile_fp4_skip_1<C, MODE, false>(smem, srow, o, nkb, mvalid, acc);
 }
 
+// The MXFP4 experts' gate / up epilogue with the down input's quantisation in it (act_quant of the bf16 pack, 32-value groups along a
+// row): a thread holds two consecutive columns of each n8 tile, a warp's 32 columns are one group, so a row's amax is its thread's eight
+// values and two xor shuffles over the four lanes of the row. The codes land at the pack's flat index (main columns [P, main], then the
+// rest columns [P, rest]) and the group's scale (fp32 power of two) at scales[flat / 32], the bytes tf_dsn_act_quant_kernel writes.
+// h (null: not written) still takes the bf16 value.
+struct QOut {
+    uint8_t* codes;
+    float* scales;
+    int ig, ir, P;  // the pack's main width, rest width and slot rows (gate / up's ldh, rest columns and P)
+};
+// native.cu gu_store's value of one entry's column (the same operations in the same order; the replay compares the two kernels' packs)
+__device__ __forceinline__ __nv_bfloat16 gu_hv(const GuArgs& a, int entry, float g_acc, float u_acc) {
+    float gv = bf16r(g_acc), uv = bf16r(u_acc);
+    if (a.limit > 0.f) {
+        uv = fminf(fmaxf(uv, -a.limit), a.limit);
+        gv = fminf(gv, a.limit);
+    }
+    float hv = silu_f(gv) * uv;
+    if (a.wts) hv = hv * a.wts[entry];
+    return __float2bfloat16_rn(hv);
+}
+template <class C>
+__device__ __forceinline__ void gu_tile_store_q(const GuArgs& a, const QOut& q, const float (&acc)[2][C::MT][C::NT][4], int n0, int base,
+                                                int m0, int cnt) {
+    static_assert(C::WN == 32 && C::NT == 4, "a warp's columns are one scale group");
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int wm = warp / C::WGN, wn = warp % C::WGN;
+    const int main = (a.n_tiles - a.rest_tiles) * 32;
+    const size_t rest_w = size_t(a.rest_tiles) * 32;
+#pragma unroll
+    for (int i = 0; i < C::MT; i++)
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const int mi = m0 + wm * C::WM + i * 16 + g + h * 8;
+            const bool ok = mi < cnt;
+            const int entry = ok ? a.ent[base + mi] : 0;
+            float v[C::NT][2];
+            float amax = 0.f;
+#pragma unroll
+            for (int j = 0; j < C::NT; j++)
+#pragma unroll
+                for (int cc = 0; cc < 2; cc++) {
+                    const __nv_bfloat16 hv = gu_hv(a, entry, acc[0][i][j][2 * h + cc], acc[1][i][j][2 * h + cc]);
+                    v[j][cc] = __bfloat162float(hv);
+                    amax = fmaxf(amax, fabsf(v[j][cc]));
+                    if (ok && a.h) {
+                        const int col = n0 + wn * 32 + j * 8 + 2 * t + cc;
+                        const size_t at = col < main ? size_t(entry) * a.ldh + col : size_t(a.P) * a.ldh + size_t(entry) * rest_w + (col - main);
+                        a.h[at] = hv;
+                    }
+                }
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+            const float sc = round_scale(fmaxf(amax, 1e-4f));
+            if (!ok) continue;
+            const int col0 = n0 + wn * 32;
+            const size_t flat0 = col0 < main ? size_t(entry) * main + col0 : size_t(a.P) * main + size_t(entry) * rest_w + (col0 - main);
+            if (t == 0) q.scales[flat0 / 32] = sc;
+#pragma unroll
+            for (int j = 0; j < C::NT; j++) {
+                const uint32_t c0 = to_e4m3(v[j][0] / sc), c1 = to_e4m3(v[j][1] / sc);
+                *reinterpret_cast<uint16_t*>(q.codes + flat0 + j * 8 + 2 * t) = uint16_t(c0 | c1 << 8);
+            }
+        }
+}
+
+// The FP8 shared expert's entries of a tile, quantised after their bf16 values are stored (its sub-tiles' warps hold 16 columns, half a
+// scale group): a warp a 32-value group, act_quant's arithmetic on the bf16 pack (read back through L2, the tile's own stores).
+__device__ __forceinline__ void gu_quant_stored(const GuArgs& a, const QOut& q, int c0, int bn, int base, int m0, int cnt) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int main = (a.n_tiles - a.rest_tiles) * 32;
+    const size_t rest_w = size_t(a.rest_tiles) * 32;
+    const int rows = min(pf::kBm, cnt - m0);
+    const int gpr = bn / 32;
+    for (int w = warp; w < rows * gpr; w += int(blockDim.x) >> 5) {
+        const int r = w / gpr, gi = w % gpr;
+        const int entry = a.ent[base + m0 + r];
+        const int col0 = c0 + gi * 32;
+        const size_t flat0 = col0 < main ? size_t(entry) * main + col0 : size_t(a.P) * main + size_t(entry) * rest_w + (col0 - main);
+        const float v = __bfloat162float(__ldcg(a.h + flat0 + lane));
+        float amax = fabsf(v);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        const float sc = round_scale(fmaxf(amax, 1e-4f));
+        q.codes[flat0 + lane] = to_e4m3(v / sc);
+        if (lane == 0) q.scales[flat0 / 32] = sc;
+    }
+}
+
 // gate / up of the grouped experts on R2's tiles: the MXFP4 tile's activation rows with padding skipped, the FP8 shared
 // expert on GuCfg8's sub-tiles the same way
+template <int MODE, class C4, bool QUANT = false>
+__device__ __forceinline__ void gu_r2(const GuArgs& a, const int2* __restrict__ tiles, const int* __restrict__ ntiles, const QOut& qo = QOut{}) {
     if (int(blockIdx.y) >= ntiles[0]) return;
     const int2 tl = tiles[blockIdx.y];
     const int e = tl.x, m0 = tl.y;
@@ -581,6 +672,8 @@ __device__ __forceinline__ void tile_fp4_skip(char* smem, const int* srow, const
         __syncthreads();
         float acc[2][C::MT][C::NT][4];
         tile_fp4_skip<C, MODE>(pf::smem, srow, o, nkb, cnt - m0, acc);
+        if constexpr (QUANT) gu_tile_store_q<C>(a, qo, acc, o.n0, base, m0, cnt);
+        else pf::gu_tile_store<C>(a, acc, o.n0, base, m0, cnt);
     }
 }
 
@@ -632,6 +725,10 @@ __device__ __forceinline__ void dn_r2(const DnArgs& a, const int2* __restrict__ 
 using GemmCfg = Cfg<128, 128, 2, 4, 1, 0, 2, 3, 2>;
 using Split64Cfg = Cfg<64, 128, 2, 4, 1, 0, 2, 6, 2>;
 using Split128Cfg = Cfg<128, 128, 2, 4, 1, 0, 2, 5, 2>;
+// split64's tile at 64 columns: warps of the same 32 x 32 (2 x 2 of them, 128 threads) and 5 stages of 8,704 bytes, so two blocks
+// share an SM (mx.zig sf_split64n_smem; an SM's shared memory is 100 KiB, each block's static 2,304 bytes and 1 KiB of its own beside
+// the dynamic ones)
+using Split64NCfg = Cfg<64, 64, 2, 2, 1, 0, 2, 5, 2>;
 // R2's expert tiles: down at 128 rows (a warp 4 m16 tiles by 4 n8), so each weight fragment feeds more MMAs; gate / up
 // keeps the baseline 64-row tile, whose two weights' accumulators already fill the registers a wider tile would need. The
 // activation rows are the baseline layout, a padding row's copies left out.
@@ -640,6 +737,8 @@ using DnR2Cfg = Cfg<128, 128, 2, 4, 1, 1, 4, 3>;
 static_assert(pf::W2<GuR2Cfg>::SMEM == 97280 && pf::W2<DnR2Cfg>::SMEM == 90112, "the experts' shared memory");
 // their dynamic shared memory (mx.zig sf_gemm_smem, sf_split64_smem, sf_split128_smem)
 static_assert(GemmCfg::SMEM == 52224 && Split64Cfg::SMEM == 76800 && Split128Cfg::SMEM == 87040, "the dense tiles' shared memory");
+static_assert(Split64NCfg::SMEM == 43520 && 2 * (Split64NCfg::SMEM + 1024 + 2048 + 256) <= 100 * 1024, "the 64-column tile's shared memory: two blocks an SM");
+static_assert(Split64NCfg::WM == Split64Cfg::WM && Split64NCfg::WN == Split64Cfg::WN && Split64NCfg::KBS == Split64Cfg::KBS, "a warp's tile and a stage's K blocks are split64's: each output element's K chain is the same");
 // the same two split tiles on 16 warps a block (TF_DS_GEMM_W16): split64 doubles its column groups (a warp's tile
 // 2 x 4 -> 2 x 2 m16 x n8) and split128 its row groups (4 x 4 -> 8 x 2), halving the C fragments a warp holds; the
 // tile, its K blocks a stage, its stages and its shared memory are the 8-warp ones'. The grids are those whose
@@ -785,6 +884,8 @@ __device__ __noinline__ void gu_fp8_tiles(const GuArgs& a, const Ops& o0, const 
 // Gate / up of the grouped experts for a prompt chunk (tf_dsn_pf_gu_r128's arguments, grid, tiles and epilogue): the
 // MXFP4 routed experts on C4's 128-byte-run tiles, the FP8 shared expert on C8's column sub-tiles (the defaults the
 // 8-warp kernels' configurations; a 16-warp block passes its own, `APART` its shared expert in gu_fp8_tiles).
+template <int MODE, class C4_ = pf::GuR128Cfg, class C8_ = pf::GuCfg8, bool APART = false, bool QUANT = false>
+__device__ __forceinline__ void gu(const GuArgs& a, const int2* __restrict__ tiles, const int* __restrict__ ntiles, const QOut& qo = QOut{}) {
     using C4 = C4_;
     if (int(blockIdx.y) >= ntiles[0]) return;
     const int2 tl = tiles[blockIdx.y];
@@ -821,6 +922,10 @@ __device__ __noinline__ void gu_fp8_tiles(const GuArgs& a, const Ops& o0, const 
                 tile_fp8<C, MODE, false>(pf::smem, srow, wss, o, nkb, 0, nkb, nkb, cnt - m0, acc);
                 pf::gu_tile_store<C>(a, acc, o.n0, base, m0, cnt);
             }
+            if constexpr (QUANT) {
+                __syncthreads();  // the sub-tiles' stores are the block's to read
+                gu_quant_stored(a, qo, c0, C4::BN, base, m0, cnt);
+            }
         }
     } else {
         using C = C4;
@@ -828,6 +933,8 @@ __device__ __noinline__ void gu_fp8_tiles(const GuArgs& a, const Ops& o0, const 
         __syncthreads();
         float acc[2][C::MT][C::NT][4];
         tile_fp4<C, MODE>(pf::smem, srow, o, nkb, cnt - m0, acc);
+        if constexpr (QUANT) gu_tile_store_q<C>(a, qo, acc, o.n0, base, m0, cnt);
+        else pf::gu_tile_store<C>(a, acc, o.n0, base, m0, cnt);
     }
 }
 
@@ -955,6 +1062,9 @@ extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_gemm_exact_kernel
 // sf::Split128Cfg::SMEM; _exact: the exact arithmetic (tf_dsn_pf_gemm_fold's bits).
 extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_split64_kernel(MxArgs a) { sf::gemm<sf::Split64Cfg, sf::kChained, true, false>(a); }
 extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_split64_exact_kernel(MxArgs a) { sf::gemm<sf::Split64Cfg, sf::kExact, true, false>(a); }
+// split64's exact kernel on the 64-column tile: grid (ceil(M / 64), N / 64), 128 threads, sf::Split64NCfg::SMEM bytes, two blocks an SM
+// (TF_DS_SPLIT64N); a warp's 32 x 32 and every output element's K chain are split64's, so its bytes are the 128-column tile's.
+extern "C" __global__ void __launch_bounds__(128, 2) tf_dsn_sf_split64n_exact_kernel(MxArgs a) { sf::gemm<sf::Split64NCfg, sf::kExact, true, false>(a); }
 extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_split128_kernel(MxArgs a) { sf::gemm<sf::Split128Cfg, sf::kChained, true, false>(a); }
 extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_split128_exact_kernel(MxArgs a) { sf::gemm<sf::Split128Cfg, sf::kExact, true, false>(a); }
 // tf_dsn_sf_split64's split a CTA (blockIdx.z of `splits`), its partial into z [splits, M, N] fp32: grid (ceil(M / 64),
@@ -1043,6 +1153,11 @@ extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_gu_kernel(GuArgs 
 }
 extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_gu_exact_kernel(GuArgs a, const int2* __restrict__ tiles, const int* __restrict__ ntiles) {
     sf::gu<sf::kExact>(a, tiles, ntiles);
+}
+// Gate / up on the exact arithmetic with the down input quantised in the epilogue (QOut): the routed experts store codes and scales
+// (and the bf16 pack where a.h is set); the FP8 shared expert's tiles store the bf16 pack as the kernel above does.
+extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_gu_exact_q_kernel(GuArgs a, const int2* __restrict__ tiles, const int* __restrict__ ntiles, sf::QOut q) {
+    sf::gu<sf::kExact, pf::GuR128Cfg, pf::GuCfg8, false, true>(a, tiles, ntiles, q);
 }
 extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_dn_kernel(DnArgs a, const int2* __restrict__ tiles, const int* __restrict__ ntiles) {
     sf::dn<sf::kChained>(a, tiles, ntiles);

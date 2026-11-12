@@ -108,6 +108,16 @@
 //!                                               without it 64 bytes, one stage's), the same arithmetic in the same
 //!                                               order (the replies' bits as without); with the checkpoint's own
 //!                                               weights and the tile kernels; every rank the same
+//!   TF_DS_ATTN_EPILOGUE=1                      a prompt chunk's attention output takes the inverse RoPE and wo_a's
+//!                                               quant (its codes and scales, or wo_a's quant-dequant rows) in one
+//!                                               launch, wo_a then reading those bytes (the same arithmetic and the
+//!                                               same bytes; the quant's read of o goes); with the checkpoint's own
+//!                                               weights; every rank the same
+//!   TF_DS_HC_STRIDE=1                           world 4: a quarter-HC layer's mixes read the gathered planes where
+//!                                               they lie in ga / gm, at the chunk's own stride, instead of the tight
+//!                                               repack (the same bytes read, no device-to-device copy); in effect
+//!                                               with TF_DS_QUARTER_HC=1 and the four-node 2D split; every rank the
+//!                                               same
 //!   TF_DS_ATTN_U=1                              a prompt chunk's sparse attention with packed latents from the kit's
 //!                                               twin _sparse_attn_part_u (aot-extra/: each code byte's two FP4 values
 //!                                               unpacked in hardware), the same keys and the same arithmetic (the
@@ -118,6 +128,13 @@
 //!                                               values unpacked in hardware), the same scores and keys (the replies'
 //!                                               bits as without); a variant without its twin keeps the baseline kernel;
 //!                                               every rank the same
+//!   TF_DS_IDX_V=1                               a prompt chunk's indexer scores from the kit's twin
+//!                                               _index_score_rows_v (aot-extra/: the key tile dequantized once a
+//!                                               program and each of its rows dotted in turn, at four warps: fewer
+//!                                               registers a thread, more warps an SM), the same scores and keys (the
+//!                                               replies' bits as without); it replaces TF_DS_IDX_U's twin where both
+//!                                               are on, and a variant without its twin falls back to that and then to
+//!                                               the baseline kernel; every rank the same
 //!   TF_DS_ATTN_U_DECODE=1                       a decode round's sparse attention with packed latents from the kit's
 //!                                               twin _sparse_attn_part_u (as TF_DS_ATTN_U's prompt call; the
 //!                                               drafter's passes read bf16 keys and are unchanged), the same keys
@@ -184,6 +201,7 @@ const link = @import("link.zig");
 const rank_cache = @import("rank_cache.zig");
 const vision_mod = @import("vision.zig");
 const tri_attn = @import("tri_attn.zig");
+const tri_hc = @import("tri_hc.zig");
 const mx = @import("mx.zig");
 const weights = @import("weights.zig");
 
@@ -393,7 +411,13 @@ pub fn tierMath(two: ?*const prompt2d.Two, k: ?*const mx.Kernels) spill_start.Ma
         .idx_u = tri_index.idx_u,
         .roci = two != null,
         .roci_collect = false,
+        .idx_v = tri_index.idx_v,
         .assemble_quant = if (k) |x| x.assemble_quant else false,
+        .attn_epilogue = prompt.attn_epilogue,
+        .hc_stride = prompt.hc_stride,
+        .hc_fused = tri_hc.hc_fused,
+        .attn_epi_fused = tri_attn.attn_epi_fused,
+        .hc_2s = tri_hc.hc_2s,
         .pf_raster = @intCast(mx.pf_raster),
         .qgate_canary = if (prompt.qgate_canary) 1 else @backingInt(prompt.qgate_body),
     };
@@ -451,6 +475,7 @@ test "every kernel switch the start-up settings carry and a prompt pass computes
     @setEvalBranchQuota(20000);
     // a switch the store's name leaves out lets one setting restore the chunk-end states another wrote; the switches
     // of decode rounds and the drafter's passes alone compute no state a prompt pass stores
+    inline for (prompt2d.kern_names ++ prompt2d.kern2_names) |name| {
         if (name.len == 0) continue; // a reserved bit: no switch here
         const field = comptime blk: {
             var b: [name.len - "TF_DS_".len]u8 = undefined;
@@ -480,6 +505,13 @@ test "every kernel switch the start-up settings carry and a prompt pass computes
     try std.testing.expect(tierMath(null, null).idx_u);
     tri_index.idx_u = false;
     try std.testing.expect(!tierMath(null, null).idx_u);
+    // TF_DS_IDX_V likewise
+    const keep_iv = tri_index.idx_v;
+    defer tri_index.idx_v = keep_iv;
+    tri_index.idx_v = true;
+    try std.testing.expect(tierMath(null, null).idx_v);
+    tri_index.idx_v = false;
+    try std.testing.expect(!tierMath(null, null).idx_v);
     // TF_DS_QGATE_CANARY: the canary in effect, the head's 1, the body's 2 or 3, none 0
     const keep_qb = prompt.qgate_body;
     defer prompt.qgate_body = keep_qb;
@@ -577,10 +609,12 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_PF_RUN128") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_ATTN_U") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_IDX_U") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_IDX_V") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_ATTN_U_DECODE") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_MMA_SF") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_MMA_SF_EXACT") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_GEMM_R2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_HC_FUSED") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_RING_WORD") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_RING_WORD_SIGNAL") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.CanariesDiffer) orelse "", "TF_DS_QGATE_CANARY") != null);

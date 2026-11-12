@@ -19,19 +19,19 @@ fn ci(name: []const u8, v: usize) aot.Const {
 pub fn hcPre(t: Tri, h: u64, fn_w: u64, scale: u64, base: u64, pre_in: u64, norm_w: u64, eps: f32, hc_eps: f32, iters: usize, out: u64, pre_out: u64, post: u64, comb: u64, part: u64, rows: usize, d: usize) !void {
     try t.run("_hc_partial", .{ u(rows), hc_blocks, 1 }, &.{ p("X", "*bf16", h), p("FN", "*fp32", fn_w), p("PART", "*fp32", part) }, &.{ ci("WIDE", 4 * d), ci("NB", hc_blocks), ci("SUB", 128) });
     try t.run("_hc_finish", .{ u(rows), 1, 1 }, &.{
-        p("X", "*bf16", h),          p("PART", "*fp32", part),       p("BASE", "*fp32", base), p("SCALE", "*fp32", scale),
-        p("PRE_IN", "*fp32", pre_in), p("NW", "*bf16", norm_w),      p("OUT", "*bf16", out),   p("PRE_OUT", "*fp32", pre_out),
-        p("POST", "*fp32", post),    p("COMB", "*fp32", comb),       aot.float("eps", eps),    aot.float("hc_eps", hc_eps),
+        p("X", "*bf16", h),           p("PART", "*fp32", part), p("BASE", "*fp32", base), p("SCALE", "*fp32", scale),
+        p("PRE_IN", "*fp32", pre_in), p("NW", "*bf16", norm_w), p("OUT", "*bf16", out),   p("PRE_OUT", "*fp32", pre_out),
+        p("POST", "*fp32", post),     p("COMB", "*fp32", comb), aot.float("eps", eps),    aot.float("hc_eps", hc_eps),
     }, &.{ ci("D", d), ci("NB", hc_blocks), ci("ITERS", iters), ci("BLOCK", 1024) });
 }
 
 /// hc_post: gathered [world, R, D] fp32 partials, h [R, 4, D] bf16 -> out [R, 4, D] (may alias h).
 pub fn hcPost(t: Tri, gathered: u64, h: u64, post: u64, comb: u64, out: u64, world: usize, rows: usize, d: usize) !void {
-    return hcPostRs(t, gathered, rows * d, h, post, comb, out, world, rows, d);
+    try hcPostAt(t, gathered, rows * d, h, post, comb, out, world, rows, d);
 }
 
-/// hcPost with the gather's rank stride `rs` in elements (prompt.gather's return).
-pub fn hcPostRs(t: Tri, gathered: u64, rs: usize, h: u64, post: u64, comb: u64, out: u64, world: usize, rows: usize, d: usize) !void {
+/// hc_post with the gathered planes' stride `rs` in elements (the tight buffer's rows * d, or a chunk's cap * d).
+pub fn hcPostAt(t: Tri, gathered: u64, rs: usize, h: u64, post: u64, comb: u64, out: u64, world: usize, rows: usize, d: usize) !void {
     try t.run("_hc_post", .{ u(rows), u(d / 1024), 1 }, &.{ p("G", "*fp32", gathered), aot.int("RS", @intCast(rs)), p("X", "*bf16", h), p("XOUT", "*bf16", out), p("POST", "*fp32", post), p("COMB", "*fp32", comb) }, &.{ ci("D", d), ci("WORLD", world), ci("BLOCK", 1024), t.pdlConst() });
 }
 
@@ -39,6 +39,11 @@ pub fn hcPostRs(t: Tri, gathered: u64, rs: usize, h: u64, post: u64, comb: u64, 
 /// pair p's D / 2 columns, `rs` elements between the blocks.
 pub fn hcPost2b(t: Tri, blk: u64, rs: usize, h: u64, post: u64, comb: u64, out: u64, rows: usize, d: usize) !void {
     try t.runExtra("_hc_post_2b", .{ u(rows), u(d / 1024), 1 }, &.{ p("G", "*bf16", blk), aot.int("RS", @intCast(rs)), p("X", "*bf16", h), p("XOUT", "*bf16", out), p("POST", "*fp32", post), p("COMB", "*fp32", comb) }, &.{ ci("D", d), ci("WORLD", 2), ci("BLOCK", 1024), t.pdlConst() });
+}
+
+/// hcPost with the gather's rank stride `rs` in elements (prompt.gather's return): the same launch as `hcPostAt`.
+pub fn hcPostRs(t: Tri, gathered: u64, rs: usize, h: u64, post: u64, comb: u64, out: u64, world: usize, rows: usize, d: usize) !void {
+    try hcPostAt(t, gathered, rs, h, post, comb, out, world, rows, d);
 }
 
 /// rmsnorm: x [R, D] (row stride xs) bf16 -> out [R, D] (row stride os) bf16.

@@ -327,6 +327,11 @@ pub const Chunk = struct {
     ga: u64, // fp32 [world, cap, D]: its gather
     neg: u64, // int64 [cap], -1: no ring slot (model.py _neg)
     ring_idx: u64, // int64 [ring]
+    // TF_DS_WINDOW_ONCE: the window indices a chunk's every layer uploads alike, made once per chunk (windowHave says which are in)
+    ridx_g: u64 = 0, // int64 [ring]: the window keys' gather indices
+    ridx_s: u64 = 0, // int64 [ring]: the ring write's scatter indices
+    win_key: [4]usize = .{ std.math.maxInt(usize), 0, 0, 0 }, // (start, n, lo, ring mode) the uploads below were made for
+    win_have: u8 = 0,
     rslot: u64 = 0, // int64 [RING_EXTRA]: ring mode's slots, pos % R
     pm_: u64 = 0, // fp32 [16, heads, 8]: the split attention's partials (ring mode's rows)
     pl_: u64 = 0,
@@ -371,6 +376,9 @@ pub const Chunk = struct {
     pm: u64, // fp32 [cap, D]: the MoE partial
     gm: u64, // fp32 [world, cap, D]: its gather (the pending post)
     // WP4 (docs/prefill-plan.md, quarter-HC): a repack of ga's or gm's owned-row slice, tightly strided [world, q, D]
+    // (q = cap / world) -- _hc_mix_pf / _hc_post take the gathered planes' per-plane stride as a runtime argument
+    // (RS), so a reader at owned rows reads either the chunk's own cap-strided planes where they lie (TF_DS_HC_STRIDE) or
+    // this tight copy. Zero size (and never touched) when there is no Two.
     qhc_g: u64 = 0,
     // WP4: `part` is pure intermediate scratch for the Sinkhorn/mix iteration (written by _hc_mix_pf, read back by
     // _hc_finish within the SAME call, never carrying state between calls) whose layout is documented only as a
@@ -505,6 +513,10 @@ pub const Chunk = struct {
         ch.ga = try a.take(e.world * cap * d * 4);
         ch.neg = try a.take(cap * 8);
         ch.ring_idx = try a.take((c.window + ring_extra) * 8);
+        ch.ridx_g = try a.take((c.window + ring_extra) * 8);
+        ch.ridx_s = try a.take((c.window + ring_extra) * 8);
+        ch.win_key = .{ std.math.maxInt(usize), 0, 0, 0 };
+        ch.win_have = 0;
         ch.rslot = try a.take(ring_extra * 8);
         ch.pm_ = try a.take(ring_extra * hl * tri_attn.attn_splits * 4);
         ch.pl_ = try a.take(ring_extra * hl * tri_attn.attn_splits * 4);
@@ -1131,6 +1143,8 @@ pub fn beginHost(ch: *Chunk, n: usize, start: usize) void {
     ch.pending = false;
     ch.encoder_only = false;
     ch.boundary_done = false;
+    ch.win_key = .{ std.math.maxInt(usize), 0, 0, 0 }; // (TF_DS_WINDOW_ONCE: one chunk, one stream: its window uploads are made again)
+    ch.win_have = 0;
     resetGathers(ch);
 }
 
@@ -1185,6 +1199,29 @@ fn xGathered(e: *const Engine, ch: *const Chunk, li: usize) bool {
     return frontRange(e, ch, li) == null and boundaryRange(e, ch, li) == null;
 }
 
+/// TF_DS_HC_STRIDE in effect (Model.open: asked, with quarter-HC): a reader at owned rows takes the gathered planes
+/// where they lie in ga / gm (`full + r.start * D`, `cap * D` elements between planes) instead of the tight repack.
+pub var hc_stride = false;
+
+/// Where a reader at owned rows takes a sublayer's gathered planes: `ptr` plane 0's first owned row (fp32), and the
+/// planes' stride in elements; null is the tight buffer's, the launch's own rows apart.
+pub const Partials = struct { ptr: u64, rs: ?usize = null };
+
+/// The chunk's own planes (`full`, fp32 [world, cap, D]) as a reader at owned rows `start ..` takes them: plane 0 at
+/// its first row, `cap * D` elements between planes.
+pub fn planeRead(full: u64, cap: usize, hidden: usize, start: usize) Partials {
+    return .{ .ptr = full + start * hidden * 4, .rs = cap * hidden };
+}
+
+/// Where a reader at owned rows `r` takes `sub`'s partials: the tight buffer [e.world, r.n, D] as the gather left it
+/// (owner sums), else the chunk's own planes at their stride (TF_DS_HC_STRIDE), else the tight buffer filled by the repack
+/// of ga's or gm's owned rows (qhcRepackG) first.
+pub fn ownedPartials(e: *const Engine, ch: *Chunk, sub: Sub, r: QRows) !Partials {
+    if (repackSource(ch, sub)) |full| {
+        if (hc_stride) return planeRead(full, ch.cap, e.c.hidden, r.start);
+        try qhcRepackG(e, ch, full, r);
+    }
+    return .{ .ptr = ch.qhc_g };
 }
 
 /// What a reader at owned rows repacks into the tight buffer first: `sub`'s gathered planes (ga or gm), or nothing
@@ -1234,6 +1271,7 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
             ch.h_alt = old_h;
             ch.pending = false;
         } else if (r.n != 0) {
+            try tri_hc.hcPre(e.t, ch.h + r.start * row_h, lay.hc_attn[0], lay.hc_attn[1], lay.hc_attn[2], ch.pre + r.start * row_p, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, ch.x + r.start * c.hidden * 2, ch.pre_a + r.start * row_p, ch.post + r.start * row_p, ch.comb + r.start * row_c, ch.qhc_part, r.n, c.hidden);
         }
         // the owned front (frontRange) reads x's own rows alone
         // (the boundary on owned rows, boundaryRange, reads them alone as well)
@@ -1245,7 +1283,10 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
         swapStreams(ch, src);
         ch.pending = false;
     } else {
-        try tri_basic.hcPre(e.t, ch.h, lay.hc_attn[0], lay.hc_attn[1], lay.hc_attn[2], ch.pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, ch.x, ch.pre_a, ch.post, ch.comb, ch.part, ch.n, c.hidden);
+        try tri_hc.hcPre(e.t, ch.h, lay.hc_attn[0], lay.hc_attn[1], lay.hc_attn[2], ch.pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, ch.x, ch.pre_a, ch.post, ch.comb, ch.part, ch.n, c.hidden);
+    }
+}
+
 /// TF_DS_DUMP=DIR (a debugging aid, off in service): TF_DS_DUMP_LAYER's layers' (a comma list, default just "0")
 /// intermediates of the first prompt chunk, each written as DIR/n<node>-<name>.bin (raw device bytes) after the
 /// stream drains. WP1's exit gate (a tensor dump at layers 0, 8 and 19) is TF_DS_DUMP_LAYER=0,8,19.
@@ -1314,19 +1355,31 @@ pub fn chunkMode(n: usize, start: usize, floor: usize, window: usize, on: bool) 
     return .{ .ring = ring, .one_split = !ring and n <= tri.decode_rows };
 }
 
+/// TF_DS_WINDOW_ONCE (Model.open): the gather indices, the window's low position and the ring write's indices depend only on the chunk
+/// (start, rows, the window's floor), not on the layer, so a chunk uploads each once, into buffers of their own, instead of in every
+/// layer (3 of the ~111 pageable uploads a 4,096-row pass makes are these, 59 of the 111 in all). The bytes the kernels read are the same.
+pub var window_once: bool = false;
 
-/// TF_DS_IDX_SPLIT (idx_split.zig; model.zig and the layer gate set it on every rank, the ranks' settings check it): the
-/// keyed indexer layers' rows of at least this many columns split by columns over the run's nodes, the same columns
-/// out; 0: as served.
-pub var split_from: usize = 0;
+/// TF_DS_WINDOW_ONCE's text: on unless set otherwise (a bit-identical speed change): unset or "1" is on, "0" or any other text is off
+/// (a typo takes the old path). Surrounding white space is ignored.
+pub fn windowOnceWanted(text: ?[]const u8) bool {
+    const v = text orelse return true;
+    return std.mem.eql(u8, std.mem.trim(u8, v, " \t\r\n"), "1");
+}
+pub const win_g: u8 = 1;
+pub const win_lo: u8 = 2;
+pub const win_s: u8 = 4;
 
-/// split_from from TF_DS_IDX_SPLIT: 1 from idx_split.default_min columns, a larger number from that many; unset or 0:
-/// as served.
-pub fn splitEnv() !void {
-    const v = std.c.getenv("TF_DS_IDX_SPLIT") orelse return;
-    const x = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadIdxSplit;
-    split_from = if (x == 1) idx_split.default_min else x;
-    if (split_from != 0) std.log.info("the keyed indexer layers' rows of {d} columns or more split over the nodes (TF_DS_IDX_SPLIT)", .{split_from});
+/// Whether the upload `bit` is due for this chunk's (start, n, lo, ring mode): true once per key (and marks it made), false after.
+pub fn windowFresh(ch: *Chunk, start: usize, n: usize, lo: usize, ring_mode: bool, bit: u8) bool {
+    const key: [4]usize = .{ start, n, lo, @intFromBool(ring_mode) };
+    if (!std.mem.eql(usize, &key, &ch.win_key)) {
+        ch.win_key = key;
+        ch.win_have = 0;
+    }
+    if (ch.win_have & bit != 0) return false;
+    ch.win_have |= bit;
+    return true;
 }
 
 /// attention_k: the partial pa [n, D] fp32 of this rank's heads; the chunk's keys go into the layer's window ring
@@ -1382,13 +1435,22 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         // wsrc[:start - lo] = ring[arange(lo, start) % R]
         var ridx: [256]i64 = undefined;
         if (start - lo > ridx.len) return error.WindowTooLong;
-        for (0..start - lo) |j| ridx[j] = @intCast((lo + j) % ring_rows);
-        try upload(e, ch.ring_idx, &ridx, (start - lo) * 8);
+        var gidx = ch.ring_idx;
+        if (window_once) {
+            gidx = ch.ridx_g;
+            if (windowFresh(ch, start, n, lo, ring_mode, win_g)) {
+                for (0..start - lo) |j| ridx[j] = @intCast((lo + j) % ring_rows);
+                try upload(e, gidx, &ridx, (start - lo) * 8);
+            }
+        } else {
+            for (0..start - lo) |j| ridx[j] = @intCast((lo + j) % ring_rows);
+            try upload(e, gidx, &ridx, (start - lo) * 8);
+        }
         try fill(e, ch.invalid, 0, 4);
-        try e.ops.gatherRows(e.s, ring, ring_rows, ch.ring_idx, ch.wsrc, hd * 2, start - lo, ch.invalid);
+        try e.ops.gatherRows(e.s, ring, ring_rows, gidx, ch.wsrc, hd * 2, start - lo, ch.invalid);
     }
     var lo64: i64 = if (ring_mode) 0 else @intCast(lo);
-    try upload(e, ch.wlo, &lo64, 8);
+    if (!window_once or windowFresh(ch, start, n, lo, ring_mode, win_lo)) try upload(e, ch.wlo, &lo64, 8);
     const kv = ch.wsrc + (start - lo) * hd * 2;
     // slots -1: the keys go to wsrc only (ring_mode is off); the ring is written after the attention
     if (!ring_mode) try tri_norm.kvNormRope(e.t, ch.y, lay.kv_norm, rope.cos, rope.sin, ch.pos, ring, ring_rows, ch.neg, c.eps, true, rd, kv, n, hd);
@@ -1419,6 +1481,10 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         }
     }
     pmark(e, .a_idx);
+    const kk = hl * hd;
+    const epi = epilogueOn(e, ch, n, kk, hd, rd);
+    // TF_DS_ATTN_EPI_FUSED: the epilogue in the part kernel's final store (the kit's _sparse_attn_part_ue); epi_ran says it did
+    var epi_ran = false;
     try tri_attn.sparseAttn(e.t, .{
         .q = ch.q,
         .out = ch.o,
@@ -1439,15 +1505,27 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         .window = c.window,
         .one_split = one_split,
         .u = tri_attn.attn_u,
+        .epi = if (epi and tri_attn.attn_epi_fused) (if (lay.wo_a_rows)
+            tri_attn.Epi{ .cos = rope.cos, .sin = rope.sin, .rd = rd, .codes = 0, .scales = 0, .fake = ch.mxs.fake }
+        else
+            tri_attn.Epi{ .cos = rope.cos, .sin = rope.sin, .rd = rd, .codes = ch.mxs.q, .scales = ch.mxs.s, .fake = 0 }) else null,
+        .epi_ran = &epi_ran,
     });
-    try tri_norm.ropeHeads(e.t, ch.o, rope.cos, rope.sin, ch.pos, rd, true, n, hl, hd);
+    if (epi_ran) {
+        // the part kernel did the inverse RoPE and the quant (o was never written)
+    } else if (epi) {
+        if (lay.wo_a_rows) try mx.attnEpilogue(e.mx.?, e.s, ch.o, rope.cos, rope.sin, ch.pos, n, hl, hd, rd, 0, 0, ch.mxs.fake, dump_dir != null) else try mx.attnEpilogue(e.mx.?, e.s, ch.o, rope.cos, rope.sin, ch.pos, n, hl, hd, rd, ch.mxs.q, ch.mxs.s, 0, dump_dir != null);
+    } else try tri_norm.ropeHeads(e.t, ch.o, rope.cos, rope.sin, ch.pos, rd, true, n, hl, hd);
     // ring[pos[-keep:] % R] = kv[-keep:] (ring mode wrote them before the attention)
     const keep: usize = if (ring_mode) 0 else @min(n, ring_rows);
     if (keep > 0) {
         var idx: [256]i64 = undefined;
-        for (0..keep) |j| idx[j] = @intCast((start + n - keep + j) % ring_rows);
-        try upload(e, ch.ring_idx, &idx, keep * 8);
-        try e.ops.scatterRows(e.s, kv + (n - keep) * hd * 2, hd * 2, ch.ring_idx, ring, hd * 2, hd * 2, keep);
+        const sidx = if (window_once) ch.ridx_s else ch.ring_idx;
+        if (!window_once or windowFresh(ch, start, n, lo, ring_mode, win_s)) {
+            for (0..keep) |j| idx[j] = @intCast((start + n - keep + j) % ring_rows);
+            try upload(e, sidx, &idx, keep * 8);
+        }
+        try e.ops.scatterRows(e.s, kv + (n - keep) * hd * 2, hd * 2, sidx, ring, hd * 2, hd * 2, keep);
     }
     pmark(e, .a_core);
     dump(e, li, "o", ch.o, n * hl * hd * 2);
@@ -1458,11 +1536,15 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     var col: usize = 0;
     if (e.mx) |k| {
         if (lay.wo_a_rows) {
+            // Format.native: o quant-dequantized, then each group's bf16 einsum (Attention.forward); TF_DS_ATTN_EPILOGUE
+            // wrote those rows already
+            if (epi) try mx.woAFromFake(k, e.s, ch.mxs, lay.wo_a[0..groups], n, ch.u, uw, null) else try mx.woA(k, e.s, ch.mxs, lay.wo_a[0..groups], ch.o, hl * hd, n, ch.u, uw, null);
             dump(e, li, "o_fake", ch.mxs.fake, n * hl * hd * 2);
             dump(e, li, "wo_a0", lay.wo_a[0].w, @as(usize, lay.wo_a[0].n) * lay.wo_a[0].k * 2);
         } else {
             // a layer loaded without the bf16 rows (TF_DS_WOA_W8): the same values from the FP8 rows, woA's bits
             const w8 = lay.wo_a8 orelse return error.NoWoA8;
+            if (epi) try mx.woA8PrefillCodes(k, e.s, ch.mxs, w8, groups, n, ch.u, uw) else try mx.woA8Prefill(k, e.s, ch.mxs, w8, groups, ch.o, hl * hd, n, ch.u, uw);
             dump(e, li, "wo_a8", w8.w, @as(usize, w8.n) * w8.k);
         }
     } else if (n > decode_rows) {
@@ -1541,6 +1623,18 @@ pub fn frontLinears(k: *const mx.Kernels, s: cuda.Stream, sc: mx.Scratch, lay: w
 /// rows quantizes x once for wq_a and wkv (attnFront's .once).
 pub var quant_once = false;
 
+/// TF_DS_ATTN_EPILOGUE in effect (Model.open: asked, with the checkpoint's own weights): a prompt chunk's attention
+/// output takes the inverse RoPE and wo_a's quant in one launch, and wo_a reads its codes (or fake rows).
+pub var attn_epilogue = false;
+
+/// Whether a layer's attention output takes the epilogue over `n` rows: the kernel's shapes (the last rd columns and
+/// the rest whole 32-value groups) and the chunk's scratch for kk codes or fake rows.
+pub fn epilogueOn(e: *const Engine, ch: *const Chunk, n: usize, kk: usize, hd: usize, rd: usize) bool {
+    if (!attn_epilogue or e.mx == null) return false;
+    if (n == 0 or n > ch.mxs.rows or kk > ch.mxs.max_k) return false;
+    return kk % 32 == 0 and hd % 32 == 0 and rd > 0 and rd <= hd and rd % 32 == 0 and (hd - rd) % 32 == 0;
+}
+
 /// How attention computes wq_a and wkv of x: on owned rows (TF_DS_FRONT_OWNED's frontOwned), on x quantized once
 /// (TF_DS_QUANT_ONCE: frontLinears over the chunk's rows), or the baseline: each linear on its own (mm, which quantizes x for
 /// each FP8 linear) above 128 rows, the layer's group (grouped) up to 128. `codes`: frontCodes of the layer.
@@ -1592,6 +1686,7 @@ pub fn frontOwnedOffAt(gpa: std.mem.Allocator, finds: anytype, native: bool, lay
         if (!frontCodes(lay)) return "wq_a and wkv are not FP8 / FP4 on one K";
         for (rows) |r| try frontNorm(t, lay, qa, qr, r, eps);
     }
+    for (log.items.items) |l| if (!l.foundIn(finds)) return "this rank's kernel set has no _rmsnorm variant for the owned rows";
     return null;
 }
 
@@ -1932,6 +2027,7 @@ pub fn idxProjOwnedOffAt(gpa: std.mem.Allocator, finds: anytype, native: bool, i
         if (lay.idx_wq_b == null) continue;
         for (rows) |r| try idxQueries(t, iq, iq4, cos, sin, pos, r, rd, ih, id);
     }
+    for (log.items.items) |l| if (!l.foundIn(finds)) return "this rank's kernel set has no _rope_heads / _fp4qd_p2 variant for the owned rows";
     return null;
 }
 
@@ -2054,6 +2150,8 @@ fn engramSumsRoci(e: *const Engine, ch: *const Chunk, rc: *roci_engine.Roci, r: 
 /// them there, else the tight buffer of fp32 planes.
 fn ownedPosted(e: *const Engine, ch: *Chunk, sub: Sub, r: QRows, h_out: u64) !tri_hc.Posted {
     if (howOf(ch, sub).blocks) return .{ .gathered = e.two.?.rc.?.addr(.blk), .world = e.world, .h_out = h_out, .blk_rs = ownQ(e, ch) * e.two.?.ow[e.two.?.p] };
+    const g = try ownedPartials(e, ch, sub, r);
+    return .{ .gathered = g.ptr, .world = e.world, .h_out = h_out, .rs = g.rs };
 }
 
 /// hcPost of the pending gather `sub` at owned rows `r`, in place on the streams.
@@ -2068,6 +2166,7 @@ fn hcPostOwned(e: *const Engine, ch: *Chunk, sub: Sub, r: QRows) !void {
         return tri_basic.hcPost2b(e.t, t.rc.?.addr(.blk), ownQ(e, ch) * t.ow[t.p], ch.h + r.start * row_h, ch.post + r.start * row_p, ch.comb + r.start * row_c, ch.h + r.start * row_h, r.n, c.hidden);
     }
     const g = try ownedPartials(e, ch, sub, r);
+    try tri_basic.hcPostAt(e.t, g.ptr, g.rs orelse r.n * c.hidden, ch.h + r.start * row_h, ch.post + r.start * row_p, ch.comb + r.start * row_c, ch.h + r.start * row_h, e.world, r.n, c.hidden);
 }
 
 /// Layer `li`'s FFN mixes: hc_pre_pf with the gathered attention partials posted into the streams first; x the MoE's
@@ -2346,6 +2445,7 @@ pub fn ffnCodesOffAt(gpa: std.mem.Allocator, finds: anytype, native: bool, layer
     for (layers[0..@min(half, layers.len)]) |lay| {
         for (rows) |r| try ffnRoute(t, lay, logits, pick, wts, r, ne, top_k, scale_, ne, sl);
     }
+    for (log.items.items) |l| if (!l.foundIn(finds)) return "this rank's kernel set has no _route variant for the owned rows";
     return null;
 }
 
@@ -2885,6 +2985,7 @@ pub fn engramOwnerSumOffAt(gpa: std.mem.Allocator, finds: anytype, ew: [2]usize,
         if (lay.engram_wkv == null) continue;
         for (rows) |r| try engramGateRows(t, lay.engram_qk, h, kv, out, r, eps, d, hc * d * 2, (ew[0] + ew[1]) * 2);
     }
+    for (log.items.items) |l| if (!l.foundIn(finds)) return "this rank's kernel set has no _engram_gate variant for the owned rows";
     return null;
 }
 
@@ -3355,7 +3456,27 @@ const FakeFinds = struct {
         const m = f.missing orelse return true;
         return !std.mem.eql(u8, m, name);
     }
+
+    /// No extra set (a runTwin launch then counts as found when the base set has its fallback, as Tri runs it).
+    pub fn hasExtra(f: FakeFinds, name: []const u8, args: []const aot.Arg, consts: []const aot.Const) bool {
+        _ = .{ f, name, args, consts };
+        return false;
+    }
 };
+
+test "TF_DS_ROPE_W on, a kit with no _rope_heads_w at the owned rows: the owned-rows check passes on _rope_heads, as the launch falls back to it" {
+    const keep = tri_norm.rope_w;
+    defer tri_norm.rope_w = keep;
+    tri_norm.rope_w = true;
+    var lays: [40]weights.Layer = undefined;
+    try checkpointLayers(&lays);
+    const gpa = std.testing.allocator;
+    const qs = [_]usize{ 256, 512, 1024, 512 };
+    var n: usize = 0;
+    try std.testing.expectEqual(@as(?[]const u8, null), try idxProjOwnedOff(gpa, FakeFinds{ .asked = &n }, true, true, &lays, 20, 64, 32, 128, &qs, 4));
+    // the fallback itself missing still refuses
+    try std.testing.expectEqualStrings("this rank's kernel set has no _rope_heads / _fp4qd_p2 variant for the owned rows", (try idxProjOwnedOff(gpa, FakeFinds{ .asked = &n, .missing = "_rope_heads" }, true, true, &lays, 20, 64, 32, 128, &qs, 4)) orelse "can");
+}
 
 test "the owned routing's image spans: every span row routed with the image bias by its owner alone, as routeSpans routes it" {
     const cap = 64;
@@ -3515,6 +3636,7 @@ test "a pass's view: its own rows when whole, the resume rows under them" {
 
 test "TF_DS_ATTN_U moves a prompt chunk's sparse attention only: its call asks for the twin, a round's and a pass's never" {
     const src = @embedFile("prompt.zig");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "        .one_split = one_split,\n        .u = tri_attn.attn_u,\n        .epi = if (epi and tri_attn.attn_epi_fused)"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, @embedFile("round.zig"), "tri_attn.attn_u,"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, @embedFile("draft.zig"), "attn_u"));
     // TF_DS_ATTN_U_DECODE: a round's call alone (the drafter's passes read bf16 compressed keys)
@@ -3833,6 +3955,7 @@ test "TF_DS_ROCI_ANY with SENT_FIRST and COMBINE_DOOR: only a whole pass of a pl
     const m = src[std.mem.indexOf(u8, src, "fn moeSendFirst(").?..std.mem.indexOf(u8, src, "const MoeRing = struct").?];
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, m, "ch.n == ch.cap and fixedPlan(ch)"));
 }
+
 test "TF_DS_ATTN_EPILOGUE: the switch, the kernel's shapes and the chunk's scratch decide the epilogue" {
     var two: prompt2d.Two = undefined;
     var cfg: Config = undefined;
@@ -4036,6 +4159,42 @@ fn hostEngine(two: *const prompt2d.Two, cfg: *Config, cm: *comm.Comm) Engine {
     e.comm = cm;
     e.world = 2;
     return e;
+}
+
+test "TF_DS_WINDOW_ONCE: a chunk's window uploads are due once per (start, rows, floor, mode) and again when the key changes" {
+    var ch: Chunk = undefined;
+    ch.win_key = .{ std.math.maxInt(usize), 0, 0, 0 };
+    ch.win_have = 0;
+    for ([_]u8{ win_g, win_lo, win_s }) |b| {
+        try std.testing.expect(windowFresh(&ch, 8192, 4096, 8064, false, b));
+        for (0..39) |_| try std.testing.expect(!windowFresh(&ch, 8192, 4096, 8064, false, b));
+    }
+    // the next chunk: all three due again, once
+    try std.testing.expect(windowFresh(&ch, 12288, 4096, 12160, false, win_lo));
+    try std.testing.expect(!windowFresh(&ch, 12288, 4096, 12160, false, win_lo));
+    try std.testing.expect(windowFresh(&ch, 12288, 4096, 12160, false, win_g));
+    // a different floor or mode under the same start is a different key
+    try std.testing.expect(windowFresh(&ch, 12288, 4096, 12000, false, win_g));
+    try std.testing.expect(windowFresh(&ch, 12288, 4096, 12000, true, win_g));
+}
+
+test "TF_DS_WINDOW_ONCE: attention uploads the window indices through windowFresh into the chunk's own buffers when the switch is on, as before when off" {
+    const code = @embedFile("prompt.zig");
+    const at = std.mem.indexOf(u8, code, "pub fn attention(").?;
+    const body = code[at .. std.mem.indexOf(u8, code[at..], "pmark(e, .a_core);").? + at];
+    for ([_][]const u8{ "windowFresh(ch, start, n, lo, ring_mode, win_g)", "windowFresh(ch, start, n, lo, ring_mode, win_lo)", "windowFresh(ch, start, n, lo, ring_mode, win_s)", "gidx = ch.ridx_g", "ch.ridx_s", "try e.ops.gatherRows(e.s, ring, ring_rows, gidx," }) |needle|
+        try std.testing.expect(std.mem.indexOf(u8, body, needle) != null);
+    // off: the same three uploads in every layer, into ring_idx and wlo
+    try std.testing.expect(std.mem.indexOf(u8, body, "var gidx = ch.ring_idx;") != null);
+}
+
+test "TF_DS_WINDOW_ONCE is on unless set otherwise: unset and 1 are on, 0 and any other text off" {
+    try std.testing.expect(windowOnceWanted(null));
+    try std.testing.expect(windowOnceWanted("1"));
+    try std.testing.expect(windowOnceWanted(" 1\n"));
+    try std.testing.expect(!windowOnceWanted("0"));
+    try std.testing.expect(!windowOnceWanted(""));
+    try std.testing.expect(!windowOnceWanted("on"));
 }
 
 test "layer 0's MoE partials take the body canary right before their gather, in a prompt chunk and in a round; off, nothing launches" {

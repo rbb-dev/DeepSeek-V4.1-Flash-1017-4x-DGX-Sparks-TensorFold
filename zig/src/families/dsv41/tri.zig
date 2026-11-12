@@ -12,22 +12,56 @@ pub var decode_rows: usize = 16;
 /// Launches a twin's call site sent to its base function: the extra set had no variant of the twin for them.
 pub var twin_misses: std.atomic.Value(u64) = .init(0);
 
+/// Fused launches (tryExtra) a call site asked for that the extra set had no variant of: it made the baseline separate launches.
+pub var fuse_misses: std.atomic.Value(u64) = .init(0);
+
 pub const Tri = struct {
     set: ?*const aot.Set = null,
+    /// The kit's extra set (aot-extra/): variants the base set lacks, searched only by the call sites that ask for it
+    /// (runExtra); every other launch searches the base set alone.
+    extra: ?*const aot.Set = null,
     stream: cuda.Stream = undefined,
     log: ?*Log = null,
     /// The "pdl" switch (TF_DS_TRITON_PDL, on in the served build): decode kernels as programmatic dependent launches.
     pdl: bool = true,
 
     pub fn run(t: Tri, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !void {
-        if (t.log) |l| return l.add(name, grid, args, consts);
+        if (t.log) |l| return l.add(name, grid, args, consts, false);
+        try t.set.?.run(t.stream, name, grid, args, consts);
+    }
+
+    /// run from the extra set: its variant of this launch, or error.MissingTritonVariant (no extra set:
+    /// error.NoExtraSet). The base set is not searched.
+    pub fn runExtra(t: Tri, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !void {
+        if (t.log) |l| return l.add(name, grid, args, consts, true);
+        const set = t.extra orelse return error.NoExtraSet;
+        const v = set.lookup(name, args, consts) orelse return error.MissingTritonVariant;
+        try aot.Set.launchVariant(v, t.stream, grid, args);
+    }
+
     /// run of `twin`, the extra set's twin of base function `name` (taking the same arguments and constexprs), where
     /// the extra set holds its variant of this launch; else run of `name` itself, counted in twin_misses (a kit
     /// without the twin: the baseline kernel, the baseline bytes).
     pub fn runTwin(t: Tri, twin: []const u8, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !void {
+        if (t.log) |l| return l.addTwin(twin, name, grid, args, consts);
         if (t.extra) |set| if (set.lookup(twin, args, consts)) |v| return aot.Set.launchVariant(v, t.stream, grid, args);
         _ = twin_misses.fetchAdd(1, .monotonic);
         try t.set.?.run(t.stream, name, grid, args, consts);
+    }
+
+    /// run from the extra set when it holds the variant of this launch: true. Else nothing is launched and false is returned
+    /// (counted in fuse_misses): the caller makes the launches the fused one replaces.
+    pub fn tryExtra(t: Tri, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !bool {
+        if (t.log) |l| {
+            try l.add(name, grid, args, consts, true);
+            return true;
+        }
+        if (t.extra) |set| if (set.lookup(name, args, consts)) |v| {
+            try aot.Set.launchVariant(v, t.stream, grid, args);
+            return true;
+        };
+        _ = fuse_misses.fetchAdd(1, .monotonic);
+        return false;
     }
 
     /// The PDL constexpr a wrapper passes when its kernel takes one (_pdl() in kernels.py).
@@ -52,8 +86,33 @@ pub fn pow2(n: usize) usize {
 pub const Log = struct {
     gpa: std.mem.Allocator,
     items: std.ArrayList(Kept) = .empty,
+    /// `extra`: a launch of the extra set's variant (runExtra, runTwin). `fallback`: a runTwin launch's base kernel, which
+    /// runs when the extra set has no variant of the twin (null for runExtra: the base set is not searched).
+    pub const Kept = struct {
+        name: []const u8,
+        grid: [3]u32,
+        args: []aot.Arg,
+        consts: []aot.Const,
+        extra: bool = false,
+        fallback: ?[]const u8 = null,
 
-    pub const Kept = struct { name: []const u8, grid: [3]u32, args: []aot.Arg, consts: []aot.Const };
+        /// Whether `finds` has the kernel this launch runs, as Tri runs it: a base-set launch in the base set (`finds.has`);
+        /// a runExtra launch in the extra set alone (`finds.hasExtra`); a runTwin launch in the extra set, else its base
+        /// kernel `fallback` in the base set. Every start check that walks a launch log asks this, never `has` alone.
+        pub fn foundIn(k: Kept, finds: anytype) bool {
+            if (k.extra) return finds.hasExtra(k.name, k.args, k.consts) or (if (k.fallback) |f| finds.has(f, k.args, k.consts) else false);
+            return finds.has(k.name, k.args, k.consts);
+        }
+    };
+
+    fn add(l: *Log, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const, extra: bool) !void {
+        try l.items.append(l.gpa, .{ .name = name, .grid = grid, .args = try l.gpa.dupe(aot.Arg, args), .consts = try l.gpa.dupe(aot.Const, consts), .extra = extra });
+    }
+
+    /// A runTwin launch: the twin in the extra set, else its base kernel `fallback` (as runTwin runs it).
+    fn addTwin(l: *Log, twin: []const u8, fallback: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !void {
+        try l.items.append(l.gpa, .{ .name = twin, .grid = grid, .args = try l.gpa.dupe(aot.Arg, args), .consts = try l.gpa.dupe(aot.Const, consts), .extra = true, .fallback = fallback });
+    }
 
     fn add(l: *Log, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !void {
         try l.items.append(l.gpa, .{ .name = name, .grid = grid, .args = try l.gpa.dupe(aot.Arg, args), .consts = try l.gpa.dupe(aot.Const, consts) });
@@ -227,6 +286,41 @@ pub fn conform(fn_name: []const u8, call: *const fn (Tri, Case) anyerror!void) !
 fn folded(args: []const aot.Arg, name: []const u8) bool {
     for (args) |a| if (std.mem.eql(u8, a.name, name)) return a.value == .i32 and a.value.i32 == 1;
     return false;
+}
+
+test "an aot.json read without its cubins finds a launch's variant as the set does, and names a function's constexprs" {
+    const json =
+        \\{"kernels": [
+        \\ {"fn": "_f", "hash": "a", "name": "_f", "num_warps": 4, "params": [{"name": "X", "type": "*bf16", "div16": true, "nospec": false}], "consts": {"H": {"int": 16}, "S": {"int": 8}}},
+        \\ {"fn": "_f", "hash": "b", "name": "_f", "num_warps": 4, "params": [{"name": "X", "type": "*bf16", "div16": true, "nospec": false}], "consts": {"H": {"int": 32}, "S": {"int": 8}}},
+        \\ {"fn": "_f", "hash": "c", "name": "_f", "num_warps": 4, "params": [{"name": "X", "type": "*bf16", "div16": false, "nospec": false}], "consts": {"H": {"int": 16}, "S": {"int": 1}}}
+        \\]}
+    ;
+    var m = try aot.Manifest.parse(std.testing.allocator, json);
+    defer m.deinit();
+    const aligned = [_]aot.Arg{aot.ptr("X", "*bf16", 256)};
+    const odd = [_]aot.Arg{aot.ptr("X", "*bf16", 258)};
+    try std.testing.expectEqual(@as(?usize, 0), m.find("_f", &aligned, &.{ aot.ci("H", 16), aot.ci("S", 8) }));
+    try std.testing.expectEqual(@as(?usize, 1), m.find("_f", &aligned, &.{ aot.ci("H", 32), aot.ci("S", 8) }));
+    // the general pass: an aligned argument takes a variant that did not assume it
+    try std.testing.expectEqual(@as(?usize, 2), m.find("_f", &aligned, &.{ aot.ci("H", 16), aot.ci("S", 1) }));
+    try std.testing.expectEqual(@as(?usize, null), m.find("_f", &odd, &.{ aot.ci("H", 16), aot.ci("S", 8) }));
+    try std.testing.expectEqual(@as(?usize, null), m.find("_f", &aligned, &.{ aot.ci("H", 8), aot.ci("S", 8) }));
+    try std.testing.expect(m.has("_f", &.{ aot.ci("H", 16), aot.ci("S", 1) }));
+    try std.testing.expect(!m.has("_f", &.{ aot.ci("H", 32), aot.ci("S", 1) }));
+    try std.testing.expect(!m.has("_g", &.{aot.ci("H", 16)}));
+}
+
+test "runExtra searches the extra set alone; run the base set" {
+    var log: Log = .{ .gpa = std.testing.allocator };
+    defer log.deinit();
+    const t: Tri = .{ .log = &log };
+    try t.run("_f", .{ 1, 1, 1 }, &.{}, &.{});
+    try t.runExtra("_f", .{ 1, 1, 1 }, &.{}, &.{});
+    try std.testing.expect(!log.items.items[0].extra);
+    try std.testing.expect(log.items.items[1].extra);
+    const none: Tri = .{};
+    try std.testing.expectError(error.NoExtraSet, none.runExtra("_f", .{ 1, 1, 1 }, &.{}, &.{}));
 }
 
 test "a function's variants and the twins compiled the same way" {

@@ -73,13 +73,78 @@ pub const Attn = struct {
     /// packed latents the part from its twin _sparse_attn_part_u (Tri.runTwin: the hardware unpack, the same keys), else
     /// from _sparse_attn_part
     u: bool = false,
+    /// TF_DS_ATTN_EPI_FUSED: the attention epilogue (inverse RoPE and wo_a's quant) in the final store of the part kernel
+    /// (the kit's _sparse_attn_part_ue): o is not written. Taken only for a prompt chunk's call (one split); packed
+    /// latents only with `u` (the hardware unpack, as the twin); `epi_ran` says whether it was (false: the caller runs the baseline epilogue on o).
+    epi: ?Epi = null,
+    epi_ran: ?*bool = null,
 };
+
+/// The epilogue the fused part kernel does: RoPE tables, the roped columns, and where the result goes (`fake` non-zero:
+/// wo_a's fake rows, else E4M3 `codes` [rows, h * hd] and fp32 `scales` [rows, h * hd / 32]).
+pub const Epi = struct { cos: u64, sin: u64, rd: usize, codes: u64, scales: u64, fake: u64 };
+
+/// TF_DS_ATTN_EPI_FUSED in effect (Model.open, once the extra set holds the kernel).
+pub var attn_epi_fused: bool = false;
+
+/// TF_DS_ATTN_TWIN w / x / z with TF_DS_ATTN_EPI_FUSED in effect and the kit holding _sparse_attn_part_we (Model.open): the fused
+/// launch asks for the twin with _sparse_attn_part_w's mainloop; the same bytes as _ue.
+pub var attn_epi_we: bool = false;
+/// TF_DS_ATTN_TWIN x with TF_DS_ATTN_EPI_FUSED in effect and the kit holding _sparse_attn_part_xe: the fused launch asks for the twin that also
+/// reads the next block's index rows ahead and prefetches its rows into L1 (the same bytes as _ue); opt-in until a Spark arm shows it faster.
+pub var attn_epi_xe: bool = false;
+/// Fused launches that took _ue because the kit has no _we variant for them.
+pub var attn_we_misses: std.atomic.Value(u64) = .init(0);
+/// Launches the switch sent to the baseline part kernel and epilogue because the extra set holds no variant for them.
+pub var attn_epi_misses: std.atomic.Value(u64) = .init(0);
 
 /// TF_DS_ATTN_U in effect (Model.open): a prompt chunk's sparse attention asks for _sparse_attn_part_u.
 pub var attn_u: bool = false;
+/// The kit's twin of _sparse_attn_part a TF_DS_ATTN_U / TF_DS_ATTN_U_DECODE call asks for (TF_DS_ATTN_TWIN, Model.open):
+/// u the hardware unpack; w u's keys with the scale bytes read in the code bytes' layout and the code bytes unpacked where
+/// they sit in their registers (the same bits); x w with the picks' index rows read one block ahead (the same bits); z w
+/// with a decode round's picks rows prefetched into L2 before the PDL wait (the same bits).
+/// TF_DS_ATTN_EPI_TWIN: which kit kernel the fused prompt attention epilogue (TF_DS_ATTN_EPI_FUSED) launches: ue (the baseline, _sparse_attn_part_ue),
+/// we (_sparse_attn_part_we: ue's epilogue after w's mainloop) or xe (_sparse_attn_part_xe: we reading the next block's indices ahead with
+/// an L1 prefetch of its rows). All give the same bytes (the kernels replay compares them). Separate from TF_DS_ATTN_TWIN, which picks the
+/// decode and unfused calls' twin. we unless set (measured: _we x1.020, replies byte-equal).
+pub const EpiTwin = enum { ue, we, xe };
+
+/// The epilogue twin `text` asks for: we when unset or empty, null for a value that is not ue, we or xe (the start refuses it by name).
+pub fn epiTwinWanted(text: ?[]const u8) ?EpiTwin {
+    const t = std.mem.trim(u8, text orelse return .we, " \t\r\n");
+    if (t.len == 0) return .we;
+    return std.meta.stringToEnum(EpiTwin, t);
+}
+
+pub const Twin = enum {
+    u,
+    w,
+    x,
+    z,
+
+    pub fn kernel(t: Twin) []const u8 {
+        return switch (t) {
+            .u => "_sparse_attn_part_u",
+            .w => "_sparse_attn_part_w",
+            .x => "_sparse_attn_part_x",
+            .z => "_sparse_attn_part_z",
+        };
+    }
+
+    pub fn parse(v: []const u8) ?Twin {
+        return std.meta.stringToEnum(Twin, v);
+    }
+};
+pub var attn_twin: Twin = .u;
 /// TF_DS_ATTN_U_DECODE in effect (Model.open): a decode round's sparse attention asks for _sparse_attn_part_u (the
 /// drafter's passes read bf16 compressed keys: nothing to unpack).
 pub var attn_u_decode: bool = false;
+
+/// TF_DS_MERGE_D in effect (Model.open): the columns per program of the decode merge's twin _sparse_attn_merge_d (16, 64 or
+/// 128), or 0 (off). The twin's programs each sum a block of the head's columns, so a round's merge runs HD / merge_db
+/// programs a row and head group instead of one; the same bits. A variant the kit's extra set lacks keeps _sparse_attn_merge.
+pub var merge_db: usize = 0;
 
 /// sparse_attn's key splits for a call of `rows` rows: a decode window's (decode_rows rows or fewer) split the keys and
 /// merge them; a prompt chunk, and a small chunk run as one (`one_split`), take one split that writes out directly.
@@ -133,7 +198,44 @@ pub fn sparseAttn(t: Tri, a: Attn) !void {
         cb("FINAL", final), cb("HAS_BASE", based), t.pdlConst(),       cb("WPF", wpf),
     };
     const grid: [3]u32 = .{ u(a.rows), u(groups), u(sp) };
+    if (a.epi) |ep| epi: {
+        if (!(attn_epi_fused and final and (a.u or !pack) and !a.extra and a.hd == 512 and ep.rd == 64)) break :epi;
+        const out_ptr: u64 = if (ep.fake != 0) ep.fake else a.out;
+        const qc: u64 = if (ep.fake != 0) ep.fake else ep.codes;
+        const qs: u64 = if (ep.fake != 0) ep.fake else ep.scales;
+        var args: [part_args.len + 4]aot.Arg = undefined;
+        @memcpy(args[0..part_args.len], &part_args);
+        for (args[0..part_args.len]) |*x| {
+            if (std.mem.eql(u8, x.name, "OUT")) x.* = p("OUT", "*bf16", out_ptr);
+        }
+        args[part_args.len + 0] = p("COS", "*fp32", ep.cos);
+        args[part_args.len + 1] = p("SIN", "*fp32", ep.sin);
+        args[part_args.len + 2] = p("QC", "*u8", qc);
+        args[part_args.len + 3] = p("QS", "*fp32", qs);
+        const consts = part_consts ++ [_]aot.Const{ ci("EPI", if (ep.fake != 0) 2 else 1), ci("RD", ep.rd) };
+        var epi_name: []const u8 = if (attn_epi_xe) "_sparse_attn_part_xe" else if (attn_epi_we) "_sparse_attn_part_we" else "_sparse_attn_part_ue";
+        if (t.log == null) {
+            const set = t.extra orelse {
+                _ = attn_epi_misses.fetchAdd(1, .monotonic);
+                break :epi;
+            };
+            // TF_DS_ATTN_TWIN w / x / z: the epilogue-fused part with _sparse_attn_part_w's mainloop (the kit's _we); a launch
+            // it has no variant for takes _ue (counted: the replay and the speed report say so)
+            if ((attn_epi_we or attn_epi_xe) and set.lookup(epi_name, &args, &consts) == null) {
+                _ = attn_we_misses.fetchAdd(1, .monotonic);
+                epi_name = "_sparse_attn_part_ue";
+            }
+            if (set.lookup(epi_name, &args, &consts) == null) {
+                _ = attn_epi_misses.fetchAdd(1, .monotonic);
+                break :epi;
+            }
+        }
+        try t.runExtra(epi_name, grid, &args, &consts);
+        if (a.epi_ran) |ran| ran.* = true;
+        return;
+    }
     if (a.u and pack and !a.extra) {
+        try t.runTwin(attn_twin.kernel(), "_sparse_attn_part", grid, &part_args, &part_consts);
     } else try (if (a.extra) &Tri.runExtra else &Tri.run)(t, "_sparse_attn_part", grid, &part_args, &part_consts);
     if (final) return;
     const merged = [_]aot.Arg{ p("PM", "*fp32", pp.pm), p("PL", "*fp32", pp.pl), p("PO", "*fp32", pp.po), p("SINK", "*fp32", a.sink), p("OUT", "*bf16", a.out) };
@@ -147,7 +249,9 @@ pub fn sparseAttn(t: Tri, a: Attn) !void {
             ci("H", a.h), ci("HD", a.hd), ci("HB", hb), ci("SPLITS", sp), ci("RD", r.rd), ci("GH", r.gh), cb("DISCARD", discard), t.pdlConst(),
         });
     } else {
-        try t.run("_sparse_attn_merge", .{ u(a.rows), u(groups), 1 }, &merged, &.{ ci("H", a.h), ci("HD", a.hd), ci("HB", hb), ci("SPLITS", sp), t.pdlConst() });
+        if (merge_db != 0 and a.hd % merge_db == 0) {
+            try t.runTwin("_sparse_attn_merge_d", "_sparse_attn_merge", .{ u(a.rows), u(groups), u(a.hd / merge_db) }, &merged, &.{ ci("H", a.h), ci("HD", a.hd), ci("HB", hb), ci("SPLITS", sp), t.pdlConst(), ci("DB", @intCast(merge_db)) });
+        } else try t.run("_sparse_attn_merge", .{ u(a.rows), u(groups), 1 }, &merged, &.{ ci("H", a.h), ci("HD", a.hd), ci("HB", hb), ci("SPLITS", sp), t.pdlConst() });
     }
 }
 
@@ -339,6 +443,35 @@ test "TF_DS_ATTN_U: a call with packed latents launches the part's twin with its
         try sparseAttn(.{ .log = &log }, b);
         try std.testing.expectEqualStrings("_sparse_attn_part", log.items.items[0].name);
         try std.testing.expect(!log.items.items[0].extra);
+    }
+}
+
+test "TF_DS_ATTN_TWIN: the call asks for the twin it names, with u's arguments and constexprs; u by default" {
+    const keep = attn_twin;
+    defer attn_twin = keep;
+    try std.testing.expectEqual(Twin.u, attn_twin);
+    try std.testing.expectEqual(@as(?Twin, .w), Twin.parse("w"));
+    try std.testing.expectEqual(@as(?Twin, null), Twin.parse("q"));
+    try std.testing.expectEqual(@as(?Twin, null), Twin.parse(""));
+    const fp4: Comp = .{ .fp4 = .{ .codes = 0x600, .scales = 0x700 } };
+    const a: Attn = .{ .q = 0x100, .out = 0x200, .rows = 6, .h = 16, .hd = 512, .sink = 0x300, .wsrc = 0x400, .wsrc_rows = 144, .wlo = 0x500, .ring = true, .comp = fp4, .idx = 0x800, .n_idx = 512, .pos = 0x900, .scale = 0.0441941738, .window = 128, .parts = .{ .pm = 0xa00, .pl = 0xb00, .po = 0xc00 }, .u = true };
+    var first: ?tri.Log = null;
+    defer if (first) |*l| l.deinit();
+    for ([_]Twin{ .u, .w, .x, .z }) |tw| {
+        attn_twin = tw;
+        var log: tri.Log = .{ .gpa = std.testing.allocator };
+        errdefer log.deinit();
+        try sparseAttn(.{ .log = &log }, a);
+        try std.testing.expectEqualStrings(tw.kernel(), log.items.items[0].name);
+        try std.testing.expect(log.items.items[0].extra);
+        if (first) |*f| {
+            const p0 = f.items.items[0];
+            const p1 = log.items.items[0];
+            try std.testing.expectEqual(p0.grid, p1.grid);
+            for (p0.args, p1.args) |q0, q1| try std.testing.expect(std.mem.eql(u8, q0.name, q1.name) and std.meta.eql(q0.value, q1.value));
+            for (p0.consts, p1.consts) |q0, q1| try std.testing.expect(std.mem.eql(u8, q0.name, q1.name) and std.meta.eql(q0.int, q1.int));
+            log.deinit();
+        } else first = log;
     }
 }
 
