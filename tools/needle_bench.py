@@ -1,8 +1,11 @@
 """Needle-in-a-haystack retrieval sweep: a random code hidden at a chosen depth inside a filler prompt of a chosen
 length, across a grid of (length, depth) pairs, checking the server's greedy reply names it.
 
-    python3 tools/needle_bench.py [--url http://127.0.0.1:8888] [--model NAME] [--lens 4096,8192,...]
+    python3 tools/needle_bench.py [--url http://localhost:8000] [--model deepseek-v4.1-flash-1017] [--lens 4096,8192,...]
         [--depths 0,25,50,75,100] [--reps 1] [--json OUT.jsonl]
+
+With keys on (start.sh with API_KEY=1) it sends API_KEY, else the first key in API_KEY_FILE (default
+~/.local/state/dsv41-tensorfold/api-key), as tools/recipe_bench.py does. tools/needle_test.sh runs the 1M and 2M sets.
 
 Needs only the Python standard library. Builds each length's haystack from a fixed filler sentence, calibrated once
 against the live server (one short request) to turn "tokens" into "sentence repeats" without needing a local
@@ -12,6 +15,7 @@ with the number only.") is appended after it, thinking off, greedy. A cell is a 
 exact code.
 """
 import json
+import os
 import random
 import sys
 import time
@@ -30,8 +34,8 @@ def arg(name, default):
     return args[i]
 
 
-URL = arg("--url", "http://127.0.0.1:8888").rstrip("/")
-MODEL = arg("--model", "DeepSeek-V4.1-Flash-1017")
+URL = arg("--url", "http://localhost:8000").rstrip("/")
+MODEL = arg("--model", "deepseek-v4.1-flash-1017")
 try:
     LENS = [int(x) for x in arg("--lens", "4096,8192,16384,32768,65536,131072,262144,524288,1000000").split(",")]
     DEPTHS = [int(x) for x in arg("--depths", "0,25,50,75,100").split(",")]
@@ -43,11 +47,31 @@ if not all(x > 0 for x in LENS) or not all(0 <= d <= 100 for d in DEPTHS) or REP
     sys.exit("--lens takes positive token counts, --depths percentages from 0 to 100, --reps at least 1")
 JSON_OUT = arg("--json", None)
 
+
+
+def api_key():
+    """The server's API key: API_KEY, else the first key in API_KEY_FILE, else none (as tools/recipe_bench.py)."""
+    key = os.environ.get("API_KEY", "").strip()
+    if key:
+        return key
+    path = os.environ.get("API_KEY_FILE", os.path.expanduser("~/.local/state/dsv41-tensorfold/api-key"))
+    try:
+        with open(path) as f:
+            line = next((x.strip() for x in f if x.strip() and not x.startswith("#")), "")
+    except OSError:
+        return ""
+    return line.split(":", 1)[1].strip() if ":" in line else line
+
+
+HEADERS = {"content-type": "application/json"}
+if api_key():
+    HEADERS["authorization"] = "Bearer " + api_key()
+
 FILLER = "The quick brown fox jumps over the lazy dog near the riverbank at dawn. "
 
 
-def post(body, timeout=1800):
-    req = urllib.request.Request(URL + "/v1/chat/completions", json.dumps(body).encode(), {"content-type": "application/json"})
+def post(body, timeout=3600):   # a cold 2M-token prompt reads in ~7 min on four Sparks
+    req = urllib.request.Request(URL + "/v1/chat/completions", json.dumps(body).encode(), HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.load(r)
