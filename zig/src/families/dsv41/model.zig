@@ -1046,6 +1046,8 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             prompt2d.roci_stagger3_asked = prompt2d.roci_stagger_lanes == 3; // every rank alike (Settings)
         }
         rocinante_mod.setCap(prompt2d.pass_rows_asked); // (the transport's arenas and plans follow the pass rows, before any layout is read)
+        prompt2d.ring_wc_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_RING_WC")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.ring_inplace_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_RING_INPLACE")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         const ring_word_text: ?[]const u8 = if (std.c.getenv("TF_DS_RING_WORD")) |v| std.mem.span(v) else null;
         prompt2d.ring_word_asked = prompt2d.switchDefaultOn(ring_word_text); // on unless set to something but 1; every rank alike (Settings)
         prompt2d.ring_word_explicit = ring_word_text != null;
@@ -1089,6 +1091,9 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         if (std.c.getenv("TF_DS_ROCI_XLOG")) |v| rdma.xlog = std.mem.eql(u8, std.mem.span(v), "1");
         if (std.c.getenv("TF_DS_L2_DN_MB")) |v| round.l2_dn_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dn_mb;
         if (std.c.getenv("TF_DS_L2_DEC_MB")) |v| round.l2_dec_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dec_mb;
+        ops_mod.Ops.add2_vec_on = prompt2d.switchDefaultOn(if (std.c.getenv("TF_DS_ADD2_VEC")) |v| std.mem.span(v) else null); // the bytes are the scalar kernel's: a rank may differ
+        if (std.c.getenv("TF_EXL3_L2_DELAY_NS")) |v| ops_mod.l2_delay_ns = std.fmt.parseInt(c_longlong, std.mem.span(v), 10) catch ops_mod.l2_delay_ns;
+        if (std.c.getenv("TF_EXL3_L2_RATE_GBPS")) |v| ops_mod.l2_rate_gbps = std.fmt.parseFloat(f64, std.mem.span(v)) catch ops_mod.l2_rate_gbps;
         m.graph_fallbacks = .init(0);
         m.pair = false;
         m.pair_open = .init(false);
@@ -1244,6 +1249,12 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             try Two.require(d, &m.comm, m.stream, "the decoder half over Rocinante", prompt2d.rociDecOff(prompt.quant_once, c.dspark_taps.slice().len, c.hidden) orelse try any_check.decoderOff(gpa, a, KitFinds{ .set = &m.set, .extra = if (m.extra) |*x| x else null }, c.*, m.w.layers));
             std.log.info("Rocinante carries the decoder half (layers {d} to {d}) on owned rows of the decoder rows, its sums and gathers, the DSpark taps and the head's row, on every rank", .{ c.layers / 2, c.layers - 1 });
             const proj_why: ?[]const u8 = if (prompt2d.idx_proj_owned_asked) try prompt.idxProjOwnedOff(gpa, SetFinds{ .set = &m.set }, m.mxk != null, m.two.?.idx_shard, m.w.layers, c.candidate_source, c.rope_dim, c.index_heads, c.index_head_dim, &rows4, m.comm.world) else null;
+                const sw = ringSwitches(prompt2d.ring_wc_asked, prompt2d.ring_inplace_asked, rk.hasInplace());
+                if (prompt2d.ring_wc_asked) std.log.info("{s}", .{ringWcLine(sw.wc)});
+                if (prompt2d.ring_inplace_asked) {
+                    var lb: [256]u8 = undefined;
+                    std.log.info("{s}", .{ringInplaceLine(&lb, sw)});
+                }
                 const ring_wait_on = ringWaitOn(rk.hasWait(), devices.items);
                 m.rdma_rings = try ring2d.Rings.open(gpa, d, rk, devices.items, role, ord, .{ .max_bytes = ring_bytes, .gid_index = rdmaGid(), .pdl = rdmaPdl(), .collect_peers = peers and rk.collect_peers != null, .wc = sw.wc, .inplace = sw.inplace, .roci = ringWordOf(), .roci_deadline_ns = ringWordDeadlineNs(), .wait = ring_wait_on, .wait_explicit = prompt2d.ring_wait_explicit }, &m.comm, m.stream, !weights.draft_4way);
                 m.two.?.rings = &m.rdma_rings.?;
@@ -1256,9 +1267,17 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
                 std.log.info("{s}", .{decodeLine(o.rank, rankOrderText(&m.two.?.rank_of))});
             }
         }
+        if (o.rdma_devices == null) {
+            // asked without an RDMA ring: say the switch changed nothing
             // (the switches are on by default: only one that was set says it changed nothing)
             if (ringNoRingNote(prompt2d.ring_word_asked, prompt2d.ring_word_explicit)) std.log.info("TF_DS_RING_WORD=1: off: no RDMA ring (TF_RDMA_DEVICES unset)", .{});
             if (ringNoRingNote(prompt2d.ring_wait_asked, prompt2d.ring_wait_explicit)) std.log.info("TF_DS_RING_WAIT=1: off: no RDMA ring (TF_RDMA_DEVICES unset)", .{});
+            if (prompt2d.ring_wc_asked) std.log.info("{s}", .{ringWcLine(false)});
+            if (prompt2d.ring_inplace_asked) {
+                var lb: [256]u8 = undefined;
+                std.log.info("{s}", .{ringInplaceLine(&lb, .{ .wc = false, .inplace = false, .why = null })});
+            }
+        }
         prompt.hc_stride = prompt2d.hc_stride_asked and m.two != null;
         logPdlControls(m.comm.rank);
         std.log.info("transport: Rocinante carries every exchange between the Sparks; no NCCL is loaded or made (rank {d})", .{o.rank});
@@ -1479,6 +1498,28 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     pub fn ringWordDeadlineNs() u64 {
         const ms: u64 = if (std.c.getenv("TF_DS_RING_WORD_DEADLINE_MS")) |v| std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0 else 0;
         return (if (ms == 0) 120_000 else ms) * std.time.ns_per_ms;
+    }
+
+    /// The rings' switches after their own checks: the in-place path needs the write-combined slots and both of its
+    /// kernels in the fatbin. `why` says why a requested switch is off (none: it is off because it was not asked).
+    pub const RingSwitch = struct { wc: bool, inplace: bool, why: ?[]const u8 };
+
+    pub fn ringSwitches(asked_wc: bool, asked_inplace: bool, have_inplace: bool) RingSwitch {
+        if (!asked_inplace) return .{ .wc = asked_wc, .inplace = false, .why = null };
+        if (rdma.inplaceOff(asked_wc, true)) |why| return .{ .wc = asked_wc, .inplace = false, .why = why };
+        if (!have_inplace) return .{ .wc = asked_wc, .inplace = false, .why = "the rings' kernels have no dsv41_rdma_publish and dsv41_rdma_await_send" };
+        return .{ .wc = true, .inplace = true, .why = null };
+    }
+
+    /// TF_DS_RING_WC's start line.
+    pub fn ringWcLine(on: bool) []const u8 {
+        return if (on) "TF_DS_RING_WC=1: the RDMA rings' send and landing data slots come from cudaHostAlloc(cudaHostAllocMapped | cudaHostAllocWriteCombined) and are registered with ibv_reg_mr as the baseline; the flags, sizes, sent words, sequence and doorbell stay in the baseline memory: the same bytes" else "TF_DS_RING_WC=1: off: no RDMA ring (TF_RDMA_DEVICES unset)";
+    }
+
+    /// TF_DS_RING_INPLACE's start line: on, or off and why.
+    pub fn ringInplaceLine(buf: []u8, sw: RingSwitch) []const u8 {
+        if (sw.inplace) return "TF_DS_RING_INPLACE=1: the decode exchanges' producers write their partial straight into a fixed send slot and publish it, so the staging copy is gone; the collecting copy-out stays: the same bytes";
+        return if (sw.why) |why| std.fmt.bufPrint(buf, "TF_DS_RING_INPLACE=1: off: {s}", .{why}) catch "TF_DS_RING_INPLACE=1: off" else "TF_DS_RING_INPLACE=1: off: no RDMA ring (TF_RDMA_DEVICES unset)";
     }
 
     /// TF_DS_RDMA_GID: the RDMA rings' GID index on every device; unset, each device's first RoCE v2 IPv4 GID.
@@ -2139,6 +2180,32 @@ test "TF_DS_RING_WORD_SIGNAL: unset and atomic name the fetch-and-add (the guara
     try std.testing.expectEqual(rdma.Roci.off, Model.ringWordOf());
 }
 
+test "TF_DS_RING_WC and TF_DS_RING_INPLACE: the settings after their checks, and their start lines" {
+    // in place needs the write-combined slots and both kernels; asked without either, it is off with the reason
+    const off = Model.ringSwitches(false, false, true);
+    try std.testing.expect(!off.wc and !off.inplace and off.why == null);
+    const wc = Model.ringSwitches(true, false, false);
+    try std.testing.expect(wc.wc and !wc.inplace and wc.why == null);
+    const nowc = Model.ringSwitches(false, true, true);
+    try std.testing.expect(!nowc.wc and !nowc.inplace);
+    try std.testing.expectEqualStrings("needs TF_DS_RING_WC=1 (the send slot is a write-combined data slot its producer writes)", nowc.why.?);
+    const nokernel = Model.ringSwitches(true, true, false);
+    try std.testing.expect(nokernel.wc and !nokernel.inplace);
+    try std.testing.expectEqualStrings("the rings' kernels have no dsv41_rdma_publish and dsv41_rdma_await_send", nokernel.why.?);
+    const on = Model.ringSwitches(true, true, true);
+    try std.testing.expect(on.wc and on.inplace and on.why == null);
+    try std.testing.expectEqualStrings("TF_DS_RING_WC=1: the RDMA rings' send and landing data slots come from cudaHostAlloc(cudaHostAllocMapped | cudaHostAllocWriteCombined) and are registered with ibv_reg_mr as the baseline; the flags, sizes, sent words, sequence and doorbell stay in the baseline memory: the same bytes", Model.ringWcLine(true));
+    try std.testing.expectEqualStrings("TF_DS_RING_WC=1: off: no RDMA ring (TF_RDMA_DEVICES unset)", Model.ringWcLine(false));
+    var lb: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("TF_DS_RING_INPLACE=1: the decode exchanges' producers write their partial straight into a fixed send slot and publish it, so the staging copy is gone; the collecting copy-out stays: the same bytes", Model.ringInplaceLine(&lb, on));
+    try std.testing.expectEqualStrings("TF_DS_RING_INPLACE=1: off: needs TF_DS_RING_WC=1 (the send slot is a write-combined data slot its producer writes)", Model.ringInplaceLine(&lb, nowc));
+    try std.testing.expectEqualStrings("TF_DS_RING_INPLACE=1: off: no RDMA ring (TF_RDMA_DEVICES unset)", Model.ringInplaceLine(&lb, .{ .wc = false, .inplace = false, .why = null }));
+    // both switches are read once in Model.open, before the settings exchange
+    const src = @embedFile("model.zig");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "prompt2d.ring_wc_asked = prompt2d.switchAsked(if (std.c.getenv(\"TF_DS_RING_WC\")) |v| std.mem.span(v) else null);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "prompt2d.ring_inplace_asked = prompt2d.switchAsked(if (std.c.getenv(\"TF_DS_RING_INPLACE\")) |v| std.mem.span(v) else null);"));
+}
+
 
 test "TF_DS_ROCI_STAGGER: every write to state a later pass reads is issued before the cache event that gates it, and the tier's copies join the pair first" {
     const model_src = @embedFile("model.zig");
@@ -2564,6 +2631,7 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
     // the partner split: the refusal is the operator's branch, the warning and the cleared flag the default's, and no lane is opened before either
     const refused = std.mem.indexOf(u8, body[v..], "return error.PartnerRefused;").?;
     const warn = std.mem.indexOf(u8, body[v..], "std.log.warn(\"TF_DS_ENGRAM_PARTNER: off:").?;
+    try std.testing.expect(refuse < refused and refused < warn and warn < cleared);
     const kv = std.mem.indexOf(u8, kb, "speed_defaults.verdict(why, speed_defaults.defaulted(\"TF_DS_ENGRAM_KEEP_AHEAD\")) == .fallback").?;
     const kwarn = std.mem.indexOf(u8, kb[kv..], "std.log.warn(\"TF_DS_ENGRAM_KEEP_AHEAD: rank").?;
     const kerr = std.mem.indexOf(u8, kb[kv..], "return error.KeepAheadSharesReader;").?;

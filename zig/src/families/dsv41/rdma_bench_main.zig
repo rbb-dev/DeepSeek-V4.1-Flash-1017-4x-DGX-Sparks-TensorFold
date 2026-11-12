@@ -4,6 +4,9 @@
 //! the plain gather and the strided gather_into, and checks every float it received. One JSON line a rank and row count.
 //!   tf-dsv41-rdma-bench RANK WORLD MASTER_IP FATBIN DEVICES [--port P] [--rows 1,6,16,48] [--width 2560] [--reps 500]
 //!                       [--pdl 0|1] [--gid N]
+//! --wc: the rings' send and landing data slots from cudaHostAlloc(Mapped | WriteCombined) (TF_DS_RING_WC's memory);
+//! --inplace: the timed gathers take the ring's fixed send slot as their source and wait for its previous send before
+//! each publish (TF_DS_RING_INPLACE's path), the row set copied there once (the bytes are the same every gather).
 //! --roci word|atomic: TF_DS_RING_WORD's arrival signal (each lane's data a plain RDMA WRITE, then its 64-bit
 //! generation word as an inline 8-byte WRITE or an ATOMIC fetch-and-add on the same queue pair; the collecting kernel
 //! waits on the words in-kernel), against the baseline path when unset: the same bytes, timed here.
@@ -37,6 +40,8 @@ pub fn main(init: std.process.Init) !u8 {
     var reps: u32 = 500;
     var pdl = true;
     var gid: ?u8 = null;
+    var wc = false;
+    var inplace = false;
     var mixed: u32 = 0;
     var roci: ring.Roci = .off;
     var i: usize = 6;
@@ -60,6 +65,10 @@ pub fn main(init: std.process.Init) !u8 {
     var devices: std.ArrayList([]const u8) = .empty;
     var dit = std.mem.splitScalar(u8, args[5], ',');
     while (dit.next()) |t| try devices.append(a, t);
+    if (inplace and !wc) {
+        std.debug.print("--inplace needs --wc 1 (its send slot is the write-combined one)\n", .{});
+        return 2;
+    }
     if (mixed > 0 and !inplace) {
         std.debug.print("--mixed needs --inplace 1 --wc 1 (two in-place users and a staged send on one ring)\n", .{});
         return 2;
@@ -77,6 +86,10 @@ pub fn main(init: std.process.Init) !u8 {
     var module = try cuda.Module.load(&driver, image);
     defer module.unload();
     const r = try ring.Ring.create(init.gpa, &driver, try ring.Kernels.load(module), devices.items, rank, world, .{ .max_bytes = std.mem.alignForward(usize, @as(usize, most) * width * 4, 64), .pdl = pdl, .gid_index = gid });
+    if (inplace and !kernels.hasInplace()) {
+        std.debug.print("--inplace: the fatbin has no dsv41_rdma_publish / dsv41_rdma_await_send\n", .{});
+        return 2;
+    }
     if (roci.on() and !kernels.hasRoci()) {
         std.debug.print("--roci: the fatbin has no dsv41_rdma_collect_roci / _into_roci / _peers_roci\n", .{});
         return 2;
@@ -113,6 +126,14 @@ pub fn main(init: std.process.Init) !u8 {
         var into = try cuda.DeviceBuffer.alloc(&driver, n * world * 4); // [rows][world x width]: rank q at columns q x width
         defer into.free();
         const n4: u32 = @intCast(n / 4);
+        // --inplace: the producer writes this stream's fixed send slot; the bench copies the row set there once (the
+        // loops send the same bytes), and each gather waits for the previous send as a producer would
+        const send_src: u64 = if (inplace) blk: {
+            const slot = (try r.sendSlotDev(stream, n * 4)) orelse return error.BadInplace;
+            try driver.check(driver.api.cuMemcpyDtoDAsync_v2(slot, send.ptr, n * 4, stream.handle), "cuMemcpyDtoDAsync");
+            try stream.synchronize();
+            break :blk slot;
+        } else send.ptr;
         var dsts: [ring.max_ranks]ring.Ring.Dst = undefined;
         for (0..world) |q| dsts[q] = .{ .ptr = into.ptr + @as(u64, q) * width * 4, .row4 = width / 4, .stride4 = world * width / 4 };
         for (0..20) |_| try r.gather(stream, send.ptr, n4, recv.ptr);
@@ -134,6 +155,35 @@ pub fn main(init: std.process.Init) !u8 {
         var bad: usize = 0;
         for (0..world) |q| for (0..n) |j| {
             if (host[q * n + j] != value(@intCast(q), j)) bad += 1;
+            for (0..20) |_| {
+                if (inplace) _ = try r.prepareSend(stream);
+                try r.gather(stream, send_src, n4, recv.ptr);
+            }
+            try stream.synchronize();
+            // 50 gathers captured in one graph and replayed, as the Python ring's --gather-bench times them
+            try cuda.graph.beginCapture(stream, .thread_local);
+            for (0..per_graph) |_| {
+                if (inplace) _ = try r.prepareSend(stream);
+                try r.gather(stream, send_src, n4, recv.ptr);
+            }
+            var g1 = try cuda.graph.endCapture(stream);
+            defer g1.deinit();
+            var e1 = try g1.instantiate();
+            defer e1.deinit();
+            for (0..20) |_| {
+                if (inplace) _ = try r.prepareSend(stream);
+                try r.gatherInto(stream, send_src, n_rows, width / 4, dsts[0..world]);
+            }
+            try stream.synchronize();
+            try cuda.graph.beginCapture(stream, .thread_local);
+            for (0..per_graph) |_| {
+                if (inplace) _ = try r.prepareSend(stream);
+                try r.gatherInto(stream, send_src, n_rows, width / 4, dsts[0..world]);
+            }
+            var g2 = try cuda.graph.endCapture(stream);
+            defer g2.deinit();
+            var e2 = try g2.instantiate();
+            defer e2.deinit();
             try out.interface.print("{{\"rank\": {d}, \"world\": {d}, \"rows\": {d}, \"bytes\": {d}, \"gathers\": {d}, \"pdl\": {d}, \"us_gather\": {d:.2}, \"us_into\": {d:.2}, \"bad\": {d}, \"bad_into\": {d}, \"collect\": \"{s}\", \"wc\": {d}, \"inplace\": {d}, \"roci\": \"{s}\", \"round\": {d}, \"stream_gbps\": {d:.0}, \"stream_ran_gbps\": [{d:.1}, {d:.1}], \"stream_outlasted\": [{}, {}], \"failure\": \"{s}\"}}\n", .{ rank, world, n_rows, n * 4, loops * per_graph, @intFromBool(pdl), us_gather, us_into, bad, bad_into, if (peers) "peers" else "rank", @intFromBool(wc), @intFromBool(inplace), if (roci.on()) roci.signalName() else "", round, stream_gbps, ran_gather.gbps, ran_into.gbps, ran_gather.outlasted, ran_into.outlasted, r.failure() orelse "" });
             try out.interface.flush();
         };

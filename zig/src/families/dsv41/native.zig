@@ -21,6 +21,15 @@
 //!                                               a rank that differs from rank 0 stops at the start, as one with
 //!                                               other graphs, graph cap, RDMA devices or drafter does
 //!   TF_RDMA_DEVICES                             the decode gathers over the RDMA ring on these devices (the rings are required)
+//!   TF_DS_RING_WC=1                             (with TF_RDMA_DEVICES) the rings' send and landing data slots from
+//!                                               cudaHostAlloc(cudaHostAllocMapped | cudaHostAllocWriteCombined),
+//!                                               registered with ibv_reg_mr as in the baseline; the flags, sizes, sent words,
+//!                                               sequence and doorbell stay in the baseline memory (the CPU reads those);
+//!                                               the same bytes, one line at the start; every rank alike
+//!   TF_DS_RING_INPLACE=1                        (with TF_DS_RING_WC) the decode exchanges' producers write their
+//!                                               partial straight into a send slot and publish it, so the staging copy
+//!                                               is gone; the collecting copy-out stays (its consumers re-read the
+//!                                               destination); the same bytes, one line at the start; every rank alike
 //!   TF_DS_RING_WORD=1                         (with TF_RDMA_DEVICES) each lane's data is a plain RDMA WRITE and its
 //!                                               64-bit generation word is written after it on the same queue pair (an
 //!                                               inline 8-byte WRITE, or with TF_DS_RING_WORD_SIGNAL=atomic an RDMA ATOMIC
@@ -286,6 +295,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
         error.CanariesDiffer => "TF_DS_QGATE_CANARY: the ranks asked different canaries (the lines above say which): set the same on every rank (a quality gate's runs, never a serving setting)",
         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
+        error.TooManyRingStreams => "TF_DS_RING_INPLACE=1: more than 2 CUDA streams gather on one ring (each stream owns a fixed send slot): run the decode on one stream, or leave the switch off",
         else => null,
     };
 }

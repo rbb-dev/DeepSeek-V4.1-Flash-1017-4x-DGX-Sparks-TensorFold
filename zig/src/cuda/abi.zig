@@ -22,6 +22,8 @@ pub const stream_non_blocking: c_uint = 1;
 pub const event_disable_timing: c_uint = 2;
 pub const host_alloc_portable: c_uint = 1;
 pub const host_alloc_devicemap: c_uint = 2;
+pub const host_alloc_writecombined: c_uint = 4;
+
 /// A 64-bit stream wait's condition: the word is at least the value, compared cyclically ((int64)(word - value) >= 0).
 pub const stream_wait_value_geq: c_uint = 0;
 pub const stream_mem_op_wait_value_64: c_uint = 4;

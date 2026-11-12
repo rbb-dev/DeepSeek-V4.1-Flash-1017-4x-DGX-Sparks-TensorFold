@@ -1,3 +1,13 @@
+//!   - TF_DS_RING_WC: a ring's data slots from cudaHostAlloc(Mapped | WriteCombined) against the baseline mmap +
+//!     cuMemHostRegister, on the real staging, publish and collecting kernels: the staging kernel's slot and the
+//!     publish kernel's fixed slot read back from the host byte for byte; the doorbell, size, slot name and last
+//!     sequence from the baseline memory; a copy-out of a write-combined landing ring against the baseline; one source byte
+//!     changed differs.
+//!   - TF_DS_RING_INPLACE: the in-place publish's copy-out (the producer's bytes in a write-combined send slot, the
+//!     waiting and publishing kernels, the landing in a write-combined receive ring) against the baseline stage and copy-out
+//!     on the same bytes: every destination byte equal; the await holds its stream while the previous send's sequence
+//!     is outstanding and ends when it completes; the publish's sequence, slot name and size; one source or landing
+//!     byte changed differs.
 //!   - TF_DS_RING_WORD: the generation-word collecting kernel (dsv41_rdma_collect_into_roci) on a receive ring's
 //!     slots against the baseline dsv41_rdma_collect_into on the same slots, a host thread writing the lanes' words after
 //!     the launch: the word signal (the sequence inline) and the atomic signal (one fetch-and-add a lane) give the baseline
@@ -47,6 +57,171 @@
 //!     (zeros, infinities, NaN and the largest finite values kept) byte-equal.
             r.report(try std.fmt.bufPrint(&line, "pf_split {s} control: one code of row 700 changed ({s})", .{ sh.name, config_names[@backingInt(cfg_on) - 2] }), differs(want, got), false);
         for (names, want, got) |nm, w, g| r.report(try std.fmt.bufPrint(&line, "idx_proj_owned q={d} (pf_split {s}): {s} at every owned block against the whole chunk's", .{ q, mx.PfSplit.name(@backingInt(sw)).?, nm }), differs(w, g), true);
+// -- the rings' data slots: write-combined and in-place --------------------------------------------------------------
+
+/// A ring's two data regions and its metadata without the NIC: enough to run the staging, publish, await and collecting
+/// kernels on the memory kinds the live rings use. The rotating slots are the engine's; user 0's in-place send slot
+/// follows them, as rdma.Ring lays them out.
+const RingRig = struct {
+    d: *const cuda.Driver,
+    s: cuda.Stream,
+    io: std.Io,
+    hr: dsv41.rdma.HostReg,
+    module: cuda.Module,
+    k: dsv41.rdma.Kernels,
+    send: dsv41.rdma.Pinned, // mmap + cuMemHostRegister (baseline)
+    send_wc: dsv41.rdma.Pinned, // cudaHostAlloc(Mapped | WriteCombined)
+    recv: dsv41.rdma.Pinned,
+    recv_wc: dsv41.rdma.Pinned,
+    meta: dsv41.rdma.Pinned, // the baseline memory: every word the CPU reads
+    seq: cuda.DeviceBuffer,
+    staged: cuda.DeviceBuffer,
+
+    const slots: usize = 4;
+    const world: usize = 2;
+    const max_bytes: usize = 4096;
+    const rank: usize = 0;
+    const q: u64 = 1; // the first published sequence: rotating slot 1
+    const user: usize = 0;
+
+    const doorbell_w = slots * world;
+    const sizes_w = doorbell_w + 1;
+    const sent_w = sizes_w + slots;
+    const abort_w = sent_w + slots;
+    const send_q_w = abort_w + 1;
+    const send_slot_w = send_q_w + slots;
+    const send_last_w = send_slot_w + slots;
+    const send_done_w = send_last_w + dsv41.rdma.max_users;
+    const meta_words = send_done_w + dsv41.rdma.max_users;
+
+    fn init(d: *const cuda.Driver, s: cuda.Stream, io: std.Io) !RingRig {
+        var hr = try dsv41.rdma.HostReg.open();
+        errdefer hr.lib.close();
+        var send = try dsv41.rdma.Pinned.alloc(d, &hr, slots * max_bytes);
+        errdefer send.free(&hr);
+        var send_wc = try dsv41.rdma.Pinned.allocHost(d, (slots + dsv41.rdma.max_users) * max_bytes, true);
+        errdefer send_wc.free(&hr);
+        var recv = try dsv41.rdma.Pinned.alloc(d, &hr, slots * world * max_bytes);
+        errdefer recv.free(&hr);
+        var recv_wc = try dsv41.rdma.Pinned.allocHost(d, slots * world * max_bytes, true);
+        errdefer recv_wc.free(&hr);
+        var meta = try dsv41.rdma.Pinned.alloc(d, &hr, meta_words * 8);
+        errdefer meta.free(&hr);
+        var seq = try cuda.DeviceBuffer.alloc(d, 8);
+        errdefer seq.free();
+        var staged = try cuda.DeviceBuffer.alloc(d, 16);
+        errdefer staged.free();
+        try seq.fill8(0, null);
+        try staged.fill8(0, null);
+        var module = try cuda.Module.load(d, cuda.kernels.dsv41_rdma);
+        errdefer module.unload();
+        return .{ .d = d, .s = s, .io = io, .hr = hr, .module = module, .k = try dsv41.rdma.Kernels.load(module), .send = send, .send_wc = send_wc, .recv = recv, .recv_wc = recv_wc, .meta = meta, .seq = seq, .staged = staged };
+    }
+
+    fn deinit(g: *RingRig) void {
+        g.module.unload();
+        g.staged.free();
+        g.seq.free();
+        g.meta.free(&g.hr);
+        g.recv_wc.free(&g.hr);
+        g.recv.free(&g.hr);
+        g.send_wc.free(&g.hr);
+        g.send.free(&g.hr);
+        g.hr.lib.close();
+    }
+
+    fn metaDev(g: *const RingRig, word: usize) u64 {
+        return g.meta.dev + word * 8;
+    }
+
+    fn words(g: *RingRig) []u64 {
+        const p: [*]u64 = @ptrCast(@alignCast(g.meta.mem.ptr));
+        return p[0..meta_words];
+    }
+
+    fn reset(g: *RingRig) void {
+        @memset(g.meta.mem, 0);
+    }
+
+    fn setSeq(g: *RingRig, v: u64) !void {
+        try g.s.synchronize();
+    }
+
+    /// dsv41_rdma_stage as rdma.Ring.stage launches it: no own slice, fence mode 1.
+    fn stage(g: *RingRig, src: u64, n4: usize, send_ring: u64, own: u64, own_row4: usize, own_stride: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(src);
+        a.add(@as(c_int, @intCast(n4)));
+        a.add(send_ring);
+        a.add(g.metaDev(sizes_w));
+        a.add(g.metaDev(doorbell_w));
+        a.add(g.metaDev(sent_w));
+        a.add(g.seq.ptr);
+        a.add(@as(c_int, slots));
+        a.add(@as(u64, max_bytes));
+        a.add(@as(u64, 0));
+        a.add(g.metaDev(abort_w));
+        a.add(g.staged.ptr);
+        a.add(@as(c_int, 1));
+        a.add(own);
+        a.add(@as(c_int, @intCast(own_row4)));
+        a.add(@as(c_longlong, @intCast(own_stride)));
+        a.add(@as(c_int, 1));
+        try cuda.launch.launch(g.k.stage, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 512, .y = 1, .z = 1 }, .pdl = true }, g.s, &a);
+    }
+
+    /// dsv41_rdma_publish as rdma.Ring.publish launches it: user 0's fixed slot, no own copy (0).
+    fn publish(g: *RingRig, nbytes: usize, own: u64, own_row4: usize, own_stride: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(g.metaDev(sizes_w));
+        a.add(g.metaDev(doorbell_w));
+        a.add(g.seq.ptr);
+        a.add(g.metaDev(send_q_w));
+        a.add(g.metaDev(send_slot_w));
+        a.add(g.metaDev(send_last_w));
+        a.add(@as(c_int, slots));
+        a.add(@as(c_int, user));
+        a.add(g.metaDev(sent_w));
+        a.add(g.metaDev(abort_w));
+        // own_src: the fixed send slot this rig's producer filled; own_dst: the caller's layout
+        const slot_src: u64 = g.send_wc.dev + (RingRig.slots + RingRig.user) * RingRig.max_bytes;
+        a.add(if (own != 0) slot_src else 0);
+        a.add(own);
+        a.add(@as(c_int, @intCast(own_row4)));
+        a.add(@as(c_longlong, @intCast(own_stride)));
+        a.add(@as(u64, nbytes));
+        a.add(@as(u64, 0));
+        a.add(@as(c_int, 1));
+        if (a.count != 17) return error.BadInfo; // dsv41_rdma_publish's 17 parameters
+        try cuda.launch.launch(g.k.publish.?, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 512, .y = 1, .z = 1 }, .pdl = true }, g.s, &a);
+    }
+
+    fn awaitSend(g: *RingRig) !void {
+        var a: cuda.Args = .{};
+        a.add(g.metaDev(send_done_w));
+        a.add(g.metaDev(send_last_w));
+        a.add(@as(c_int, user));
+        a.add(g.metaDev(abort_w));
+        a.add(@as(c_int, 1));
+        try cuda.launch.launch(g.k.await_send.?, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 }, .pdl = true }, g.s, &a);
+    }
+
+    /// The copy-out (dsv41_rdma_collect_into) of both ranks' slots into `dst` [2, n4 float4], as gather_into's.
+    fn collect(g: *RingRig, recv_dev: u64, dst: u64, n4: usize) !void {
+        var dd: dsv41.rdma.Dsts = .{};
+        for (0..world) |p| {
+            dd.ptr[p] = dst + p * n4 * 16;
+            dd.row4[p] = @intCast(n4);
+            dd.stride4[p] = @intCast(n4);
+        }
+        var copy4: u64 = 0;
+        for (0..world) |p| if (p != rank) {
+            copy4 += n4;
+        };
+        const ring: dsv41.rdma.CollectRing = .{ .recv = recv_dev, .flags = g.metaDev(0), .seq = g.seq.ptr, .abort = g.metaDev(abort_w), .rank = rank, .world = world };
+        try dsv41.rdma.launchCollect(g.k, .{ .max_bytes = max_bytes, .slots = slots }, g.s, dd, 1, ring, copy4);
+    }
+
     /// The generation-word copy-out (dsv41_rdma_collect_into_roci) of both ranks' slots into `dst`, the signal the
     /// waiting kernel sees and the failure record it writes, through the same launch the rings use.
     fn collectRoci(g: *RingRig, recv_dev: u64, dst: u64, n4: usize, gen: u64, lanes: u64, fault: u64, deadline_ns: u64, sig: dsv41.rdma.Roci) !void {
@@ -63,6 +238,227 @@
         const ring: dsv41.rdma.CollectRing = .{ .recv = recv_dev, .flags = g.metaDev(0), .seq = g.seq.ptr, .abort = g.metaDev(abort_w), .rank = rank, .world = world, .gen = gen, .lanes = lanes, .fault = fault, .deadline_ns = deadline_ns, .roci = sig };
         try dsv41.rdma.launchCollect(g.k, .{ .max_bytes = max_bytes, .slots = slots, .roci = sig }, g.s, dd, 1, ring, copy4);
     }
+
+    /// The NIC's landing of `nbytes` from a send slot at byte `off` of `send_mem` into this rank's slot, and every flag
+    /// at q (the data before the flag, as the proxy publishes it).
+    fn land(g: *RingRig, send_mem: []const u8, off: usize, recv_mem: []u8, nbytes: usize) void {
+        const at = (@as(usize, @intCast(q % slots)) * world + rank) * max_bytes;
+        @memcpy(recv_mem[at..][0..nbytes], send_mem[off..][0..nbytes]);
+        const w = g.words();
+        for (0..world) |p| w[@as(usize, @intCast(q % slots)) * world + p] = q;
+    }
+};
+
+fn ringWc(r: *Run, rng_in: std.Random) !void {
+    var prng = std.Random.DefaultPrng.init(0x77c1);
+    const rng = prng.random();
+    _ = rng_in;
+    var g = try RingRig.init(r.d, r.s, r.io orelse return error.NoIo);
+    defer g.deinit();
+    r.note("ring_wc: the rings' fatbin has the in-place kernels (publish, await)", g.k.hasInplace());
+    if (!g.k.hasInplace()) {
+        for (0..5) |_| r.note("ring_wc: no publish/await kernel to run", false);
+        return;
+    }
+    const n4: usize = 192; // 3,072 bytes
+    const nbytes = n4 * 16;
+    const host = try r.a.alloc(u8, nbytes);
+    for (host) |*b| b.* = rng.int(u8);
+    var src = try upload(r.d, host);
+    defer src.free();
+    const want = try get(src.ptr, nbytes, r.d);
+    defer free(want);
+
+    // the baseline slot, then the write-combined one: the same staging kernel, the same bytes read from the host
+    g.reset();
+    try g.setSeq(0);
+    try g.stage(src.ptr, n4, g.send.dev, 0, n4, n4);
+    try r.s.synchronize();
+    const staging_today = differs(want, g.send.mem[@as(usize, @intCast(RingRig.q % RingRig.slots)) * RingRig.max_bytes ..][0..nbytes]);
+    g.reset();
+    try g.setSeq(0);
+    try g.stage(src.ptr, n4, g.send_wc.dev, 0, n4, n4);
+    try r.s.synchronize();
+    const staging_wc = differs(want, g.send_wc.mem[@as(usize, @intCast(RingRig.q % RingRig.slots)) * RingRig.max_bytes ..][0..nbytes]);
+
+    // the publish kernel writes the user's fixed slot and keeps every CPU-read word in the baseline memory
+    g.reset();
+    try g.setSeq(0);
+    const slot_off = (RingRig.slots + RingRig.user) * RingRig.max_bytes;
+    try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(g.send_wc.dev + slot_off, src.ptr, nbytes, r.s.handle), "cuMemcpyDtoDAsync");
+    try g.awaitSend();
+    try g.publish(nbytes, 0, n4, n4);
+    try r.s.synchronize();
+    const w = g.words();
+    const meta_ok = w[RingRig.doorbell_w] == RingRig.q and w[RingRig.sizes_w + RingRig.q % RingRig.slots] == nbytes and
+        w[RingRig.send_q_w + RingRig.q % RingRig.slots] == RingRig.q and
+        w[RingRig.send_slot_w + RingRig.q % RingRig.slots] == RingRig.user and
+        w[RingRig.send_last_w + RingRig.user] == RingRig.q;
+    r.report("ring_wc: the publish kernel's write-combined slot against the source's bytes", differs(want, g.send_wc.mem[slot_off..][0..nbytes]), true);
+
+    // the collecting kernel out of a write-combined landing ring gives the baseline bytes
+    const peer = try r.a.alloc(u8, nbytes);
+    defer r.a.free(peer);
+    for (peer) |*b| b.* = rng.int(u8);
+    @memcpy(g.recv.mem[(RingRig.q % RingRig.slots) * RingRig.world * RingRig.max_bytes + RingRig.max_bytes ..][0..nbytes], peer);
+    @memcpy(g.recv_wc.mem[(RingRig.q % RingRig.slots) * RingRig.world * RingRig.max_bytes + RingRig.max_bytes ..][0..nbytes], peer);
+    for (0..2) |p| {
+        g.words()[@as(usize, @intCast(RingRig.q % RingRig.slots)) * RingRig.world + p] = RingRig.q;
+    }
+    var dst_today = try cuda.DeviceBuffer.alloc(r.d, 2 * nbytes);
+    defer dst_today.free();
+    var dst_wc = try cuda.DeviceBuffer.alloc(r.d, 2 * nbytes);
+    defer dst_wc.free();
+    try r.d.check(r.d.api.cuMemsetD8Async(dst_today.ptr, 0x5a, 2 * nbytes, r.s.handle), "cuMemsetD8Async");
+    try r.d.check(r.d.api.cuMemsetD8Async(dst_wc.ptr, 0x5a, 2 * nbytes, r.s.handle), "cuMemsetD8Async");
+    try g.collect(g.recv.dev, dst_today.ptr, n4);
+    try g.collect(g.recv_wc.dev, dst_wc.ptr, n4);
+    try r.s.synchronize();
+    const today = try get(dst_today.ptr, 2 * nbytes, r.d);
+    defer free(today);
+    const wc = try get(dst_wc.ptr, 2 * nbytes, r.d);
+    defer free(wc);
+
+    // a control: one source byte changed moves the published slot
+    var changed = try r.a.dupe(u8, host);
+    defer r.a.free(changed);
+    changed[0] ^= 0xff;
+    var src2 = try upload(r.d, changed);
+    defer src2.free();
+    g.reset();
+    try g.setSeq(0);
+    try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(g.send_wc.dev + slot_off, src2.ptr, nbytes, r.s.handle), "cuMemcpyDtoDAsync");
+    try g.awaitSend();
+    try g.publish(nbytes, 0, n4, n4);
+    try r.s.synchronize();
+    r.report("ring_wc: one source byte changed moves the write-combined slot's bytes", differs(want, g.send_wc.mem[slot_off..][0..nbytes]), false);
+}
+
+fn ringInplace(r: *Run, rng_in: std.Random) !void {
+    _ = rng_in;
+    var g = try RingRig.init(r.d, r.s, r.io orelse return error.NoIo);
+    defer g.deinit();
+    r.note("ring_inplace: the rings' fatbin has the in-place kernels (publish, await)", g.k.hasInplace());
+    if (!g.k.hasInplace()) {
+        for (0..7) |_| r.note("ring_inplace: no publish/await kernel to run", false);
+        return;
+    }
+    var prng = std.Random.DefaultPrng.init(0x1d1a);
+    const rng = prng.random();
+    const n4: usize = 192;
+    const nbytes = n4 * 16;
+    const host = try r.a.alloc(u8, nbytes);
+    defer r.a.free(host);
+    for (host) |*b| b.* = rng.int(u8);
+    var src = try upload(r.d, host);
+    defer src.free();
+    const peer = try r.a.alloc(u8, nbytes);
+    defer r.a.free(peer);
+    for (peer) |*b| b.* = rng.int(u8);
+
+    var dst_today = try cuda.DeviceBuffer.alloc(r.d, 2 * nbytes);
+    defer dst_today.free();
+    var dst_inplace = try cuda.DeviceBuffer.alloc(r.d, 2 * nbytes);
+    defer dst_inplace.free();
+
+    // baseline: stage into the rotating slot, land it, collect
+    g.reset();
+    try g.setSeq(0);
+    try g.stage(src.ptr, n4, g.send.dev, dst_today.ptr, n4, n4);
+    try r.s.synchronize();
+    g.land(g.send.mem, @as(usize, @intCast(RingRig.q % RingRig.slots)) * RingRig.max_bytes, g.recv.mem, nbytes);
+    @memcpy(g.recv.mem[(RingRig.q % RingRig.slots) * RingRig.world * RingRig.max_bytes + RingRig.max_bytes ..][0..nbytes], peer);
+    for (0..2) |p| g.words()[@as(usize, @intCast(RingRig.q % RingRig.slots)) * RingRig.world + p] = RingRig.q;
+    try g.collect(g.recv.dev, dst_today.ptr, n4);
+    try r.s.synchronize();
+
+    // in place: the producer wrote the user slot, await then publish, land it, collect from the write-combined ring
+    g.reset();
+    try g.setSeq(0);
+    const slot_off = (RingRig.slots + RingRig.user) * RingRig.max_bytes;
+    try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(g.send_wc.dev + slot_off, src.ptr, nbytes, r.s.handle), "cuMemcpyDtoDAsync");
+    try g.awaitSend();
+    try g.publish(nbytes, dst_inplace.ptr, n4, n4);
+    try r.s.synchronize();
+    g.land(g.send_wc.mem, slot_off, g.recv_wc.mem, nbytes);
+    @memcpy(g.recv_wc.mem[(RingRig.q % RingRig.slots) * RingRig.world * RingRig.max_bytes + RingRig.max_bytes ..][0..nbytes], peer);
+    for (0..2) |p| g.words()[@as(usize, @intCast(RingRig.q % RingRig.slots)) * RingRig.world + p] = RingRig.q;
+    try g.collect(g.recv_wc.dev, dst_inplace.ptr, n4);
+    try r.s.synchronize();
+
+    const today = try get(dst_today.ptr, 2 * nbytes, r.d);
+    defer free(today);
+    const mine = try get(dst_inplace.ptr, 2 * nbytes, r.d);
+    defer free(mine);
+    const expect = try r.a.alloc(u8, 2 * nbytes);
+    defer r.a.free(expect);
+    @memcpy(expect[0..nbytes], host);
+    @memcpy(expect[nbytes..], peer);
+    r.report("ring_inplace: the in-place copy-out against the bytes sent (this rank's partial and the peer's slot)", differs(mine, expect), true);
+
+    // the await waits for the previous send: not done with last 5 and done 0, done once done reaches 5
+    g.reset();
+    g.words()[RingRig.send_last_w + RingRig.user] = 5;
+    g.words()[RingRig.send_done_w + RingRig.user] = 0;
+    try g.awaitSend();
+    var waited: usize = 0;
+    while (!(try r.s.done())) : (waited += 1) {
+        if (waited == 2000) break;
+        std.Io.sleep(g.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    const blocked = !(try r.s.done());
+    g.words()[RingRig.send_done_w + RingRig.user] = 5;
+    if (blocked) g.words()[RingRig.abort_w] = 1; // (a host write that never arrives must not hang the replay)
+    try r.s.synchronize();
+    r.note("ring_inplace: the await holds the stream while the previous send is outstanding and ends when its sequence completes", blocked);
+
+    // the publish's sequence and its slot name
+    g.reset();
+    try g.setSeq(0);
+    try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(g.send_wc.dev + slot_off, src.ptr, nbytes, r.s.handle), "cuMemcpyDtoDAsync");
+    try g.awaitSend();
+    try g.publish(nbytes, 0, n4, n4);
+    try r.s.synchronize();
+    const w = g.words();
+    const meta_ok = w[RingRig.doorbell_w] == RingRig.q and w[RingRig.sizes_w + RingRig.q % RingRig.slots] == nbytes and
+        w[RingRig.send_q_w + RingRig.q % RingRig.slots] == RingRig.q and
+        w[RingRig.send_slot_w + RingRig.q % RingRig.slots] == RingRig.user and
+        w[RingRig.send_last_w + RingRig.user] == RingRig.q;
+    r.note("ring_inplace: the publish names user 0's fixed send slot, its size and sequence, and rings the doorbell at q", meta_ok);
+
+    // controls: one source byte and one landing byte changed differ
+    var changed = try r.a.dupe(u8, host);
+    defer r.a.free(changed);
+    changed[0] ^= 0xff;
+    var src2 = try upload(r.d, changed);
+    defer src2.free();
+    g.reset();
+    try g.setSeq(0);
+    try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(g.send_wc.dev + slot_off, src2.ptr, nbytes, r.s.handle), "cuMemcpyDtoDAsync");
+    try g.awaitSend();
+    try g.publish(nbytes, dst_inplace.ptr, n4, n4);
+    try r.s.synchronize();
+    @memcpy(g.recv_wc.mem[(RingRig.q % RingRig.slots) * RingRig.world * RingRig.max_bytes + RingRig.max_bytes ..][0..nbytes], peer);
+    for (0..2) |p| g.words()[@as(usize, @intCast(RingRig.q % RingRig.slots)) * RingRig.world + p] = RingRig.q;
+    g.land(g.send_wc.mem, slot_off, g.recv_wc.mem, nbytes);
+    try g.collect(g.recv_wc.dev, dst_inplace.ptr, n4);
+    try r.s.synchronize();
+    const ctl = try get(dst_inplace.ptr, 2 * nbytes, r.d);
+    defer free(ctl);
+    r.report("ring_inplace: one source byte changed differs", differs(mine, ctl), false);
+
+    var peer2 = try r.a.dupe(u8, peer);
+    defer r.a.free(peer2);
+    peer2[0] ^= 0xff;
+    @memcpy(g.recv_wc.mem[(RingRig.q % RingRig.slots) * RingRig.world * RingRig.max_bytes + RingRig.max_bytes ..][0..nbytes], peer2);
+    for (0..2) |p| g.words()[@as(usize, @intCast(RingRig.q % RingRig.slots)) * RingRig.world + p] = RingRig.q;
+    try g.collect(g.recv_wc.dev, dst_inplace.ptr, n4);
+    try r.s.synchronize();
+    const ctl2 = try get(dst_inplace.ptr, 2 * nbytes, r.d);
+    defer free(ctl2);
+    r.report("ring_inplace: one landing byte changed differs", differs(ctl, ctl2), false);
+    r.note("ring_inplace: user 0's send slot begins after the rotating slots, at slots x max_bytes", (RingRig.slots + RingRig.user) * RingRig.max_bytes == RingRig.slots * RingRig.max_bytes + RingRig.user * RingRig.max_bytes);
+}
 
 // -- TF_DS_RING_WORD: the generation word wakes the collecting kernel ----------------------------------------------
 
@@ -1538,6 +1934,63 @@ fn wcAdd2(r: *Run, env: WcEnv, rng: std.Random) !void {
         res.add(vr.label, try wcTime(r, C, .{ .ops = ops, .s = r.s, .a = a, .b = b, .out = out }, C.go));
     }
     try wcLine(r, "add2_bf16 reading the partial and the landed stage block, into the sum block (1,024 x 2,560)", &res, 83);
+    try wcAdd2Vec(r, env, ops, a_host, b_host, n);
+}
+
+/// TF_DS_ADD2_VEC: the four-wide add2 (tf_ds_add2_bf16_v4_kernel) against the scalar kernel in every variant: every output byte equal, and the ms of
+/// each (the page cost of the vector loads), then TF_DS_STAGE_WC's question: the partial in locked pages and the landed stage block in write-combined
+/// host memory, against both in locked pages (the arena's kind in the baseline), with the scalar kernel.
+fn wcAdd2Vec(r: *Run, env: WcEnv, ops: *const dsv41.ops.Ops, a_host: []const u8, b_host: []const u8, n: usize) !void {
+    const C = struct {
+        ops: *const dsv41.ops.Ops,
+        s: cuda.Stream,
+        a: u64,
+        b: u64,
+        out: u64,
+        vec: bool,
+        fn go(c: @This()) anyerror!void {
+            dsv41.ops.Ops.add2_vec_on = c.vec;
+            defer dsv41.ops.Ops.add2_vec_on = true;
+        }
+    };
+    if (ops.add2_v4 == null) {
+        r.note("add2_vec: tf_ds_add2_bf16_v4_kernel is in this build's module", false);
+        r.note("add2_vec page-cost line: not run without the kernel", false);
+        r.note("add2_vec stage in write-combined memory: not run without the kernel", false);
+        return;
+    }
+    var t: WcText = .{};
+    try t.add("roci_wc_classes add2_vec: ms a launch scalar / four-wide", .{});
+    var bad: usize = 0;
+    var locked: ?struct { w: Where, a: u64, b: u64 } = null;
+    var wc: ?Where = null;
+    for (env.list()) |vr| {
+        const a = try env.buf(vr.w, n * 4);
+        const b = try env.buf(vr.w, n * 4);
+        const out_s = try env.buf(vr.w, n * 2);
+        const out_v = try env.buf(vr.w, n * 2);
+        try r.s.synchronize();
+        const gs = try get(out_s, n * 2, r.d);
+        defer free(gs);
+        const gv = try get(out_v, n * 2, r.d);
+        defer free(gv);
+        bad += differs(gs, gv);
+        try t.add(", {s} {d:.4} / {d:.4}", .{ vr.label, ms_s, ms_v });
+        if (std.mem.indexOf(u8, vr.label, "mmap") != null) locked = .{ .w = vr.w, .a = a, .b = b };
+        if (std.mem.indexOf(u8, vr.label, "WC") != null) wc = vr.w;
+    }
+    r.report("add2_vec: the four-wide kernel's bytes against the scalar kernel's in every page type", bad, true);
+    r.note(t.buf[0..t.n], true);
+    // stage in write-combined memory, partial in locked pages
+    if (locked) |l| if (wc) |ww| {
+        const b_wc = try env.buf(ww, n * 4);
+        const out = try env.buf(l.w, n * 2);
+        var u: WcText = .{};
+        try u.add("roci_wc_classes add2 with the partial in locked pages: stage locked {d:.4} ms, stage write-combined {d:.4} ms a launch ({d:.2} against {d:.2} ms a pass at 83 launches)", .{ both, split, both * 83, split * 83 });
+        r.note(u.buf[0..u.n], true);
+        return;
+    };
+    r.note("add2_vec stage in write-combined memory: this machine allocates both locked and write-combined pages", false);
 }
 
 /// _hc_mix_pf_2b (tri_hc.hcMixPf with the blocks as they land) reading the two bf16 sum blocks from each variant: 4,096 rows x 5,120.
@@ -4665,12 +5118,15 @@ fn qgateBody(r: *Run, rng: std.Random) !void {
 }
 
     .{ "qgate_body", qgateBody, 3 },
+    .{ "ring_wc", ringWc, 6 },
+    .{ "ring_inplace", ringInplace, 8 },
     .{ "ring_word", ringWord, 9 },
     .{ "roci_readers", rociReaders, 1 + 7 * 3 + 3 },
     .{ "roci_stage", rociStage, 2 * 4 + 1 },
     .{ "roci_collect", rociCollect, 3 },
     .{ "roci_split_cost", rociSplitCost, 2 },
     .{ "roci_combine_first", rociCombineFirst, 5 },
+    .{ "roci_wc_classes", rociWcClasses, 20 },
     .{ "roci_local_first", rociLocalFirst, 15 },
     .{ "roci_sent_first", rociSentFirst, 5 },
     .{ "roci_door", rociDoor, 13 },

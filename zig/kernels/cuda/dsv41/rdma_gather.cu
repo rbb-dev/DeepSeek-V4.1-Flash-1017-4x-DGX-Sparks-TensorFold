@@ -129,6 +129,67 @@ extern "C" __global__ void __launch_bounds__(STAGE_THREADS) dsv41_rdma_stage(con
 }
 
 
+// The in-place send's wait: before its producer writes this stream's fixed send slot, the previous send from that slot
+// must have completed (the NIC has read the bytes the next producer is about to replace). `send_last` holds the
+// sequence the producer last published for the user; `send_done` the sequence the proxy last completed.
+extern "C" __global__ void __launch_bounds__(32) dsv41_rdma_await_send(const uint64_t* send_done,
+        const uint64_t* send_last, int user, const uint64_t* abort_word, int pdl) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // this kernel waits for the one before it but must not let the producer that follows it launch early: pdl_enter
+    // would trigger the next kernel before the spin below, so only the wait is here (the producer's wait then waits for
+    // this kernel's end)
+    if (pdl) asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+    if (threadIdx.x == 0) {
+        const uint64_t want = load_sys(send_last + user);
+        for (uint32_t i = 1; load_sys(send_done + user) < want; ++i)
+            if ((i & 1023) == 0 && load_sys(abort_word)) break;
+    }
+}
+
+// The in-place send's publish: the producer has written this stream's fixed send slot, so this kernel copies this
+// rank's own slice to its destination (as the staging kernel did; none when own_dst is null) and publishes the slot:
+// its size and name at the rotating sequence's slot, the user's last sequence, then the sequence and the doorbell
+// (a system release, as the staging kernel's). The send slot's previous use was awaited before the producer wrote it;
+// the rotating slot's metadata is held off as the staging kernel held its slot.
+extern "C" __global__ void __launch_bounds__(STAGE_THREADS) dsv41_rdma_publish(uint64_t* sizes, uint64_t* doorbell,
+        uint64_t* seq, uint64_t* send_q, uint64_t* send_slot, uint64_t* send_last, int slots, int user,
+        const uint64_t* sent, const uint64_t* abort_word, const float4* __restrict__ own_src,
+        float4* __restrict__ own_dst, int own_row4, long long own_stride4, uint64_t nbytes, uint64_t* probe, int pdl) {
+    pdl_enter(pdl);                              // the producer's partial and own slice are written
+    const uint64_t t0 = now_ns();
+    const uint64_t q = *seq + 1;
+    const int slot = (int)(q % slots);
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        if (q > (uint64_t)slots)
+            for (uint32_t i = 1; load_sys(sent + slot) + slots < q; ++i)
+                if ((i & 1023) == 0 && load_sys(abort_word)) break;
+        store_relaxed_sys(sizes + slot, nbytes);
+        store_relaxed_sys(send_q + slot, q);
+        store_relaxed_sys(send_slot + slot, (uint64_t)user);
+        store_relaxed_sys(send_last + user, q);
+        *seq = q;
+        __threadfence_system();
+        store_relaxed_sys(doorbell, q);
+        if (probe) {
+            probe[0] += now_ns() - t0;
+            probe[4] = now_ns();
+        }
+    }
+    if (own_dst) {
+        const int n4 = (int)(nbytes / 16);
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) {
+            if (own_stride4 == own_row4) {
+                own_dst[i] = own_src[i];
+            } else {
+                const int r = i / own_row4;
+                own_dst[(size_t)r * own_stride4 + (i - r * own_row4)] = own_src[i];
+            }
+        }
+    }
+}
+
+
 // Wait for every peer's flag at this sequence, then copy the slots (and this rank's own source) out in rank order.
 extern "C" __global__ void __launch_bounds__(COLLECT_THREADS) dsv41_rdma_collect(const float4* __restrict__ own,
         float4* __restrict__ dst, int n4, const char* recv_ring, const uint64_t* flags, const uint64_t* seq, int rank,

@@ -230,6 +230,29 @@ pub const Engine = struct {
         return r.gather(e.s, src, @intCast(count / 4), dst);
     }
 
+    /// The device address of the fixed send slot this stream's producer writes when the in-place switch is on, or
+    /// null (no ring, the switch off, or a buffer larger than a slot: the caller allocates its own). The first call
+    /// gives the stream its slot; every later gather on the same stream finds it.
+    pub fn ringSendSlot(e: *const Engine, stream: cuda.Stream, bytes: usize) !?u64 {
+        if (e.two) |tw| if (tw.rings) |rs| return rs.all4.sendSlotDev(stream, bytes) catch |err| switch (err) {
+            error.BadInfo => return error.TooManyRingStreams,
+            else => return err,
+        };
+        if (e.ring) |r| return r.sendSlotDev(stream, bytes) catch |err| switch (err) {
+            error.BadInfo => return error.TooManyRingStreams,
+            else => return err,
+        };
+        return null;
+    }
+
+    /// Before a producer that writes `ringSendSlot`'s buffer: wait (on the GPU) for the previous send from that slot to
+    /// complete, so its bytes are not replaced while the NIC reads them. Nothing when the ring is not in place.
+    pub fn prepareRingSend(e: *const Engine, stream: cuda.Stream) !void {
+        if (e.two) |tw| if (tw.rings) |rs| {
+            _ = try rs.all4.prepareSend(stream);
+            return;
+        };
+        if (e.ring) |r| _ = try r.prepareSend(stream);
     }
 
     pub fn heads(e: *const Engine) usize {

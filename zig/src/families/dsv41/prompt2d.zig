@@ -239,6 +239,8 @@ pub const exch_roci_engram_ahead: u32 = 1 << 9;
 pub const exch_roci_sent_first: u32 = 1 << 11;
 pub const exch_roci_combine_door: u32 = 1 << 18;
 pub const exch_roci_stagger: u32 = 1 << 21;
+pub const exch_ring_wc: u32 = 1 << 23;
+pub const exch_ring_inplace: u32 = 1 << 24;
 pub const exch_ring_word: u32 = 1 << 25;
 pub const exch_ring_word_atomic: u32 = 1 << 26; // the switch's signal is the atomic fetch-and-add (unset: the inline word)
 pub const exch_ring_wait: u32 = 1 << 27; // TF_DS_RING_WAIT: the rings' queue pairs wait in the card (no proxy threads)
@@ -286,12 +288,22 @@ pub var roci_stagger_lanes_set: bool = false;
     if (roci_combine_door_asked) x |= exch_roci_combine_door;
     if (roci_stagger_asked) x |= exch_roci_stagger;
     if (roci_stagger3_asked) x |= exch_roci_stagger_lanes;
+    if (ring_wc_asked) x |= exch_ring_wc;
+    if (ring_inplace_asked) x |= exch_ring_inplace;
     if (ring_word_asked) x |= exch_ring_word;
     if (ring_word_atomic_asked) x |= exch_ring_word_atomic;
     if (ring_wait_asked) x |= exch_ring_wait;
 /// text "1", switchAsked; TF_DS_QGATE_CANARY's "1", "2" or "3", qgateAsked); an empty name is a reserved bit (kern_reserved). Each is read once by Model.open, before the
 };
 
+
+/// TF_DS_RING_WC as Model.open read it (switchAsked), once (Settings.exch, rdma.Settings.wc): the RDMA rings' send and
+/// landing slots from cudaHostAlloc(Mapped | WriteCombined).
+pub var ring_wc_asked: bool = false;
+
+/// TF_DS_RING_INPLACE as Model.open read it (switchAsked), once (Settings.exch, rdma.Settings.inplace): the producers of
+/// the decode exchanges write their partial into a fixed send slot and publish it; needs TF_DS_RING_WC.
+pub var ring_inplace_asked: bool = false;
 
 /// TF_DS_RING_WORD as Model.open read it (switchDefaultOn: on unless set to something but 1), once (Settings.exch, rdma.Settings.roci): each lane's data is
 /// a plain RDMA WRITE and its 64-bit generation word is written after it on the same queue pair, the collecting kernel

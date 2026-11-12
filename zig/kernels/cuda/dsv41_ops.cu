@@ -19,6 +19,23 @@ extern "C" __global__ void tf_ds_add2_bf16_kernel(const float* g0, const float* 
          i += uint64_t(gridDim.x) * blockDim.x) output[i] = __float2bfloat16_rn(__fadd_rn(g0[i], g1[i]));
 }
 
+// tf_ds_add2_bf16_kernel, four elements a thread (TF_DS_ADD2_VEC): one 16-byte load of each fp32 operand, one 8-byte store of four bf16. The same
+// per-element arithmetic (one fp32 add, rounded to nearest even): the bytes are the scalar kernel's. count is a multiple of 4; g0 and g1 are 16-byte
+// aligned and output 8-byte aligned (the host checks; any other call takes the scalar kernel).
+extern "C" __global__ void tf_ds_add2_bf16_v4_kernel(const float4* g0, const float4* g1, uint2* output, uint64_t count4) {
+    for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count4;
+         i += uint64_t(gridDim.x) * blockDim.x) {
+        const float4 a = g0[i];
+        const float4 b = g1[i];
+        __nv_bfloat162 lo = __halves2bfloat162(__float2bfloat16_rn(__fadd_rn(a.x, b.x)), __float2bfloat16_rn(__fadd_rn(a.y, b.y)));
+        __nv_bfloat162 hi = __halves2bfloat162(__float2bfloat16_rn(__fadd_rn(a.z, b.z)), __float2bfloat16_rn(__fadd_rn(a.w, b.w)));
+        uint2 o;
+        o.x = *reinterpret_cast<uint32_t*>(&lo);
+        o.y = *reinterpret_cast<uint32_t*>(&hi);
+        output[i] = o;
+    }
+}
+
 // Two equal parts of n16 16-byte words copied from s0, s1 to d0, d1 (grid.y picks the part, consecutive threads consecutive
 // words: whole lines): the owner sums' send blocks from device memory into the transport's arena.
 extern "C" __global__ void tf_ds_collect2_kernel(const uint4* s0, uint4* d0, const uint4* s1, uint4* d1, unsigned long long n16) {

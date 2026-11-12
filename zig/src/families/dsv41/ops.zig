@@ -47,7 +47,17 @@ pub const Ops = struct {
     rest_group: cuda.Function,
     remap_picks: cuda.Function,
     assemble_rest: cuda.Function,
+    /// tf_ds_add2_bf16_v4_kernel (TF_DS_ADD2_VEC): add2Bf16 four elements a thread; null when the image lacks it.
+    add2_v4: ?cuda.Function = null,
     keys_rebase: cuda.Function,
+
+    /// Whether add2Bf16 takes the four-wide kernel where it can (TF_DS_ADD2_VEC, on unless 0, read at Model.open; the bytes are the scalar kernel's).
+    pub var add2_vec_on: bool = true;
+
+    /// Whether a call of add2Bf16 can take the four-wide kernel: a count of whole fours, 16-byte aligned operands, an 8-byte aligned output.
+    pub fn add2VecFits(g0: u64, g1: u64, out: u64, count: usize) bool {
+        return count % 4 == 0 and g0 % 16 == 0 and g1 % 16 == 0 and out % 8 == 0;
+    }
 
     /// The three images (cuda.kernels.torch_pointwise, torch_movement and dsv41_ops, or the fatbins' bytes).
     pub fn load(d: *const cuda.Driver, pointwise: []const u8, movement: []const u8, family: []const u8) !Ops {
@@ -85,6 +95,7 @@ pub const Ops = struct {
             .rest_group = try fm.function("tf_ds_rest_group_kernel"),
             .remap_picks = try fm.function("tf_ds_remap_picks_kernel"),
             .assemble_rest = try fm.function("tf_ds_assemble_rest_kernel"),
+            .add2_v4 = fm.function("tf_ds_add2_bf16_v4_kernel") catch null,
             .keys_rebase = try fm.function("tf_ds_keys_rebase_kernel"),
         };
     }
@@ -127,6 +138,12 @@ pub const Ops = struct {
         a.add(g0);
         a.add(g1);
         a.add(out);
+        if (add2_vec_on and add2VecFits(g0, g1, out, count)) {
+            if (o.add2_v4) |f| {
+                a.add(@as(u64, count / 4));
+                return go(f, s, blocks(count / 4, 256), 256, &a);
+            }
+        }
         a.add(@as(u64, count));
         try go(o.add2_bf16, s, blocks(count, 256), 256, &a);
     }
@@ -431,4 +448,22 @@ test "launch geometry of the development launchers" {
     try std.testing.expectEqual(@as(u32, 1), blocks(1, 256));
     try std.testing.expectEqual(@as(u32, 2), blocks(257, 256));
     try std.testing.expectEqual(@as(u32, 65535), blocks(1 << 40, 256));
+}
+
+test "TF_DS_ADD2_VEC: the four-wide add takes whole fours at 16-byte operands and an 8-byte output, anything else the scalar kernel; off unless asked" {
+    const O = Ops;
+    try std.testing.expect(O.add2_vec_on); // on unless TF_DS_ADD2_VEC=0 (a bit-identical speed change)
+    try std.testing.expect(O.add2VecFits(0x1000, 0x2000, 0x3008, 2560 * 1024));
+    try std.testing.expect(!O.add2VecFits(0x1000, 0x2000, 0x3000, 7)); // not whole fours
+    try std.testing.expect(!O.add2VecFits(0x1004, 0x2000, 0x3000, 8)); // a partial not 16-byte aligned
+    try std.testing.expect(!O.add2VecFits(0x1000, 0x2008, 0x3000, 8));
+    try std.testing.expect(!O.add2VecFits(0x1000, 0x2000, 0x3004, 8)); // output not 8-byte aligned
+    // the owner sums' real operands: a quarter (q rows x w columns) at the plan's offsets of 4-float multiples
+    for ([_]usize{ 1024, 512, 16 }) |q| try std.testing.expect(O.add2VecFits(0x40000 + q * 2560 * 4, 0x80000, 0xc0000 + q * 2560 * 2, q * 2560));
+    // the call: the vector launch unless switched off and only when the kernel is loaded, the scalar launch after it
+    const src = @embedFile("ops.zig");
+    const f = src[std.mem.indexOf(u8, src, "pub fn add2Bf16(").?..];
+    const v = std.mem.indexOf(u8, f, "if (add2_vec_on and add2VecFits(g0, g1, out, count))").?;
+    const sc = std.mem.indexOf(u8, f, "try go(o.add2_bf16, s, blocks(count, 256), 256, &a);").?;
+    try std.testing.expect(v < sc);
 }

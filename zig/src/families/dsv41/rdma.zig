@@ -29,9 +29,17 @@ const DevicePtr = cuda.abi.DevicePtr;
 pub const max_ranks = seqs.max_ranks;
 pub const max_devices = seqs.max_devices;
 const recv_depth = 256; // receive requests kept posted on every QP (a write with immediate consumes one)
+/// The streams that may gather in place on one ring: each gets a fixed send slot after the rotating ones, so a
+/// captured graph's producer pointer is stable and a staged send's rotating slot can never overwrite it.
+pub const max_users = 2;
 /// The device scalars: seq (u64, offset 0), staged (u32, 8), probe (8 x u64, 16), then send_last [max_users] (80): the sequence each in-place user
 /// last published, written and read by the GPU alone, so it lives in device memory (the await kernel reads it from L2, not from pinned host memory).
 const scalars_bytes = 80 + max_users * 8;
+/// Whether an in-place ring is possible: it needs the write-combined data slots; null: it is, else why not.
+pub fn inplaceOff(wc: bool, inplace: bool) ?[]const u8 {
+    if (inplace and !wc) return "needs TF_DS_RING_WC=1 (the send slot is a write-combined data slot its producer writes)";
+    return null;
+}
 
 /// The arrival signal TF_DS_RING_WORD may use: the sending proxy writes each lane's data with a plain RDMA WRITE
 /// and then, on the same queue pair, the lane's 64-bit generation word. `.word` writes the sequence itself as an
@@ -108,6 +116,8 @@ pub const Settings = struct {
     unroll: bool = true,
     fence: bool = true,
     probing: bool = false,
+    wc: bool = false, // TF_DS_RING_WC: the send and landing data slots from cudaHostAlloc(Mapped | WriteCombined)
+    inplace: bool = false, // TF_DS_RING_INPLACE (needs wc): a producer writes a fixed send slot; no staging copy
     roci: Roci = .off, // TF_DS_RING_WORD: each lane's plain data write then the generation word it waits on in-kernel
     roci_deadline_ns: u64 = 120 * std.time.ns_per_s, // a lane's word not reaching its sequence: fail stop after this
     wait_explicit: bool = true, // TF_DS_RING_WAIT was set (to 1), not the default: only names the switch in a refusal (Model.open has already fallen back where the default cannot run)
@@ -118,6 +128,7 @@ pub const Settings = struct {
 /// What the other side's queue pairs toward this rank need (a device each), and where this rank's receive ring is.
 pub const Info = extern struct {
     devices: u32,
+    flags: u32, // the rings' switches (switchBits): every rank must run the same ones, or the ring's slots lay out another way
     qpn: [max_devices]u32,
     psn: [max_devices]u32,
     rkey: [max_devices]u32,
@@ -128,7 +139,8 @@ pub const Info = extern struct {
     mac: [max_devices][6]u8, // TF_DS_RING_WAIT: the MAC of each device's network port (a DEVX queue pair is given its peer's, not resolved)
 };
 
-/// The kernel pair, from the family's rdma_gather fatbin.
+/// The kernel pair, from the family's rdma_gather fatbin (collect_peers, publish and await_send: null in a fatbin
+/// without them).
 pub const Kernels = struct {
     stage: cuda.Function,
     collect: cuda.Function,
@@ -136,6 +148,8 @@ pub const Kernels = struct {
     collect_roci: ?cuda.Function = null,
     collect_into_roci: ?cuda.Function = null,
     collect_peers_roci: ?cuda.Function = null,
+    publish: ?cuda.Function = null,
+    await_send: ?cuda.Function = null,
     stage_wait: ?cuda.Function = null,
     publish_wait: ?cuda.Function = null,
     await_send_wait: ?cuda.Function = null,
@@ -152,12 +166,18 @@ pub const Kernels = struct {
     /// Whether TF_DS_RING_WAIT can run: its three kernels (the staging, publish and await_send kernels reading the completion queues) are in the fatbin.
     pub fn hasWait(k: Kernels) bool {
         return k.stage_wait != null and k.publish_wait != null and k.await_send_wait != null;
+    }
+
     /// The kernel to launch for a plain one and its logging variant: the variant when TF_DS_ROCI_XLOG is on and the fatbin has it, else the plain one.
     fn pick(plain: ?cuda.Function, x: ?cuda.Function) struct { f: ?cuda.Function, logging: bool } {
         if (xlog) if (x) |xf| return .{ .f = xf, .logging = true };
         return .{ .f = plain, .logging = false };
     }
 
+    /// Whether the in-place path can run: both of its kernels are in the fatbin.
+    pub fn hasInplace(k: Kernels) bool {
+        return k.publish != null and k.await_send != null;
+    }
 
     /// Whether the generation-word path can run: the collecting kernels it waits in are in the fatbin.
     pub fn hasRoci(k: Kernels) bool {
@@ -374,11 +394,14 @@ const HostReg = struct {
 
 extern "c" fn mlock(addr: *const anyopaque, len: usize) c_int;
 
-/// Zeroed pages registered with CUDA (mapped, portable). On GB10 the GPU reaches them over the coherent path of its own
-/// memory, where cuMemHostAlloc memory goes through an uncached one; mlock keeps them resident (best effort).
-const Pinned = struct {
+/// Zeroed pages CUDA maps for the device. `alloc` takes anonymous pages, mlock keeps them resident (best effort) and
+/// cuMemHostRegister makes them mapped and portable. `allocHost` takes them from cudaHostAlloc instead: with `wc` it
+/// asks for write-combined pages, which a kernel writes and the NIC reads (the GPU reads them too; a CPU read of them
+/// is uncached and slow, so only the rings' data slots live here, never a flag, size, sent word or the doorbell).
     mem: []align(std.heap.page_size_min) u8,
     dev: DevicePtr,
+    host: bool = false, // cudaHostAlloc memory: free it with cuMemFreeHost, not munmap + cuMemHostUnregister
+    d: ?*const cuda.Driver = null,
 
     fn alloc(d: *const cuda.Driver, hr: *const HostReg, len: usize) Error!Pinned {
         const n = std.mem.alignForward(usize, len, 1 << 16);
@@ -392,7 +415,33 @@ const Pinned = struct {
         return .{ .mem = mem, .dev = dev };
     }
 
-    fn free(p: *Pinned, hr: *const HostReg) void {
+    /// Mapped, pinned pages from cudaHostAlloc; `wc` adds WriteCombined. Zeroed like `alloc` (the allocation's bytes are
+    /// not defined), by a CPU store: write-combined pages take it slowly, once, before anything reads them.
+    pub fn allocHost(d: *const cuda.Driver, len: usize, wc: bool) Error!Pinned {
+        const n = std.mem.alignForward(usize, len, 1 << 16);
+        var p: ?*anyopaque = null;
+        try d.check(d.api.cuMemHostAlloc(&p, n, cuda.abi.host_alloc_devicemap | (if (wc) cuda.abi.host_alloc_writecombined else 0)), "cuMemHostAlloc");
+        // a page-aligned allocation is what every data slot's type carries (an unaligned one is refused, not trapped)
+        if (@intFromPtr(p.?) % std.heap.page_size_min != 0) {
+            _ = d.api.cuMemFreeHost(p.?);
+            return error.BadInfo;
+        }
+        const base: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(p.?));
+        const mem = base[0..n];
+        @memset(mem, 0);
+        var dev: DevicePtr = 0;
+        d.check(d.api.cuMemHostGetDevicePointer_v2(&dev, mem.ptr, 0), "cuMemHostGetDevicePointer") catch |e| {
+            _ = d.api.cuMemFreeHost(mem.ptr);
+            return e;
+        };
+        return .{ .mem = mem, .dev = dev, .host = true, .d = d };
+    }
+
+        if (p.host) {
+            _ = p.d.?.api.cuMemFreeHost(p.mem.ptr);
+            p.* = undefined;
+            return;
+        }
         _ = hr.unregister(p.mem.ptr);
         std.posix.munmap(p.mem);
     }
@@ -631,8 +680,12 @@ pub const Ring = struct {
     running: std.atomic.Value(bool) = .init(false),
     failed: std.atomic.Value(bool) = .init(false),
     why: [128]u8 = @splat(0),
+    streams: [max_users]?cuda.abi.Stream = @splat(null), // the streams an in-place send slot was given to
+    n_users: u32 = 0,
 
-    // the metadata block: flags [slots][world], doorbell, sizes [slots], sent [slots], abort word
+    // the metadata block: flags [slots][world], doorbell, sizes [slots], sent [slots], abort word, then the in-place
+    // words: send_q [slots] (the sequence a slot's send_slot names), send_slot [slots], send_last [max_users] (the
+    // sequence a producer last published) and send_done [max_users] (the sequence the proxy last sent)
     fn flags(r: *const Ring) [*]u64 {
         return @ptrCast(@alignCast(r.meta.mem.ptr));
     }
@@ -648,6 +701,25 @@ pub const Ring = struct {
     fn abortWord(r: *const Ring) *u64 {
         return &r.sent()[r.s.slots];
     }
+    fn sendQ(r: *const Ring) [*]u64 {
+        return r.flags() + r.s.slots * r.world + 1 + 2 * r.s.slots + 1;
+    }
+    fn sendSlotWord(r: *const Ring) [*]u64 {
+        return r.sendQ() + r.s.slots;
+    }
+    fn sendLast(r: *const Ring) [*]u64 {
+        return r.sendSlotWord() + r.s.slots;
+    }
+    fn sendDone(r: *const Ring) [*]u64 {
+        return r.sendLast() + max_users;
+    }
+    /// The metadata block's words: the ring's own, then the in-place words (the allocation always has room for them,
+    /// so their offsets never move and an older ring image's words keep their places).
+    pub fn metaWords(r: *const Ring) usize {
+        return r.s.slots * r.world + 1 + 2 * r.s.slots + 1 + 2 * r.s.slots + 2 * max_users;
+    }
+    /// The rings' switches as the peers compare them (Info.flags).
+    pub fn switchBits(r: *const Ring) u32 {
         return @intFromBool(r.s.wc) | (@as(u32, @intFromBool(r.s.inplace)) << 1) |
             (@as(u32, @intFromBool(r.s.roci.on())) << 2) | (@as(u32, @intFromBool(r.s.roci == .atomic)) << 3) | (@as(u32, @intFromBool(r.s.wait)) << 4) | (@as(u32, r.cdDepth()) << 8);
     }
@@ -667,6 +739,44 @@ pub const Ring = struct {
     fn rociWordBytes(r: *const Ring) []const u8 {
         const p: [*]const u8 = @ptrCast(r.rociWord());
         return p[0..8];
+    }
+    /// The write region a staged send reads: slots 0 .. slots - 1. The in-place users' slots follow.
+    fn sendBytes(r: *const Ring) usize {
+        return (r.s.slots + (if (r.s.inplace) @as(usize, max_users) else 0)) * r.s.max_bytes;
+    }
+    /// The send slot of an in-place user (after the rotating slots).
+    fn userSendSlot(r: *const Ring, u: u32) usize {
+        return r.s.slots + u;
+    }
+    fn userOfHandle(r: *const Ring, h: cuda.abi.Stream) ?u32 {
+        for (r.streams[0..r.n_users], 0..) |s, i| if (s == h) return @intCast(i);
+        return null;
+    }
+    /// The in-place send slot `stream` owns, assigned on first use: a stream's producer always writes the same slot,
+    /// so a captured graph's pointer stays right whatever sequence a replay reaches. Null when the switch is off.
+    fn userSlot(r: *Ring, stream: cuda.Stream) Error!?u32 {
+        if (!r.s.inplace) return null;
+        if (r.userOfHandle(stream.handle)) |u| return u;
+        if (r.n_users == max_users) return error.BadInfo;
+        const u = r.n_users;
+        r.streams[u] = stream.handle;
+        r.n_users += 1;
+        return u;
+    }
+    /// The device address of `stream`'s in-place send slot: a producer writes its partial there. Null when the
+    /// switch is off or the exchange is larger than a slot (then the staged path must run).
+    pub fn sendSlotDev(r: *Ring, stream: cuda.Stream, bytes: usize) Error!?DevicePtr {
+        const u = try r.userSlot(stream) orelse return null;
+        if (bytes > r.s.max_bytes) return null;
+        return r.send.dev + @as(DevicePtr, @intCast(r.userSendSlot(u))) * r.s.max_bytes;
+    }
+    /// The in-place send slot already given to `stream` (no assignment): what a gather tests its source against.
+    fn sendSlotHeld(r: *const Ring, stream: cuda.Stream, send: DevicePtr) ?u32 {
+        if (!r.s.inplace) return null;
+        const u = r.userOfHandle(stream.handle) orelse return null;
+        if (send != r.send.dev + @as(DevicePtr, @intCast(r.userSendSlot(u))) * r.s.max_bytes) return null;
+        return u;
+    }
     fn metaDev(r: *const Ring, p: anytype) DevicePtr {
         return r.meta.dev + (@intFromPtr(p) - @intFromPtr(r.meta.mem.ptr));
     }
@@ -675,6 +785,7 @@ pub const Ring = struct {
     pub fn create(gpa: std.mem.Allocator, d: *const cuda.Driver, k: Kernels, devices: []const []const u8, rank: u32, world: u32, s: Settings) Error!*Ring {
         if (world < 2 or world > max_ranks or rank >= world or devices.len == 0 or devices.len > max_devices) return error.BadInfo;
         if (s.slots < 2 or s.slots > seqs.max_slots or s.max_bytes == 0 or s.max_bytes % 64 != 0) return error.BadInfo;
+        if (inplaceOff(s.wc, s.inplace) != null) return error.BadInfo; // the send slot must be write-combined
         if (s.roci.on() and s.roci_deadline_ns == 0) return error.BadInfo; // a lost word must end, never wait forever
         if (s.wait and (!s.roci.on() or !k.hasWait())) {
             // the chains end in the generation word's signal (the inline WRITE or the atomic) and the kernels read the completion queues: the start's
@@ -699,10 +810,12 @@ pub const Ring = struct {
         var cd_sink: ?Pinned = null;
         if (s.wait and s.roci == .atomic) cd_sink = try Pinned.alloc(d, &hr, max_ranks * max_devices * 8);
         errdefer if (cd_sink) |*t| t.free(&hr);
+        const send_bytes = (s.slots + (if (s.inplace) @as(usize, max_users) else 0)) * s.max_bytes;
+        var send = if (s.wc) try Pinned.allocHost(d, send_bytes, true) else try Pinned.alloc(d, &hr, send_bytes);
         errdefer send.free(&hr);
-        var recv = try Pinned.alloc(d, &hr, s.slots * world * s.max_bytes);
+        var recv = if (s.wc) try Pinned.allocHost(d, s.slots * world * s.max_bytes, true) else try Pinned.alloc(d, &hr, s.slots * world * s.max_bytes);
         errdefer recv.free(&hr);
-        var meta = try Pinned.alloc(d, &hr, (s.slots * world + 1 + 2 * s.slots + 1) * 8);
+        var meta = try Pinned.alloc(d, &hr, (s.slots * world + 1 + 2 * s.slots + 1 + 2 * s.slots + 2 * max_users) * 8);
         errdefer meta.free(&hr);
         var scalars = try cuda.DeviceBuffer.alloc(d, scalars_bytes);
         errdefer scalars.free();
@@ -1059,6 +1172,7 @@ pub const Ring = struct {
     pub fn info(r: *const Ring, p: u32) Info {
         var out: Info = std.mem.zeroes(Info);
         out.devices = r.nd;
+        out.flags = r.switchBits();
         out.recv = @intFromPtr(r.recv.mem.ptr);
         out.gen = if (r.gen) |g| @intFromPtr(g.mem.ptr) else 0;
         for (r.nics[0..r.nd], 0..) |n, d| {
@@ -1087,6 +1201,7 @@ pub const Ring = struct {
         var all: [max_ranks]Info = undefined;
         for (0..r.world) |p| all[p] = if (p == r.rank) r.info(@intCast((r.rank + 1) % r.world)) else remote[p];
         for (remote, 0..) |ri, p| if (p != r.rank and (ri.devices == 0 or ri.devices > max_devices)) return error.BadInfo;
+        // the switches change where and how a part is laid out: a peer that runs others would read another race
         for (remote, 0..) |ri, p| if (p != r.rank and ri.flags != r.switchBits()) {
             std.log.err("{s}: rank {d}'s ring switches 0x{x} differ from this rank's 0x{x} (bit 2 generation word, 3 atomic signal, 4 card WAIT, bits 8-15 the ATOMICs in flight): every rank must choose alike", .{ r.s.name, p, ri.flags, r.switchBits() });
             return error.BadInfo;
@@ -1450,13 +1565,12 @@ pub const Ring = struct {
                 const q = posted + 1;
                 const slot: usize = @intCast(q % r.s.slots);
                 const n = @atomicLoad(u64, &r.sizes()[slot], .acquire);
-                for (r.nics[0..nd], 0..) |nic, d| {
-                    const pt = seqs.part(n, nd, @intCast(d));
-                    const off: usize = @intCast(pt.off);
-                    const len: usize = @intCast(pt.len);
-                    for (0..r.world) |p| {
-                        if (p == r.rank) continue;
-                        const local = r.send.mem[slot * r.s.max_bytes + off ..][0..len];
+                // an in-place publish names the fixed slot its producer wrote (send_q holds q, so a staged send's
+                // rotation is never mistaken for it); a staged send reads the rotating slot itself
+                const send_slot: usize = if (r.s.inplace and @atomicLoad(u64, &r.sendQ()[slot], .acquire) == q)
+                    r.userSendSlot(@intCast(@atomicLoad(u64, &r.sendSlotWord()[slot], .acquire)))
+                else
+                    slot;
                 // the inline word's source: one value for every lane of this sequence, copied when each WQE is posted
                 if (r.roci_live and r.s.roci == .word) @atomicStore(u64, r.rociWord(), ringWordSignalWord(q), .release);
                 for (0..r.world) |p| {
@@ -1467,6 +1581,7 @@ pub const Ring = struct {
                         const pt = seqs.part(n, peer.lanes, @intCast(k));
                         const off: usize = @intCast(pt.off);
                         const len: usize = @intCast(pt.len);
+                        const local = r.send.mem[send_slot * r.s.max_bytes + off ..][0..len];
                         const at: u64 = @intCast((slot * r.world + r.rank) * r.s.max_bytes + off);
                         if (r.roci_live) {
                             const mr_gen = nic.mr_gen orelse {
@@ -1560,6 +1675,16 @@ pub const Ring = struct {
                         };
                     } else if (w.wr_id & relay_wr != 0) {
                         relays.complete(w.wr_id & ~relay_wr);
+                        if (sends.complete(w.wr_id)) |q| {
+                            const qslot: usize = @intCast(q % r.s.slots);
+                            // read the slot's name before publishing `sent`: a producer of q + slots may overwrite the
+                            // name only after sent[qslot] reaches q
+                            const in_place = r.s.inplace and @atomicLoad(u64, &r.sendQ()[qslot], .acquire) == q;
+                            const u: usize = if (in_place) @intCast(@atomicLoad(u64, &r.sendSlotWord()[qslot], .acquire)) else 0;
+                            @atomicStore(u64, &r.sent()[qslot], q, .release);
+                            // the fixed send slot's producer may write again once this send has completed
+                            if (in_place) @atomicStore(u64, &r.sendDone()[u], q, .release);
+                        }
                     }
                 }
             }
@@ -1616,6 +1741,12 @@ pub const Ring = struct {
         return r.scalar(80);
     }
 
+    /// Wait, before a producer writes its in-place send slot, for the previous send from that slot to complete. The
+    /// producer kernel itself must follow this on the stream (after it, its stores are the only writer); false when the
+    /// ring is not in place. `sendSlotDev` assigns the slot first (Round.init), so a gather finds it here.
+    pub fn prepareSend(r: *Ring, stream: cuda.Stream) Error!bool {
+        if (!r.s.inplace) return false;
+        const u = r.userOfHandle(stream.handle) orelse return false;
         if (r.cd != null) {
             const fw = r.k.await_send_wait orelse return error.BadInfo;
             var w: cuda.Args = .{};
@@ -1627,19 +1758,57 @@ pub const Ring = struct {
             try cuda.launch.launch(fw, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &w);
             return true;
         }
+        const f = r.k.await_send orelse return error.BadInfo;
         var a: cuda.Args = .{};
-        a.add(send);
+        a.add(r.metaDev(r.sendDone()));
         a.add(r.sendLastDev());
+        a.add(@as(c_int, @intCast(u)));
+        a.add(r.metaDev(r.abortWord()));
+        a.add(@as(c_int, @intFromBool(r.s.pdl)));
+        try cuda.launch.launch(f, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
+        return true;
+    }
+
+    /// Publish `stream`'s in-place send slot as sequence `*seq + 1`: the slot's size, the slot's name and the sequence,
+    /// then the doorbell (a system release, as the staging kernel's). The producer wrote the partial into the slot
+    /// before this launch; `own` (0: none) is this rank's slice of the caller's layout, copied here as stage copied it.
+    fn publish(r: *Ring, stream: cuda.Stream, n4: u32, own: DevicePtr, own_row4: u32, own_stride4: u64) Error!void {
+        const u = (try r.userSlot(stream)) orelse return error.BadInfo;
         const waiting = r.cd != null;
         if (waiting) try r.cdLaunch(stream, @as(u64, n4) * 16, @intCast(u));
         const pw = Kernels.pick(r.k.publish_wait, r.k.publish_wait_x);
         const f = (if (waiting) pw.f else r.k.publish) orelse return error.BadInfo;
+        var a: cuda.Args = .{};
+        a.add(r.metaDev(r.sizes()));
+        a.add(r.metaDev(r.doorbell()));
+        a.add(r.scalar(0));
+        a.add(r.metaDev(r.sendQ()));
+        a.add(r.metaDev(r.sendSlotWord()));
         a.add(r.sendLastDev());
+        a.add(@as(c_int, @intCast(r.s.slots)));
+        a.add(@as(c_int, @intCast(u)));
         if (waiting) a.add(r.cd_tab) else a.add(r.metaDev(r.sent())); // the card's completions (by value), where the proxy path's `sent` words are
+        a.add(r.metaDev(r.abortWord()));
+        // the own slice's source is the fixed send slot the producer wrote; its destination is the caller's layout
+        const slot: DevicePtr = r.send.dev + @as(DevicePtr, @intCast(r.userSendSlot(u))) * r.s.max_bytes;
+        a.add(if (own != 0) slot else 0);
+        a.add(own);
+        a.add(@as(c_int, @intCast(own_row4)));
+        a.add(@as(c_longlong, @intCast(own_stride4)));
+        a.add(@as(u64, @as(u64, n4) * 16));
         a.add(if (waiting) r.probeOrPubLog(pw.logging) else r.probe());
+        a.add(@as(c_int, @intFromBool(r.s.pdl)));
         // dsv41_rdma_publish's 17 parameters (dsv41_rdma_publish_wait's 17 too: the completion table by value for `sent`); the driver reads
         // one argument address per parameter, so a short pack would read past the set ones
         if (a.count != 17) return error.BadInfo;
+        const blocks = std.math.clamp((@as(u64, n4) + 1023) / 1024, 1, r.s.stage_blocks);
+        const g: u32 = if (own != 0) @intCast(blocks) else 1;
+        try cuda.launch.launch(f, .{ .grid = .{ .x = g, .y = 1, .z = 1 }, .block = .{ .x = stage_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
+    }
+
+    /// The collecting half of `gather`: every rank's slot (and this rank's own, from `own_src` unless `skip_own`) into
+    /// `recv`, rank after rank.
+    fn launchGatherCollect(r: *Ring, stream: cuda.Stream, own_src: DevicePtr, skip_own: bool, n4: u32, recv: DevicePtr) Error!void {
         if (r.roci_live) {
             const f = r.k.collect_roci orelse return error.BadInfo;
             var b: cuda.Args = .{};
@@ -1666,6 +1835,8 @@ pub const Ring = struct {
             const blocks = std.math.clamp((@as(u64, n4) * r.world + per - 1) / per, 1, r.s.collect_blocks);
             return cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &b);
         }
+        var a: cuda.Args = .{};
+        a.add(own_src);
         a.add(recv);
         a.add(@as(c_int, @intCast(n4)));
         a.add(r.recv.dev);
@@ -1677,12 +1848,27 @@ pub const Ring = struct {
         a.add(@as(u64, r.s.max_bytes));
         a.add(r.probe());
         a.add(r.metaDev(r.abortWord()));
-        a.add(@as(c_int, @intFromBool(r.s.own_early)));
+        a.add(@as(c_int, @intFromBool(skip_own)));
         a.add(@as(c_int, @intFromBool(r.s.unroll)));
         a.add(@as(c_int, @intFromBool(r.s.pdl)));
         const per = collect_threads * r.s.collect_grain;
         const blocks = std.math.clamp((@as(u64, n4) * r.world + per - 1) / per, 1, r.s.collect_blocks);
         try cuda.launch.launch(r.k.collect, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
+    }
+
+    /// recv [world x n4 float4] <- every rank's send [n4 float4] (fp32, 16-byte aligned), on `stream`. With the in-place
+    /// switch on and `send` this stream's send slot (Round.init's pointer), the producer's bytes are published as they
+    /// are: no staging copy; the collecting copy-out is unchanged.
+    pub fn gather(r: *Ring, stream: cuda.Stream, send: DevicePtr, n4: u32, recv: DevicePtr) Error!void {
+        if (r.failure() != null) return error.Failed;
+        if (@as(usize, n4) * 16 > r.s.max_bytes) return error.TooLarge;
+        if (r.sendSlotHeld(stream, send) != null) {
+            try r.publish(stream, n4, 0, 0, 0);
+            return r.launchGatherCollect(stream, send, false, n4, recv);
+        }
+        const own: DevicePtr = if (r.s.own_early) recv + @as(u64, r.rank) * n4 * 16 else 0;
+        try r.stage(stream, send, n4, own, n4, n4);
+        try r.launchGatherCollect(stream, send, r.s.own_early, n4, recv);
     }
 
     /// A rank's slice in `dsts` (its rows `row4` float4 wide, `stride4` apart; ptr 0: not copied out).
@@ -1707,27 +1893,13 @@ pub const Ring = struct {
             if (p != r.rank) copy4 += @as(u64, rows) * t.row4;
         }
         const mine = dsts[r.rank];
-        try r.stage(stream, send, n4, mine.ptr, if (mine.ptr != 0) mine.row4 else n4, if (mine.ptr != 0) mine.stride4 else n4);
-        var a: cuda.Args = .{};
-        a.add(dd);
-        a.add(@as(c_int, @intCast(rows)));
-        a.add(r.recv.dev);
-        a.add(r.metaDev(r.flags()));
-        a.add(r.scalar(0));
-        a.add(@as(c_int, @intCast(r.rank)));
-        a.add(@as(c_int, @intCast(r.world)));
-        a.add(@as(c_int, @intCast(r.s.slots)));
-        a.add(@as(u64, r.s.max_bytes));
-        a.add(r.probe());
-        a.add(r.metaDev(r.abortWord()));
-        a.add(@as(c_int, @intFromBool(r.s.pdl)));
-        const per = collect_threads * r.s.collect_grain;
-        const blocks = std.math.clamp((copy4 + per - 1) / per, 1, r.s.collect_blocks);
-        try cuda.launch.launch(r.k.collect_into, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
+        const own_row4n = if (mine.ptr != 0) mine.row4 else n4;
+        const own_stride = if (mine.ptr != 0) mine.stride4 else n4;
         // With the generation-word peers kernel the copy-out copies this rank's own slice too (the publishing / staging kernel does not): its
         // doorbell is not behind the copy
         const fold_own = mine.ptr != 0 and r.roci_live and r.s.roci.on() and r.s.collect_peers and r.k.collect_peers_roci != null;
         const post_own: DevicePtr = if (fold_own) 0 else mine.ptr;
+        if (r.sendSlotHeld(stream, send) != null) {
             try r.publish(stream, n4, post_own, own_row4n, own_stride);
         } else try r.stage(stream, send, n4, post_own, own_row4n, own_stride);
         try launchCollect(r.k, r.s, stream, dd, rows, .{
@@ -2053,7 +2225,98 @@ test "lanes pair each subnet's devices in list order; a peer across the ring has
     const ll = [_][16]u8{.{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8 }};
     try std.testing.expectEqual(@as(?u32, null), pairLanes(&ll, &s2, 24, &out));
 }
+
+test "TF_DS_RING_INPLACE needs TF_DS_RING_WC: the setting is refused in words and no ring is made without it" {
+    try std.testing.expectEqual(@as(?[]const u8, null), inplaceOff(false, false));
+    try std.testing.expectEqual(@as(?[]const u8, null), inplaceOff(true, false));
+    try std.testing.expectEqual(@as(?[]const u8, null), inplaceOff(true, true));
+    try std.testing.expectEqualStrings("needs TF_DS_RING_WC=1 (the send slot is a write-combined data slot its producer writes)", inplaceOff(false, true).?);
+    const src = @embedFile("rdma.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (inplaceOff(s.wc, s.inplace) != null) return error.BadInfo;") != null);
+    const s: Settings = .{ .max_bytes = 64 };
+    try std.testing.expect(!s.wc and !s.inplace); // both off by default
+}
+
+test "an in-place ring puts each stream's fixed send slot after the rotating ones, and only while the switch is on" {
+    var t = try TestRing.init(false, 1000);
+    defer t.deinit();
+    const a: cuda.abi.Stream = @ptrFromInt(0x1000);
+    const b: cuda.abi.Stream = @ptrFromInt(0x2000);
+    const c: cuda.abi.Stream = @ptrFromInt(0x3000);
+    // off: no slot, nothing assigned
+    try std.testing.expectEqual(@as(?u32, null), try t.r.userSlot(.{ .d = undefined, .handle = a }));
+    try std.testing.expectEqual(@as(u32, 0), t.r.n_users);
+    try std.testing.expectEqual(@as(usize, 4 * 64), t.r.sendBytes());
+    // on: a stream keeps its index; the slots start after the rotating ones; the region grows by max_users
+    t.r.s.wc = true;
+    t.r.s.inplace = true;
+    const sa: cuda.Stream = .{ .d = undefined, .handle = a };
+    const sb: cuda.Stream = .{ .d = undefined, .handle = b };
+    const sc: cuda.Stream = .{ .d = undefined, .handle = c };
+    try std.testing.expectEqual(@as(?u32, 0), try t.r.userSlot(sa));
+    try std.testing.expectEqual(@as(?u32, 0), try t.r.userSlot(sa));
+    try std.testing.expectEqual(@as(?u32, 1), try t.r.userSlot(sb));
+    try std.testing.expectError(error.BadInfo, t.r.userSlot(sc)); // max_users reached
+    try std.testing.expectEqual(@as(usize, 4), t.r.userSendSlot(0));
+    try std.testing.expectEqual(@as(usize, 5), t.r.userSendSlot(1));
+    try std.testing.expectEqual(@as(usize, (4 + max_users) * 64), t.r.sendBytes());
+    try std.testing.expectEqual(@as(?u32, 0), t.r.sendSlotHeld(sa, 4 * 64));
+    try std.testing.expectEqual(@as(?u32, null), t.r.sendSlotHeld(sa, 0)); // not this stream's slot
+    try std.testing.expectEqual(@as(?u32, null), t.r.sendSlotHeld(sc, (4 + max_users - 1) * 64)); // unassigned stream
+    try std.testing.expectEqual(@as(u32, 3), t.r.switchBits());
+}
+
+test "the in-place words follow the ring's own metadata and keep the doorbell, sizes, sent and abort where they were" {
+    var t = try TestRing.init(false, 1000);
+    defer t.deinit();
+    const base = @intFromPtr(t.r.flags());
+    const words = t.r.s.slots * t.r.world + 1 + 2 * t.r.s.slots + 1;
+    try std.testing.expectEqual(@as(usize, words + 2 * t.r.s.slots + 2 * max_users), t.r.metaWords());
+    try std.testing.expectEqual(base + (t.r.s.slots * t.r.world) * 8, @intFromPtr(t.r.doorbell()));
+    try std.testing.expectEqual(base + (t.r.s.slots * t.r.world + 1) * 8, @intFromPtr(t.r.sizes()));
+    try std.testing.expectEqual(base + (t.r.s.slots * t.r.world + 1 + t.r.s.slots) * 8, @intFromPtr(t.r.sent()));
+    try std.testing.expectEqual(base + (words - 1) * 8, @intFromPtr(t.r.abortWord()));
+    try std.testing.expectEqual(base + words * 8, @intFromPtr(t.r.sendQ()));
+    try std.testing.expectEqual(base + (words + t.r.s.slots) * 8, @intFromPtr(t.r.sendSlotWord()));
+    try std.testing.expectEqual(base + (words + 2 * t.r.s.slots) * 8, @intFromPtr(t.r.sendLast()));
+    try std.testing.expectEqual(base + (words + 2 * t.r.s.slots + max_users) * 8, @intFromPtr(t.r.sendDone()));
+    // a set of slots that differs is refused: the peers lay slots out the same way or not at all
+    var o = t.r.*;
+    o.s.wc = true;
+    try std.testing.expect(t.r.switchBits() != o.switchBits());
+}
+
+test "gather and gatherInto take the in-place publish only for a stream's own send slot, and stage otherwise" {
+    const src = @embedFile("rdma.zig");
+    const g = std.mem.indexOf(u8, src, "pub fn gather(r: *Ring,") orelse return error.TestUnexpectedResult;
+    const gend = g + (std.mem.indexOf(u8, src[g..], "\n    }\n") orelse return error.TestUnexpectedResult);
+    const gbody = src[g..gend];
+    const held = std.mem.indexOf(u8, gbody, "if (r.sendSlotHeld(stream, send) != null) {") orelse return error.TestUnexpectedResult;
+    const publish_at = std.mem.indexOf(u8, gbody, "try r.publish(stream, n4, 0, 0, 0);") orelse return error.TestUnexpectedResult;
+    const stage = std.mem.indexOf(u8, gbody, "try r.stage(stream, send, n4, own, n4, n4);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(held < publish_at and publish_at < stage);
+    const gi = std.mem.indexOf(u8, src, "pub fn gatherInto(") orelse return error.TestUnexpectedResult;
+    const giend = gi + (std.mem.indexOf(u8, src[gi..], "\n    }\n") orelse return error.TestUnexpectedResult);
+    const gbody2 = src[gi..giend];
+    const held2 = std.mem.indexOf(u8, gbody2, "if (r.sendSlotHeld(stream, send) != null) {") orelse return error.TestUnexpectedResult;
     const publish_at2 = std.mem.indexOf(u8, gbody2, "try r.publish(stream, n4, post_own, own_row4n, own_stride);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(held2 < publish_at2);
+    // the awaiting producer is the caller's: the ring offers it, the gather does not wait after the producer
+    try std.testing.expect(std.mem.indexOf(u8, src, "pub fn prepareSend(r: *Ring, stream: cuda.Stream) Error!bool {") != null);
+}
+
+test "TF_DS_RING_WC is off by default; a ring's switch word carries it, and the peers must agree" {
+    const s: Settings = .{ .max_bytes = 64 };
+    try std.testing.expect(!s.wc);
+    var t = try TestRing.init(false, 1000);
+    defer t.deinit();
+    try std.testing.expectEqual(@as(u32, 0), t.r.switchBits());
+    t.r.s.wc = true;
+    try std.testing.expectEqual(@as(u32, 1), t.r.switchBits());
+    // the switch changes pages, not the ring's fields: a Pinned made by alloc (not allocHost) frees by unregister
+    const p: Pinned = .{ .mem = t.r.send.mem, .dev = 0 };
+    try std.testing.expect(!p.host and p.d == null);
+}
 
 test "TF_DS_RING_WAIT: the Settings struct's own default is the proxy path (the engine's default is Model.open's, the card's WAIT); a ring's switch word carries it only when set, its info carries no MAC then, the proxy path's kernels and arguments are the ones they were" {
     const s: Settings = .{ .max_bytes = 64 };

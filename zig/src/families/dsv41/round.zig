@@ -288,12 +288,16 @@ pub const Round = struct {
         rd.xhwo = try a.take(R * wo_k * 2);
         rd.xb = try a.take(R * l0.wo_b.k * 2);
         rd.u = try a.take(R * l0.groups * l0.wo_a[0].n * 2);
-        rd.pa = try a.take(R * d * 4);
+        // TF_DS_RING_INPLACE: the producers of the exchanges (attention's and the MoE's partials, the Engram projection
+        // and the head's columns) write the ring's fixed send slot for this stream instead of a device buffer; the
+        // gather then publishes it with no staging copy. A buffer too large for the ring's slot, or no ring, allocates
+        // its own as before (and the gather stages it).
+        rd.pa = (try e.ringSendSlot(e.s, R * d * 4)) orelse try a.take(R * d * 4);
         rd.ga = try a.take(e.world * R * d * 4);
         rd.gl = try a.take(R * (d / 256) * c.experts * 4);
         rd.pick = try a.take(R * e.slots() * 4);
         rd.mw = try a.take(R * e.slots() * 4);
-        rd.pm = try a.take(R * d * 4);
+        rd.pm = (try e.ringSendSlot(e.s, R * d * 4)) orelse try a.take(R * d * 4);
         rd.gm = try a.take(e.world * R * d * 4);
         rd.e_in = 0;
         rd.ek = 0;
@@ -303,14 +307,14 @@ pub const Round = struct {
             const ew = lay.engram_wkv orelse continue;
             rd.e_in = try a.take(R * ew.k * 2);
             const en = if (e.two) |tw| tw.engramWidth() else ew.n; // the summed projection's width (2D: both pairs')
-            rd.ek = try a.take(R * ew.n * 4);
+            rd.ek = (try e.ringSendSlot(e.s, R * @max(ew.n, if (e.two) |tw| @max(tw.ew[0], tw.ew[1]) else 0) * 4)) orelse try a.take(R * ew.n * 4);
             rd.ekg = try a.take(e.world * R * en * 4);
             rd.ekv = try a.take(R * en * 2);
             break;
         }
         rd.xc = try a.take(R * d * 2);
         const hh = if (e.two) |tw| tw.hw[0] + tw.hw[1] else w.head.n; // a rank's vocabulary half (2D: both pairs' parts)
-        rd.hl = try a.take(R * w.head.n * 4);
+        rd.hl = (try e.ringSendSlot(e.s, R * @max(w.head.n, if (e.two) |tw| @max(tw.hw[0], tw.hw[1]) else 0) * 4)) orelse try a.take(R * w.head.n * 4);
         rd.hg = try a.take(e.world * R * hh * 4);
         rd.logits = try a.take(R * e.world * hh * 4);
         rd.taps = try a.take(R * @max(c.dspark_taps.slice().len, 1) * d * 2);
@@ -1198,7 +1202,7 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
                 try tri_basic.hcPost(t, gp, h, rd.post, rd.comb, h, e.world, R, d);
                 pending = null;
             }
-            try prompt.grouped(e, ch, R, &.{ew}, &.{rd.e_in}, &.{ew.k}, &.{rd.ek}, &.{ew.n}, &.{.f32});
+            try e.prepareRingSend(e.s); // the projection below writes the ring's send slot
             try prompt.groupedDecode(e, ch, R, &.{ew}, &.{rd.e_in}, &.{ew.k}, &.{rd.ek}, &.{ew.n}, &.{.f32});
             try Probe.check(probe, .engram_proj, l, rd.ek);
             const en = if (e.two) |tw| tw.engramWidth() else ew.n;
@@ -1219,6 +1223,7 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
             ntap += 1;
         }
         try Probe.check(probe, .attn_in, l, rd.x);
+        try e.prepareRingSend(e.s); // attention's output is written into the ring's send slot
         try attention(e, rd, ch, cs, rings, &sh, l);
         try rd.mark(e, .attn);
         try Probe.check(probe, .attn_out, l, rd.pa);
@@ -1229,6 +1234,7 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
         h = try mix(e, rd, h, &spare, &pending, lay.hc_ffn, rd.pre_a, lay.ffn_norm, pre_f, R);
         try rd.mark(e, .mix_ffn);
         try Probe.check(probe, .moe_in, l, rd.x);
+        try e.prepareRingSend(e.s); // the MoE's output is written into the ring's send slot
         try moe(e, rd, ch, l);
         try rd.mark(e, .moe);
         try Probe.check(probe, .moe_out, l, rd.pm);
@@ -1249,7 +1255,7 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
     // the head on every row: the logits, the ranks' columns in rank order (g.permute(1, 0, 2))
     try tri_basic.collapseNorm(t, h, pre, w.norm, rd.xc, c.eps, R, d);
     const hn: usize = w.head.n;
-    try prompt.grouped(e, ch, R, &.{w.head}, &.{rd.xc}, &.{d}, &.{rd.hl}, &.{hn}, &.{.f32});
+    try e.prepareRingSend(e.s); // the head's columns are written into the ring's send slot
     try Probe.check(probe, .head_cols, w.layers.len, rd.hl);
     const hh = if (e.two) |tw| tw.hw[0] + tw.hw[1] else hn; // a rank's vocabulary half (2D: both pairs' quarters)
     if (e.two) |tw| try tw.quarters(e, rd.hl, rd.hg, R, tw.hw, 4) else try e.gatherF32(rd.hl, rd.hg, R * hn);
