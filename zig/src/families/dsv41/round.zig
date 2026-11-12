@@ -469,6 +469,18 @@ pub const Round = struct {
         if (rd.timer) |t| try t.mark(e.s, p);
     }
 
+    /// After a capture that did not complete (G0.3): the side and prefetch forks it recorded went with it, so nothing is
+    /// outstanding; a side stream still capturing (its capture sequence not ended with the main stream's) is logged.
+    fn abortCapture(rd: *Round, e: *const Engine) void {
+        rd.side_out = false;
+        rd.pf_out = false;
+        _ = e;
+        for ([_]?cuda.Stream{ rd.side, rd.pf, rd.par }) |os| if (os) |st| {
+            const status = cuda.graph.captureStatus(st) catch continue;
+            if (status != .none) std.log.err("a side stream is still in a stream capture after a failed capture ({s})", .{@tagName(status)});
+        };
+    }
+
     /// The main stream waits for the side work forked so far.
     fn joinSide(rd: *Round, e: *const Engine) !void {
         if (!rd.side_out) return;
@@ -1001,21 +1013,8 @@ pub const Graphs = struct {
             rd.has_cblk = cy.has_cblk;
             return;
         }
-        const start = cy.*;
-        try cuda.graph.beginCapture(e.s, .thread_local);
-        stretch(e, rd, ch, cs, rings, cy, li, end, null) catch |err| {
-            if (cuda.graph.endCapture(e.s)) |got| {
-                var x = got;
-                x.deinit();
-            } else |_| {}
-            return err;
-        };
-        var graph = try cuda.graph.endCapture(e.s);
-        defer graph.deinit();
-        var exec = try graph.instantiate();
-        errdefer exec.deinit();
-        try g.map.put(g.gpa, key, .{ .exec = exec, .start = start, .end = cy.* });
-        try exec.launchOn(e.s);
+        // G0.3 (docs/UNIFIED-DECODE-IMPROVEMENTS.md): a capture or instantiate that fails on one rank only (Hector saw
+        // cuGraphInstantiateWithFlags fail with 800 after hours) left that rank out of the stretch's exchanges and the
     }
 };
 
@@ -1044,6 +1043,10 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
     // (its GPU time covers the reads), landed on the host before each Engram layer's stretch
     var ah: Ahead = .{};
     var ahead = e.c.engram_layers.slice().len == 0;
+    // a round that fails between submitting its Engram reads and landing them (a failed stretch, G0.3) drains the
+    // reads still in flight, so the next round's reads cannot meet them in the staging buffers or the batch ids
+    var landed: [2]bool = .{ false, false };
+    errdefer if (eh) |x| drainAhead(e, x, &ah, landed); // (slots never submitted: ids 0, batch 0, nothing to wait)
     // the stretches: cut before each Engram layer (TF_DS_ENGRAM_SPLIT on), its rows read on the host before it
     var li: usize = 0;
     var sn: u32 = 0;
@@ -1056,6 +1059,7 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
             if (!ahead) try engramAhead(e, eh orelse return error.NoEngramTables, seq, rows, &ah);
             ahead = true;
             try engramLand(e, rd, eh orelse return error.NoEngramTables, &ah, li);
+            if (std.mem.indexOfScalar(u16, e.c.engram_layers.slice(), @intCast(li))) |j| landed[j] = true;
         }
         try rd.clock(e, Round.clock_wait);
         if (graphs) |g| {
@@ -1182,6 +1186,20 @@ fn mix(e: *const Engine, rd: *Round, h: u64, spare: *u64, pending: *?u64, params
 /// layers), each layer's ids in its own part of the host buffers (two layers in flight); with AIO every layer's reads
 /// go out at the round's start, else each layer's when its stretch comes (the reader pool).
 const Ahead = struct { ids: [2]u64 = .{ 0, 0 }, aio: bool = false, R: usize = 0 };
+
+/// The round's Engram reads not yet landed (slots j with landed[j] false) waited for and dropped (G0.3: a round that
+/// failed after engramAhead). Errors are ignored: the round has failed already.
+fn drainAhead(e: *const Engine, eh: *prompt.EngramHost, ah: *const Ahead, landed: [2]bool) void {
+    const n = @min(e.c.engram_layers.slice().len, 2);
+    for (0..n) |j| {
+        if (landed[j]) continue;
+        if (eh.pk) |pr| {
+            pr.roundDrain(j);
+        } else if (ah.aio) {
+            if (eh.aio) |aio| aio.wait(ah.ids[j]) catch {};
+        }
+    }
+}
 
 /// Layer slot j's first row in the Engram host's buffers (a round's rows of each Engram layer apart).
 fn aheadRow(j: usize) usize {
