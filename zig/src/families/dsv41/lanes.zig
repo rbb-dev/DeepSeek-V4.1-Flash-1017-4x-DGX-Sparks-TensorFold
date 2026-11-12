@@ -29,6 +29,7 @@ const draft_vocab = @import("draft_vocab.zig");
 const sampling = @import("sampling.zig");
 const head_cand = @import("head_cand.zig");
 const link = @import("link.zig");
+const prompt2d = @import("prompt2d.zig");
 const spill_tier = @import("spill_tier.zig");
 const spill_mirror = @import("spill_mirror.zig");
 const land = @import("land.zig");
@@ -2963,6 +2964,7 @@ test "a prefix two conversations share: the second one resuming it in place woul
     try std.testing.expect(ln.keptOver(shared.base + shared.at, shared.base + 55296, &shared)); // the second one moves
     try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
 }
+
 test "finish sends one done frame; nothing reaches a follower after it, and deinit sends no second done" {
     const gpa = std.testing.allocator;
     const c = std.c;
@@ -3001,6 +3003,14 @@ test "finish sends one done frame; nothing reaches a follower after it, and dein
     try std.testing.expectError(error.PeerDown, follower.recv(&buf));
 }
 
+test "a new frame kind bumps the start-up check's frame protocol" {
+    // protocol -> the frame kinds it carries (prompt2d.frame_protocol, checked by every rank at the start)
+    const kinds = [_][]const u8{
+        &.{},
+        &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9 },
+        &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 13 },
+        &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13 },
+        &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 },
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 },
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 },
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 },
@@ -3008,6 +3018,17 @@ test "finish sends one done frame; nothing reaches a follower after it, and dein
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, // 9: the same kinds, the Rocinante-only Settings
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }, // 10: and cfg, a live change of settings of class A
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }, // 11: the same kinds, fill_pair carries the third pass's rows
+    };
+    try std.testing.expect(prompt2d.frame_protocol < kinds.len);
+    var have: [32]u8 = undefined;
+    var n: usize = 0;
+    for (std.enums.values(Kind)) |k| {
+        have[n] = @backingInt(k);
+        n += 1;
+    }
+    std.mem.sort(u8, have[0..n], {}, std.sort.asc(u8));
+    try std.testing.expectEqualSlices(u8, kinds[prompt2d.frame_protocol], have[0..n]);
+}
 
 test "a restore's destination is held back from placement, never a victim and never usable until installed" {
     const c = model.chunk_rows;

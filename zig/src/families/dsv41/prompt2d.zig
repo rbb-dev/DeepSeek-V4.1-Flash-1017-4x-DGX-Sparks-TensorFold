@@ -234,12 +234,14 @@ fn nibble(c: u8) ?u8 {
     };
 }
 
+/// The follower frame kinds this build sends and decodes (lanes.Kind): 1 = kinds 1-9; 2 = 1-9 and 13; 3 = 1-9, 12 and
 /// 13; 4 = 1-11 (fill_resume 10, rdma_idle 11); 5 = 1-12 (and snap_land 12, the SSD tier's landing); 6 = 1-13 (and
 /// head_whole 13, TF_DS_HEAD_CAND's whole head after a round's candidates fell back); 7 = 1-14 (and fill_pair 14, TF_DS_ROCI_STAGGER's two passes); 8 = 1-15 (and snap_sync 15, the SSD tier's stores on every rank); 9 = the same kinds, a Settings of the Rocinante-only layout (no
 /// NCCL cores, retired exchange and kernel bits) and a start-up exchange without a library's id. 10 = 1-16 (and cfg 16, a live change of settings of class A to every rank: live_config.CfgFrame). 11 = the same kinds, a fill_pair frame that carries the third pass's rows (TF_DS_ROCI_STAGGER_LANES; 0: a pair). A new set of kinds takes the next
 /// number, never an old one, so a follower image with other kinds refuses at the start (Settings) instead of ending
 /// with BadFrame at a kind's first use.
 pub const frame_protocol: u32 = 11;
+
 /// What the ranks of a run must agree on, checked at the start (Fan.settingsChecked) from Model.open's options.
 pub const Settings = extern struct {
     magic: u32 = tag,
@@ -251,6 +253,7 @@ pub const Settings = extern struct {
     graphs: u32, // TF_DS_GRAPHS (--graphs): the same (a rank with graphs votes on each capture, one without never does)
     graph_cap: u32, // TF_DS_GRAPH_CAP (--graph-cap), with graphs: the same (every rank keeps and drops the same graphs)
     pool: u64, // rank 0's window (--context, or TF_DS_WINDOW; a follower's --pool): a follower's holds rank 0's
+    protocol: u32 = frame_protocol, // the frame kinds (frame_protocol): the same
     replay_floor: u32, // TF_DS_REPLAY_FLOOR: the same
     idx_rb: u32, // TF_DS_IDX_RB (tri_index.idx_rb, the indexer's prompt score rows a program): the same
     land_slots: u32 = 0, // rank 0's TF_DS_SPILL_LAND_SLOTS (0: its SSD tier off): every follower takes it, never compared
@@ -274,6 +277,11 @@ pub const Settings = extern struct {
     pub fn differ(mine: Settings, lead: Settings, rank: u32, buf: []u8) []const u8 {
         var w: std.Io.Writer = .fixed(buf);
         const sep = "; ";
+        if (mine.protocol != lead.protocol) {
+            // another image: nothing else is worth comparing
+            w.print("rank {d} decodes frame protocol {d} and rank 0 sends {d}: run every rank from the same image", .{ rank, mine.protocol, lead.protocol }) catch {};
+            return w.buffered();
+        }
         if (mine.world != lead.world)
             w.print("{s}rank {d} runs WORLD {d} and rank 0 {d}", .{ sepIf(&w, sep), rank, mine.world, lead.world }) catch {};
         if (mine.streams < lead.streams)
@@ -1727,6 +1735,11 @@ test "a follower holds rank 0's streams and pool and runs its round rows and gra
     var off2 = off;
     off2.graph_cap = 7;
     try std.testing.expectEqualStrings("", off2.differ(off, 1, &buf));
+    // another image's frame kinds: refused, whatever else agrees
+    var older = served;
+    older.protocol = frame_protocol + 1;
+    var want: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&want, "rank 3 decodes frame protocol {d} and rank 0 sends {d}: run every rank from the same image", .{ frame_protocol + 1, frame_protocol }), older.differ(served, 3, &buf));
 }
 
 test "a follower runs rank 0's replay floor, or says to set the same on every rank" {
