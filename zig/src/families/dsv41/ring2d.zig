@@ -64,8 +64,7 @@ pub const Rings = struct {
         for (0..2) |q| mine[6 + q] = if (pair) |x| x.info(@intCast(q)) else std.mem.zeroes(rdma.Info);
         var dev = try cuda.DeviceBuffer.alloc(d, 5 * 8 * per);
         defer dev.free();
-        try dev.upload(0, std.mem.sliceAsBytes(&mine));
-        try comm.allGather(dev.ptr, dev.ptr + 8 * per, 8 * per, .u8, stream);
+        try dev.uploadAsync(0, std.mem.sliceAsBytes(&mine), stream.handle);
         try comm.gatherHost(d, dev.ptr, dev.ptr + 8 * per, 8 * per, stream);
         try stream.synchronize();
         var all: [4][8]rdma.Info = undefined; // by rank

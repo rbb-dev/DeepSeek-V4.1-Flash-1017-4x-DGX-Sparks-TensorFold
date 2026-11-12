@@ -342,7 +342,7 @@ pub const Tower = struct {
     /// cuMemcpyHtoDAsync on the tower's stream (a pageable source: the driver stages it before returning).
     fn upload(tw: *const Tower, dst: u64, bytes: []const u8) !void {
         const d = tw.d;
-        try d.check(d.api.cuMemcpyHtoDAsync_v2(dst, bytes.ptr, bytes.len, tw.stream.handle), "cuMemcpyHtoDAsync");
+        try d.copyHtoDAsync(@src(), dst, bytes.ptr, bytes.len, tw.stream.handle);
         try tw.stream.synchronize(); // (the host copy may go once the call returns)
     }
 

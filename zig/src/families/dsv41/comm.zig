@@ -63,6 +63,7 @@ const DriverMem = struct {
     }
 
     fn write(m: DriverMem, dst: u64, src: []const u8) !void {
+        try m.d.copyHtoD(@src(), dst, src.ptr, src.len);
     }
 };
 
@@ -137,8 +138,65 @@ test "a host collective on a rank without links fails by name: nothing else coul
     try std.testing.expectError(error.NoHostLinks, c.gatherHost(d, 0x1000, 0x2000, 1, stream));
     try std.testing.expectError(error.NoHostLinks, c.maxHost(d, 0x3000, 1, stream));
 }
+
+test "a host word reaches a collective in the collective's stream order: no synchronous copy feeds one, and the copy names its stream" {
+    // a synchronous copy from pageable memory can return before its DMA lands, on the legacy stream, which the family's
+    // non-blocking streams do not wait for: the collective after it could send a rank's word before it is there
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = std.Io.Dir.cwd().openDir(io, "zig/src/families/dsv41", .{ .iterate = true }) catch |e| {
+        std.debug.print("zig/src/families/dsv41: {s} (the tests run from the tree's root)\n", .{@errorName(e)});
+        return error.TestUnexpectedResult;
+    };
+    defer dir.close(io);
+    const collectives = [_][]const u8{ "gatherHost(", "maxHost(" };
+    var it = dir.iterate();
+    var fed: usize = 0;
+    var bad = false;
+    while (try it.next(io)) |e| {
+        if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".zig") or std.mem.endsWith(u8, e.name, "_test.zig")) continue;
+        const text = try dir.readFileAlloc(io, e.name, gpa, .limited(1 << 24));
+        defer gpa.free(text);
+        var lines: std.ArrayList([]const u8) = .empty;
+        defer lines.deinit(gpa);
+        var li = std.mem.splitScalar(u8, text, '\n');
+        while (li.next()) |l| try lines.append(gpa, l);
+        var in_test = false;
+        for (lines.items, 0..) |l, i| {
+            if (std.mem.startsWith(u8, l, "test \"")) in_test = true;
+            if (in_test) {
+                if (std.mem.eql(u8, l, "}")) in_test = false;
+                continue;
+            }
+            const sync = std.mem.indexOf(u8, l, ".upload(") != null and std.mem.indexOf(u8, l, "fn upload(") == null;
+            const async_at = std.mem.indexOf(u8, l, ".uploadAsync(");
+            if (!sync and async_at == null) continue;
+            // the next three lines' collective, and the stream it runs on (its last argument)
+            for (lines.items[i + 1 .. @min(i + 4, lines.items.len)]) |n| {
+                const c = for (collectives) |name| {
+                    if (std.mem.indexOf(u8, n, name)) |at| break at;
+                } else continue;
+                if (sync) {
+                    std.debug.print("{s}:{d}: a synchronous copy feeds a collective: {s}\n", .{ e.name, i + 1, std.mem.trim(u8, l, " ") });
+                    bad = true;
+                } else {
+                    const close = std.mem.lastIndexOf(u8, n, ");") orelse continue;
+                    const comma = std.mem.lastIndexOfScalar(u8, n[c..close], ',') orelse continue;
+                    const stream = std.mem.trim(u8, n[c + comma + 1 .. close], " ");
+                    const want = try std.fmt.allocPrint(gpa, ", {s}.handle);", .{stream});
+                    defer gpa.free(want);
+                    if (std.mem.indexOf(u8, l, want) == null) {
+                        std.debug.print("{s}:{d}: the copy is not on the collective's stream {s}: {s}\n", .{ e.name, i + 1, stream, std.mem.trim(u8, l, " ") });
+                        bad = true;
+                    }
+                    fed += 1;
+                }
+                break;
             }
         }
     }
-    for (0..4) |g| for (0..4) |q| try std.testing.expectEqual(@as(u8, @intCast(q + 1)), have[g][q]);
+    try std.testing.expect(!bad);
+    // the start's agreements that upload a word and gather it: Two's idx-shard and topology words, ranksThatCannot's flag and
+    // the rings' queue-pair infos: none may go unseen
+    try std.testing.expect(fed >= 4);
 }

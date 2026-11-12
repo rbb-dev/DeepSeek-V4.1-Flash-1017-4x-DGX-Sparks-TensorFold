@@ -210,6 +210,7 @@ pub const Probe = struct {
         if (out.len < n) return error.TooManyRanks;
         // on the model's stream, so the all-gather reads it after the copy (a synchronous copy runs on the legacy
         // stream, which does not order the model's non-blocking one)
+        try d.copyHtoDAsync(@src(), p.dev.ptr, &mine, 32, m.eng.s.handle);
         try m.eng.comm.gatherHost(d, p.dev.ptr, p.dev.ptr + 32, 32, m.eng.s);
         try m.eng.s.synchronize();
         try d.check(d.api.cuMemcpyDtoH_v2(@ptrCast(out.ptr), p.dev.ptr + 32, 32 * n), "cuMemcpyDtoH");

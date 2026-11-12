@@ -3533,6 +3533,7 @@ pub const Model = struct {
         pub fn h2d(dv: SpillDev, dst: u64, src: []const u8) !void {
             try dv.m.pairJoin();
             const d = dv.m.ctx.d;
+            try d.copyHtoDAsync(@src(), dst, src.ptr, src.len, dv.m.stream.handle);
         }
 
         pub fn fill(dv: SpillDev, dst: u64, value: u8, bytes: usize) !void {
@@ -3660,6 +3661,14 @@ pub const Model = struct {
             const dst = try m.arena.take(t.bytes.len);
             const tmp = try m.gpa.dupe(u8, t.bytes); // (a copy out of the file mapping first: see vit.zig)
             defer m.gpa.free(tmp);
+            try m.ctx.d.copyHtoD(@src(), dst, tmp.ptr, tmp.len);
+            lay.gate_b_vl = dst;
+        }
+    }
+
+    /// The filling prompt's image spans (absolute positions, in order) and their rows bf16 [tokens, hidden] from the
+    /// host, after fillBegin and before its chunks.
+    pub fn setImages(m: *Model, spans: []const prompt.Span, rows: []const u8) !void {
         try m.pairJoin(); // (a pair's second pass may still read the image rows this replaces)
         if (rows.len > 0) {
             if (m.img_buf == null or m.img_buf.?.len < rows.len) {
@@ -3668,6 +3677,15 @@ pub const Model = struct {
                 m.img_buf = try cuda.DeviceBuffer.alloc(m.ctx.d, rows.len);
             }
             const d = m.ctx.d;
+            try d.copyHtoDAsync(@src(), m.img_buf.?.ptr, rows.ptr, rows.len, m.stream.handle);
+            try m.stream.synchronize(); // (the caller's rows may go once this returns)
+        }
+        m.spans.clearRetainingCapacity();
+        try m.spans.appendSlice(m.gpa, spans);
+        m.ch.spans = m.spans.items;
+        m.ch.img_rows = if (m.img_buf) |b| b.ptr else 0;
+    }
+
     /// TF_DS_ENGRAM_KEEP_AHEAD at start (every rank alike): the decision (keep_ahead.decide), the check that the round's Engram
     /// buffers and the worker's share no byte, and the start line. A round reads through eh.hashes/flat/w/s/rows, its own AIO ring
     /// (eh.aio) and its own stages and records (Rows.round); the worker through wk_*, the prompt ring (eh.paio) and Rows.wk. The row
@@ -6761,6 +6779,7 @@ test "TF_DS_AQ_VEC: Model.open refuses a bad value by name at its call site (the
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "TF_DS_AQ_VEC={s}: not 0 or " ++ "1; not started"));
     const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator").?;
     const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    const parse = std.mem.indexOf(u8, body, "mx.aq_vec_on = mx.aqVec" ++ "Wanted(aq_text) orelse {").?; // split: the count above scans this file too
     const load = std.mem.indexOf(u8, body, "m.mxk = if (c.format == .native) try mx.Kernels.load(d, cuda.kernels.dsv41_native) else null;").?;
     const use = std.mem.indexOf(u8, body, "useAqVec(if (m.mxk) |*x| x else null);").?;
     try std.testing.expect(parse < load and load < use);
@@ -6993,5 +7012,17 @@ test "the four-way drafter's mismatch between ranks still refuses, naming the ca
     try std.testing.expect(std.mem.indexOf(u8, src, "the ranks' kits differ: give every Spark the same kit, or set TF_DS_DRAFT_4WAY=0") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "set TF_DS_DRAFT_MAIN_4WAY=0 on every Spark") != null);
 }
+
+test "every host-to-device copy of the dsv41 family goes through Driver.copyHtoD / copyHtoDAsync with its own @src(): no file calls the driver's entry point itself, and a failed copy names its call site" {
+    const files = .{ @embedFile("model.zig"), @embedFile("prompt.zig"), @embedFile("lanes.zig"), @embedFile("engram_rows.zig"), @embedFile("comm.zig"), @embedFile("cublas.zig"), @embedFile("vit.zig"), @embedFile("replay_io.zig") };
+    var calls: usize = 0;
+    inline for (files) |f| {
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, f, "api.cuMemcpy" ++ "HtoD"));
+        // every call passes @src() first (the site is the caller's, not the wrapper's)
+        try std.testing.expectEqual(std.mem.count(u8, f, ".copyHtoD" ++ "("), std.mem.count(u8, f, ".copyHtoD" ++ "(@src(), "));
+        try std.testing.expectEqual(std.mem.count(u8, f, ".copyHtoDAsync" ++ "("), std.mem.count(u8, f, ".copyHtoDAsync" ++ "(@src(), "));
+        calls += std.mem.count(u8, f, ".copyHtoD" ++ "(@src(), ") + std.mem.count(u8, f, ".copyHtoDAsync" ++ "(@src(), ");
     }
-};
+    // the family's 13 copies as written: model 3, prompt 2, lanes 1, engram_rows 1, comm 1, cublas 3, vit 1, replay_io 1
+    try std.testing.expectEqual(@as(usize, 13), calls);
+}

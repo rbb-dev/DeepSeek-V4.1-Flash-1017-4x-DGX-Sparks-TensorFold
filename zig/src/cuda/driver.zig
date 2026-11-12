@@ -53,6 +53,62 @@ pub const Driver = struct {
         if (res == abi.success) return;
         if (res == abi.error_not_ready) return error.NotReady;
         std.log.err("{s}: {s} ({d}) {s}", .{ what, self.errorName(res), res, self.errorText(res) });
+    /// The one place a synchronous host-to-device copy is issued (a source-scan test holds every call site of the engine to it). `loc` is the caller's @src(), comptime: nothing of it
+    /// costs anything when the copy succeeds; a failure logs the call site, both ends and the length (copyFailed).
+    pub inline fn copyHtoD(self: *const Driver, comptime loc: std.builtin.SourceLocation, dst: abi.DevicePtr, src: ?*const anyopaque, bytes: usize) Error!void {
+        const res = self.api.cuMemcpyHtoD_v2(dst, src, bytes);
+        if (res == abi.success) return;
+        return self.copyFailed("cuMemcpyHtoD", loc, dst, src, bytes, null, res);
+    }
+
+    /// `copyHtoD` on `stream`: the asynchronous copy (a pageable source is staged by the driver before the call returns).
+    pub inline fn copyHtoDAsync(self: *const Driver, comptime loc: std.builtin.SourceLocation, dst: abi.DevicePtr, src: ?*const anyopaque, bytes: usize, stream: abi.Stream) Error!void {
+        const res = self.api.cuMemcpyHtoDAsync_v2(dst, src, bytes, stream);
+        if (res == abi.success) return;
+        return self.copyFailed("cuMemcpyHtoDAsync", loc, dst, src, bytes, stream, res);
+    }
+
+    /// A failed host-to-device copy: the line `check` would write (the driver's name and text for the code, first, as every log reader has it), then where it was issued
+    /// (file, line, function), the destination (and the device allocation around it: its base, its size, and whether the copy leaves it), the source (its memory kind to the driver:
+    /// host / device / unified, or "unknown to CUDA": pageable, or not an address at all), the length and the stream. Only this branch asks the driver anything.
+    noinline fn copyFailed(self: *const Driver, what: []const u8, comptime loc: std.builtin.SourceLocation, dst: abi.DevicePtr, src: ?*const anyopaque, bytes: usize, stream: ?abi.Stream, res: abi.Result) Error {
+        if (res == abi.error_not_ready) return error.NotReady;
+        @import("context_health.zig").observe(self, res);
+        var db: [160]u8 = undefined;
+        var sb: [96]u8 = undefined;
+        std.log.err("{s}: {s} ({d}) {s}; from {s}:{d} in {s}: dst 0x{x} ({s}), src 0x{x} ({s}), {d} bytes{s}", .{
+            what,                                                  self.errorName(res), res,                     self.errorText(res),
+            loc.file,                                              loc.line,            loc.fn_name,             dst,
+            self.deviceEnd(dst, bytes, &db),                       @intFromPtr(src),    self.hostKind(src, &sb), bytes,
+            if (stream) |_| ", asynchronous" else ", synchronous",
+        });
+        return errorOf(res);
+    }
+
+    /// What the driver says the source of a host-to-device copy is (the failure branch only).
+    fn hostKind(self: *const Driver, src: ?*const anyopaque, buf: []u8) []const u8 {
+        var kind: c_uint = 0;
+        const r = self.api.cuPointerGetAttribute(&kind, 2, @intFromPtr(src)); // CU_POINTER_ATTRIBUTE_MEMORY_TYPE
+        if (r != abi.success) return std.fmt.bufPrint(buf, "unknown to CUDA: pageable host memory, or not an address ({s})", .{self.errorName(r)}) catch "unknown to CUDA";
+        return switch (kind) {
+            1 => "page-locked host memory",
+            2 => "device memory",
+            3 => "array",
+            4 => "unified memory",
+            else => std.fmt.bufPrint(buf, "memory type {d}", .{kind}) catch "memory type",
+        };
+    }
+
+    /// The device allocation around a copy's destination (the failure branch only): its base and size, and whether dst + bytes stays inside it.
+    fn deviceEnd(self: *const Driver, dst: abi.DevicePtr, bytes: usize, buf: []u8) []const u8 {
+        var base: abi.DevicePtr = 0;
+        var size: usize = 0;
+        const r = self.api.cuMemGetAddressRange_v2(&base, &size, dst);
+        if (r != abi.success) return std.fmt.bufPrint(buf, "in no device allocation ({s})", .{self.errorName(r)}) catch "in no device allocation";
+        const off = dst - base;
+        return std.fmt.bufPrint(buf, "allocation 0x{x} + {d} bytes, offset {d}, {s}", .{ base, size, off, if (off + bytes > size) "the copy LEAVES it" else "the copy stays inside it" }) catch "allocation";
+    }
+
         return switch (res) {
             2 => error.OutOfDeviceMemory,
             abi.error_not_found => error.NotFound,
@@ -105,3 +161,20 @@ pub const Driver = struct {
         return std.mem.sliceTo(buf, 0);
     }
 };
+
+test "every host-to-device copy of the cuda module goes through Driver.copyHtoD / copyHtoDAsync, the one place that names the driver's entry points and says where a failure came from" {
+    const d = @embedFile("driver.zig");
+    const m = @embedFile("memory.zig");
+    // the driver's own two calls, once each; no other file of this module calls either entry point
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, d, "self.api.cuMemcpy" ++ "HtoD_v2(dst, src, bytes)"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, d, "self.api.cuMemcpy" ++ "HtoDAsync_v2(dst, src, bytes, stream)"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, m, "api.cuMemcpy" ++ "HtoD"));
+    // the failure branch alone asks the driver about the two ends
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, d, "self.api.cuPointer" ++ "GetAttribute("));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, d, "self.api.cuMemGet" ++ "AddressRange_v2("));
+    // the success path is the call and one comparison: nothing is formatted before it
+    const at = std.mem.indexOf(u8, d, "pub inline fn copyHtoDAsync(").?;
+    const body = d[at .. at + std.mem.indexOf(u8, d[at..], "\n    }\n").?];
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (res == abi.success) return;").? < std.mem.indexOf(u8, body, "copyFailed(").?);
+    try std.testing.expect(std.mem.indexOf(u8, body, "bufPrint") == null and std.mem.indexOf(u8, body, "std.log") == null);
+}

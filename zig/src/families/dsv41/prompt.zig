@@ -243,6 +243,7 @@ pub const Engine = struct {
         const mine = graph_fallback.ballot(stage, recorded);
         if (e.comm.world <= 1) return graph_fallback.decide(mine);
         if (e.agree_flag == 0) return error.NoAgreeFlag;
+        try e.d.copyHtoDAsync(@src(), e.agree_flag, &mine, mine.len, e.s.handle);
         try e.comm.maxHost(e.d, e.agree_flag, mine.len, e.s);
         try e.s.synchronize(); // (also the end of the copy from `mine`, on this stack)
         var v: [graph_fallback.ballot_len]u8 = undefined;
@@ -890,7 +891,7 @@ pub fn decodeScratch(e: *const Engine, a: *Arena, ex: weights.Experts, slots: us
 /// Host bytes to the device in the stream's order (the stream is non-blocking: the legacy stream's synchronous copies
 /// would not wait for its kernels). Pageable host memory is staged before the call returns.
 pub fn upload(e: *const Engine, dst: u64, src: *const anyopaque, bytes: usize) !void {
-    try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(dst, src, bytes, e.s.handle), "cuMemcpyHtoDAsync");
+    try e.d.copyHtoDAsync(@src(), dst, src, bytes, e.s.handle);
 }
 
 /// cuMemsetD8 in the stream's order.

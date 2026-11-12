@@ -147,6 +147,8 @@ test "two handles on two streams give a pass's bytes: the same GEMMs on the seco
         defer x.free();
         var w = try cuda.DeviceBuffer.alloc(&driver, wb.len * 2);
         defer w.free();
+        try driver.copyHtoD(@src(), x.ptr, xb.ptr, xb.len * 2);
+        try driver.copyHtoD(@src(), w.ptr, wb.ptr, wb.len * 2);
         var o: [3]cuda.DeviceBuffer = undefined;
         for (&o) |*b| b.* = try cuda.DeviceBuffer.alloc(&driver, rows * n * 2);
         defer for (&o) |*b| b.free();
@@ -165,6 +167,7 @@ test "two handles on two streams give a pass's bytes: the same GEMMs on the seco
         try std.testing.expectEqualSlices(u8, got[0..len], got[2 * len .. 3 * len]);
         // the control: one weight changed differs (the comparison is live)
         const one: u16 = 0x3f80;
+        try driver.copyHtoD(@src(), w.ptr, &one, 2);
         try b1.linearBf16(x.ptr, w.ptr, o[2].ptr, rows, k, n);
         try s1.synchronize();
         const again = try gpa.alloc(u8, len);

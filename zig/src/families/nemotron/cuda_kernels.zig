@@ -391,7 +391,7 @@ pub const Ops = struct {
 
     pub fn upload(o: Ops, dst: u64, bytes: []const u8) !void {
         if (bytes.len == 0) return;
-        try o.k.d.check(o.k.d.api.cuMemcpyHtoDAsync_v2(dst, bytes.ptr, bytes.len, o.s.handle), "cuMemcpyHtoDAsync");
+        try o.k.d.copyHtoDAsync(@src(), dst, bytes.ptr, bytes.len, o.s.handle);
     }
 
     pub fn download(o: Ops, dst: []u8, src: u64) !void {
@@ -411,6 +411,17 @@ test "items follow the Python shapes" {
     try std.testing.expectEqual(@as(usize, 135), maxItems(328, 130, 64));
     try std.testing.expectEqual(@as(usize, 1154), maxItems(16384, 130, 16));
     try std.testing.expectEqual(@as(usize, 8), maxItems(8, 130, 16));
+}
+
+test "the nemotron family's host-to-device copies go through Driver.copyHtoDAsync with their own @src()" {
+    const files = .{ @embedFile("cuda_kernels.zig"), @embedFile("cuda_source.zig") };
+    var calls: usize = 0;
+    inline for (files) |f| {
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, f, "api.cuMemcpy" ++ "HtoD"));
+        try std.testing.expectEqual(std.mem.count(u8, f, ".copyHtoDAsync" ++ "("), std.mem.count(u8, f, ".copyHtoDAsync" ++ "(@src(), "));
+        calls += std.mem.count(u8, f, ".copyHtoDAsync" ++ "(@src(), ");
+    }
+    try std.testing.expectEqual(@as(usize, 2), calls);
 }
 
 test "ModelOpt's floor refuses every card below sm_90, the Ampere ones included, and admits sm_90 up" {

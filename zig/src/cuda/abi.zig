@@ -239,6 +239,9 @@ pub const Api = struct {
     cuMemGetAllocationGranularity: *const fn (*usize, *const MemAllocationProp, c_int) callconv(.c) R,
     cuMemHostAlloc: *const fn (*Ptr, usize, c_uint) callconv(.c) R,
     cuMemHostGetDevicePointer_v2: *const fn (*DevicePtr, Ptr, c_uint) callconv(.c) R,
+    // the failure branch of a host-to-device copy (driver.zig copyFailed) asks what its two ends are
+    cuPointerGetAttribute: *const fn (*anyopaque, c_int, DevicePtr) callconv(.c) R,
+    cuMemGetAddressRange_v2: *const fn (*DevicePtr, *usize, DevicePtr) callconv(.c) R,
     cuMemFreeHost: *const fn (Ptr) callconv(.c) R,
     cuMemHostRegister_v2: *const fn (Ptr, usize, c_uint) callconv(.c) R,
     cuMemHostUnregister: *const fn (Ptr) callconv(.c) R,

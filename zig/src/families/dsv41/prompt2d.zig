@@ -1127,6 +1127,7 @@ pub const Two = struct {
         var dev = try cuda.DeviceBuffer.alloc(d, (1 + w) * 4);
         defer dev.free();
         const mine: u32 = @intFromBool(want);
+        try dev.uploadAsync(0, std.mem.asBytes(&mine), stream.handle);
         try comm.gatherHost(d, dev.ptr, dev.ptr + 4, 4, stream);
         try stream.synchronize();
         var all: [8]u32 = undefined;
@@ -1203,6 +1204,7 @@ pub const Two = struct {
         const mine: Cfg = .{ .rank_of = t.rank_of, .ow = .{ @intCast(t.ow[0]), @intCast(t.ow[1]) } };
         var dev = try cuda.DeviceBuffer.alloc(d, (1 + w) * @sizeOf(Cfg));
         defer dev.free();
+        try dev.uploadAsync(0, std.mem.asBytes(&mine), stream.handle);
         try comm.gatherHost(d, dev.ptr, dev.ptr + @sizeOf(Cfg), @sizeOf(Cfg), stream);
         try stream.synchronize();
         var all: [8]Cfg = undefined;
@@ -1403,6 +1405,7 @@ pub fn ranksThatCannot(d: *const cuda.Driver, comm: *const Comm, stream: cuda.St
     var dev = try cuda.DeviceBuffer.alloc(d, (1 + w) * 4);
     defer dev.free();
     const mine: u32 = @intFromBool(can);
+    try dev.uploadAsync(0, std.mem.asBytes(&mine), stream.handle);
     try comm.gatherHost(d, dev.ptr, dev.ptr + 4, 4, stream);
     try stream.synchronize();
     try dev.download(4, std.mem.sliceAsBytes(all[0..w]));

@@ -245,6 +245,8 @@ CUDA traps:
   streaming reader, or the GB10 memory budget silently falls back to MemFree.
 - A synchronous copy (`cuMemcpyHtoD`) runs on the legacy stream. A kernel launched right after on a non-blocking
   stream can read the old bytes. Upload on the stream that reads.
+  Issue host-to-device copies through `Driver.copyHtoD` / `copyHtoDAsync` with `@src()` (never the driver's entry point): a failed copy then logs its call site, both ends
+  (the destination's device allocation, the source's memory kind) and the length; `tools/schema/check_htod_sites.py` and a source-scan test hold every call to it.
 - A shared round drafts before it keeps. Commit each window to its kept path at whichever comes first, or the round
   commits twice.
 - Two GB10s ran identical code 4-6% apart. Compare engines on the same box.

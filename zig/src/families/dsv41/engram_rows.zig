@@ -509,6 +509,7 @@ fn stepLand(data: ?*anyopaque) callconv(.c) void {
 /// Bytes to the device in `s`'s order (pinned bytes copy when the stream gets there; pageable ones are staged now).
 fn upload(s: cuda.Stream, dst: u64, src: []const u8) !void {
     if (src.len == 0) return;
+    try s.d.copyHtoDAsync(@src(), dst, src.ptr, src.len, s.handle);
 }
 
 /// Records of `ids` from `pk` into `dsts` through `aio`: batches of half its ring, all submitted, waited for in order.

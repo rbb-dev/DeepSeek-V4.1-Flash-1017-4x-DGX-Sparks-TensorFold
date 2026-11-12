@@ -16,6 +16,7 @@ pub var stream: ?cuda.Stream = null;
 /// n host bytes to the device at `dst`, on the stream, landed when it returns.
 pub fn put(d: *const cuda.Driver, dst: u64, src: ?*const anyopaque, n: usize) !void {
     const s = stream orelse return error.NoReplayStream;
+    try d.copyHtoDAsync(@src(), dst, src, n, s.handle);
     try s.synchronize();
 }
 
@@ -62,6 +63,7 @@ pub fn get(d: *const cuda.Driver, src: u64, n: usize, a: std.mem.Allocator) ![]u
 
 /// What a tool may not call itself: every synchronous copy and fill, and every asynchronous copy of its own (its
 /// device-to-device copies and its fills on its own stream are in its stream's order already).
+const forbidden = [_][]const u8{ "copyHtoD(", "copyHtoDAsync(", "cuMemcpyHtoD_v2(", "cuMemcpyDtoH_v2(", "cuMemcpyHtoDAsync_v2(", "cuMemcpyDtoHAsync_v2(", ".upload(", ".download(", "fromHost(", "uploadAsync(", "downloadAsync(", "cuMemsetD8_v2(", "cuMemsetD32_v2(", "cuMemcpyDtoD_v2(" };
 
 /// For each tool's test: the copies and fills of `src` (a tool's source) that are not through this file, and whether its
 /// main sets `stream`.
@@ -108,6 +110,7 @@ test "the replay tools' copies: in on the stream and landed before the call retu
     };
     const p = Body.of(self, "pub fn put(");
     const t = Body.of(self, "pub fn take(");
+    try std.testing.expect(Body.before(p, "copyHtoDAsync(@src(), dst, src, n, s.handle)", "try s.synchronize();"));
     try std.testing.expect(Body.before(t, "try s.synchronize();", "cuMemcpyDtoH_v2(dst, src, n)"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, Body.of(self, "pub fn fill("), "cuMemsetD8Async(dst, byte, n, s.handle)"));
     // every other copy here is put's or take's
