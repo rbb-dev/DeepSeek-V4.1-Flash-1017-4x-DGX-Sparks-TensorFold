@@ -15,9 +15,13 @@ static void* dec_fn(int kind, int rg) {  // 0 fp8, 1 fp4, 2 bf16, 3 gate / up, 4
                      {(void*)tf_dsn_dec_dn_r1_kernel, (void*)tf_dsn_dec_dn_r2_kernel, (void*)tf_dsn_dec_dn_r4_kernel, (void*)tf_dsn_dec_dn_r8_kernel}};
     return t[kind][rg == 1 ? 0 : rg == 2 ? 1 : rg == 4 ? 2 : 3];
 }
+static cudaError_t dec_launch(int kind, int rg, dim3 grid, int warps, void* args) {
     void* f = dec_fn(kind, rg);
     const int smem = warps * (kind < 3 ? dec::warpBytes<dec::kRbD, dec::kNsD>(1, rg) : kind == 3 ? dec::warpBytes<dec::kRbG, dec::kNsG>(1, rg) : dec::warpBytes<dec::kRbE, dec::kNsE>(1, rg));
+    cudaError_t e = cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (e != cudaSuccess) return e;
     void* pp[1] = {args};
+    return cudaLaunchKernel(f, grid, dim3(32 * warps), pp, smem, 0);
 }
 
 extern "C" {
@@ -55,6 +59,30 @@ int dsn_dec_dense(int fmt, const void* q, const float* s, const int* rows, long 
         }
         mm.n = multi;
     }
+    const cudaError_t le = dec_launch(fmt, dec_rg(M), dim3(mm.cta0[mm.n], 1, cs), 8, &mm);
+    if (le != cudaSuccess) return int(le);
+    return int(cudaDeviceSynchronize());
+}
+
+// one dense decode launch with every DecArgs field the engine sets (the block-diagonal groups gn / gq / gs of wo_a's FP8
+// twin, accumulate), at the pointers given: check_native.py's G0.1 slab checks call it per 64-row slab at the slab's
+// row offsets, as mx.decSlab does
+int dsn_dec_dense_g(int fmt, const void* q, const float* s, const int* rows, long ldq, long lds, const uint8_t* w,
+                    const uint8_t* ws, long ldw, long ldws, int M, int N, int K, int ks, float* z, int* cnt, void* y,
+                    long ldy, int y_dtype, int accumulate, int gn, long gq, long gs) {
+    DecArgs a{};
+    a.q = reinterpret_cast<const uint8_t*>(q); a.s = s; a.rows = rows; a.ldq = ldq; a.lds = lds; a.w = w; a.ws = ws;
+    a.ldw = ldw; a.ldws = ldws; a.fmt = fmt; a.M = M; a.N = N; a.K = K; a.ks = ks; a.cs = 1; a.z = z; a.cnt = cnt;
+    a.y = y; a.ldy = ldy; a.y_dtype = y_dtype; a.accumulate = accumulate; a.scale = 1.f; a.round_first = 0;
+    a.gn = gn; a.gq = gq; a.gs = gs;
+    if (M > 64) return -1;
+    const int tpc = 8 / ks;
+    DecMulti mm{};
+    mm.p[0] = a;
+    mm.n = 1;
+    mm.cta0[1] = (N / 16 + tpc - 1) / tpc;
+    const cudaError_t le = dec_launch(fmt, dec_rg(M), dim3(mm.cta0[1], 1, 1), 8, &mm);
+    if (le != cudaSuccess) return int(le);
     return int(cudaDeviceSynchronize());
 }
 

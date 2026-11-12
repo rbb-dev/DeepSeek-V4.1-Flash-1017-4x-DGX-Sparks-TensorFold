@@ -230,8 +230,110 @@ def run_dec(lib, fmt, q, s, w, ws, n, k, ks, cs, rows=None, m=None, y_dtype=2, s
     return y
 
 
+def slab_dec(lib, fmt, q, s, rows, ldq, lds, w, ws, n, k, ks, y, y_dtype, accumulate, m, gn=0, gq=0, gs=0):
+    """mx.decDenseMulti past 64 rows: launches of 64 rows at the slab's offsets into one y (decSlab's arithmetic: codes
+    ldq bytes a row (bf16: ldq elements), scales lds floats, a rows list 4 bytes an entry, y ldy elements of its type)."""
+    qsz = 2 if fmt == 2 else 1
+    ysz = 4 if (accumulate or y_dtype == 2) else 2
+    for r0 in range(0, m, 64):
+        mm = min(64, m - r0)
+        qp = q.data_ptr() + (0 if rows is not None else r0 * ldq * qsz)
+        sp = 0 if s is None else s.data_ptr() + (0 if rows is not None else r0 * lds * 4)
+        rp = 0 if rows is None else rows.data_ptr() + r0 * 4
+        assert lib.dsn_dec_dense_g(fmt, P(qp), P(sp), P(rp), ldq, lds, ptr(w), ptr(ws), w.shape[1] * w.element_size(),
+                                   ws.shape[1] if ws is not None else 0, mm, n, k, ks, P(0), ptr(DEC_CNT),
+                                   P(y.data_ptr() + r0 * y.stride(0) * ysz), y.stride(0), y_dtype, accumulate, gn, gq, gs) == 0
+
+
+def check_dec_slabs_prod(lib, sh, layer):
+    """G0.1 with the engine's own slab offsets into ONE output (not a fresh output a slab): FP8 into fp32 with accumulate,
+    a gathered rows list, and wo_a's FP8 twin as the block-diagonal groups (gn, gq, gs), at R = 80 against each row's
+    launch alone (R = 1) and inside one 64-row launch."""
+    global DEC_CNT
+    if DEC_CNT is None:
+        DEC_CNT = torch.zeros(65536, dtype=torch.int32, device=dev)
+    pre = f"layers.{layer}."
+    torch.manual_seed(5)
+    # FP8 (wq_a) into fp32 rows that already hold values, accumulate=1
+    w = sh.get(pre + "attn.wq_a.weight").to(dev).view(torch.uint8).contiguous()
+    ws = sh.get(pre + "attn.wq_a.scale").to(dev)
+    n, k = w.shape[0], w.shape[1]
+    x = torch.randn(80, k, device=dev, dtype=torch.bfloat16) * 3
+    q, s = ref_act_quant(x)
+    ref = ref_linear64(q, s, dequant_fp8(sh.get(pre + "attn.wq_a.weight").to(dev), ws))
+    q = q.view(torch.uint8).contiguous()
+    y0 = torch.randn(80, n, device=dev)
+    for ks in (8, 4, 2):
+        y = y0.clone()
+        slab_dec(lib, 0, q, s, None, k, k // 32, w, ws, n, k, ks, y, 2, 1, 80)
+        alone = y0.clone()
+        for i in (0, 63, 64, 79):
+            slab_dec(lib, 0, q[i:i + 1], s[i:i + 1], None, k, k // 32, w, ws, n, k, ks, alone[i:i + 1], 2, 1, 1)
+        y64 = y0.clone()
+        slab_dec(lib, 0, q[16:80], s[16:80], None, k, k // 32, w, ws, n, k, ks, y64[16:80], 2, 1, 64)
+        ok = all(torch.equal(y[i], alone[i]) for i in (0, 63, 64, 79)) and torch.equal(y[16:80], y64[16:80])
+        check(f"attn.wq_a (fp8) dec ks={ks}: R = 80 slabs, accumulate into fp32: a row's bits at R = 1, 64, 80", ok)
+        # a gathered rows list across the slab boundary
+        rows = torch.tensor([79, 3, 64, 64, 10] * 16, dtype=torch.int32, device=dev)
+        yg = torch.zeros(80, n, device=dev)
+        slab_dec(lib, 0, q, s, rows, k, k // 32, w, ws, n, k, ks, yg, 2, 0, 80)
+        yr = torch.zeros(80, n, device=dev)
+        slab_dec(lib, 0, q, s, None, k, k // 32, w, ws, n, k, ks, yr, 2, 0, 80)
+        check(f"attn.wq_a (fp8) dec ks={ks}: gathered rows across slabs equal their rows", torch.equal(yg, yr[rows.long()]))
+        r = rel(yr, ref)
+        check(f"attn.wq_a (fp8) dec ks={ks}: R = 80 slabs vs fp64", r < 2e-6, f"max rel {r:.2e}")
+    # wo_a's FP8 twin: two groups of gk inputs, each half of the output columns reading its own group, bf16 out
+    w = sh.get(pre + "attn.wo_a.weight").to(dev).view(torch.uint8).contiguous()
+    ws = sh.get(pre + "attn.wo_a.scale").to(dev)
+    n, gk = w.shape[0], w.shape[1]
+    groups = 2
+    x = torch.randn(80, groups * gk, device=dev, dtype=torch.bfloat16) * 3
+    q8, s = ref_act_quant(x)
+    q = q8.view(torch.uint8).contiguous()
+    kk = groups * gk
+    for ks in (8, 4):
+        y = torch.zeros(80, n, device=dev, dtype=torch.bfloat16)
+        slab_dec(lib, 0, q, s, None, kk, kk // 32, w, ws, n, gk, ks, y, 1, 0, 80, n // groups, gk, gk // 32)
+        alone = torch.zeros(80, n, device=dev, dtype=torch.bfloat16)
+        for i in (0, 63, 64, 79):
+            slab_dec(lib, 0, q[i:i + 1], s[i:i + 1], None, kk, kk // 32, w, ws, n, gk, ks, alone[i:i + 1], 1, 0, 1, n // groups, gk, gk // 32)
+        ok = all(torch.equal(y[i], alone[i]) for i in (0, 63, 64, 79))
+        # and the groups as two plain launches on their own columns and inputs
+        y2 = torch.zeros(80, n, device=dev, dtype=torch.bfloat16)
+        for g in range(groups):
+            slab_dec(lib, 0, q[:, g * gk:].contiguous()[:, :gk].contiguous(), s[:, g * gk // 32:(g + 1) * gk // 32].contiguous(), None, gk, gk // 32,
+                     w[g * (n // groups):(g + 1) * (n // groups)].contiguous(), ws[g * (n // groups) // 32:(g + 1) * (n // groups) // 32].contiguous(),
+                     n // groups, gk, ks, y2[:, g * (n // groups):], 1, 0, 80)
+        check(f"attn.wo_a (fp8 twin) dec ks={ks}: R = 80 grouped slabs: a row's bits at R = 1 and as two plain launches", ok and torch.equal(y, y2))
+        # an independent bound: each group's columns against fp64 of its own inputs (bf16 out: the rounding of the sum)
+        wdq = dequant_fp8(sh.get(pre + "attn.wo_a.weight").to(dev), ws)
+        refg = torch.cat([ref_linear64(q8[:, g * gk:(g + 1) * gk].contiguous(), s[:, g * gk // 32:(g + 1) * gk // 32].contiguous(), wdq[g * (n // groups):(g + 1) * (n // groups)])
+                          for g in range(groups)], dim=1)
+        same = (y.float() == refg.to(torch.bfloat16).float()).double().mean().item()
+        check(f"attn.wo_a (fp8 twin) dec ks={ks}: grouped bf16 out rounds as the fp64 sum", same > 0.995, f"{same:.5f} equal")
+
+
 def rel(a, b):
     return ((a.double() - b).abs().max() / b.abs().max().clamp_min(1e-30)).item()
+
+
+def check_dec_slabs(lib, name, fmt, q, s, w, ws, n, k, y_dtype=2):
+    """G0.1 (docs/UNIFIED-DECODE-IMPROVEMENTS.md): past 64 rows mx.decDenseMulti runs slabs of 64 rows, each launch on
+    its slab's rows (q + r0 ldq, s + r0 lds, y + r0 ldy). A row's bits must be the same at R = 1, inside R = 64 and as the
+    remainder of R = 65 (and inside the first slab of R = 80)."""
+    for ks, cs in DEC_SPLITS:
+        def slabs(m, r0=0):
+            return torch.cat([run_dec(lib, fmt, q[r0 + a:r0 + min(a + 64, m)], s[r0 + a:r0 + min(a + 64, m)] if s is not None else None,
+                                      w, ws, n, k, ks, cs, y_dtype=y_dtype) for a in range(0, m, 64)])
+        one = {i: run_dec(lib, fmt, q[i:i + 1], s[i:i + 1] if s is not None else None, w, ws, n, k, ks, cs, y_dtype=y_dtype) for i in (0, 63, 64, 79)}
+        r64 = slabs(64)
+        r65 = slabs(65)
+        r80 = slabs(80)
+        r64b = slabs(64, 1)  # rows 1 .. 64 in one launch: row 64 at position 63
+        ok = (torch.equal(r65[:64], r64) and torch.equal(r80[:64], r64) and torch.equal(r65[64:65], one[64]) and
+              torch.equal(r64[0:1], one[0]) and torch.equal(r64[63:64], one[63]) and torch.equal(r64b[63:64], one[64]) and
+              torch.equal(r80[79:80], one[79]) and torch.equal(r80[64:65], one[64]))
+        check(f"{name} dec {ks}x{cs}: 64-row slabs (R = 1, 64, 65, 80): a row's bits at every width", ok)
 
 
 def check_gemm(lib, name, w, ws, fmt, wdq):
@@ -283,6 +385,8 @@ def check_gemm(lib, name, w, ws, fmt, wdq):
         check(f"{name} dec {ks}x{cs}: gathered rows equal their batch rows", torch.equal(g, yd[[47, 5, 5, 30]]))
         y3 = run_dec(lib, fmt, q[:xs], s[:xs], w, ws, n, k, ks, cs, multi=3)
         check(f"{name} dec {ks}x{cs}: three in one launch equal it alone", torch.equal(y3, torch.cat([yd, yd, yd])))
+    check_dec_slabs(lib, name, fmt, q, s, w, ws, n, k)
+    check_dec_slabs(lib, name + " bf16 out", fmt, q, s, w, ws, n, k, y_dtype=1)
     # row-invariance: each row alone, and rows gathered through a rows table, equal the batch's rows
     for splits in (1, 4):
         full = run_mx(lib, q, s, w, ws, fmt, n, k, splits, 2)
@@ -574,6 +678,7 @@ def main():
     lib.dsn_pf_bf16.argtypes = [P, L, L, P, L, L, I, I, I, I, P, L, L, I, F, I]
     lib.dsn_experts_pf.argtypes = [P, I, I, P, P, I, I, P, P, P, P, L, L, P, P, L, L, I, I, F, I, L, L, L, L] + [P] * 14 + [I, I]
     lib.dsn_dec_dense.argtypes = [I, P, P, P, L, L, P, P, L, L, I, I, I, I, I, P, P, P, L, I, I, F, I, I]
+    lib.dsn_dec_dense_g.argtypes = [I, P, P, P, L, L, P, P, L, L, I, I, I, I, P, P, P, L, I, I, I, L, L]
     sh = Shards(root, sys.argv[3] if len(sys.argv) > 3 else None)
     check_act_quant(lib)
     pre = f"layers.{layer}."
@@ -596,6 +701,12 @@ def main():
     check_experts(lib, sh, layer)
     check_experts_pf(lib, sh, layer)
     check_bf16(lib, sh, layer)
+    # the router (ffn.gate, bf16, fp32 logits): the drafter's pass of 13+ streams reaches it past 64 rows (G0.1)
+    gw = sh.get(pre + "ffn.gate.weight").to(dev).contiguous()
+    torch.manual_seed(3)
+    xg = (torch.randn(80, gw.shape[1], device=dev) * 2).to(torch.bfloat16)
+    check_dec_slabs(lib, "ffn.gate (bf16)", 2, xg, None, gw, None, gw.shape[0], gw.shape[1])
+    check_dec_slabs_prod(lib, sh, layer)
     print(f"{len(failures)} failed" if failures else "all checks passed")
     sys.exit(1 if failures else 0)
 

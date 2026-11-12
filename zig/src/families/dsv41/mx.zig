@@ -400,8 +400,40 @@ pub fn decZFloats(fmt: u2, n: usize, kdim: usize, rows: usize) usize {
 /// FP8, 1 FP4, 2 bf16, and one row count), each as its own launch would compute it.
 /// pdl: a programmatic dependent launch (its weights' prologue beside the predecessor), only right after quantDec:
 /// the predecessor must be an ordinary launch (all earlier work done when it started) that lets it start early.
+/// Past decode_rows rows (the drafter's pass of 13 or more streams: five rows a stream) the rows run in slabs of
+/// decode_rows, each its own launch with the slab's row pointers and the split, quantization and epilogue it has alone
+/// (the templates store at most decode_rows rows; a row's bits do not depend on the launch's row count). Only the first
+/// slab may be a programmatic dependent launch: the later ones follow a decode kernel, so they are ordinary launches.
 fn decDenseMulti(k: *const Kernels, s: cuda.Stream, kind: u2, as: []const DecArgs, z: ?Z, pdl: bool) !void {
     if (as.len == 0 or as.len > 4) return error.UnsupportedShape;
+    const m: usize = @intCast(as[0].M);
+    if (m <= decode_rows) return decDenseLaunch(k, s, kind, as, z, pdl);
+    for (as) |a| if (a.M != as[0].M) return error.UnsupportedShape;
+    var r0: usize = 0;
+    while (r0 < m) : (r0 += decode_rows) {
+        var sl: [4]DecArgs = undefined;
+        for (as, 0..) |a, i| sl[i] = decSlab(a, r0, @min(decode_rows, m - r0));
+        try decDenseLaunch(k, s, kind, sl[0..as.len], z, pdl and r0 == 0);
+    }
+}
+
+/// Rows r0 .. r0 + mm of a decode launch's arguments: the activation rows (a row list, else the codes and scales: FP8 /
+/// FP4 codes ldq bytes a row, bf16 rows ldq elements; scales lds floats) and the output rows (ldy elements of y_dtype).
+fn decSlab(a: DecArgs, r0: usize, mm: usize) DecArgs {
+    var b = a;
+    b.M = @intCast(mm);
+    if (a.rows != 0) {
+        b.rows = a.rows + r0 * 4;
+    } else {
+        const qsz: usize = if (a.fmt == 2) 2 else 1;
+        b.q = a.q + r0 * @as(usize, @intCast(a.ldq)) * qsz;
+        if (a.s != 0) b.s = a.s + r0 * @as(usize, @intCast(a.lds)) * 4;
+    }
+    b.y = a.y + r0 * @as(usize, @intCast(a.ldy)) * ysz;
+    return b;
+}
+
+fn decDenseLaunch(k: *const Kernels, s: cuda.Stream, kind: u2, as: []const DecArgs, z: ?Z, pdl: bool) !void {
     var mm: DecMulti = .{ .n = @intCast(as.len) };
     const m: usize = @intCast(as[0].M);
     if (m > decode_rows) return error.NotADecodeWindow;
@@ -660,6 +692,14 @@ pub fn gemv(k: *const Kernels, s: cuda.Stream, l: weights.Linear, q: u64, ldq: u
 /// With `z` (a decode launch: one group, its rows within z) K is split as bfSplits(kdim, n), the partials summed in
 pub fn bf16Gemm(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: u64, ldw: usize, m: usize, n: usize, kdim: usize, y: u64, ldy: usize, y_dtype: DType, scale: f32, round_first: bool, groups: usize, gx: usize, gw: usize, gy: usize, z: ?Z) !void {
     if (n % 32 != 0 or kdim % 16 != 0) return error.UnsupportedShape;
+    if (z != null and groups == 1 and m > decode_rows) {
+        // a decode launch past decode_rows rows (the drafter's router at 13+ streams): slabs of decode_rows rows, each
+        // as a launch of its own rows (the split partials are sized for decode_rows rows; a row's bits are its own)
+        const ysz: usize = if (y_dtype == .f32) 4 else 2;
+        var r0: usize = 0;
+        while (r0 < m) : (r0 += decode_rows)
+        return;
+    }
     if (z != null and groups == 1 and decTakes(k, 2, n, kdim)) return decDense(k, s, 2, .{
         .q = x,
         .ldq = @intCast(ldx),
@@ -758,7 +798,24 @@ fn decKind(l: weights.Linear) ?u2 {
 /// Decode linears on m rows (mx.linear decode for each, bf16 x): the FP8 / FP4 ones sharing an input quantized once
 /// (consecutive linears of the same x, row stride and K read the same codes: act_quant's are a function of the row),
 /// and consecutive linears of one format and one input on the tensor-core kernels in one launch (each as alone).
+/// Past decode_rows rows (the drafter's pass of 13 or more streams) in slabs of decode_rows rows, each slab as a call of
+/// its own rows (codes and scales are functions of the row; the decode kernels' and GEMV's row bits do not depend on the
+/// row count), never the prompt GEMMs.
 pub fn linearsDecode(k: *const Kernels, s: cuda.Stream, sc: Scratch, ls: []const weights.Linear, xs: []const u64, ldxs: []const usize, m: usize, outs: []const u64, ldos: []const usize, types: []const DType, z: Z) !void {
+    if (m > decode_rows) {
+        if (ls.len > 8) return error.UnsupportedShape;
+        var r0: usize = 0;
+        while (r0 < m) : (r0 += decode_rows) {
+            var sx: [8]u64 = undefined;
+            var so: [8]u64 = undefined;
+            for (0..ls.len) |i| {
+                sx[i] = xs[i] + r0 * ldxs[i] * 2;
+                so[i] = outs[i] + r0 * ldos[i] * @as(usize, if (types[i] == .f32) 4 else 2);
+            }
+            try linearsDecode(k, s, sc, ls, sx[0..ls.len], ldxs, @min(decode_rows, m - r0), so[0..ls.len], ldos, types, z);
+        }
+        return;
+    }
     var i: usize = 0;
     while (i < ls.len) {
         const l = ls[i];

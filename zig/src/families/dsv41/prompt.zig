@@ -707,6 +707,7 @@ pub fn grouped(e: *const Engine, ch: *const Chunk, m: usize, ls: []const weights
 /// (mx.linear decode), each row its own bits at any row count; EXL3 as grouped.
 pub fn groupedDecode(e: *const Engine, ch: *const Chunk, m: usize, ls: []const weights.Linear, xs: []const u64, ldxs: []const usize, outs: []const u64, ldos: []const usize, types: []const exl3_linear.DType) !void {
     const k = e.mx orelse return grouped(e, ch, m, ls, xs, ldxs, outs, ldos, types);
+    // past mx.decode_rows rows (the drafter's pass of 13+ streams) linearsDecode runs slabs of the same kernels
     try mx.linearsDecode(k, e.s, ch.mxs, ls, xs, ldxs, m, outs, ldos, types, ch.mxe.z);
 }
 
