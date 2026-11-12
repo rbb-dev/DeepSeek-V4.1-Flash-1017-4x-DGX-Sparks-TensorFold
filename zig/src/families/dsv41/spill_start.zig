@@ -1,4 +1,5 @@
 pub const Math = struct { pair_sum: bool, qhc: bool, owner_gather: bool, idx_shard: bool, idx_rb: usize, negzero: bool, replay_floor: bool, owner_yx: bool, cat_partner: bool, front_owned: bool, ffn_codes: bool, pack_codes: bool, engram_owner_sum: bool, boundary_owned: bool, cat_codes: bool, pf_split: []const u8, woa_w8: bool, quant_once: bool, pf_gemm5: bool, group_tiles: bool, topk_tiles: bool, idx_proj_owned: bool, bf16_rows: bool, pf_run128: bool, pass_rows: usize, pass_from: usize, pass_tail: bool, decode_fuse: bool, attn_u: bool, idx_u: bool, mma_sf: bool, mma_sf_exact: bool, roci: bool = false, roci_collect: bool = false, idx_v: bool = false, gemm_w16: bool = false, assemble_quant: bool = false, attn_epilogue: bool = false, hc_stride: bool = false, hc_fused: bool = false, gemm_r2: bool = false, gemm_halves: bool = false, pf_raster: u32 = 0, attn_epi_fused: bool = false, qgate_canary: u8 = 0, hc_2s: bool = false };
+    math: [768]u8 = undefined,
 /// The math switches in effect as the store name's text (`m`'s every field, its name=value in Math's order).
 pub fn mathText(buf: []u8, m: Math) ![]const u8 {
     const base = try mathBase(buf, m);
@@ -9,6 +10,13 @@ pub fn mathText(buf: []u8, m: Math) ![]const u8 {
         const x = try std.fmt.bufPrint(buf[n..], " qgate_canary={d}", .{m.qgate_canary});
         n += x.len;
     }
+    if (m.pf_raster != 0) {
+        const x = try std.fmt.bufPrint(buf[n..], " pf_raster={d}", .{m.pf_raster});
+        n += x.len;
+    }
+    .{ "gemm_w16", "gemm_w16" },
+    .{ "assemble_quant", "assemble_quant" },
+    .{ "gemm_r2", "gemm_r2" },
 
 fn mathBase(buf: []u8, m: Math) ![]const u8 {
     return std.fmt.bufPrint(buf, "pair_sum={d} qhc={d} owner_gather={d} idx_shard={d} idx_rb={d} negzero={d} replay_floor={d} owner_yx={d} cat_partner={d} front_owned={d} ffn_codes={d} pack_codes={d} engram_owner_sum={d} boundary_owned={d} cat_codes={d} pf_split={s} woa_w8={d} quant_once={d} pf_gemm5={d} group_tiles={d} topk_tiles={d} idx_proj_owned={d} bf16_rows={d} pf_run128={d} pass_rows={d} pass_from={d} pass_tail={d} decode_fuse={d} attn_u={d} idx_u={d} mma_sf={d} mma_sf_exact={d}", .{

@@ -34,6 +34,7 @@ pub const MxArgs = extern struct {
     ldy: i64 = 0,
     y_dtype: c_int = 0,
     accumulate: c_int = 0,
+    raster: c_int = 0, // pfRaster's group of row tiles for the tile GEMMs (native.cu pf_tile_of); 0: row tiles fastest
 };
 
 /// native.cu's GuArgs.
@@ -122,6 +123,25 @@ pub const BfArgs = extern struct {
     splits: c_int = 1,
     ksteps: c_int = 0,
     z: u64 = 0,
+    raster: c_int = 0, // as MxArgs.raster, for tf_dsn_pf_bf16_kernel
+};
+
+/// native.cu's W8Args (tf_dsn_pf_bf16w8: wo_a's groups of a prompt chunk on their FP8 rows).
+pub const W8Args = extern struct {
+    q: u64 = 0,
+    s: u64 = 0,
+    ldq: i64 = 0,
+    lds: i64 = 0,
+    w: u64 = 0,
+    ws: u64 = 0,
+    ldw: i64 = 0,
+    ldws: i64 = 0,
+    M: c_int = 0,
+    N: c_int = 0,
+    K: c_int = 0,
+    y_dtype: c_int = 0,
+    y: u64 = 0,
+    ldy: i64 = 0,
 };
 
 /// native.cu's DecArgs (the decode tensor-core kernels' dense linears).
@@ -188,8 +208,10 @@ const dec_counters = 16384;
 
 comptime {
     // the layouts native.cu was compiled with (pointers and int64 8 bytes, ints and floats 4, C padding)
+    std.debug.assert(@sizeOf(MxArgs) == 136 and @offsetOf(MxArgs, "z") == 96 and @offsetOf(MxArgs, "raster") == 128);
     std.debug.assert(@offsetOf(GuArgs, "sldw") == 136 and @offsetOf(GuArgs, "owner") == 152 and @offsetOf(GuArgs, "z") == 216 and @offsetOf(GuArgs, "early_exit") == 224 and @sizeOf(GuArgs) == 232);
     std.debug.assert(@offsetOf(DnArgs, "sldw") == 104 and @offsetOf(DnArgs, "out") == 136 and @offsetOf(DnArgs, "z") == 160 and @offsetOf(DnArgs, "early_exit") == 172 and @sizeOf(DnArgs) == 176);
+    std.debug.assert(@offsetOf(BfArgs, "y") == 64 and @offsetOf(BfArgs, "z") == 112 and @offsetOf(BfArgs, "raster") == 120 and @sizeOf(BfArgs) == 128);
 }
 
 /// The kernels of cuda.kernels.dsv41_native.
@@ -238,7 +260,22 @@ pub const Kernels = struct {
     pf_dn: cuda.Function,
     pf_tiles: cuda.Function,
     pf_bf16: cuda.Function,
+    // TF_DS_PF_T64 in effect (usePfT64): the router's bf16 GEMM of a prompt chunk on a 64 x 64 tile; its kernel (null until then)
+    pf_t64: bool = false,
+    pf_bf16_t64: ?cuda.Function = null,
     pf_off: bool, // TF_DS_PF_TILES=0: prompt chunks on the tile kernels (the same bits)
+    // TF_DS_PF_SPLIT in effect (useSplit): the split FP8 GEMMs' kernel; the configurations' kernels (null until then)
+    split: PfSplit = .off,
+    pf_split: [4]?cuda.Function = @splat(null),
+    // wo_a on its FP8 rows (useW8: a layer the loader left without its bf16 rows, TF_DS_WOA_W8); null until then
+    pf_bf16w8: ?cuda.Function = null,
+    // TF_DS_GEMM_W16 in effect (useGemmW16): a prompt chunk's exact GEMMs and wo_a's bf16 rows on 16 warps a block
+    // (512 threads); the kernels are loaded with the others (SfKernels.w16, pf_bf16w8_w16) and this one chooses them
+    gemm_w16: bool = false,
+    pf_bf16w8_w16: ?cuda.Function = null,
+    // TF_DS_PF_GEMM5 in effect (useGemm5): the dense FP8 GEMM without a K split at 5 stages; its kernel
+    gemm5: bool = false,
+    pf_gemm5: ?cuda.Function = null,
     // the transport's arena [wc[0], wc[1]) (useStaged): a dense GEMM whose fp32 y lies in it takes the _st kernels, which store
     // whole lines (write-combined host memory takes partial lines slowly); the same values
     wc: [2]u64 = .{ 0, 0 },
@@ -248,8 +285,24 @@ pub const Kernels = struct {
     st_split: [4]?cuda.Function = @splat(null),
     // tf_dsn_combine over a row-quarter order with the doorbell rung from inside (useStaged)
     combine_door: ?cuda.Function = null,
+    // TF_DS_GROUP_TILES in effect (useGroupTiles): a prompt chunk's tile list built once, by the grouping; its kernel
+    group_tiles: bool = false,
+    group_tiles_fn: ?cuda.Function = null,
+    // TF_DS_TOPK_TILES in effect (useTopkTiles): the indexer's pruned top-k in one launch (topkTiles); its kernel
+    topk_tiles: bool = false,
+    topk_tiles_fn: ?cuda.Function = null,
+    // TF_DS_BF16_ROWS in effect: a prompt launch of tf_dsn_bf16_gemm takes a CTA a 16-row tile (bfGridRows)
+    bf16_rows: bool = false,
+    // TF_DS_PF_RUN128 in effect (useRun128): a prompt chunk's MXFP4 expert tiles with their weights staged 128 bytes a
+    // row (pfExpertsLaunch); their kernels
+    run128: bool = false,
+    pf_gu_r128: ?cuda.Function = null,
+    pf_dn_r128: ?cuda.Function = null,
     // TF_DS_QGATE_CANARY 2 or 3 in effect (useQgateBody): the body canary's kernel (qgateBody); null until then
     qgate_body_fn: ?cuda.Function = null,
+    // TF_DS_ASSEMBLE_QUANT in effect (useAssembleQuant): the same assembly-and-quant launch for a prompt chunk's
+    // parity experts, its kernel loaded on its own (not with TF_DS_DECODE_FUSE's routed sum)
+    assemble_quant: bool = false,
     // TF_DS_MMA_SF in effect (useMmaSf): a prompt chunk's FP8 GEMMs on the block-scaled kernels (sfGemmOf, sfExperts);
     // their module, null until then
     sf: MmaSf = .off,
@@ -261,6 +314,8 @@ pub const Kernels = struct {
     sf_nproven: usize = 0,
     sf_seen: [3][2]u8 = @splat(.{ 255, 0 }), // the guard's scale bytes seen: FP8 dense, MXFP4, the shared expert
     sf_apart: usize = 0, // the layers whose experts the guard kept for their packing (other lengths than its reads)
+    // TF_DS_GEMM_R2 in effect (useGemmR2): the exact arithmetic's split GEMMs and expert tiles on its kernels (SfKernels.r2)
+    gemm_r2: bool = false,
 
     pub fn load(d: *const cuda.Driver, image: []const u8) !Kernels {
         var m = try cuda.Module.load(d, image);
@@ -282,6 +337,7 @@ pub const Kernels = struct {
             .nact_log = m.function("tf_dsn_nact_log_kernel") catch null,
             .dec_quant = try m.function("tf_dsn_dec_quant_kernel"),
             .dec_l2pf = try m.function("tf_dsn_dec_l2pf_kernel"),
+            .dec_on = decOnEnv(),
             .dec_pdl = if (std.c.getenv("TF_DS_DEC_PDL")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true,
             .expert_exit = if (std.c.getenv("TF_DS_EXPERT_EXIT")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false,
             .counters = counters,
@@ -313,6 +369,7 @@ pub const Kernels = struct {
             .pf_dn = try pfFunction(m, "tf_dsn_pf_dn_kernel", pf_dn_smem),
             .pf_tiles = try m.function("tf_dsn_pf_tiles_kernel"),
             .pf_bf16 = try pfFunction(m, "tf_dsn_pf_bf16_kernel", pf_bf16_smem),
+            .pf_off = pfOffEnv(),
         };
     }
 
@@ -322,9 +379,47 @@ pub const Kernels = struct {
         return f;
     }
 
+    /// TF_DS_ASSEMBLE_QUANT in effect: tf_dsn_dec_asm_quant (the parity assembly with down's quant in one launch),
+    /// then the switch. An error leaves it off.
+    pub fn useAssembleQuant(k: *Kernels) !void {
+        k.dec_asm_quant = try k.module.function("tf_dsn_dec_asm_quant_kernel");
+        k.assemble_quant = true;
+    }
+
+    /// TF_DS_PF_RUN128 in effect: tf_dsn_pf_gu_r128 and tf_dsn_pf_dn_r128, then the switch. An error leaves it off.
+    pub fn useRun128(k: *Kernels) !void {
+        const gu = try pfFunction(k.module, "tf_dsn_pf_gu_r128_kernel", pf_gu_r128_smem);
+        const dn = try pfFunction(k.module, "tf_dsn_pf_dn_r128_kernel", pf_dn_r128_smem);
+        k.pf_gu_r128 = gu;
+        k.pf_dn_r128 = dn;
+        k.run128 = true;
+    }
+
+    /// TF_DS_GEMM_R2 `asked` in effect: the exact arithmetic's expert tiles take the R2 kernels loaded beside the baseline
+    /// (SfKernels.r2). They stage the activation rows as the baseline kernels do with a padding row's copies left out, and
+    /// give down a 128-row tile, keeping every K block's MMA order and fp32 adds. Nothing loads here: an image built
+    /// without both (or a GPU that did not load them, or another arithmetic than the exact form) leaves the switch off.
+    pub fn useGemmR2(k: *Kernels, asked: bool) bool {
+        const ok = if (k.sfk) |x| x.r2.gu != null and x.r2.dn != null else false;
+        k.gemm_r2 = asked and ok and k.sf == .exact;
+        return k.gemm_r2;
+    }
+
+    /// TF_DS_TOPK_TILES in effect: tf_dsn_topk_tiles, then the switch. An error leaves it off.
+    pub fn useTopkTiles(k: *Kernels) !void {
+        k.topk_tiles_fn = try k.module.function("tf_dsn_topk_tiles_kernel");
+        k.topk_tiles = true;
+    }
+
     /// TF_DS_QGATE_CANARY 2 or 3 (prompt.qgate_body): the body canary's kernel, for qgateBody.
     pub fn useQgateBody(k: *Kernels) !void {
         k.qgate_body_fn = try k.module.function("tf_dsn_qgate_body_kernel");
+    }
+
+    /// TF_DS_GROUP_TILES in effect: tf_dsn_group_tiles, then the switch. An error leaves it off.
+    pub fn useGroupTiles(k: *Kernels) !void {
+        k.group_tiles_fn = try k.module.function("tf_dsn_group_tiles_kernel");
+        k.group_tiles = true;
     }
 
     /// The dense GEMMs' whole-line twins for a y in [lo, hi) (the transport's arena): the _st kernels of the tile, fold, 5-stage
@@ -338,6 +433,46 @@ pub const Kernels = struct {
         // the GPU-scope release with the last arrival's system fence (door_arrive_cta<2>)
         k.combine_door = try k.module.function("tf_dsn_combine_door_g_kernel");
         k.wc = .{ lo, hi };
+    }
+
+    /// TF_DS_PF_GEMM5 in effect: tf_dsn_pf_gemm5, then the switch. An error leaves it off.
+    pub fn useGemm5(k: *Kernels) !void {
+        k.pf_gemm5 = try pfFunction(k.module, "tf_dsn_pf_gemm5_kernel", pf_gemm5_smem);
+        k.gemm5 = true;
+    }
+
+    /// tf_dsn_pf_bf16w8 for woA8Prefill (the layers the loader left without their bf16 rows), and its 16-warp twin.
+    pub fn useW8(k: *Kernels) !void {
+        k.pf_bf16w8 = try pfFunction(k.module, "tf_dsn_pf_bf16w8_kernel", pf_w8_smem);
+        k.pf_bf16w8_w16 = pfFunction(k.module, "tf_dsn_pf_bf16w8_w16_kernel", pf_w8_smem) catch null;
+    }
+
+    /// TF_DS_GEMM_W16 `asked` in effect: a prompt chunk's exact GEMMs and wo_a's bf16 rows launch the 16-warp (512
+    /// thread) kernels loaded beside the baseline. Their tiles, stages and shared memory are the 8-warp kernels' and their
+    /// bytes are theirs. Nothing loads here: an image built without the twins (or, for the block-scaled kernels, a GPU
+    /// that did not load them) leaves the switch off.
+    pub fn useGemmW16(k: *Kernels, asked: bool) bool {
+        const sf = if (k.sfk) |x| x.w16.split64 != null and x.w16.split128 != null and x.w16.gu != null and x.w16.dn != null else true;
+        k.gemm_w16 = asked and k.pf_bf16w8_w16 != null and sf;
+        return k.gemm_w16;
+    }
+
+    /// TF_DS_PF_T64 `asked` in effect: tf_dsn_pf_bf16_t64 (the bf16 prompt GEMM on a 64 x 64 tile, two CTAs an SM), then the switch. An
+    /// image built without the kernel, or a GPU that did not load it, leaves the switch off.
+    pub fn usePfT64(k: *Kernels, asked: bool) bool {
+        if (asked and k.pf_bf16_t64 == null) k.pf_bf16_t64 = pfFunction(k.module, "tf_dsn_pf_bf16_t64_kernel", pf_bf16_t64_smem) catch null;
+        k.pf_t64 = asked and k.pf_bf16_t64 != null;
+        return k.pf_t64;
+    }
+
+    /// TF_DS_PF_SPLIT `sw` in effect (off: nothing changes, nothing loaded): the four configurations' kernels, then
+    /// the switch. An error leaves it off.
+    pub fn useSplit(k: *Kernels, sw: PfSplit) !void {
+        if (sw == .off) return;
+        var fs: [4]?cuda.Function = undefined;
+        for (&fs, split_kernels, split_smem) |*f, name, smem| f.* = try pfFunction(k.module, name, smem);
+        k.pf_split = fs;
+        k.split = sw;
     }
 
     /// TF_DS_MMA_SF `sw` in effect (off: nothing changes, nothing loaded): native_sf.cu's kernels from `image`, then the
@@ -360,17 +495,46 @@ fn launch(f: cuda.Function, s: cuda.Stream, grid: [3]usize, block: usize, args: 
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = @intCast(block) } }, s, args);
 }
 
+/// TF_DS_DECODE_DEC as Kernels.load reads it: the decode tensor-core kernels unless "0".
+pub fn decOnEnv() bool {
+    return if (std.c.getenv("TF_DS_DECODE_DEC")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+}
+
+/// TF_DS_PF_TILES as Kernels.load reads it: "0" turns the prompt chunks' tile kernels off.
+pub fn pfOffEnv() bool {
+    return if (std.c.getenv("TF_DS_PF_TILES")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
+}
+
 /// The prefill tile kernels' dynamic shared memory (native.cu asserts the same: pf::kGemmSmem, kGuSmem, kDnSmem).
 pub const pf_gemm_smem: u32 = 76800;
 pub const pf_gu_smem: u32 = 79872;
 pub const pf_dn_smem: u32 = 53760;
 pub const pf_bf16_smem: u32 = 81920;
+/// tf_dsn_pf_bf16_t64 (pf::kBf64Smem: 4 stages of 128 rows of 80 bytes): two CTAs and their 1 KiB each reserve fit an SM's 100 KiB.
+pub const pf_bf16_t64_smem: u32 = 40960;
+pub const pf_w8_smem: u32 = 84480; // tf_dsn_pf_bf16w8 (pf::kW8Smem)
+pub const pf_gemm5_smem: u32 = 87040; // tf_dsn_pf_gemm5 (pf::GemmFiveCfg::SMEM)
+pub const pf_gu_r128_smem: u32 = 97280; // tf_dsn_pf_gu_r128 (pf::kGuR128Smem)
+pub const pf_dn_r128_smem: u32 = 62464; // tf_dsn_pf_dn_r128 (pf::kDnR128Smem)
+
+/// The grouped experts' prefill tile kernels a prompt chunk launches and their dynamic shared memory: the baseline
+/// tf_dsn_pf_gu / tf_dsn_pf_dn, or with TF_DS_PF_RUN128 their 128-byte-run twins (the same grid and arguments).
+pub const ExpertsLaunch = struct { r128: bool, gu_smem: u32, dn_smem: u32 };
+pub fn pfExpertsLaunch(run128: bool) ExpertsLaunch {
+    return if (run128) .{ .r128 = true, .gu_smem = pf_gu_r128_smem, .dn_smem = pf_dn_r128_smem } else .{ .r128 = false, .gu_smem = pf_gu_smem, .dn_smem = pf_dn_smem };
+}
 /// The grouped prefill tiles' rows (native.cu pf::kBm).
 pub const pf_bm = 64;
 /// Rows from which a dense prompt GEMM takes the prefill tile kernel (fewer: the tile kernel; the same bits either way).
 pub const pf_min_rows = 64;
 
 fn launchShared(f: cuda.Function, s: cuda.Stream, grid: [3]usize, smem: u32, args: *cuda.Args) !void {
+    try launchSharedT(f, s, grid, smem, 256, args);
+}
+
+/// launchShared for a block of `threads` threads (the 16-warp kernels' 512).
+fn launchSharedT(f: cuda.Function, s: cuda.Stream, grid: [3]usize, smem: u32, threads: u32, args: *cuda.Args) !void {
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = threads }, .shared = smem }, s, args);
 }
 
 fn aligned(p: u64, a: u64) bool {
@@ -404,6 +568,35 @@ pub fn bf16ToF16(k: *const Kernels, s: cuda.Stream, in: u64, out: u64, n: usize)
 /// it bounds the split partials' buffer.
 pub const slab_rows = 1024;
 
+/// TF_DS_PF_RASTER in effect (Model.open): the group of row tiles G (2, 4, 8 or 16) the prompt tile GEMMs walk their grid
+/// in (native.cu pf_tile_of: G row tiles across all the column tiles, then the next G), or 0: row tiles fastest. It
+/// changes only the order whole output tiles run in, so every output byte is the default order's.
+pub var pf_raster: u32 = 0;
+
+/// The activation slab a launch must read, in bytes, before the grouped order applies: below it the slab stays in the L2
+/// whichever order the tiles run in. vLLM PR #55180's gate for the SM12x blockwise-FP8 GEMM (the 24 MiB L2 of a GB10
+/// holds a slab of up to about this much beside the weight tiles in flight).
+pub const raster_slab_bytes: usize = 14 << 20;
+
+/// The `raster` argument of a tile GEMM launch of `m` rows whose activation takes `row_bytes` a row: `g` (pf_raster) where the
+/// slab m * row_bytes reaches raster_slab_bytes, else 0.
+pub fn rasterOf(g: u32, m: usize, row_bytes: usize) c_int {
+    return if (g != 0 and m * row_bytes >= raster_slab_bytes) @intCast(g) else 0;
+}
+
+/// native.cu pf_tile_of: the (row tile, column tile) of the CTA at (bx, by) of a grid of nrow x ncol tiles under group `g`
+/// (0: bx, by). Every tile of the grid is the image of exactly one CTA.
+pub fn rasterTile(g: u32, nrow: u32, ncol: u32, bx: u32, by: u32) [2]u32 {
+    if (g == 0) return .{ bx, by };
+    const lin = bx + nrow * by;
+    const gsize = g * ncol;
+    const gid = lin / gsize;
+    const r0 = gid * g;
+    const rows = @min(g, nrow - r0);
+    const w = lin - gid * gsize;
+    return .{ r0 + w % rows, w / rows };
+}
+
 /// A layer's K splits, from its shape alone (a row's sum is the same at every row count): enough CTAs over N (four
 /// 32-column warps a CTA) to fill the GPU twice, at least 8 K blocks a split, at most 16 splits.
 pub fn splits(k: usize, n: usize) usize {
@@ -414,9 +607,106 @@ pub fn splits(k: usize, n: usize) usize {
     return s;
 }
 
+/// TF_DS_PF_SPLIT: the kernel of a prompt chunk's split FP8 GEMMs (a K split, from pf_min_rows rows: wq_a, wkv, wq_b,
+/// wo_b, the indexer's wq_b). off: tf_dsn_pf_gemm_fold (the baseline); a, b, c6, c7: that configuration of
+/// tf_dsn_pf_gemm_split* for every shape it divides (pfSplitCfg); table: split_table's choice by shape and rows. Every
+/// choice gives the fold kernel's bits: the same MMAs, scaling and split merge in the same order (native.cu
+/// run_tile_split1).
+pub const PfSplit = enum(u32) {
+    off = 0,
+    table = 1,
+    a = 2,
+    b = 3,
+    c6 = 4,
+    c7 = 5,
+
+    const texts = [_][]const u8{ "0", "1", "A", "B", "C6", "C7" };
+
+    /// TF_DS_PF_SPLIT's text: unset or "0" off, "1" the table, "A", "B", "C6" or "C7" that configuration; null for any
+    /// other text (not a setting: the start says so and runs off).
+    pub fn parse(text: ?[]const u8) ?PfSplit {
+        const v = text orelse return .off;
         for (texts, 0..) |t, i| if (std.mem.eql(u8, v, t)) return @fromBackingInt(@intCast(i));
+        return null;
+    }
+
+    /// The setting's text for a Settings word or the SSD tier's math (null: no setting of this build).
+    pub fn name(word: u32) ?[]const u8 {
+        return if (word < texts.len) texts[word] else null;
+    }
+};
+
+/// The split configurations (native.cu GemmSplit*Cfg, kernels tf_dsn_pf_gemm_split{A,B,C6,C7}_kernel): rows a tile,
+/// K blocks a stage, dynamic shared memory.
+pub const SplitCfg = enum(u2) { a, b, c6, c7 };
+pub const split_bm = [4]usize{ 128, 64, 64, 64 };
+pub const split_kbs = [4]usize{ 2, 4, 2, 2 };
+pub const split_smem = [4]u32{ 87040, 76800, 76800, 89600 };
 const split_st_kernels = [4][:0]const u8{ "tf_dsn_pf_gemm_splitA_st_kernel", "tf_dsn_pf_gemm_splitB_st_kernel", "tf_dsn_pf_gemm_splitC6_st_kernel", "tf_dsn_pf_gemm_splitC7_st_kernel" };
+const split_kernels = [4][:0]const u8{ "tf_dsn_pf_gemm_splitA_kernel", "tf_dsn_pf_gemm_splitB_kernel", "tf_dsn_pf_gemm_splitC6_kernel", "tf_dsn_pf_gemm_splitC7_kernel" };
+
+/// TF_DS_PF_SPLIT=1's table: a split FP8 GEMM's shape (K, N) and its configuration by the launch's rows (at most 512,
+/// at most 1,024, more); null and every shape not listed: the fold kernel.
+pub const SplitRow = struct { k: usize, n: usize, cfg: [3]?SplitCfg };
+pub const split_table = [_]SplitRow{
+    .{ .k = 5120, .n = 1280, .cfg = .{ null, null, .a } }, // wq_a
+    .{ .k = 5120, .n = 512, .cfg = .{ null, null, .a } }, // wkv
+    .{ .k = 1280, .n = 8192, .cfg = .{ null, null, .a } }, // a 2D node's wq_b
+    .{ .k = 4096, .n = 2560, .cfg = .{ null, null, .a } }, // a 2D node's wo_b
+    .{ .k = 1280, .n = 4096, .cfg = .{ null, null, .a } }, // the indexer's wq_b
+};
+
+/// split_table's configuration for a launch of m rows of shape (K, N).
+fn tableCfg(m: usize, kdim: usize, n: usize) ?SplitCfg {
+    const class: usize = if (m <= 512) 0 else if (m <= 1024) 1 else 2;
+    for (split_table) |row| if (row.k == kdim and row.n == n) return row.cfg[class];
+    return null;
+}
+
+/// The configuration a split FP8 GEMM of m rows and shape (K, N) takes under TF_DS_PF_SPLIT (null: the fold kernel):
+/// the forced one or the table's, only for a K split (splits > 1) whose fold (K blocks a split) and K blocks are
+/// multiples of the configuration's K blocks a stage.
+pub fn pfSplitCfg(sw: PfSplit, m: usize, kdim: usize, n: usize) ?SplitCfg {
+    const cfg: SplitCfg = switch (sw) {
+        .off => return null,
+        .table => tableCfg(m, kdim, n) orelse return null,
+        .a => .a,
+        .b => .b,
+        .c6 => .c6,
+        .c7 => .c7,
+    };
+    const sp = splits(kdim, n);
+    if (sp < 2) return null;
+    const nkb = kdim / 32;
     const kbs = split_kbs[@backingInt(cfg)];
+    if (cdiv(nkb, sp) % kbs != 0 or nkb % kbs != 0) return null;
+    return cfg;
+}
+
+/// Why TF_DS_PF_SPLIT asked for cannot run (null: it can): the checkpoint's own FP8 / MXFP4 weights and the prompt
+/// chunks' tile kernels.
+pub fn splitOff(native: bool, pf_off: bool) ?[]const u8 {
+    if (!native) return "needs the checkpoint's own FP8 / MXFP4 weights";
+    if (pf_off) return "needs the prompt chunks' tile kernels (TF_DS_PF_TILES=0 turns them off)";
+    return null;
+}
+
+/// The prompt tile GEMM of a dense FP8 linear that pfDense admits: tf_dsn_pf_gemm without a K split, the fold kernel
+/// with one, or the split configuration TF_DS_PF_SPLIT gives the shape (pfSplitCfg).
+pub const PfGemm = union(enum) { gemm, fold, split: SplitCfg, gemm5 };
+pub fn pfGemmOf(sw: PfSplit, m: usize, kdim: usize, n: usize) PfGemm {
+    if (splits(kdim, n) < 2) return .gemm;
+    if (pfSplitCfg(sw, m, kdim, n)) |c| return .{ .split = c };
+    return .fold;
+}
+
+/// pfGemmOf with TF_DS_PF_GEMM5 (`gemm5`): a GEMM without a K split on tf_dsn_pf_gemm5 (the same tile, K blocks a
+/// stage and K order at 5 stages: tf_dsn_pf_gemm's bits).
+pub fn pfGemmKernel(sw: PfSplit, gemm5: bool, m: usize, kdim: usize, n: usize) PfGemm {
+    const c = pfGemmOf(sw, m, kdim, n);
+    return if (c == .gemm and gemm5) .gemm5 else c;
+}
+
 /// TF_DS_MMA_SF: a prompt chunk's FP8 GEMMs on the tensor core's block-scaled MMA (native_sf.cu, the dsv41_native_sf
 /// image built for sm_121a): the dense FP8 GEMMs mx.gemm takes to its tile kernels and the grouped experts' gate / up
 /// and down. chained: a split's K blocks accumulate in the MMA (the switch's arithmetic: not the baseline bits); exact: each
@@ -433,6 +723,10 @@ pub const SfKernels = struct {
     zsplit: cuda.Function,
     gu: [2]cuda.Function,
     dn: [2]cuda.Function,
+    // the exact arithmetic's kernels on 16 warps a block (TF_DS_GEMM_W16); null each in an image built without it
+    w16: W16 = .{},
+    // TF_DS_GEMM_R2's kernels (the exact arithmetic's): null each in an image built without it
+    r2: R2 = .{},
     ranges: ?cuda.Function = null, // tf_dsn_sf_ranges: TF_DS_MMA_SF_EXACT's guard
     // the whole-line twins for a y in the transport's arena (Kernels.useStaged)
     st_gemm: [2]?cuda.Function = @splat(null),
@@ -498,6 +792,16 @@ pub const SfKernels = struct {
             .zsplit = try pf(m, "tf_dsn_sf_zsplit_kernel", sf_split64_smem),
             .gu = .{ try pf(m, "tf_dsn_sf_gu_kernel", pf_gu_r128_smem), try pf(m, "tf_dsn_sf_gu_exact_kernel", pf_gu_r128_smem) },
             .dn = .{ try pf(m, "tf_dsn_sf_dn_kernel", pf_dn_r128_smem), try pf(m, "tf_dsn_sf_dn_exact_kernel", pf_dn_r128_smem) },
+            .w16 = .{
+                .split64 = pf(m, "tf_dsn_sf_split64_exact_w16_kernel", sf_split64_smem) catch null,
+                .split128 = pf(m, "tf_dsn_sf_split128_exact_w16_kernel", sf_split128_smem) catch null,
+                .gu = pf(m, "tf_dsn_sf_gu_exact_w16_kernel", pf_gu_r128_smem) catch null,
+                .dn = pf(m, "tf_dsn_sf_dn_exact_w16_kernel", pf_dn_r128_smem) catch null,
+            },
+            .r2 = .{
+                .gu = pf(m, "tf_dsn_sf_gu_exact_r2_kernel", pf_gu_r128_smem) catch null,
+                .dn = pf(m, "tf_dsn_sf_dn_exact_r2_kernel", r2_dn_smem) catch null,
+            },
             .ranges = try m.function("tf_dsn_sf_ranges_kernel"),
         };
         sk.dn_three = pf(m, "tf_dsn_sf_dn_exact_three_kernel", pf_dn_r128_smem) catch null;
@@ -548,12 +852,31 @@ pub fn packAt(p: usize, ig: usize, ir: usize, owner_second: bool, kb: usize, m: 
     return .{ .part = @intFromBool(owner_second), .q = b.rest_q + m * ir + r * 32, .s = b.rest_s + (m * (ir / 32) + r) * 4 };
 }
 
+/// The exact arithmetic's split tiles and experts on 16 warps a block (TF_DS_GEMM_W16), each null where the image
+/// was built without it. Their tiles and stages are the 8-warp kernels', so their dynamic shared memory is theirs.
+pub const W16 = struct {
+    split64: ?cuda.Function = null,
+    split128: ?cuda.Function = null,
+    gu: ?cuda.Function = null,
+    dn: ?cuda.Function = null,
+};
+
+/// TF_DS_GEMM_R2's kernels, each null where the image was built without it: the experts' gate / up and down on the
+/// exact arithmetic. Their shared memory is pf_gu_r128_smem and r2_dn_smem.
+pub const R2 = struct {
+    gu: ?cuda.Function = null,
+    dn: ?cuda.Function = null,
+};
+
 /// The block-scaled kernels' dynamic shared memory (native_sf.cu asserts its tiles'): tf_dsn_sf_gemm (3 stages of
 /// 17,408 bytes), tf_dsn_sf_split64 and tf_dsn_sf_zsplit (6 of 12,800), tf_dsn_sf_split128 (5 of 17,408); the experts'
 /// take their 128-byte-run twins' (pf_gu_r128_smem, pf_dn_r128_smem).
 pub const sf_gemm_smem: u32 = 52224;
 pub const sf_split64_smem: u32 = 76800;
 pub const sf_split128_smem: u32 = 87040;
+/// TF_DS_GEMM_R2's kernels' dynamic shared memory (native_sf.cu asserts its tiles'): the experts' down at 128 rows
+/// (90,112 bytes); gate / up takes the tile above.
+pub const r2_dn_smem: u32 = 90112;
 
 /// The block-scaled kernel of a dense FP8 GEMM of m rows whose K split is `sp` (splits()): gemm without a split; with
 /// one, the split folded in the CTA on 64-row tiles up to 1,024 rows and on 128-row tiles past them, and (chained) one
@@ -608,10 +931,14 @@ fn sfGemm(k: *const Kernels, s: cuda.Stream, kind: SfGemm, l: weights.Linear, q:
     const x: usize = @intFromBool(k.sf == .exact);
     const stage = stagedY(k, y, ldy, y_dtype, accumulate) and kind != .zsplit and sk.st_gemm[x] != null;
     const sp = splits(l.k, l.n);
+    const a: MxArgs = .{ .q = q, .s = sc, .ldq = @intCast(ldq), .lds = @intCast(lds), .w = l.w, .ws = l.s, .ldw = l.k, .ldws = l.k / 32, .fmt = 0, .M = @intCast(m), .N = @intCast(l.n), .K = @intCast(l.k), .splits = @intCast(sp), .kblocks = @intCast(cdiv(l.k / 32, sp)), .z = z, .y = y, .ldy = @intCast(ldy), .y_dtype = @backingInt(y_dtype), .accumulate = @intFromBool(accumulate), .raster = rasterOf(pf_raster, m, l.k) };
     var args: cuda.Args = .{};
     args.add(a);
+    // the exact arithmetic's split tiles on 16 warps a block when TF_DS_GEMM_W16 is on and this image has its twins
+    const w = if (k.gemm_w16 and x == 1) sk.w16 else W16{};
     switch (kind) {
         .gemm => try launchShared(if (stage) sk.st_gemm[x].? else sk.gemm[x], s, .{ cdiv(m, 128), l.n / 128, 1 }, sf_gemm_smem, &args),
+        .split128 => if (stage) try launchShared(sk.st_split128[x].?, s, .{ cdiv(m, 128), l.n / 128, 1 }, sf_split128_smem, &args) else if (w.split128) |f| try launchSharedT(f, s, .{ cdiv(m, 128), l.n / 128, 1 }, sf_split128_smem, 512, &args) else try launchShared(sk.split128[x], s, .{ cdiv(m, 128), l.n / 128, 1 }, sf_split128_smem, &args),
         .zsplit => {
             try launchShared(sk.zsplit, s, .{ cdiv(m, 64), l.n / 128, sp }, sf_split64_smem, &args);
             var ra: cuda.Args = .{};
@@ -747,10 +1074,29 @@ pub fn linearSentFirst(k: *const Kernels, s: cuda.Stream, sc: Scratch, l: weight
     try gemmSentFirst(k, s, l, sc.q, l.k, sc.s, l.k / 32, m, y, ldy, sc.z, ro, door);
 }
 
+/// A kernel with the block it launches and its dynamic shared memory.
+pub const Launch = struct { f: cuda.Function, threads: u32, smem: u32 };
+
 /// TF_DS_MMA_SF's kernel of a prompt chunk's expert tiles (gate / up, else down: the 128-byte-run twins' arguments,
+/// grid and tiles), the block it launches and its shared memory: the baseline 256 threads, with TF_DS_GEMM_R2 the exact
+/// arithmetic's R2 tiles (which stage the same arguments and tiles), or with TF_DS_GEMM_W16 its 16-warp twin's 512; null: the baseline kernel (the switch off, or with TF_DS_MMA_SF_EXACT the layer's
+/// experts not proven by its guard, `key` their gate scale table NativeExperts.s1).
+pub fn sfExperts(k: *const Kernels, key: u64, of_down: bool) ?Launch {
     if (k.sf == .off or (k.sf == .exact and !sfProvenKey(k, key))) return null;
     const sk = k.sfk orelse return null;
     const x: usize = @intFromBool(k.sf == .exact);
+    if (k.gemm_r2 and x == 1) {
+        if (of_down) {
+            if (sk.r2.dn) |f| return .{ .f = f, .threads = 256, .smem = r2_dn_smem };
+        } else if (sk.r2.gu) |f| return .{ .f = f, .threads = 256, .smem = pf_gu_r128_smem };
+    }
+    if (k.gemm_w16 and x == 1) {
+        const w = sk.w16;
+        const smem = if (of_down) pf_dn_r128_smem else pf_gu_r128_smem;
+        const f = (if (of_down) w.dn else w.gu) orelse return .{ .f = if (of_down) sk.dn[1] else sk.gu[1], .threads = 256, .smem = smem };
+        return .{ .f = f, .threads = 512, .smem = smem };
+    }
+    return .{ .f = if (of_down) sk.dn[x] else sk.gu[x], .threads = 256, .smem = if (of_down) pf_dn_r128_smem else pf_gu_r128_smem };
 }
 
 /// TF_DS_MMA_SF_EXACT's proven ranges of weight scale bytes (UE8M0). Within them every scaled block sum of a GEMM is a
@@ -1156,6 +1502,7 @@ pub fn gemm(k: *const Kernels, s: cuda.Stream, l: weights.Linear, q: u64, ldq: u
         else => 2,
     };
         // the prefill tile GEMM: every row at once, a split folded in the CTA (the tile kernel's and reduce's bits)
+        const a: MxArgs = .{ .q = q, .s = sc, .ldq = @intCast(ldq), .lds = @intCast(lds), .w = l.w, .ws = l.s, .ldw = l.k, .ldws = l.k / 32, .fmt = 0, .M = @intCast(m), .N = @intCast(l.n), .K = @intCast(l.k), .splits = @intCast(sp), .kblocks = @intCast(cdiv(l.k / 32, sp)), .y = y, .ldy = @intCast(ldy), .y_dtype = @backingInt(y_dtype), .accumulate = @intFromBool(accumulate), .raster = rasterOf(pf_raster, m, l.k) };
         var args: cuda.Args = .{};
         args.add(a);
         const stage = stagedY(k, y, ldy, y_dtype, accumulate);
@@ -1163,6 +1510,7 @@ pub fn gemm(k: *const Kernels, s: cuda.Stream, l: weights.Linear, q: u64, ldq: u
             .gemm5 => launchShared((if (stage) k.st_gemm5 else k.pf_gemm5) orelse return error.NoGemm5Kernel, s, .{ cdiv(m, 128), l.n / 128, 1 }, pf_gemm5_smem, &args),
             .fold => launchShared(if (stage) k.st_fold.? else k.pf_gemm_fold, s, .{ cdiv(m, 64), l.n / 128, 1 }, pf_gemm_smem, &args),
             .split => |c| launchShared((if (stage) k.st_split[@backingInt(c)] else k.pf_split[@backingInt(c)]) orelse return error.NoSplitKernel, s, .{ cdiv(m, split_bm[@backingInt(c)]), l.n / 128, 1 }, split_smem[@backingInt(c)], &args),
+        };
     }
     var r0: usize = 0;
     while (r0 < m) : (r0 += slab_rows) {
@@ -1261,6 +1609,13 @@ pub fn gemv(k: *const Kernels, s: cuda.Stream, l: weights.Linear, q: u64, ldq: u
 /// With `z` (a decode launch: one group, its rows within z) K is split as bfSplits(kdim, n), the partials summed in
 pub fn bf16Gemm(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: u64, ldw: usize, m: usize, n: usize, kdim: usize, y: u64, ldy: usize, y_dtype: DType, scale: f32, round_first: bool, groups: usize, gx: usize, gw: usize, gy: usize, z: ?Z) !void {
     if (n % 32 != 0 or kdim % 16 != 0) return error.UnsupportedShape;
+/// The launch of a prompt chunk's bf16 GEMM under TF_DS_PF_T64 (`on`): the 64 x 64 tile for the router's 384 columns of a single group,
+/// else null (the 128 x 128 tile). Its grid is (cdiv(m, 64), n / 64, 1) at 128 threads.
+pub fn pfT64Of(k: *const Kernels, on: bool, n: usize, groups: usize) ?cuda.Function {
+    if (!on or groups != 1 or n != 384) return null;
+    return k.pf_bf16_t64;
+}
+
     if (z != null and groups == 1 and m > decode_rows) {
         // a decode launch past decode_rows rows (the drafter's router at 13+ streams): slabs of decode_rows rows, each
         // as a launch of its own rows (the split partials are sized for decode_rows rows; a row's bits are its own)
@@ -1284,6 +1639,7 @@ pub fn bf16Gemm(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: u64, l
         .scale = scale,
         .round_first = @intFromBool(round_first),
     }, z);
+    var a: BfArgs = .{ .x = x, .ldx = @intCast(ldx), .gx = @intCast(gx), .w = w, .ldw = @intCast(ldw), .gw = @intCast(gw), .M = @intCast(m), .N = @intCast(n), .K = @intCast(kdim), .y = y, .ldy = @intCast(ldy), .gy = @intCast(gy), .y_dtype = @backingInt(y_dtype), .scale = scale, .round_first = @intFromBool(round_first), .raster = rasterOf(pf_raster, m, kdim * 2) };
     const sp = if (z != null) bfSplits(kdim, n) else 1;
     if (sp > 1) {
         const zz = z.?;
@@ -1299,13 +1655,22 @@ pub fn bf16Gemm(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: u64, l
         gx % 8 == 0 and aligned(w, 16) and ldw % 8 == 0 and gw % 8 == 0)
     {
         // the prefill bf16 GEMM: the same MMA chain (the tile kernel's bits), staged tiles
+        if (pfT64Of(k, k.pf_t64, n, groups)) |f| return launchSharedT(f, s, .{ cdiv(m, 64), n / 64, 1 }, pf_bf16_t64_smem, 128, &args);
         return launchShared(k.pf_bf16, s, .{ cdiv(m, 128), n / 128, groups }, pf_bf16_smem, &args);
     }
+    try launch(k.bf16, s, .{ cdiv(n / 32, 4), bfGridRows(k.bf16_rows, z == null, m), if (sp > 1) sp else groups }, 128, &args);
     if (sp > 1) {
         var ra: cuda.Args = .{};
         ra.add(a);
         try launch(k.bf_reduce, s, .{ cdiv(m * n, 256), 1, 1 }, 256, &ra);
     }
+}
+
+/// tf_dsn_bf16_gemm's CTAs over m rows (grid y): at most 64, each walking its 16-row tiles gridDim.y apart; with
+/// TF_DS_BF16_ROWS (`rows_on`) a prompt launch (`prompt`: no decode split) takes one a tile. A tile's chain is the same
+/// whichever CTA runs it, so either grid gives the same bits.
+pub fn bfGridRows(rows_on: bool, prompt: bool, m: usize) usize {
+    return if (rows_on and prompt) cdiv(m, 16) else @min(cdiv(m, 16), 64);
 }
 
 /// A native linear on m rows of x (dtype x_dtype, row stride ldx) into y (row stride ldy, y_dtype): FP8 / FP4 through
@@ -1436,7 +1801,53 @@ pub fn woA(k: *const Kernels, s: cuda.Stream, sc: Scratch, wo: []const weights.L
     }
 }
 
+/// woA of a prompt chunk's layer the loader left without its bf16 rows (weights.Layer.wo_a_rows false: TF_DS_WOA_W8),
+/// on its FP8 rows (Layer.wo_a8, every group stacked): o [m, groups * gk] bf16 (row stride ldo) quantized once
+/// (act_quant: the codes and scales whose quant-dequant values woA's fake rows hold), then each group's columns through
+/// tf_dsn_pf_bf16w8 into u's column block (row stride ldu, bf16). The kernel multiplies the values woA multiplies (each
+/// code times its scale rounded to bf16; each weight's E4M3 value times its block scale cut to bf16, the loader's rows)
+pub fn woA8Prefill(k: *const Kernels, s: cuda.Stream, sc: Scratch, w8: weights.Linear, groups: usize, o: u64, ldo: usize, m: usize, u: u64, ldu: usize) !void {
+    // TF_DS_GEMM_W16: the 16-warp twin (the same tile, stages and bytes, a warp's 32 rows of it)
+    const w16 = if (k.gemm_w16) k.pf_bf16w8_w16 else null;
+    const f = w16 orelse k.pf_bf16w8 orelse return error.NoW8Kernel;
+    const gk: usize = w8.k;
+    const kk = gk * groups;
+    const gn = w8.n / groups;
+            const a: W8Args = .{
+                .ldq = @intCast(kk),
+                .lds = @intCast(kk / 32),
+                .w = w8.w + g * gn * gk,
+                .ws = w8.s + g * (gn / 32) * (gk / 32),
+                .ldw = @intCast(gk),
+                .ldws = @intCast(gk / 32),
+                .N = @intCast(gn),
+                .K = @intCast(gk),
                 .y_dtype = @backingInt(DType.bf16),
+                .ldy = @intCast(ldu),
+            };
+            var args: cuda.Args = .{};
+            args.add(a);
+    }
+}
+
+/// Whether tf_dsn_pf_bf16w8 takes a layer's stacked FP8 wo_a: each group's outputs whole 128-column tiles, K whole
+/// 32-column stages (16-byte rows) and at most weights.w8_max_k (its tile's scales in the kernel's static array), the
+/// groups' rows whole 32-row scale blocks.
+pub fn w8Shape(w8: weights.Linear, groups: usize) bool {
+    if (groups == 0 or w8.fmt != .fp8 or w8.n % groups != 0) return false;
+    const gn = w8.n / groups;
+    return gn % 128 == 0 and w8.k % 32 == 0 and w8.k > 0 and w8.k <= weights.w8_max_k;
+}
+
+/// Why TF_DS_WOA_W8 asked for cannot run on this rank (null: it can): the checkpoint's own weights, the prompt chunks'
+/// tile kernels and the decode tensor-core kernels (without them a round reads wo_a's bf16 rows).
+pub fn woaW8Off(native: bool, pf_off: bool, dec_on: bool) ?[]const u8 {
+    if (!native) return "needs the checkpoint's own FP8 / MXFP4 weights";
+    if (pf_off) return "needs the prompt chunks' tile kernels (TF_DS_PF_TILES=0 turns them off)";
+    if (!dec_on) return "needs the decode tensor-core kernels (TF_DS_DECODE_DEC=0 reads wo_a's bf16 rows)";
+    return null;
+}
+
 /// wo_a of a decode launch on its FP8 rows (weights.Layer.wo_a8, every group stacked): o [m, groups * gk] bf16 (row
 /// stride ldo) quantized once (act_quant: the codes and scales the reference's quant-dequant rows hold), every group's
 /// columns in one launch, group g's output columns reading its input columns, into u [m, groups * o_lora] bf16 (row
@@ -1562,6 +1973,20 @@ fn nactLog(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScr
         return quantDec(k, s, x, .bf16, ldx, r, ex.dims, sc.q, ex.dims, sc.s, ex.dims / 32);
     }
     if (!coded) try quant(k, s, x, .bf16, ldx, r, ex.dims, sc.q, ex.dims, sc.s, ex.dims / 32);
+    try grouping(k, s, d, e, sc, pick, r);
+}
+
+/// Whether a grouping on scratch `sc` builds the prefill tile list itself (TF_DS_GROUP_TILES with a tile list: the
+/// prompt chunk's scratch), so gate / up and down take it as built; else each builds it (tileList).
+pub fn tilesOnce(group_tiles: bool, sc: ExpertScratch) bool {
+    return group_tiles and sc.tiles != 0;
+}
+
+/// A prompt chunk's grouping of the picks pick [r, slots] over `e` experts (ids past them another node's): the counts,
+/// their prefix and the active list (tf_dsn_group_scan; with tilesOnce tf_dsn_group_tiles, which also writes the tile
+/// list), then each pick's entry (tf_dsn_group_place).
+pub fn grouping(k: *const Kernels, s: cuda.Stream, d: *const cuda.Driver, e: usize, sc: ExpertScratch, pick: u64, r: usize) !void {
+    const rs = r * sc.slots;
     try d.check(d.api.cuMemsetD32Async(sc.cnt, 0, e, s.handle), "cuMemsetD32Async");
     var a: cuda.Args = .{};
     a.add(pick);
@@ -1572,11 +1997,23 @@ fn nactLog(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScr
     a = .{};
     a.add(sc.cnt);
     a.add(@as(c_int, @intCast(e)));
+    if (tilesOnce(k.group_tiles, sc)) {
+        a.add(@as(c_int, pf_bm));
+        a.add(sc.off);
+        a.add(sc.fill);
+        a.add(sc.act);
+        a.add(sc.nact);
+        a.add(sc.tiles);
+        a.add(sc.ntiles);
+        const f = k.group_tiles_fn orelse return error.NoGroupTilesKernel;
+        try cuda.launch.launch(f, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 1024 }, .shared = @intCast(e * 4) }, s, &a);
+    } else {
         a.add(sc.off);
         a.add(sc.fill);
         a.add(sc.act);
         a.add(sc.nact);
         try launch(k.scan, s, .{ 1, 1, 1 }, 32, &a);
+    }
     a = .{};
     a.add(pick);
     a.add(@as(c_int, @intCast(rs)));
@@ -1587,6 +2024,29 @@ fn nactLog(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScr
     a.add(sc.ent);
     a.add(sc.erow);
     try launch(k.place, s, .{ cdiv(rs, 256), 1, 1 }, 256, &a);
+}
+
+/// The largest k tf_dsn_topk_tiles takes (its shared lists).
+pub const topk_tiles_max = 512;
+
+/// The indexer's pruned top-k of `rows` rows in one launch (tri_index.topkSelectPruned's result): keys [rows, n] int64
+/// (row stride ks), their 64-key tiles' maxima tmax [rows, nt = cdiv(n, 64)], each row's visible count vis [rows] ->
+/// out [rows, k] int64, the k largest keys' indices ascending, -1 at or past vis. k at most topk_tiles_max, more than
+/// k tiles (the chain prunes only then).
+pub fn topkTiles(k: *const Kernels, s: cuda.Stream, keys: u64, ks: usize, tmax: u64, n: usize, kk: usize, vis: u64, out: u64, rows: usize) !void {
+    const f = k.topk_tiles_fn orelse return error.NoTopkTilesKernel;
+    const nt = cdiv(n, 64);
+    if (kk == 0 or kk > topk_tiles_max or nt <= kk or n > std.math.maxInt(c_int)) return error.UnsupportedShape;
+    var a: cuda.Args = .{};
+    a.add(keys);
+    a.add(@as(i64, @intCast(ks)));
+    a.add(tmax);
+    a.add(@as(c_int, @intCast(nt)));
+    a.add(@as(c_int, @intCast(n)));
+    a.add(@as(c_int, @intCast(kk)));
+    a.add(vis);
+    a.add(out);
+    try launch(f, s, .{ rows, 1, 1 }, 1024, &a);
 }
 
 /// The active experts' down weights (down's order) into L2 on stream `s`, up to `budget` bytes, paced at about
@@ -1681,8 +2141,13 @@ pub fn gateUpCodes(k: *const Kernels, s: cuda.Stream, d: *const cuda.Driver, ex:
     args.add(a);
     const main = (nx.tiles - nx.rest_tiles) * 32;
     if (pfExperts(k, sc, dd, nx.tiles * 32, main) and dd % 128 == 0) {
+        if (!tilesOnce(k.group_tiles, sc)) try tileList(k, s, sc);
         args.add(sc.tiles);
         args.add(sc.ntiles);
+        if (sfExperts(k, nx.s1, false)) |fsf| return launchSharedT(fsf.f, s, .{ nx.tiles * 32 / 128, p / pf_bm + ex.count, 1 }, fsf.smem, fsf.threads, &args);
+        const el = pfExpertsLaunch(k.run128);
+        const f = if (el.r128) k.pf_gu_r128 orelse return error.NoRun128Kernel else k.pf_gu;
+        return launchShared(f, s, .{ nx.tiles * 32 / 128, p / pf_bm + ex.count, 1 }, el.gu_smem, &args);
     }
     const t = @min(tiles(r), 2);
     try launch(k.gu[t], s, .{ cdiv(nx.tiles, 4), ny, 1 }, 128, &args);
@@ -1696,6 +2161,7 @@ fn pfExperts(k: *const Kernels, sc: ExpertScratch, kdim: usize, n: usize, main: 
 }
 
 /// The prefill tiles of the current grouping (sc.off / act / nact) into sc.tiles, sc.ntiles.
+pub fn tileList(k: *const Kernels, s: cuda.Stream, sc: ExpertScratch) !void {
     var a: cuda.Args = .{};
     a.add(sc.off);
     a.add(sc.act);
@@ -1778,6 +2244,7 @@ fn downOf(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScra
     } else if (split) {
         if (k.sab) try launch(k.dn_sab, s, .{ cdiv(n, 16), ny, 1 }, 256, &args) else try launch(k.dn_gemv, s, .{ cdiv(n, 8), ny, 1 }, 256, &args);
     } else if (pfExperts(k, sc, i, n, 0)) {
+        if (!tilesOnce(k.group_tiles, sc)) try tileList(k, s, sc);
         if (sc.three) |th| {
             // the pack's parts where they lie: the first part is the base (its main block), the second's main block and both rest blocks ride along
             const f3 = (k.sfk orelse return error.NoMmaSfKernels).three(k.sf) orelse return error.NoMmaSfKernels;
@@ -1797,6 +2264,10 @@ fn downOf(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScra
         } else {
             args.add(sc.tiles);
             args.add(sc.ntiles);
+            if (sfExperts(k, nx.s1, true)) |fsf| try launchSharedT(fsf.f, s, .{ n / 128, p / pf_bm + ex.count, 1 }, fsf.smem, fsf.threads, &args) else {
+                const el = pfExpertsLaunch(k.run128);
+                const f = if (el.r128) k.pf_dn_r128 orelse return error.NoRun128Kernel else k.pf_dn;
+                try launchShared(f, s, .{ n / 128, p / pf_bm + ex.count, 1 }, el.dn_smem, &args);
             }
         }
     } else {
@@ -1804,12 +2275,19 @@ fn downOf(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScra
         try launch(k.dn[t], s, .{ cdiv(n / 32, 4), ny, 1 }, 128, &args);
     }
     if (cf) |f| return combineFirst(k, s, sc, pick, r, ex.count, n, out, ldo, accumulate, f);
+    try combine(k, s, sc, pick, r, ex.count, n, out, ldo, accumulate);
+}
+
+/// down's last launch (tf_dsn_combine): the slots' outputs of r rows (sc.out [r * slots, n] fp32, by entry) summed in
+/// expert id order over `experts` experts into out [r, n] fp32 (row stride ldo; accumulate: added to it).
+pub fn combine(k: *const Kernels, s: cuda.Stream, sc: ExpertScratch, pick: u64, r: usize, experts: usize, n: usize, out: u64, ldo: usize, accumulate: bool) !void {
     var ca: cuda.Args = .{};
     ca.add(sc.out);
     ca.add(@as(i64, @intCast(n)));
     ca.add(pick);
     ca.add(@as(c_int, @intCast(r)));
     ca.add(@as(c_int, @intCast(sc.slots)));
+    ca.add(@as(c_int, @intCast(experts)));
     ca.add(@as(c_int, @intCast(n)));
     ca.add(out);
     ca.add(@as(i64, @intCast(ldo)));
@@ -1891,6 +2369,327 @@ test "splits depend on the shape alone and fill the GPU" {
     try std.testing.expectEqual(@as(usize, 16), splits(5120, 640)); // a 2D node's expert gate / up pack
     try std.testing.expectEqual(@as(usize, 16), bfSplits(5120, 384)); // the router
     try std.testing.expectEqual(@as(usize, 16), bfSplits(4096, 1024)); // a wo_a group
+}
+
+/// The split FP8 GEMMs a prompt chunk runs on a 2D node (K, N) with their folds (K blocks a split), and Engram's
+/// unsplit wkv.
+const split_shapes = [_]struct { k: usize, n: usize, fold: usize }{
+    .{ .k = 5120, .n = 1280, .fold = 10 }, // wq_a
+    .{ .k = 5120, .n = 512, .fold = 10 }, // wkv
+    .{ .k = 1280, .n = 8192, .fold = 20 }, // wq_b
+    .{ .k = 4096, .n = 2560, .fold = 16 }, // wo_b
+    .{ .k = 1280, .n = 4096, .fold = 10 }, // the indexer's wq_b
+};
+const row_counts = [_]usize{ 64, 65, 127, 128, 129, 256, 512, 513, 1000, 1024, 1025, 2048, 4096 };
+
+test "TF_DS_PF_SPLIT's text: unset or 0 off, 1 the table, A, B, C6 or C7 that configuration, any other text no setting" {
+    try std.testing.expectEqual(@as(?PfSplit, .off), PfSplit.parse(null));
+    try std.testing.expectEqual(@as(?PfSplit, .off), PfSplit.parse("0"));
+    try std.testing.expectEqual(@as(?PfSplit, .table), PfSplit.parse("1"));
+    try std.testing.expectEqual(@as(?PfSplit, .a), PfSplit.parse("A"));
+    try std.testing.expectEqual(@as(?PfSplit, .b), PfSplit.parse("B"));
+    try std.testing.expectEqual(@as(?PfSplit, .c6), PfSplit.parse("C6"));
+    try std.testing.expectEqual(@as(?PfSplit, .c7), PfSplit.parse("C7"));
+    for ([_][]const u8{ "", "a", "c7", "2", "A ", " 1", "C8", "on" }) |t| try std.testing.expectEqual(@as(?PfSplit, null), PfSplit.parse(t));
+    // the words a Settings frame or the tier's text carries, and none past them
+    for ([_][]const u8{ "0", "1", "A", "B", "C6", "C7" }, 0..) |t, i| try std.testing.expectEqualStrings(t, PfSplit.name(@intCast(i)).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), PfSplit.name(6));
+}
+
+test "a split configuration divides the fold of every production shape at every row count, B only wq_b's and wo_b's" {
+    for (split_shapes) |sh| for (row_counts) |m| {
+        try std.testing.expectEqual(sh.fold, cdiv(sh.k / 32, splits(sh.k, sh.n)));
+        try std.testing.expectEqual(@as(?SplitCfg, .a), pfSplitCfg(.a, m, sh.k, sh.n));
+        try std.testing.expectEqual(@as(?SplitCfg, .c6), pfSplitCfg(.c6, m, sh.k, sh.n));
+        try std.testing.expectEqual(@as(?SplitCfg, .c7), pfSplitCfg(.c7, m, sh.k, sh.n));
+        // B stages 4 K blocks: folds of 10 (wq_a, wkv, the indexer's wq_b) stay on the fold kernel
+        try std.testing.expectEqual(if (sh.fold % 4 == 0) @as(?SplitCfg, .b) else null, pfSplitCfg(.b, m, sh.k, sh.n));
+        // the table: the baseline kernel up to 1,024 rows, A past them
+        try std.testing.expectEqual(if (m > 1024) @as(?SplitCfg, .a) else null, pfSplitCfg(.table, m, sh.k, sh.n));
+        try std.testing.expectEqual(@as(?SplitCfg, null), pfSplitCfg(.off, m, sh.k, sh.n));
+    };
+    // no K split (Engram's wkv), a split shape outside the table, a fold of an odd count of K blocks
+    for ([_]PfSplit{ .table, .a, .b, .c6, .c7 }) |sw| try std.testing.expectEqual(@as(?SplitCfg, null), pfSplitCfg(sw, 2048, 3072, 12800));
+    try std.testing.expectEqual(@as(?SplitCfg, null), pfSplitCfg(.table, 2048, 5120, 640));
+    try std.testing.expectEqual(@as(?SplitCfg, .a), pfSplitCfg(.a, 2048, 5120, 640));
+    try std.testing.expectEqual(@as(usize, 4), splits(1152, 4096)); // a fold of 9 K blocks
+    for ([_]PfSplit{ .a, .b, .c6, .c7 }) |sw| try std.testing.expectEqual(@as(?SplitCfg, null), pfSplitCfg(sw, 2048, 1152, 4096));
+    // each configuration's tile rows, stage width and shared memory as native.cu's static_assert holds them
+    try std.testing.expectEqualSlices(usize, &.{ 128, 64, 64, 64 }, &split_bm);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 4, 2, 2 }, &split_kbs);
+    try std.testing.expectEqualSlices(u32, &.{ 87040, 76800, 76800, 89600 }, &split_smem);
+}
+
+test "TF_DS_PF_SPLIT unset runs the baseline kernels: the fold kernel with a K split, tf_dsn_pf_gemm without" {
+    for (split_shapes) |sh| for (row_counts) |m| {
+        try std.testing.expectEqual(PfGemm.fold, pfGemmOf(.off, m, sh.k, sh.n));
+        try std.testing.expectEqual(PfGemm{ .split = .c7 }, pfGemmOf(.c7, m, sh.k, sh.n));
+    };
+    for ([_]PfSplit{ .off, .table, .a, .b, .c6, .c7 }) |sw| try std.testing.expectEqual(PfGemm.gemm, pfGemmOf(sw, 2048, 3072, 12800));
+    try std.testing.expectEqual(PfGemm.fold, pfGemmOf(.b, 2048, 5120, 1280));
+    try std.testing.expectEqual(PfGemm{ .split = .b }, pfGemmOf(.b, 2048, 4096, 2560));
+}
+
+test "TF_DS_PF_GEMM5 takes the GEMMs without a K split to the 5-stage kernel and nothing else; unset, tf_dsn_pf_gemm" {
+    for (row_counts) |m| {
+        // Engram's wkv (no K split)
+        try std.testing.expectEqual(PfGemm.gemm, pfGemmKernel(.off, false, m, 3072, 12800));
+        try std.testing.expectEqual(PfGemm.gemm5, pfGemmKernel(.off, true, m, 3072, 12800));
+        try std.testing.expectEqual(PfGemm.gemm5, pfGemmKernel(.a, true, m, 3072, 12800));
+        // the split shapes keep the fold kernel or their split configuration
+        for (split_shapes) |sh| {
+            try std.testing.expectEqual(PfGemm.fold, pfGemmKernel(.off, true, m, sh.k, sh.n));
+            try std.testing.expectEqual(PfGemm{ .split = .a }, pfGemmKernel(.a, true, m, sh.k, sh.n));
+            try std.testing.expectEqual(pfGemmOf(.c7, m, sh.k, sh.n), pfGemmKernel(.c7, false, m, sh.k, sh.n));
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 87040), pf_gemm5_smem);
+}
+
+test "TF_DS_PF_SPLIT runs with the checkpoint's own weights and the prompt tile kernels, else off and why" {
+    try std.testing.expectEqual(@as(?[]const u8, null), splitOff(true, false));
+    try std.testing.expectEqualStrings("needs the checkpoint's own FP8 / MXFP4 weights", splitOff(false, false).?);
+    try std.testing.expectEqualStrings("needs the prompt chunks' tile kernels (TF_DS_PF_TILES=0 turns them off)", splitOff(true, true).?);
+}
+
+test "TF_DS_WOA_W8 runs with the checkpoint's own weights, the prompt tile kernels and the decode kernels, else off and why" {
+    try std.testing.expectEqual(@as(?[]const u8, null), woaW8Off(true, false, true));
+    try std.testing.expectEqualStrings("needs the checkpoint's own FP8 / MXFP4 weights", woaW8Off(false, false, true) orelse "none");
+    try std.testing.expectEqualStrings("needs the prompt chunks' tile kernels (TF_DS_PF_TILES=0 turns them off)", woaW8Off(true, true, true) orelse "none");
+    try std.testing.expectEqualStrings("needs the decode tensor-core kernels (TF_DS_DECODE_DEC=0 reads wo_a's bf16 rows)", woaW8Off(true, false, false) orelse "none");
+}
+
+test "the FP8 wo_a kernel takes a 2D node's stacked groups: whole 128-column tiles a group, whole 32-column stages" {
+    const w8: weights.Linear = .{ .words = 1, .w = 1, .s = 1, .k = 4096, .n = 2 * 1024, .fmt = .fp8 };
+    try std.testing.expect(w8Shape(w8, 2));
+    try std.testing.expect(w8Shape(w8, 4) and w8Shape(w8, 16) and !w8Shape(w8, 32)); // 64-column groups
+    try std.testing.expect(!w8Shape(w8, 3) and !w8Shape(w8, 0));
+    var odd = w8;
+    odd.k = 4096 + 16;
+    try std.testing.expect(!w8Shape(odd, 2));
+    var bf = w8;
+    bf.fmt = .bf16;
+    try std.testing.expect(!w8Shape(bf, 2));
+    var wide = w8;
+    wide.k = weights.w8_max_k;
+    try std.testing.expect(w8Shape(wide, 2));
+    wide.k = weights.w8_max_k + 32;
+    try std.testing.expect(!w8Shape(wide, 2));
+}
+
+test "a layer loaded without wo_a's bf16 rows sizes every buffer as with them (wo_a's Linears keep their shapes)" {
+    var full: weights.Layer = .{ .idx = 2, .ratio = 2 };
+    full.wq_a = .{ .words = 1, .w = 1, .s = 1, .k = 5120, .n = 1280, .fmt = .fp8 };
+    full.wkv = .{ .words = 2, .w = 2, .s = 2, .k = 5120, .n = 512, .fmt = .fp8 };
+    full.wq_b = .{ .words = 3, .w = 3, .s = 3, .k = 1280, .n = 8192, .fmt = .fp8 };
+    full.wo_b = .{ .words = 4, .w = 4, .s = 4, .k = 4096, .n = 2560, .fmt = .fp8 };
+    full.groups = 2;
+    full.wo_a[0] = .{ .words = 5, .w = 5, .k = 4096, .n = 1024, .fmt = .bf16 };
+    full.wo_a[1] = .{ .words = 6, .w = 6, .k = 4096, .n = 1024, .fmt = .bf16 };
+    full.wo_a8 = .{ .words = 7, .w = 7, .s = 7, .k = 4096, .n = 2048, .fmt = .fp8 };
+    full.experts = std.mem.zeroes(weights.Experts);
+    var shape_only = full;
+    for (shape_only.wo_a[0..2]) |*wo| wo.* = .{ .words = 0, .w = 0, .k = wo.k, .n = wo.n, .fmt = .bf16 };
+    shape_only.wo_a_rows = false;
+    for ([_]usize{ 1, 16, 64 }) |rows| try std.testing.expectEqual(decodeZFloats(full, 5120, 384, 32, rows, 7), decodeZFloats(shape_only, 5120, 384, 32, rows, 7));
+    for (full.wo_a[0..2], shape_only.wo_a[0..2]) |a, b| {
+        try std.testing.expectEqual(a.k, b.k);
+        try std.testing.expectEqual(a.n, b.n);
+        try std.testing.expectEqual(a.fmt, b.fmt);
+    }
+}
+
+test "TF_DS_GROUP_TILES: the grouping builds the tile list on a prompt chunk's scratch only; unset, gate / up and down build it each" {
+    var sc = std.mem.zeroes(ExpertScratch);
+    try std.testing.expect(!tilesOnce(false, sc)); // the baseline: count, scan, place, then tileList in gate / up and in down
+    try std.testing.expect(!tilesOnce(true, sc)); // no tile list (the drafter's scratch): nothing to build
+    sc.tiles = 0x1000;
+    try std.testing.expect(!tilesOnce(false, sc));
+    try std.testing.expect(tilesOnce(true, sc));
+}
+
+test "gate / up and down build the tile list only when the grouping did not; the grouping launches one of the two kernels" {
+    const src = @embedFile("mx.zig");
+    const gu = std.mem.indexOf(u8, src, "fn gateUpOf(").?;
+    const dn = std.mem.indexOf(u8, src, "fn downOf(").?;
+    const gp = std.mem.indexOf(u8, src, "pub fn grouping(").?;
+    for ([_]usize{ gu, dn }) |at| {
+        const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n}\n").?];
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "if (!tilesOnce(k.group_tiles, sc)) try tileList(k, s, sc);"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "tileList("));
+    }
+    const body = src[gp .. gp + std.mem.indexOf(u8, src[gp..], "\n}\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "if (tilesOnce(k.group_tiles, sc)) {"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "launch(k.scan,"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "k.group_tiles_fn orelse"));
+}
+
+/// tf_dsn_topk_tiles' radix select on the host, step for step (8-bit digits from the top, the bins counted from 255
+/// down, the stop when every value of the chosen bin is needed): the smallest threshold exactly kk of the values reach
+/// (null entries skipped).
+fn selectKthModel(vals: []const ?u64, kk: usize) u64 {
+    var prefix: u64 = 0;
+    var need = kk;
+    var shift: u6 = 56;
+    while (true) : (shift -= 8) {
+        var hist: [256]usize = @splat(0);
+        const hi: u64 = if (shift == 56) 0 else ~@as(u64, 0) << (shift + 8);
+        for (vals) |ov| {
+            const u = ov orelse continue;
+            if (u & hi == prefix) hist[@intCast((u >> shift) & 255)] += 1;
+        }
+        var above: usize = 0;
+        var d: usize = 255;
+        while (d > 0) : (d -= 1) {
+            if (above + hist[d] >= need) break;
+            above += hist[d];
+        }
+        prefix |= @as(u64, d) << shift;
+        need -= above;
+        if (hist[d] == need or shift == 0) return prefix;
+    }
+}
+
+fn flipKey(key: i64) u64 {
+    return @as(u64, @bitCast(key)) ^ (1 << 63);
+}
+
+/// tf_dsn_topk_tiles' three steps on the host for one row (its keys [n], tile maxima [nt]): the kk tiles of the
+/// largest maxima, the kk largest of their keys, their positions ascending, -1 at or past vis.
+fn topkTilesModel(gpa: std.mem.Allocator, keys: []const i64, tmax: []const i64, kk: usize, vis: i64, out: []i64) !void {
+    const tv = try gpa.alloc(?u64, tmax.len);
+    defer gpa.free(tv);
+    for (tv, tmax) |*v, m| v.* = flipKey(m);
+    const t1 = selectKthModel(tv, kk);
+    var tl: std.ArrayList(usize) = .empty;
+    defer tl.deinit(gpa);
+    for (tmax, 0..) |m, i| if (flipKey(m) >= t1) try tl.append(gpa, i);
+    if (tl.items.len != kk) return error.NotKk;
+    const kv = try gpa.alloc(?u64, kk * 64);
+    defer gpa.free(kv);
+    for (kv, 0..) |*v, c| {
+        const pos = tl.items[c / 64] * 64 + c % 64;
+        v.* = if (pos < keys.len) flipKey(keys[pos]) else null;
+    }
+    const t2 = selectKthModel(kv, kk);
+    var pos: std.ArrayList(i64) = .empty;
+    defer pos.deinit(gpa);
+    for (kv, 0..) |v, c| if (v) |u| if (u >= t2) try pos.append(gpa, @intCast(tl.items[c / 64] * 64 + c % 64));
+    if (pos.items.len != kk) return error.NotKk;
+    std.mem.sort(i64, pos.items, {}, std.sort.asc(i64));
+    for (out, pos.items) |*o, p| o.* = if (p < vis) p else -1;
+}
+
+/// The pruned chain's result for one row, by its definition (kernels.py topk_select_pruned): the kk largest tile
+/// maxima's tiles, those tiles' keys (past n none), their kk largest, each key's index (its low 32 bits inverted)
+/// sorted ascending, -1 at or past vis.
+fn prunedChainRef(gpa: std.mem.Allocator, keys: []const i64, tmax: []const i64, kk: usize, vis: i64, out: []i64) !void {
+    const order = try gpa.alloc(usize, tmax.len);
+    defer gpa.free(order);
+    for (order, 0..) |*o, i| o.* = i;
+    std.mem.sort(usize, order, tmax, struct {
+        fn gt(tm: []const i64, a: usize, b: usize) bool {
+            return tm[a] > tm[b];
+        }
+    }.gt);
+    var cand: std.ArrayList(i64) = .empty;
+    defer cand.deinit(gpa);
+    for (order[0..kk]) |t| for (t * 64..@min(t * 64 + 64, keys.len)) |p| try cand.append(gpa, keys[p]);
+    std.mem.sort(i64, cand.items, {}, std.sort.desc(i64));
+    const idx = try gpa.alloc(i64, kk);
+    defer gpa.free(idx);
+    for (idx, cand.items[0..kk]) |*x, key| x.* = 0xFFFFFFFF - (key & 0xFFFFFFFF);
+    std.mem.sort(i64, idx, {}, std.sort.asc(i64));
+    for (out, idx) |*o, x| o.* = if (x < vis) x else -1;
+}
+
+/// topk_indices' key of a score at position t (kernels.py: the score's bits in total order above, ~t below).
+fn scoreKey(sc: f32, t: usize) i64 {
+    const b: i32 = if (sc == 0) 0 else @bitCast(sc);
+    const o: i32 = if (b < 0) b ^ 0x7FFFFFFF else b;
+    const hi: u64 = @as(u64, @bitCast(@as(i64, o))) << 32;
+    return @bitCast(hi | (0xFFFFFFFF - @as(u64, t)));
+}
+
+test "the pruned top-k in one kernel (its steps on the host) gives the pruned chain's indices: every vis, ties, a partial last tile, rows all -inf" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x4b53);
+    const rng = prng.random();
+    const cases = [_]struct { n: usize, kk: usize }{ .{ .n = 4097, .kk = 64 }, .{ .n = 4160, .kk = 64 }, .{ .n = 32769, .kk = 512 }, .{ .n = 33000, .kk = 512 }, .{ .n = 65536, .kk = 512 } };
+    for (cases) |cs| {
+        const nt = cdiv(cs.n, 64);
+        const keys = try gpa.alloc(i64, cs.n);
+        defer gpa.free(keys);
+        const tmax = try gpa.alloc(i64, nt);
+        defer gpa.free(tmax);
+        const want = try gpa.alloc(i64, cs.kk);
+        defer gpa.free(want);
+        const got = try gpa.alloc(i64, cs.kk);
+        defer gpa.free(got);
+        // every vis: all visible, past n, fewer than kk, inside the last (partial) tile, none (every score -inf)
+        for ([_]usize{ cs.n, cs.n + 9, cs.kk / 2, cs.n - 3, 0, cs.n / 2 }, 0..) |vis, vi| {
+            for (keys, 0..) |*key, t| {
+                // scores from a few hundred values (ties), some negative, -inf at or past vis
+                var sc: f32 = @as(f32, @floatFromInt(rng.uintLessThan(u32, 300))) * 0.125 - 8;
+                if (vi == 5 and t % 7 == 0) sc = 0; // zeros (-0 as +0)
+                key.* = scoreKey(if (t < vis) sc else -std.math.inf(f32), t);
+            }
+            for (tmax, 0..) |*m, b| m.* = std.mem.max(i64, keys[b * 64 .. @min(b * 64 + 64, cs.n)]);
+            try prunedChainRef(gpa, keys, tmax, cs.kk, @intCast(vis), want);
+            try topkTilesModel(gpa, keys, tmax, cs.kk, @intCast(vis), got);
+            try std.testing.expectEqualSlices(i64, want, got);
+        }
+    }
+}
+
+test "TF_DS_BF16_ROWS: a prompt launch of the bf16 GEMM takes a CTA a 16-row tile; unset, and every decode launch, at most 64" {
+    for ([_]usize{ 1, 16, 17, 256, 512, 1024, 1025, 2048, 4096 }) |m| {
+        const today = @min((m + 15) / 16, 64);
+        for ([_]bool{ false, true }) |prompt| try std.testing.expectEqual(today, bfGridRows(false, prompt, m));
+        try std.testing.expectEqual(today, bfGridRows(true, false, m)); // a decode launch keeps its grid
+        try std.testing.expectEqual((m + 15) / 16, bfGridRows(true, true, m));
+    }
+    // the same grid up to 1,024 rows (an owned quarter of 512: 32 CTAs either way)
+    try std.testing.expectEqual(bfGridRows(false, true, 512), bfGridRows(true, true, 512));
+    try std.testing.expectEqual(@as(usize, 128), bfGridRows(true, true, 2048));
+}
+
+test "the bf16 GEMM's plain launch takes its rows' grid from bfGridRows" {
+    const src = @embedFile("mx.zig");
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n}\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "try launch(k.bf16, s, .{ cdiv(n / 32, 4), bfGridRows(k.bf16_rows, z == null, m), if (sp > 1) sp else groups }, 128, &args);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "launch(k.bf16,"));
+}
+
+test "TF_DS_PF_RUN128: the experts' prefill tiles on their 128-byte-run twins with their shared memory; unset, the baseline kernels" {
+    try std.testing.expectEqual(ExpertsLaunch{ .r128 = false, .gu_smem = 79872, .dn_smem = 53760 }, pfExpertsLaunch(false));
+    try std.testing.expectEqual(ExpertsLaunch{ .r128 = true, .gu_smem = 97280, .dn_smem = 62464 }, pfExpertsLaunch(true));
+    // native.cu's pf::kGuR128Smem / kDnR128Smem: 3 activation slots of 9,216 bytes and 2 weight pairs (gate and up:
+    // 256 rows of 128 bytes and their 8 scale bytes; down: 128 rows), within GB10's 101,376 bytes a CTA with the
+    // kernels' 3,328 static bytes
+    try std.testing.expectEqual(@as(u32, 3 * 9216 + 2 * (256 * 128 + 256 * 8)), pf_gu_r128_smem);
+    try std.testing.expectEqual(@as(u32, 3 * 9216 + 2 * (128 * 128 + 128 * 8)), pf_dn_r128_smem);
+    try std.testing.expect(pf_gu_r128_smem + 3328 <= 101376);
+}
+
+test "gate / up and down launch their prefill tiles through pfExpertsLaunch" {
+    const src = @embedFile("mx.zig");
+    const fns = [_][]const u8{ "fn gateUpOf(", "fn downOf(" };
+    const picks = [_][]const u8{
+        "const f = if (el.r128) k.pf_gu_r128 orelse return error.NoRun128Kernel else k.pf_gu;\n",
+        "const f = if (el.r128) k.pf_dn_r128 orelse return error.NoRun128Kernel else k.pf_dn;\n",
+    };
+    const launches = [_][]const u8{
+        "return launchShared(f, s, .{ nx.tiles * 32 / 128, p / pf_bm + ex.count, 1 }, el.gu_smem, &args);",
+        "try launchShared(f, s, .{ n / 128, p / pf_bm + ex.count, 1 }, el.dn_smem, &args);",
+    };
+    for (fns, picks, launches) |fname, pick, launch_| {
+        const at = std.mem.indexOf(u8, src, fname).?;
+        const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n}\n").?];
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "const el = pfExpertsLaunch(k.run128);"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, pick));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, launch_));
+    }
 }
 test "TF_DS_ROCI_COMBINE_FIRST: the two stages' blocks are the four row quarters, each once" {
     var dummy: u8 = 0;
@@ -1975,7 +2774,11 @@ test "TF_DS_MMA_SF's dense kernels' shared memory: native_sf.cu's tiles; a small
     // sf::Split64Cfg: 64 activation rows; 6 stages. sf::Split128Cfg: GemmCfg's stage, 5 stages
     try std.testing.expectEqual(@as(u32, 6 * (64 * 64 + 128 * 64 + 64 * 2 * 4)), sf_split64_smem);
     try std.testing.expectEqual(@as(u32, 5 * (128 * 64 + 128 * 64 + 128 * 2 * 4)), sf_split128_smem);
+    // TF_DS_GEMM_R2's expert tile: sf::DnR2Cfg's W2 ring (128 activation rows, 4 K blocks a stage, 3 stages, a
+    // pair of 128-byte weight slots); its split GEMM takes sf_split128_smem's tile
+    try std.testing.expectEqual(@as(u32, 3 * (128 * 128 + 128 * 4 * 4) + 2 * (128 * 128 + 128 * 8)), r2_dn_smem);
     // with the kernels' 2,560 static bytes, within GB10's 101,376 a CTA
+    for ([_]u32{ sf_gemm_smem, sf_split64_smem, sf_split128_smem, pf_gu_r128_smem, pf_dn_r128_smem, r2_dn_smem }) |b| try std.testing.expect(b + 2560 <= 101376);
     // one split a CTA (below pf_min_rows): splits x rows x N floats, within zFloats of any scratch of at least those rows
     const l: weights.Linear = .{ .words = 0, .k = 5120, .n = 1280, .fmt = .fp8 };
     try std.testing.expect(splits(5120, 1280) * (pf_min_rows - 1) * 1280 <= zFloats(l, pf_min_rows - 1));
@@ -1994,16 +2797,143 @@ test "TF_DS_MMA_SF's expert kernels follow the switch: chained or exact, else no
     k.sfk = .{ .module = undefined, .gemm = .{ f(0), f(1) }, .split64 = .{ f(2), f(3) }, .split128 = .{ f(4), f(5) }, .zsplit = f(6), .gu = .{ f(7), f(8) }, .dn = .{ f(9), f(10) } };
     try std.testing.expect(sfExperts(&k, 0, false) == null);
     k.sf = .chained;
+    try std.testing.expectEqual(f(7).handle, (sfExperts(&k, 0, false) orelse return error.TestUnexpectedResult).f.handle);
+    try std.testing.expectEqual(f(9).handle, (sfExperts(&k, 0, true) orelse return error.TestUnexpectedResult).f.handle);
     k.sf = .exact;
     k.sf_nkept = 0;
     k.sf_nproven = 0;
     try std.testing.expect(sfExperts(&k, 0, false) == null); // not proven: the baseline
     try sfProve(&k, 0);
+    try std.testing.expectEqual(f(8).handle, (sfExperts(&k, 0, false) orelse return error.TestUnexpectedResult).f.handle);
+    try std.testing.expectEqual(f(10).handle, (sfExperts(&k, 0, true) orelse return error.TestUnexpectedResult).f.handle);
     // Kernels' defaults: off, no module
     const d: Kernels = .{ .module = undefined, .act_quant = undefined, .attn_epilogue = undefined, .gemm = undefined, .reduce = undefined, .count = undefined, .scan = undefined, .place = undefined, .gu = undefined, .dn = undefined, .gu_finish = undefined, .dn_finish = undefined, .gu_gemv = undefined, .dn_gemv = undefined, .gemv = undefined, .mx_sab = undefined, .gu_sab = undefined, .dn_sab = undefined, .sab = false, .dec = undefined, .dec_group = undefined, .dec_group2 = undefined, .nact_log = null, .group2 = false, .dec_quant = undefined, .dec_l2pf = undefined, .dec_on = true, .dec_pdl = true, .expert_exit = false, .counters = undefined, .combine = undefined, .bf16 = undefined, .bf_reduce = undefined, .to_f16 = undefined, .pf_gemm = undefined, .pf_gemm_fold = undefined, .pf_gu = undefined, .pf_dn = undefined, .pf_tiles = undefined, .pf_bf16 = undefined, .pf_off = false };
     try std.testing.expectEqual(MmaSf.off, d.sf);
     try std.testing.expect(d.sfk == null);
     try std.testing.expectEqual(@as(usize, 0), d.sf_nproven);
+}
+
+test "TF_DS_GEMM_W16 launches the exact kernels' 16-warp twins at 512 threads, the baseline at 256 elsewhere" {
+    const f = struct {
+        fn of(i: usize) cuda.Function {
+            return .{ .d = undefined, .handle = @ptrFromInt(0x1000 + i * 16) };
+        }
+    }.of;
+    var k: Kernels = undefined;
+    k.sf = .exact;
+    k.sf_nkept = 0;
+    k.sf_nproven = 0;
+    k.gemm_w16 = false;
+    k.pf_bf16w8_w16 = null;
+    k.sfk = .{ .module = undefined, .gemm = .{ f(0), f(1) }, .split64 = .{ f(2), f(3) }, .split128 = .{ f(4), f(5) }, .zsplit = f(6), .gu = .{ f(7), f(8) }, .dn = .{ f(9), f(10) }, .w16 = .{ .split64 = f(20), .split128 = f(21), .gu = f(22), .dn = f(23) } };
+    try sfProve(&k, 0);
+    // the switch off: the baseline exact kernels, 256 threads
+    try std.testing.expectEqual(f(8).handle, sfExperts(&k, 0, false).?.f.handle);
+    try std.testing.expectEqual(@as(u32, 256), sfExperts(&k, 0, false).?.threads);
+    // the chained arithmetic: the baseline kernel at either setting (the twins are the exact form's)
+    k.sf = .chained;
+    k.gemm_w16 = true;
+    try std.testing.expectEqual(f(9).handle, sfExperts(&k, 0, true).?.f.handle);
+    try std.testing.expectEqual(@as(u32, 256), sfExperts(&k, 0, true).?.threads);
+    // the exact arithmetic with the switch on: the twins, 512 threads
+    k.sf = .exact;
+    try std.testing.expectEqual(f(22).handle, sfExperts(&k, 0, false).?.f.handle);
+    try std.testing.expectEqual(@as(u32, 512), sfExperts(&k, 0, false).?.threads);
+    try std.testing.expectEqual(f(23).handle, sfExperts(&k, 0, true).?.f.handle);
+    try std.testing.expectEqual(@as(u32, 512), sfExperts(&k, 0, true).?.threads);
+    // an image without a twin keeps that kernel the baseline
+    k.sfk.?.w16.gu = null;
+    try std.testing.expectEqual(f(8).handle, sfExperts(&k, 0, false).?.f.handle);
+    try std.testing.expectEqual(@as(u32, 256), sfExperts(&k, 0, false).?.threads);
+    k.sfk.?.w16.gu = f(22);
+    // the switch needs every twin: wo_a's, and the block-scaled kernels' where they loaded
+    try std.testing.expect(!k.useGemmW16(true));
+    k.pf_bf16w8_w16 = f(24);
+    try std.testing.expect(k.useGemmW16(true));
+    try std.testing.expect(k.gemm_w16);
+    try std.testing.expect(!k.useGemmW16(false));
+    try std.testing.expect(!k.gemm_w16);
+    k.sfk.?.w16.dn = null;
+    try std.testing.expect(!k.useGemmW16(true));
+}
+
+test "TF_DS_GEMM_W16's launches: the twins on the tiles' own shared memory, 512 threads" {
+    const src = @embedFile("mx.zig");
+    const code = src[0..std.mem.indexOf(u8, src, "\ntest \"").?];
+    // the dense split tiles: the twin at 512 threads, else the baseline at 256, on the configurations' dynamic bytes
+    for ([_][]const u8{
+        "else if (w.split64) |f| try launchSharedT(f, s, .{ cdiv(m, 64), l.n / 128, 1 }, sf_split64_smem, 512, &args) else try launchShared(sk.split64[x], s, .{ cdiv(m, 64), l.n / 128, 1 }, sf_split64_smem, &args),",
+        "else if (w.split128) |f| try launchSharedT(f, s, .{ cdiv(m, 128), l.n / 128, 1 }, sf_split128_smem, 512, &args) else try launchShared(sk.split128[x], s, .{ cdiv(m, 128), l.n / 128, 1 }, sf_split128_smem, &args),",
+    }) |want| try std.testing.expect(std.mem.indexOf(u8, code, want) != null);
+    // the twins are the exact form's alone: the switch is read with the arithmetic
+    try std.testing.expect(std.mem.indexOf(u8, code, "const w = if (k.gemm_w16 and x == 1) sk.w16 else W16{};") != null);
+    // wo_a's rows: the twin at 512, else the baseline at 256, on the kernel's dynamic bytes
+    // the expert tiles launch the block sfExperts names (512 for a twin, 256 for the baseline)
+    try std.testing.expect(std.mem.indexOf(u8, code, "return launchSharedT(fsf.f, s, .{ nx.tiles * 32 / 128, p / pf_bm + ex.count, 1 }, fsf.smem, fsf.threads, &args);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "try launchSharedT(fsf.f, s, .{ n / 128, p / pf_bm + ex.count, 1 }, fsf.smem, fsf.threads, &args) else {") != null);
+}
+
+test "TF_DS_PF_T64 takes the 64 x 64 bf16 tile for the router's 384 columns of one group alone, and nothing else changes" {
+    var k: Kernels = undefined;
+    k.pf_t64 = false;
+    k.pf_bf16_t64 = .{ .d = undefined, .handle = @ptrFromInt(0x5000) };
+    // on, N 384, one group: the 64 x 64 kernel
+    try std.testing.expectEqual(k.pf_bf16_t64.?.handle, pfT64Of(&k, true, 384, 1).?.handle);
+    // off, another N, or a grouped launch keeps the 128 x 128 tile
+    try std.testing.expect(pfT64Of(&k, false, 384, 1) == null);
+    for ([_]usize{ 64, 128, 256, 512, 1280, 2560, 4096 }) |n| try std.testing.expect(pfT64Of(&k, true, n, 1) == null);
+    try std.testing.expect(pfT64Of(&k, true, 384, 2) == null);
+    // an image without the kernel: none
+    k.pf_bf16_t64 = null;
+    try std.testing.expect(pfT64Of(&k, true, 384, 1) == null);
+    // the launch: the 64 x 64 grid at 128 threads on the kernel's own dynamic bytes, ahead of the 128 x 128 launch
+    const src = @embedFile("mx.zig");
+    const code = src[0..std.mem.indexOf(u8, src, "\ntest \"").?];
+    const at = std.mem.indexOf(u8, code, "if (pfT64Of(k, k.pf_t64, n, groups)) |f| return " ++ "launchSharedT(f, s, .{ cdiv(m, 64), n / 64, 1 }, pf_bf16_t64_smem, 128, &args)") orelse return error.TestUnexpectedResult;
+    const shipping = std.mem.indexOf(u8, code, "return " ++ "launchShared(k.pf_bf16, s, .{ cdiv(m, 128), n / 128, groups }, pf_bf16_smem, &args)") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(at < shipping);
+    // two CTAs an SM: 4 stages of (64 + 64) rows of 80 bytes (native_sf asserts the same), each CTA with its 1 KiB reserve within 100 KiB
+    try std.testing.expectEqual(@as(u32, 4 * (64 + 64) * 80), pf_bf16_t64_smem);
+    try std.testing.expect(2 * (pf_bf16_t64_smem + 1024) <= 100 * 1024);
+}
+
+test "TF_DS_GEMM_R2 takes its exact expert kernels, and only those; without every kernel or another arithmetic, the baseline's" {
+    const f = struct {
+        fn of(i: usize) cuda.Function {
+            return .{ .d = undefined, .handle = @ptrFromInt(0x2000 + i * 16) };
+        }
+    }.of;
+    var k: Kernels = undefined;
+    k.sf = .exact;
+    k.gemm_r2 = false;
+    k.sf_nkept = 0;
+    k.sf_nproven = 0;
+    k.sfk = .{ .module = undefined, .gemm = .{ f(0), f(1) }, .split64 = .{ f(2), f(3) }, .split128 = .{ f(4), f(5) }, .zsplit = f(6), .gu = .{ f(7), f(8) }, .dn = .{ f(9), f(10) }, .r2 = .{ .gu = f(22), .dn = f(23) } };
+    try sfProve(&k, 0);
+    // off: the baseline kernels and shared memory
+    try std.testing.expectEqual(f(8).handle, sfExperts(&k, 0, false).?.f.handle);
+    try std.testing.expectEqual(pf_gu_r128_smem, sfExperts(&k, 0, false).?.smem);
+    try std.testing.expectEqual(f(10).handle, sfExperts(&k, 0, true).?.f.handle);
+    try std.testing.expectEqual(pf_dn_r128_smem, sfExperts(&k, 0, true).?.smem);
+    // on: the R2 kernels, their shared memory
+    try std.testing.expect(k.useGemmR2(true));
+    try std.testing.expectEqual(f(22).handle, sfExperts(&k, 0, false).?.f.handle);
+    try std.testing.expectEqual(pf_gu_r128_smem, sfExperts(&k, 0, false).?.smem);
+    try std.testing.expectEqual(f(23).handle, sfExperts(&k, 0, true).?.f.handle);
+    try std.testing.expectEqual(r2_dn_smem, sfExperts(&k, 0, true).?.smem);
+    // the chained arithmetic is not R2's: off, the baseline kernels
+    k.sf = .chained;
+    try std.testing.expect(!k.useGemmR2(true));
+    try std.testing.expectEqual(f(9).handle, sfExperts(&k, 0, true).?.f.handle);
+    // an image without one R2 kernel: off
+    k.sf = .exact;
+    k.sfk.?.r2.dn = null;
+    try std.testing.expect(!k.useGemmR2(true));
+    try std.testing.expectEqual(f(10).handle, sfExperts(&k, 0, true).?.f.handle);
+    k.sfk.?.r2.dn = f(23);
+    try std.testing.expect(k.useGemmR2(true));
+    try std.testing.expect(!k.useGemmR2(false));
+    try std.testing.expect(!k.gemm_r2);
 }
 
 test "the door, two-base and down-on-the-parts kernels follow the block-scaled arithmetic in effect: the chained twins under TF_DS_MMA_SF, the exact ones under its exact form" {
@@ -2041,6 +2971,8 @@ test "gemm, gate / up and down take TF_DS_MMA_SF's kernels before the baseline's
     try std.testing.expect(sfl < pfl);
     const fns = [_][]const u8{ "fn gateUpOf(", "fn downOf(" };
     const sfs = [_][]const u8{
+        "if (sfExperts(k, nx.s1, false)) |fsf| return launchSharedT(fsf.f, s, .{ nx.tiles * 32 / 128, p / pf_bm + ex.count, 1 }, fsf.smem, fsf.threads, &args);",
+        "if (sfExperts(k, nx.s1, true)) |fsf| try launchSharedT(fsf.f, s, .{ n / 128, p / pf_bm + ex.count, 1 }, fsf.smem, fsf.threads, &args) else {",
     };
     for (fns, sfs) |fname, sfline| {
         const at = std.mem.indexOf(u8, code, fname).?;
@@ -2276,6 +3208,55 @@ test "TF_DS_ROCI_SENT_FIRST: the kernels' argument structs are the device struct
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(RowOrder));
     try std.testing.expectEqual(@as(usize, 12), @sizeOf(QuarterOrder));
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(Door));
+}
+
+test "TF_DS_PF_RASTER's tile order: every (row tile, column tile) is visited exactly once, group by group, for odd grids too" {
+    const a = std.testing.allocator;
+    for ([_]u32{ 0, 2, 4, 8, 16 }) |g| for ([_][2]u32{ .{ 1, 1 }, .{ 1, 9 }, .{ 3, 5 }, .{ 7, 1 }, .{ 16, 10 }, .{ 17, 3 }, .{ 33, 7 }, .{ 64, 10 }, .{ 65, 20 }, .{ 129, 9 } }) |grid| {
+        const seen = try a.alloc(u8, grid[0] * grid[1]);
+        defer a.free(seen);
+        @memset(seen, 0);
+        for (0..grid[1]) |by| for (0..grid[0]) |bx| {
+            const t = rasterTile(g, grid[0], grid[1], @intCast(bx), @intCast(by));
+            try std.testing.expect(t[0] < grid[0] and t[1] < grid[1]);
+            seen[t[1] * grid[0] + t[0]] += 1;
+        };
+        for (seen) |c| try std.testing.expectEqual(@as(u8, 1), c);
+    };
+    // the walk: group 8 on 64 x 10 tiles takes rows 0 .. 7 of column 0, then rows 0 .. 7 of column 1, and the second group
+    // of rows only after the tenth column
+    try std.testing.expectEqual([2]u32{ 7, 0 }, rasterTile(8, 64, 10, 7, 0));
+    try std.testing.expectEqual([2]u32{ 0, 1 }, rasterTile(8, 64, 10, 8, 0));
+    try std.testing.expectEqual([2]u32{ 7, 9 }, rasterTile(8, 64, 10, 79, 0));
+    try std.testing.expectEqual([2]u32{ 8, 0 }, rasterTile(8, 64, 10, 80, 0));
+    // the last group is the remaining row tiles: 65 row tiles at group 8 end with one row tile across the columns
+    try std.testing.expectEqual([2]u32{ 64, 0 }, rasterTile(8, 65, 3, 65 * 3 - 3, 0));
+    try std.testing.expectEqual([2]u32{ 64, 2 }, rasterTile(8, 65, 3, 65 * 3 - 1, 0));
+    // off: the default order
+    try std.testing.expectEqual([2]u32{ 5, 2 }, rasterTile(0, 64, 10, 5, 2));
+}
+
+test "TF_DS_PF_RASTER's gate: the group applies from an activation slab of 14 MiB, never when off" {
+    try std.testing.expectEqual(@as(c_int, 8), rasterOf(8, 4096, 5120)); // wq_a's input at a 4,096-row pass: 20 MiB
+    try std.testing.expectEqual(@as(c_int, 8), rasterOf(8, 16384, 4096));
+    try std.testing.expectEqual(@as(c_int, 0), rasterOf(8, 4096, 1280)); // wq_b's input: 5 MiB stays in the L2
+    try std.testing.expectEqual(@as(c_int, 0), rasterOf(8, 2048, 5120)); // a 2,048-row pass: 10 MiB
+    try std.testing.expectEqual(@as(c_int, 0), rasterOf(8, 2867, 5120)); // 14,679,040 B: one row short of 14 MiB
+    try std.testing.expectEqual(@as(c_int, 4), rasterOf(4, 2868, 5120));
+    try std.testing.expectEqual(@as(c_int, 0), rasterOf(0, 16384, 5120));
+    try std.testing.expectEqual(@as(usize, 14 << 20), raster_slab_bytes);
+}
+
+test "TF_DS_PF_RASTER's launches: the tile GEMMs get the group, the argument structs carry it last" {
+    const src = @embedFile("mx.zig");
+    // the dense FP8 launches (the prefill tile kernels, the block-scaled MMA) and the bf16 tile GEMM; the experts, the
+    // TWO / ROWMAP launches and the decode GEMMs keep the default order
+    // (each count includes the literal in this test)
+    try std.testing.expectEqual(@as(usize, 2 + 1), std.mem.count(u8, src, ".raster = rasterOf(pf_raster, m, l.k) }"));
+    try std.testing.expectEqual(@as(usize, 1 + 1), std.mem.count(u8, src, ".raster = rasterOf(pf_raster, m, kdim * 2) }"));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(MxArgs, "raster") % 4);
+    try std.testing.expectEqual(@offsetOf(MxArgs, "accumulate") + 4, @offsetOf(MxArgs, "raster"));
+    try std.testing.expectEqual(@offsetOf(BfArgs, "z") + 8, @offsetOf(BfArgs, "raster"));
 }
 
 test "the expert-count log: device words decode to records in call order, empty slots left out, and out.len bounds them" {

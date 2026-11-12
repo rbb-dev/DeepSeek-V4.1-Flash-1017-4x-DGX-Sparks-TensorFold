@@ -291,7 +291,8 @@ test "hc_mix_pf and hc_pre_pf launch as recorded" {
     }.call);
 }
 
-/// One argument a logged launch must have: the launch's index, the argument's name, its address.
+/// One argument a logged launch must have: the launch's index, the argument's name, its value (a pointer's
+/// address, an integer's bits).
 const Wire = struct { usize, []const u8, u64 };
 
 /// Checks the logged launches are `names` in order, each wired as `wires` says, then empties the log.
@@ -303,11 +304,28 @@ fn expectLog(log: *tri.Log, names: []const []const u8, wires: []const Wire) !voi
     try std.testing.expectEqual(names.len, log.items.items.len);
     for (names, log.items.items) |n, k| try std.testing.expectEqualStrings(n, k.name);
     for (wires) |w| {
-        const got = for (log.items.items[w[0]].args) |a| {
-            if (std.mem.eql(u8, a.name, w[1])) break a.value.ptr.addr;
+        const got: u64 = for (log.items.items[w[0]].args) |a| {
+            if (std.mem.eql(u8, a.name, w[1])) break switch (a.value) {
+                .ptr => |x| x.addr,
+                .i32 => |x| @as(u32, @bitCast(x)),
+                .f32 => |x| @as(u32, @bitCast(x)),
+                .u64 => |x| x,
+            };
         } else return error.TestUnexpectedResult;
         try std.testing.expectEqual(w[2], got);
     }
+}
+
+test "expectLog reads a logged argument by its kind, a pointer or an integer" {
+    var log: tri.Log = .{ .gpa = std.testing.allocator };
+    defer log.deinit();
+    const t: Tri = .{ .log = &log };
+    try t.run("k", .{ 1, 1, 1 }, &.{ p("P", "*bf16", 0x1234_5678), aot.int("N", 7), aot.float("F", 1.5) }, &.{});
+    try expectLog(&log, &.{"k"}, &.{
+        .{ 0, "P", 0x1234_5678 },
+        .{ 0, "N", 7 },
+        .{ 0, "F", @as(u64, @as(u32, @bitCast(@as(f32, 1.5)))) },
+    });
 }
 
 test "hc_pre2 and hc_pre_pf launch in kernels.py's order, each kernel on the streams kernels.py gives it" {

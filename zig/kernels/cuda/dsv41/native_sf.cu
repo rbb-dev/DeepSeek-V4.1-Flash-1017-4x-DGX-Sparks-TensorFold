@@ -24,6 +24,7 @@
 namespace sf {
 
 using pf::Cfg;
+using pf::kThreads;  // the 8-warp R2 kernels' block (the W16 tiles name theirs: C::THREADS)
 using pf::Ops;
 
 constexpr int kChained = 0;  // the switch's arithmetic: a split's K blocks accumulate in the MMA
@@ -349,13 +350,304 @@ __device__ __forceinline__ void tile_fp4(char* smem, const int* srow, const Ops&
     else tile_fp4_1<C, MODE, false, THREE>(smem, srow, o, nkb, mvalid, acc);
 }
 
+// TF_DS_GEMM_R2's activation staging: pf::load_a / pf::load_stage with a padding row's copies left out. A stored
+// output row's sum reads only its own A row and its own scale word, and the epilogues store only rows below the tile's
+// valid count, so a padding row's slot feeds no stored output and its copy (which pf::load_a would zero-fill) is
+// skipped. The weight staging, the fragment loads and every MMA are the baseline.
+template <class C>
+__device__ __forceinline__ void load_a_skip(char* st, const int* srow, const Ops& o, int kb0) {
+    const int tid = threadIdx.x;
+    char* A = st;
+    char* AS = A + C::A_BYTES;
+    constexpr int CPA = C::KBS * 2;
+    for (int c = tid; c < C::BM * CPA; c += kThreads) {
+        const int r = c / CPA, cc = c % CPA;
+        const int row = srow[r];
+        if (row < 0) continue;
+        pf::cp16(A + r * C::SA + C::pa(r, cc) * 16, o.q + size_t(row) * o.ldq + kb0 * 32 + cc * 16, true);
+    }
+    for (int r = tid; r < C::BM; r += kThreads) {
+        const int row = srow[r];
+        if (row < 0) continue;
+        const float* src = o.s + size_t(row) * o.lds + kb0;
+        if (C::KBS == 4) pf::cp16(AS + r * 16, src, true);
+        else pf::cp8(AS + r * 8, src, true);
+    }
+}
+
+// pf::load_stage with the activation rows and scales staged as there, a padding row's copies left out
+template <class C>
+__device__ __forceinline__ void load_stage_skip(char* st, const int* srow, const Ops& o, int kb0) {
+    const int tid = threadIdx.x;
+    char* A = st;
+    char* B = A + C::A_BYTES;
+    char* AS = B + C::B_BYTES;
+    constexpr int CPA = C::KBS * 2;
+    for (int c = tid; c < C::BM * CPA; c += kThreads) {
+        const int r = c / CPA, cc = c % CPA;
+        const int row = srow[r];
+        if (row < 0) continue;
+        pf::cp16(A + r * C::SA + C::pa(r, cc) * 16, o.q + size_t(row) * o.ldq + kb0 * 32 + cc * 16, true);
+    }
+    for (int r = tid; r < C::BM; r += kThreads) {
+        const int row = srow[r];
+        if (row < 0) continue;
+        const float* src = o.s + size_t(row) * o.lds + kb0;
+        if (C::KBS == 4) pf::cp16(AS + r * 16, src, true);
+        else pf::cp8(AS + r * 8, src, true);
+    }
+    constexpr int CPB = C::KBS * 2;
+    for (int c = tid; c < C::NWT * C::BN * CPB; c += kThreads) {
+        const int r = c / CPB, cc = c % CPB;
+        const int wi = r / C::BN, col = o.n0 + r % C::BN;
+        pf::cp16(B + r * C::SB + C::pb(r, cc) * 16, o.w(wi) + size_t(col) * o.ldw + kb0 * 32 + cc * 16, true);
+    }
+}
+
+// fp8_stage with load_stage_skip
+template <class C, int MODE, bool FULL>
+__device__ __forceinline__ void fp8_stage_skip(char* smem, const int* srow, const uint8_t* wss, const Ops& o, int nkb, int kb_lo, int nst, int st,
+                                               int mvalid, float (&part)[C::NWT][C::MT][C::NT][4]) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int wm = warp / C::WGN, wn = warp % C::WGN;
+    pf::wait_groups<C::STAGES - 2>();
+    __syncthreads();
+    {
+        const int nx = st + C::STAGES - 1;
+        if (nx < nst) load_stage_skip<C>(smem + (nx % C::STAGES) * C::STAGE, srow, o, kb_lo + nx * C::KBS);
+        pf::commit();
+    }
+    const char* A = smem + (st % C::STAGES) * C::STAGE;
+    const char* B = A + C::A_BYTES;
+    const float* AS = reinterpret_cast<const float*>(B + C::B_BYTES);
+    const int kb0 = kb_lo + st * C::KBS;
+    uint32_t saw[C::MT];
+#pragma unroll
+    for (int i = 0; i < C::MT; i++) saw[i] = act_word<C::KBS>(AS + (wm * C::WM + i * 16 + g + 8 * (t & 1)) * C::KBS);
+    uint32_t sbw[C::NWT][C::NT];
+#pragma unroll
+    for (int wi = 0; wi < C::NWT; wi++)
+#pragma unroll
+        for (int j = 0; j < C::NT; j++) sbw[wi][j] = fp8_word<C::KBS>(wss + (wi * (C::BN / kBlk) + (wn * C::WN + j * 8) / kBlk) * nkb + kb0);
+    fp8_block<C, MODE, FULL, 0>(A, B, saw, sbw, wm, wn, g, t, mvalid, part);
+    fp8_block<C, MODE, FULL, 1>(A, B, saw, sbw, wm, wn, g, t, mvalid, part);
+    if constexpr (C::KBS == 4) {
+        fp8_block<C, MODE, FULL, 2>(A, B, saw, sbw, wm, wn, g, t, mvalid, part);
+        fp8_block<C, MODE, FULL, 3>(A, B, saw, sbw, wm, wn, g, t, mvalid, part);
+    }
+}
+
+template <class C, int MODE, bool SPLIT, bool FULL>
+__device__ __forceinline__ void tile_fp8_skip_1(char* smem, const int* srow, const uint8_t* wss, const Ops& o, int nkb, int kb_lo, int kb_hi,
+                                                int fold, int mvalid, float (&acc)[C::NWT][C::MT][C::NT][4]) {
+    static_assert(C::FMT == 0 && (C::KBS == 2 || C::KBS == 4), "FP8 weights, 2 or 4 K blocks a stage");
+#pragma unroll
+    for (int wi = 0; wi < C::NWT; wi++) zero(acc[wi]);
+    const int nst = (kb_hi - kb_lo) / C::KBS;
+#pragma unroll
+    for (int s = 0; s < C::STAGES - 1; s++) {
+        if (s < nst) load_stage_skip<C>(smem + s * C::STAGE, srow, o, kb_lo + s * C::KBS);
+        pf::commit();
+    }
+    if constexpr (!SPLIT) {
+        for (int st = 0; st < nst; st++) fp8_stage_skip<C, MODE, FULL>(smem, srow, wss, o, nkb, kb_lo, nst, st, mvalid, acc);
+    } else {
+        const int sps = fold / C::KBS;  // stages a split
+        int st = 0;
+        for (int split = 0; st < nst; split++) {
+            float part[C::NWT][C::MT][C::NT][4];
+#pragma unroll
+            for (int wi = 0; wi < C::NWT; wi++) zero(part[wi]);
+            const int st_end = min(nst, st + sps);
+            for (; st < st_end; st++) fp8_stage_skip<C, MODE, FULL>(smem, srow, wss, o, nkb, kb_lo, nst, st, mvalid, part);
+#pragma unroll
+            for (int wi = 0; wi < C::NWT; wi++)
+#pragma unroll
+                for (int i = 0; i < C::MT; i++)
+#pragma unroll
+                    for (int j = 0; j < C::NT; j++)
+#pragma unroll
+                        for (int c = 0; c < 4; c++) acc[wi][i][j][c] = split == 0 ? part[wi][i][j][c] : acc[wi][i][j][c] + part[wi][i][j][c];
+        }
+    }
+    pf::wait_groups<0>();
+}
+
+template <class C, int MODE, bool SPLIT>
+__device__ __forceinline__ void tile_fp8_skip(char* smem, const int* srow, const uint8_t* wss, const Ops& o, int nkb, int kb_lo, int kb_hi,
+                                              int fold, int mvalid, float (&acc)[C::NWT][C::MT][C::NT][4]) {
+    if (mvalid >= C::BM) tile_fp8_skip_1<C, MODE, SPLIT, true>(smem, srow, wss, o, nkb, kb_lo, kb_hi, fold, mvalid, acc);
+    else tile_fp8_skip_1<C, MODE, SPLIT, false>(smem, srow, wss, o, nkb, kb_lo, kb_hi, fold, mvalid, acc);
+}
+
+// tile_fp4_1 with load_a_skip: the weight ring, the fragment loads and the arithmetic as there
+template <class C, int MODE, bool FULL>
+__device__ __forceinline__ void tile_fp4_skip_1(char* smem, const int* srow, const Ops& o, int nkb, int mvalid,
+                                                float (&acc)[C::NWT][C::MT][C::NT][4]) {
+    static_assert(C::FMT == 1 && C::KBS == 4, "MXFP4 tiles of W2's 4 K blocks a stage");
+    using P = pf::W2<C>;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int wm = warp / C::WGN, wn = warp % C::WGN;
+    char* aring = smem;
+    char* bring = smem + C::STAGES * P::A_SLOT;
+#pragma unroll
+    for (int wi = 0; wi < C::NWT; wi++) zero(acc[wi]);
+    const int nst = nkb / C::KBS;
+#pragma unroll
+    for (int s = 0; s < C::STAGES - 1; s++) {
+        if (s < nst) {
+            load_a_skip<C>(aring + s * P::A_SLOT, srow, o, s * C::KBS);
+            if ((s & 1) == 0) pf::load_b2<C>(bring + ((s >> 1) & 1) * P::SLOT, o, s * C::KBS, nkb);
+        }
+        pf::commit();
+    }
+    for (int st = 0; st < nst; st++) {
+        pf::wait_groups<C::STAGES - 2>();
+        __syncthreads();
+        {
+            const int nx = st + C::STAGES - 1;
+            if (nx < nst) {
+                load_a_skip<C>(aring + (nx % C::STAGES) * P::A_SLOT, srow, o, nx * C::KBS);
+                if ((nx & 1) == 0) pf::load_b2<C>(bring + ((nx >> 1) & 1) * P::SLOT, o, nx * C::KBS, nkb);
+            }
+            pf::commit();
+        }
+        const char* A = aring + (st % C::STAGES) * P::A_SLOT;
+        const float* AS = reinterpret_cast<const float*>(A + C::A_BYTES);
+        const char* B = bring + ((st >> 1) & 1) * P::SLOT;
+        const uint32_t* WS = reinterpret_cast<const uint32_t*>(B + P::B_BYTES);
+        const int half = st & 1;
+        uint32_t saw[C::MT];
+#pragma unroll
+        for (int i = 0; i < C::MT; i++) saw[i] = act_word<C::KBS>(AS + (wm * C::WM + i * 16 + g + 8 * (t & 1)) * C::KBS);
+        uint32_t sbw[C::NWT][C::NT];
+#pragma unroll
+        for (int wi = 0; wi < C::NWT; wi++)
+#pragma unroll
+            for (int j = 0; j < C::NT; j++) sbw[wi][j] = WS[(wi * C::BN + wn * C::WN + j * 8 + g) * 2 + half];
+        fp4_block<C, MODE, FULL, 0>(A, B, half, saw, sbw, wm, wn, g, t, mvalid, acc);
+        fp4_block<C, MODE, FULL, 1>(A, B, half, saw, sbw, wm, wn, g, t, mvalid, acc);
+        fp4_block<C, MODE, FULL, 2>(A, B, half, saw, sbw, wm, wn, g, t, mvalid, acc);
+        fp4_block<C, MODE, FULL, 3>(A, B, half, saw, sbw, wm, wn, g, t, mvalid, acc);
+    }
+    pf::wait_groups<0>();
+}
+
+template <class C, int MODE>
+__device__ __forceinline__ void tile_fp4_skip(char* smem, const int* srow, const Ops& o, int nkb, int mvalid,
+                                              float (&acc)[C::NWT][C::MT][C::NT][4]) {
+    if (mvalid >= C::BM) tile_fp4_skip_1<C, MODE, true>(smem, srow, o, nkb, mvalid, acc);
+    else tile_fp4_skip_1<C, MODE, false>(smem, srow, o, nkb, mvalid, acc);
+}
+
+// gate / up of the grouped experts on R2's tiles: the MXFP4 tile's activation rows with padding skipped, the FP8 shared
+// expert on GuCfg8's sub-tiles the same way
+    if (int(blockIdx.y) >= ntiles[0]) return;
+    const int2 tl = tiles[blockIdx.y];
+    const int e = tl.x, m0 = tl.y;
+    const int c0 = blockIdx.x * C4::BN;
+    const int main = (a.n_tiles - a.rest_tiles) * 32;
+    if (a.owner && c0 >= main && a.owner[e] == 0) return;
+    __shared__ int srow[C4::BM];
+    __shared__ __align__(16) uint8_t wss[pf::kWss];
+    const int base = a.off[e], cnt = a.off[e + 1] - base;
+    for (int r = threadIdx.x; r < C4::BM; r += kThreads) srow[r] = m0 + r < cnt ? a.erow[base + m0 + r] : -1;
+    const bool fp8 = e == a.shared;
+    Ops o{};
+    o.q = a.q; o.s = a.s; o.ldq = a.ldq; o.lds = a.lds;
+    o.w0 = reinterpret_cast<const uint8_t*>(a.w1[e]);
+    o.w1 = reinterpret_cast<const uint8_t*>(a.w3[e]);
+    o.ws0 = reinterpret_cast<const uint8_t*>(a.s1[e]);
+    o.ws1 = reinterpret_cast<const uint8_t*>(a.s3[e]);
+    o.ldw = fp8 ? a.sldw : a.ldw;
+    o.ldws = fp8 ? a.sldws : a.ldws;
+    o.stream = 0;
+    const int nkb = a.D / kBlk;
+    static_assert(C4::BM == pf::GuCfg8::BM, "the shared expert's sub-tiles: the tile's rows");
+    if (fp8) {
+        using C = pf::GuCfg8;
+        for (int half = 0; half < C4::BN / C::BN; half++) {
+            o.n0 = c0 + half * C::BN;
+            if (half) __syncthreads();
+            pf::fp8_scales<C>(wss, o, nkb);
+            __syncthreads();
+            float acc[2][C::MT][C::NT][4];
+            tile_fp8_skip<C, MODE, false>(pf::smem, srow, wss, o, nkb, 0, nkb, nkb, cnt - m0, acc);
+            pf::gu_tile_store<C>(a, acc, o.n0, base, m0, cnt);
+        }
+    } else {
+        using C = C4;
+        o.n0 = c0;
+        __syncthreads();
+        float acc[2][C::MT][C::NT][4];
+        tile_fp4_skip<C, MODE>(pf::smem, srow, o, nkb, cnt - m0, acc);
+    }
+}
+
+// down of the grouped experts on R2's 128-row MXFP4 tile (the 64-row tile list's entries at a multiple of 128 take a
+// tile, the others return at once) and the FP8 shared expert's 64-row sub-tiles, two at a time
+template <int MODE, class C4>
+__device__ __forceinline__ void dn_r2(const DnArgs& a, const int2* __restrict__ tiles, const int* __restrict__ ntiles) {
+    if (int(blockIdx.y) >= ntiles[0]) return;
+    const int2 tl = tiles[blockIdx.y];
+    const int e = tl.x, m0 = tl.y;
+    if (m0 % C4::BM != 0) return;  // C4::BM rows a tile: the list's other entries lie inside one
+    __shared__ int srow[C4::BM];
+    __shared__ __align__(16) uint8_t wss[pf::kWss];
+    const int base = a.off[e], cnt = a.off[e + 1] - base;
+    for (int r = threadIdx.x; r < C4::BM; r += kThreads) srow[r] = m0 + r < cnt ? a.ent[base + m0 + r] : -1;
+    const bool fp8 = e == a.shared;
+    Ops o{};
+    o.q = a.q; o.s = a.s; o.ldq = a.ldq; o.lds = a.lds;
+    o.w0 = o.w1 = reinterpret_cast<const uint8_t*>(a.w2[e]);
+    o.ws0 = o.ws1 = reinterpret_cast<const uint8_t*>(a.s2[e]);
+    o.ldw = fp8 ? a.sldw : a.ldw;
+    o.ldws = fp8 ? a.sldws : a.ldws;
+    o.stream = 0;
+    o.n0 = blockIdx.x * C4::BN;
+    const int nkb = a.I / kBlk;
+    if (fp8) {
+        using C = pf::DnCfg8;
+        for (int rh = 0; rh < C4::BM / C::BM; rh++) {
+            const int s0 = m0 + rh * C::BM;
+            if (s0 >= cnt) break;  // the tile's rows are done: the rest is padding
+            if (rh) __syncthreads();
+            pf::fp8_scales<C>(wss, o, nkb);
+            __syncthreads();
+            float acc[1][C::MT][C::NT][4];
+            const int mv = cnt > s0 ? cnt - s0 : 0;
+            tile_fp8_skip<C, MODE, false>(pf::smem, srow + rh * C::BM, wss, o, nkb, 0, nkb, nkb, mv, acc);
+            pf::dn_tile_store<C>(a, acc, o.n0, base, s0, cnt);
+        }
+    } else {
+        using C = C4;
+        __syncthreads();
+        float acc[1][C::MT][C::NT][4];
+        tile_fp4_skip<C, MODE>(pf::smem, srow, o, nkb, cnt - m0, acc);
+        pf::dn_tile_store<C>(a, acc, o.n0, base, m0, cnt);
+    }
+}
+
+
 using GemmCfg = Cfg<128, 128, 2, 4, 1, 0, 2, 3, 2>;
 using Split64Cfg = Cfg<64, 128, 2, 4, 1, 0, 2, 6, 2>;
 using Split128Cfg = Cfg<128, 128, 2, 4, 1, 0, 2, 5, 2>;
+// R2's expert tiles: down at 128 rows (a warp 4 m16 tiles by 4 n8), so each weight fragment feeds more MMAs; gate / up
+// keeps the baseline 64-row tile, whose two weights' accumulators already fill the registers a wider tile would need. The
+// activation rows are the baseline layout, a padding row's copies left out.
+using GuR2Cfg = Cfg<64, 128, 2, 4, 2, 1, 4, 3>;
+using DnR2Cfg = Cfg<128, 128, 2, 4, 1, 1, 4, 3>;
+static_assert(pf::W2<GuR2Cfg>::SMEM == 97280 && pf::W2<DnR2Cfg>::SMEM == 90112, "the experts' shared memory");
 // their dynamic shared memory (mx.zig sf_gemm_smem, sf_split64_smem, sf_split128_smem)
 static_assert(GemmCfg::SMEM == 52224 && Split64Cfg::SMEM == 76800 && Split128Cfg::SMEM == 87040, "the dense tiles' shared memory");
+// the same two split tiles on 16 warps a block (TF_DS_GEMM_W16): split64 doubles its column groups (a warp's tile
+// 2 x 4 -> 2 x 2 m16 x n8) and split128 its row groups (4 x 4 -> 8 x 2), halving the C fragments a warp holds; the
+// tile, its K blocks a stage, its stages and its shared memory are the 8-warp ones'. The grids are those whose
+// fragments, scale words and addresses fit 128 registers a thread (a 512-thread block's limit), which the 512-thread
+// build's spill count decides.
 using Split64CfgW16 = Cfg<64, 128, 2, 8, 1, 0, 2, 6, 2>;
 using Split128CfgW16 = Cfg<128, 128, 8, 2, 1, 0, 2, 5, 2>;
+static_assert(Split64CfgW16::SMEM == Split64Cfg::SMEM && Split128CfgW16::SMEM == Split128Cfg::SMEM, "the 16-warp tiles' shared memory");
 // The experts: pf::pf_gu's / pf_dn's 128-byte-run tiles (pf::GuR128Cfg, DnR128Cfg) and the FP8 shared expert's
 // (pf::GuCfg8, DnCfg8: every one of their stages starts at an even K block)
 static_assert(pf::GuCfg8::KBS % 2 == 0 && pf::DnCfg8::KBS % 2 == 0, "the shared expert's stages");
@@ -414,6 +706,16 @@ template <class C, int MODE, bool SPLIT, bool ZSPLIT, bool STAGE = false, bool R
 __device__ __forceinline__ void gemm(const MxArgs& a, const RowOrder& ro = RowOrder{}, const Part2& p2 = Part2{}) {
     __shared__ int srow[C::BM];
     __shared__ __align__(16) uint8_t wss[pf::kWss];  // fp8_word reads it 2 bytes at a time
+    // row tiles fastest: a wave's CTAs share their weight tiles in L2; without ROWMAP, a.raster (pf_tile_of) groups them
+    int tr, tc;
+    if constexpr (ROWMAP) {
+        tr = int(tile_row<true>(ro));
+        tc = int(tile_col<true>(ro));
+    } else {
+        pf_tile_of(a.raster, tr, tc);
+    }
+    const int m0 = tr * C::BM;
+    for (int r = threadIdx.x; r < C::BM; r += C::THREADS) {
         const int m = m0 + r;
         srow[r] = m < a.M ? (a.rows ? a.rows[m] : m) : -1;
     }
@@ -425,6 +727,7 @@ __device__ __forceinline__ void gemm(const MxArgs& a, const RowOrder& ro = RowOr
         o.kb_split = p2.kb_split;
     }
     o.w0 = o.w1 = a.w; o.ws0 = o.ws1 = a.ws; o.ldw = a.ldw; o.ldws = a.ldws;
+    o.n0 = tc * C::BN;
     o.stream = 0;
     const int nkb = a.K / kBlk;
     pf::fp8_scales<C>(wss, o, nkb);
@@ -461,7 +764,28 @@ __device__ __forceinline__ void gemm(const MxArgs& a, const RowOrder& ro = RowOr
             }
 }
 
+// The FP8 shared expert's column sub-tiles of sf::gu, a function of their own when `apart` (a 16-warp block's 128
+// registers a thread do not hold this path's scale words and fragments beside the MXFP4 path's): each sub-tile's
+// weight scales, K loop and epilogue in sf::gu's order.
+template <class C4, class C, int MODE>
+__device__ __noinline__ void gu_fp8_tiles(const GuArgs& a, const Ops& o0, const int* srow, uint8_t* wss, int c0, int base, int m0,
+                                          int cnt, int nkb) {
+    Ops o = o0;
+    for (int half = 0; half < C4::BN / C::BN; half++) {
+        o.n0 = c0 + half * C::BN;
+        if (half) __syncthreads();  // the stages' buffers and the scales are the next sub-tile's
+        fp8_scales<C>(wss, o, nkb);
+        __syncthreads();
+        float acc[2][C::MT][C::NT][4];
+        tile_fp8<C, MODE, false>(pf::smem, srow, wss, o, nkb, 0, nkb, nkb, cnt - m0, acc);
+        pf::gu_tile_store<C>(a, acc, o.n0, base, m0, cnt);
+    }
+}
+
 // Gate / up of the grouped experts for a prompt chunk (tf_dsn_pf_gu_r128's arguments, grid, tiles and epilogue): the
+// MXFP4 routed experts on C4's 128-byte-run tiles, the FP8 shared expert on C8's column sub-tiles (the defaults the
+// 8-warp kernels' configurations; a 16-warp block passes its own, `APART` its shared expert in gu_fp8_tiles).
+    using C4 = C4_;
     if (int(blockIdx.y) >= ntiles[0]) return;
     const int2 tl = tiles[blockIdx.y];
     const int e = tl.x, m0 = tl.y;
@@ -471,6 +795,7 @@ __device__ __forceinline__ void gemm(const MxArgs& a, const RowOrder& ro = RowOr
     __shared__ int srow[pf::kBm];
     __shared__ __align__(16) uint8_t wss[pf::kWss];  // fp8_word reads it 2 bytes at a time
     const int base = a.off[e], cnt = a.off[e + 1] - base;
+    for (int r = threadIdx.x; r < pf::kBm; r += C4::THREADS) srow[r] = m0 + r < cnt ? a.erow[base + m0 + r] : -1;
     const bool fp8 = e == a.shared;
     Ops o{};
     o.q = a.q; o.s = a.s; o.ldq = a.ldq; o.lds = a.lds;
@@ -483,6 +808,10 @@ __device__ __forceinline__ void gemm(const MxArgs& a, const RowOrder& ro = RowOr
     o.stream = 0;
     const int nkb = a.D / kBlk;
     if (fp8) {
+        using C = C8_;
+        if constexpr (APART) {
+            gu_fp8_tiles<C4, C, MODE>(a, o, srow, wss, c0, base, m0, cnt, nkb);
+        } else {
             for (int half = 0; half < C4::BN / C::BN; half++) {
                 o.n0 = c0 + half * C::BN;
                 if (half) __syncthreads();  // the stages' buffers and the scales are the next sub-tile's
@@ -492,6 +821,7 @@ __device__ __forceinline__ void gemm(const MxArgs& a, const RowOrder& ro = RowOr
                 tile_fp8<C, MODE, false>(pf::smem, srow, wss, o, nkb, 0, nkb, nkb, cnt - m0, acc);
                 pf::gu_tile_store<C>(a, acc, o.n0, base, m0, cnt);
             }
+        }
     } else {
         using C = C4;
         o.n0 = c0;
@@ -502,6 +832,8 @@ __device__ __forceinline__ void gemm(const MxArgs& a, const RowOrder& ro = RowOr
 }
 
 // Down of the grouped experts for a prompt chunk (tf_dsn_pf_dn_r128's arguments, grid, tiles and epilogue): the MXFP4
+// routed experts on C4's 128-byte-run tiles, the FP8 shared expert on C8's tile (the defaults the 8-warp kernels'
+// configurations; a 16-warp block passes its own).
 // THREE: down's activation rows (the pack, hq / hs) as the two pairs' pack parts where they lie, not assembled. A part is its main block
 // [rows, ig] of codes (row stride a.ldq) then its rest block [rows, ir] (ldq_rest), the scales the same (a.lds, lds_rest). K blocks
 // [0, kb_main) come from the first part's main block (a.q, a.s), [kb_main, 2 kb_main) from the second's (q1, s1), and the rest block from
@@ -519,13 +851,16 @@ struct Part3 {
     int kb_main;
 };
 
+template <int MODE, bool THREE = false, class C4_ = pf::DnR128Cfg, class C8_ = pf::DnCfg8>
 __device__ __forceinline__ void dn(const DnArgs& a, const int2* __restrict__ tiles, const int* __restrict__ ntiles, const Part3& p3 = Part3{}) {
+    using C4 = C4_;
     if (int(blockIdx.y) >= ntiles[0]) return;
     const int2 tl = tiles[blockIdx.y];
     const int e = tl.x, m0 = tl.y;
     __shared__ int srow[pf::kBm];
     __shared__ __align__(16) uint8_t wss[pf::kWss];  // fp8_word reads it 2 bytes at a time
     const int base = a.off[e], cnt = a.off[e + 1] - base;
+    for (int r = threadIdx.x; r < pf::kBm; r += C4::THREADS) srow[r] = m0 + r < cnt ? a.ent[base + m0 + r] : -1;
     const bool fp8 = e == a.shared;
     Ops o{};
     o.q = a.q; o.s = a.s; o.ldq = a.ldq; o.lds = a.lds;
@@ -548,6 +883,7 @@ __device__ __forceinline__ void dn(const DnArgs& a, const int2* __restrict__ til
     o.n0 = blockIdx.x * C4::BN;
     const int nkb = a.I / kBlk;
     if (fp8) {
+        using C = C8_;
         pf::fp8_scales<C>(wss, o, nkb);
         __syncthreads();
         float acc[1][C::MT][C::NT][4];
@@ -721,4 +1057,27 @@ extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_dn_exact_three_ke
 }
 extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_dn_exact_kernel(DnArgs a, const int2* __restrict__ tiles, const int* __restrict__ ntiles) {
     sf::dn<sf::kExact>(a, tiles, ntiles);
+}
+
+// The exact arithmetic's split tiles and experts on 16 warps a block (TF_DS_GEMM_W16). The tile, its K blocks a
+// stage, its stages and its loads are the 8-warp kernels'; only the warp grid moves, so every output element is still
+// produced by one accumulator over the same K blocks in the same order, and the bytes are theirs. The dynamic shared
+// memory is theirs too (mx.zig sf_split64_smem, sf_split128_smem, pf_gu_r128_smem, pf_dn_r128_smem): one block an SM.
+extern "C" __global__ void __launch_bounds__(512, 1) tf_dsn_sf_split64_exact_w16_kernel(MxArgs a) { sf::gemm<sf::Split64CfgW16, sf::kExact, true, false>(a); }
+extern "C" __global__ void __launch_bounds__(512, 1) tf_dsn_sf_split128_exact_w16_kernel(MxArgs a) { sf::gemm<sf::Split128CfgW16, sf::kExact, true, false>(a); }
+extern "C" __global__ void __launch_bounds__(512, 1) tf_dsn_sf_gu_exact_w16_kernel(GuArgs a, const int2* __restrict__ tiles, const int* __restrict__ ntiles) {
+    sf::gu<sf::kExact, pf::GuR128CfgW16, pf::GuCfg8W16, true>(a, tiles, ntiles);
+}
+extern "C" __global__ void __launch_bounds__(512, 1) tf_dsn_sf_dn_exact_w16_kernel(DnArgs a, const int2* __restrict__ tiles, const int* __restrict__ ntiles) {
+    sf::dn<sf::kExact, false, pf::DnR128CfgW16, pf::DnCfg8W16>(a, tiles, ntiles);
+}
+
+// TF_DS_GEMM_R2: the exact arithmetic on the same split fold (down on 128-row tiles), its activation rows staged so an
+// m16 tile's A fragment of a K block is one 16-byte load and padding rows are not copied. Each output's MMAs, K order
+// and fp32 adds are the kernels above's, so their bytes.
+extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_gu_exact_r2_kernel(GuArgs a, const int2* __restrict__ tiles, const int* __restrict__ ntiles) {
+    sf::gu_r2<sf::kExact, sf::GuR2Cfg>(a, tiles, ntiles);
+}
+extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_dn_exact_r2_kernel(DnArgs a, const int2* __restrict__ tiles, const int* __restrict__ ntiles) {
+    sf::dn_r2<sf::kExact, sf::DnR2Cfg>(a, tiles, ntiles);
 }

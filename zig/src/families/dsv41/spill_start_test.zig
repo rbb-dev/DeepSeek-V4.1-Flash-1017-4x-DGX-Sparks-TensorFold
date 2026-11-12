@@ -7,23 +7,49 @@ test "the math text holds every switch at the widest TF_DS_IDX_RB" {
     widest.idx_rb = std.math.maxInt(usize);
     var texts: start.Texts = .{};
     const c = try start.common(io, Env{ .pairs = &recipe_env }, facts(&tmp), widest, &texts);
+    try std.testing.expect(std.mem.indexOf(u8, c.math, " engram_owner_sum=1 boundary_owned=1 cat_codes=1 ") != null);
     try std.testing.expect(std.mem.indexOf(u8, c.math, "idx_rb=18446744073709551615 ") != null);
 }
 
     try std.testing.expectEqualStrings("packed=1 owned=0 instream=0 aio=1", c.engram_switches);
     try std.testing.expectEqualStrings("packed=1 owned=0 instream=0 aio=0", odd.engram_switches);
+    // every switch at its longest value fits the text
+    var longest = math;
+    longest.idx_rb = std.math.maxInt(usize);
+    var texts3: start.Texts = .{};
+    _ = try start.common(io, Env{ .pairs = &recipe_env }, facts(&tmp), longest, &texts3);
 
     var buf: [1024]u8 = undefined;
     var off = math;
     off.roci = false;
     off.roci_collect = false;
+    off.gemm_w16 = false;
+    off.assemble_quant = false;
+    off.gemm_r2 = false;
     off.qgate_canary = 0;
+    off.pf_raster = 0;
     const text = try start.mathText(&buf, off);
     try std.testing.expect(std.mem.indexOf(u8, text, "roci") == null);
     try std.testing.expect(std.mem.endsWith(u8, text, "mma_sf_exact=1"));
     var buf2: [1024]u8 = undefined;
     const on = try start.mathText(&buf2, math);
     try std.testing.expectEqualStrings(text, on[0..text.len]);
+}
+
+test "the math text names TF_DS_PF_RASTER with its group only when it is on, after the other optional switches" {
+    var off_buf: [1024]u8 = undefined;
+    var on_buf: [1024]u8 = undefined;
+    var m = math;
+    m.pf_raster = 0;
+    const off = try start.mathText(&off_buf, m);
+    try std.testing.expect(std.mem.indexOf(u8, off, "pf_raster") == null);
+    for ([_]u32{ 2, 4, 8, 16 }) |g| {
+        m.pf_raster = g;
+        const on = try start.mathText(&on_buf, m);
+        try std.testing.expectEqualStrings(off, on[0..off.len]);
+        var want: [16]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&want, " pf_raster={d}", .{g}), on[off.len..]);
+    }
 }
     on.qgate_canary = 1;
 

@@ -57,6 +57,57 @@
 //!   TF_DS_NO_COPIES=1                           a drafted stream proposes no suffix-lookup copy windows
 //!   TF_DS_PASS_ROWS=N, TF_DS_PASS_FROM=P        a prompt pass's rows at most (a multiple of 2,048 up to the build's
 //!                                               pass rows), passes of 2,048 below position P (8192 unless set)
+//!   TF_DS_PF_SPLIT=A|B|C6|C7|1                  a prompt chunk's split FP8 GEMMs (wq_a, wkv, wq_b, wo_b, the
+//!                                               indexer's wq_b) on a restructured split loop: that tile
+//!                                               configuration wherever it divides the shape's split, or (1) the
+//!                                               per-shape table (mx.split_table); the fold kernel's bits; unset or 0:
+//!                                               the fold kernel; with the checkpoint's own weights and the tile
+//!                                               kernels (one line at the start says which is missing); every rank the
+//!                                               same
+//!   TF_DS_WOA_W8=1                              the main layers' wo_a loaded from its FP8 rows alone (the bf16 rows
+//!                                               not loaded: about 16.8 MB a layer); a prompt chunk's wo_a converts
+//!                                               them to the bf16 rows' values in its kernel (the replies' bits as
+//!                                               without); a layer whose FP8 bytes the kernel cannot take keeps its
+//!                                               rows (the load's line says how many); with the checkpoint's own
+//!                                               weights, the tile kernels and the decode kernels (one line at the
+//!                                               start says which is missing); every rank the same
+//!   TF_DS_QUANT_ONCE=1                          a prompt chunk's attention front quantizes x once for wq_a and wkv
+//!                                               (baseline: once for each) where TF_DS_FRONT_OWNED does not run it on
+//!                                               owned rows (the replies' bits as without); with the checkpoint's own
+//!                                               weights; every rank the same
+//!   TF_DS_ASSEMBLE_QUANT=1                      world 4: a parity chunk's expert intermediate is assembled and
+//!                                               down's quant of it computed in one launch (the assembled rows and
+//!                                               down's codes and scales, the bytes of the two launches), and down
+//!                                               reads the codes without quantizing again; in effect with the
+//!                                               checkpoint's own weights and the 2D split's parity experts; every
+//!                                               rank the same
+//!   TF_DS_PF_GEMM5=1                            a prompt chunk's dense FP8 GEMMs without a K split (Engram's wkv) at 5
+//!                                               pipeline stages (tf_dsn_pf_gemm's tile, its bits); with the
+//!                                               checkpoint's own weights and the tile kernels; every rank the same
+//!   TF_DS_GROUP_TILES=1                         a prompt chunk's experts' grouping builds their tile list in its own
+//!                                               launch (the prefix, the active list and the tiles at once), which
+//!                                               gate / up and down read instead of building it each (the same lists);
+//!                                               with the checkpoint's own weights and the tile kernels; every rank
+//!                                               the same
+//!   TF_DS_TOPK_TILES=1                          the indexer's pruned top-k of a prompt chunk (rows past 4,096 keys) in
+//!                                               one launch a row block: the tiles of the largest maxima, their keys'
+//!                                               top k, the indices sorted (the chain's picks); with the checkpoint's
+//!                                               own weights and an index_topk of at most 512; every rank the same
+//!   TF_DS_IDX_PROJ_OWNED=1                      world 4: the indexer's queries (wq_b, RoPE, fp4_qd) and head weights
+//!                                               (weights_proj) of a layer TF_DS_IDX_SHARD shards run on the node's
+//!                                               owned rows alone, the rows its scorer reads (the replies' bits as
+//!                                               without); in effect with TF_DS_IDX_SHARD=1, the checkpoint's own
+//!                                               weights and the owned rows' kernel variants on every rank (one line at
+//!                                               the start says which rank cannot); every rank the same
+//!   TF_DS_BF16_ROWS=1                           a prompt chunk's plain bf16 GEMMs (the indexer's weights_proj) take a
+//!                                               CTA a 16-row tile instead of at most 64 CTAs (each tile's chain as
+//!                                               without: the same bits); decode launches as without; with the
+//!                                               checkpoint's own weights; every rank the same
+//!   TF_DS_PF_RUN128=1                           a prompt chunk's MXFP4 expert tiles (gate / up and down) stage each
+//!                                               weight row 128 bytes at a time (two stages' K blocks in one run;
+//!                                               without it 64 bytes, one stage's), the same arithmetic in the same
+//!                                               order (the replies' bits as without); with the checkpoint's own
+//!                                               weights and the tile kernels; every rank the same
 //!   TF_DS_MMA_SF=1                              a prompt chunk's FP8 GEMMs (the dense ones the tile kernels take and
 //!                                               the experts' gate / up and down) on the tensor core's block-scaled
 //!                                               MMA (native_sf.cu, built for sm_121a): each K block's sum scaled by
@@ -74,6 +125,28 @@
 //!                                               kernels first; with the checkpoint's own weights, the tile kernels and
 //!                                               a GPU that loads the kernels, on every rank or none; every rank the
 //!                                               same; the SSD tier's math names it
+//!   TF_DS_GEMM_W16=1                            a prompt chunk's exact GEMMs (TF_DS_MMA_SF_EXACT's arithmetic: the
+//!                                               dense FP8 split GEMMs and the experts' gate / up and down) and wo_a's
+//!                                               bf16 rows on 16 warps a block (512 threads, a warp's tile half as
+//!                                               wide) instead of 8: the same tiles, stages and shared memory, the
+//!                                               same arithmetic in the same order, so the replies' bits without it;
+//!                                               needs TF_DS_MMA_SF=1 (exact) for the GEMMs, and runs wo_a's rows
+//!                                               either way where the layer has its FP8 rows; every rank the same;
+//!                                               the SSD tier's math names it
+//!   TF_DS_GEMM_R2=1                             TF_DS_MMA_SF_EXACT's expert GEMMs (gate / up and down) on kernels that
+//!                                               leave padding rows' copies out and give down a 128-row tile: the
+//!                                               replies' bits without it; needs TF_DS_MMA_SF_EXACT=1 in effect and an
+//!                                               image with the kernels; one line says whether it runs; every rank the
+//!                                               same; the SSD tier's math names it
+//!   TF_DS_PF_RASTER=G                           (G = 2, 4, 8 or 16; other text refuses the start) a prompt GEMM whose
+//!                                               activation slab is 14 MiB or more (the tile FP8 GEMMs, the block-scaled
+//!                                               MMA's and the bf16 tile GEMM) walks its grid G row tiles at a time
+//!                                               across all the column tiles instead of row tiles fastest, so a wave
+//!                                               shares a G-tile slab of the activation in the L2 where the default
+//!                                               order re-reads all of it per column; only the order of whole output
+//!                                               tiles changes, so the replies' bits are unchanged. It does not need
+//!                                               TF_DS_GEMM_HALVES and may run with it (each 4,096-row block is a
+//!                                               launch of its own); the SSD tier's math names it; every rank the same
 //!   TF_DS_QGATE_CANARY=2 or 3                   not a serving setting: layer 0's MoE partials, each rank's before
 //!                                               their gather, in every prompt chunk and every round, take one more
 //!                                               FP8 step (2: act_quant's quant-dequant of each 32-value group) or
@@ -95,6 +168,8 @@ const round = @import("round.zig");
 const link = @import("link.zig");
 const rank_cache = @import("rank_cache.zig");
 const vision_mod = @import("vision.zig");
+const mx = @import("mx.zig");
+const weights = @import("weights.zig");
 
 pub const model_type = "deepseek_v41";
 pub const formats: []const []const u8 = &.{"exl3-mul1"};
@@ -262,6 +337,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     st.m.watchPeers() catch |err| std.log.warn("dsv41: rank 0 cannot watch its followers: {s}", .{@errorName(err)});
     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .lane_vision = if (st.vision) |v| v.hook() else null, .usable_window = @as(u32, @intCast(rows_mod.usableRows(st.m.ctx_cap, st.m.eng.round_rows, model.chunk_rows))), .tier = tier, .grid = model.chunk_rows, .beside = prompt2d.pass_beside_asked, .rounds = prompt2d.rounds_beside_asked, .replay = @intCast(st.m.cfg.window), .spill_state = st.spill_state, .spill_info = st.spill_info, .fill = prompt2d.prompt_order, .quiet = quietFn, .finish = finishFn };
 /// The math switches in effect for the SSD tier's store name: the 2D node's agreed flags (all off without one), the
+/// indexer's score rows, the pair sums' zero, the replay floor and the native kernels' switches in effect (all off
+/// without them).
+pub fn tierMath(two: ?*const prompt2d.Two, k: ?*const mx.Kernels) spill_start.Math {
     return .{
         // the switches that no longer exist keep the values the shipped settings gave them, so a store written before the NCCL
         // removal keeps its name (the numerics are the same bytes): pair sums off, quarter-HC and the owner gather on
@@ -280,17 +358,30 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .engram_owner_sum = two != null,
         .boundary_owned = two != null,
         .cat_codes = two != null,
+        .woa_w8 = weights.woa_w8,
+        .quant_once = prompt.quant_once,
+        .pf_gemm5 = if (k) |x| x.gemm5 else false,
+        .group_tiles = if (k) |x| x.group_tiles else false,
+        .topk_tiles = if (k) |x| x.topk_tiles else false,
+        .idx_proj_owned = if (two) |t| t.idx_proj_owned else false,
+        .bf16_rows = if (k) |x| x.bf16_rows else false,
+        .pf_run128 = if (k) |x| x.run128 else false,
         .pass_rows = prompt2d.pass_rows_asked,
         .pass_from = prompt2d.pass_from_asked,
         .pass_tail = prompt2d.pass_tail_asked,
         .mma_sf = if (k) |x| x.sf == .chained else false,
         .mma_sf_exact = if (k) |x| x.sf == .exact else false,
+        .gemm_w16 = if (k) |x| x.gemm_w16 else false,
+        .gemm_r2 = if (k) |x| x.gemm_r2 else false,
         .roci = two != null,
         .roci_collect = false,
+        .assemble_quant = if (k) |x| x.assemble_quant else false,
+        .pf_raster = @intCast(mx.pf_raster),
         .qgate_canary = if (prompt.qgate_canary) 1 else @backingInt(prompt.qgate_body),
     };
 }
 
+    const math = tierMath(if (m.two) |*t| t else null, if (m.mxk) |*x| x else null);
     if (world > 1 and !reconciled) abstainBare(st.gpa, st.m);
     if (world > 1) {
     if (world > 1)
@@ -350,7 +441,59 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     try std.testing.expectEqual(@as(u8, 2), tierMath(null, null).qgate_canary);
     prompt.qgate_body = .body_ulp;
     try std.testing.expectEqual(@as(u8, 3), tierMath(null, null).qgate_canary);
+test "the tier's math carries TF_DS_QUANT_ONCE in effect" {
+    const was = prompt.quant_once;
+    defer prompt.quant_once = was;
+    prompt.quant_once = false;
+    try std.testing.expect(!tierMath(null, null).quant_once);
+    prompt.quant_once = true;
+    try std.testing.expect(tierMath(null, null).quant_once);
+}
+
+test "the tier's math carries TF_DS_WOA_W8 as the load ran with it" {
+    const was = weights.woa_w8;
+    defer weights.woa_w8 = was;
+    weights.woa_w8 = false;
+    try std.testing.expect(!tierMath(null, null).woa_w8);
+    weights.woa_w8 = true;
+    try std.testing.expect(tierMath(null, null).woa_w8);
+}
+
+test "the tier's math carries TF_DS_PF_SPLIT in effect: the native kernels' setting, off without them" {
+    try std.testing.expectEqualStrings("0", tierMath(null, null).pf_split);
+    var k: mx.Kernels = undefined;
+    k.gemm5 = false;
+    k.group_tiles = false;
+    k.topk_tiles = false;
+    k.bf16_rows = false;
+    k.run128 = false;
     k.sf = .off;
+    for ([_]mx.PfSplit{ .off, .table, .a, .b, .c6, .c7 }, [_][]const u8{ "0", "1", "A", "B", "C6", "C7" }) |sw, text| {
+        k.split = sw;
+        try std.testing.expectEqualStrings(text, tierMath(null, &k).pf_split);
+    }
+    // TF_DS_PF_GEMM5 likewise: the kernels' setting, off without them
+    try std.testing.expect(!tierMath(null, null).pf_gemm5);
+    k.gemm5 = false;
+    try std.testing.expect(!tierMath(null, &k).pf_gemm5);
+    k.gemm5 = true;
+    try std.testing.expect(tierMath(null, &k).pf_gemm5);
+    // TF_DS_GROUP_TILES likewise
+    try std.testing.expect(!tierMath(null, null).group_tiles and !tierMath(null, &k).group_tiles);
+    k.group_tiles = true;
+    try std.testing.expect(tierMath(null, &k).group_tiles);
+    // TF_DS_TOPK_TILES likewise
+    try std.testing.expect(!tierMath(null, null).topk_tiles and !tierMath(null, &k).topk_tiles);
+    k.topk_tiles = true;
+    try std.testing.expect(tierMath(null, &k).topk_tiles);
+    // TF_DS_BF16_ROWS likewise
+    try std.testing.expect(!tierMath(null, null).bf16_rows and !tierMath(null, &k).bf16_rows);
+    k.bf16_rows = true;
+    try std.testing.expect(tierMath(null, &k).bf16_rows);
+    // TF_DS_PF_RUN128 likewise
+    try std.testing.expect(!tierMath(null, null).pf_run128 and !tierMath(null, &k).pf_run128);
+    k.run128 = true;
+    try std.testing.expect(tierMath(null, &k).pf_run128);
     // TF_DS_MMA_SF likewise: the arithmetic in effect after the agreement, off without the native kernels
     k.sf = .off;
     try std.testing.expect(!tierMath(null, null).mma_sf and !tierMath(null, &k).mma_sf);
@@ -360,6 +503,10 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     try std.testing.expect(!tierMath(null, null).mma_sf_exact);
     k.sf = .exact;
     try std.testing.expect(tierMath(null, &k).mma_sf_exact and !tierMath(null, &k).mma_sf);
+    // TF_DS_GEMM_R2 likewise
+    try std.testing.expect(!tierMath(null, null).gemm_r2 and !tierMath(null, &k).gemm_r2);
+    k.gemm_r2 = true;
+    try std.testing.expect(tierMath(null, &k).gemm_r2);
 }
 
 test "refusals name what to set" {
@@ -368,8 +515,18 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "--streams") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "--graph-cap") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_REPLAY_FLOOR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_PF_SPLIT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_WOA_W8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_QUANT_ONCE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_PF_GEMM5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_GROUP_TILES") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_TOPK_TILES") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_IDX_PROJ_OWNED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_BF16_ROWS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_PF_RUN128") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_MMA_SF") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_MMA_SF_EXACT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_GEMM_R2") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_RING_WORD") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_RING_WORD_SIGNAL") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.CanariesDiffer) orelse "", "TF_DS_QGATE_CANARY") != null);

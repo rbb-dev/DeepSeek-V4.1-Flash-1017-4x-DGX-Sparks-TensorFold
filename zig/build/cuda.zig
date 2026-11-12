@@ -209,6 +209,14 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     ds_rows_replay.addImport("dsv41", ds_check.import_table.get("dsv41").?);
     ds_rows_replay.addImport("cuda", cuda);
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-rows-replay", .root_module = ds_rows_replay }));
+    // The prompt path's kernel switches against the baseline kernels on the real kernels (TF_DS_PF_SPLIT's configurations
+    // against the fold kernel, ...): each switch's launches the baseline bytes, each control different
+    const ds_kernels_replay = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/kernels_replay_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    ds_kernels_replay.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+    ds_kernels_replay.addImport("cuda", cuda);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-kernels-replay", .root_module = ds_kernels_replay }));
+    // the overlap tax: a pass's kernel classes beside its exchanges on two streams, alone, in both orders and on one
+    // stream, at 2,048- and 1,024-row waves on the four nodes
     // WP6: _index_score_rows at TF_DS_IDX_RB=1 (today) vs 2 (the kit's own other capture), random fixed-seed data,
     // keyed and plain, even and odd row counts, bit compared
     const ds_idx_replay = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/idx_replay_main.zig"), .target = target, .optimize = optimize, .link_libc = true });

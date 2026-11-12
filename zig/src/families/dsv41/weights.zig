@@ -130,6 +130,9 @@ pub const Layer = struct {
     // values), every group's rows in one tensor [groups * o_lora, K] with its scales [groups * o_lora / 32, K / 32];
     // the decode rounds' wo_a (mx.woA8)
     wo_a8: ?Linear = null,
+    // wo_a's bf16 rows loaded (wo_a's Linears hold them); false: TF_DS_WOA_W8 left them out (wo_a's Linears give the
+    // groups' shapes alone, fmt bf16, no bytes) and the prompt path reads wo_a8 (mx.woA8Prefill)
+    wo_a_rows: bool = true,
     wo_b: Linear = undefined, // this rank's groups' input rows (a 2D node: its pair's output columns of them)
     comp_wkv: ?Linear = null,
     comp_wgate: ?Linear = null,
@@ -212,6 +215,38 @@ pub fn quantFp4(src: []const u8, n: usize, k: usize, w: []u8, sc: []u8) void {
 pub fn draftWoAFp8() bool {
     const v = std.c.getenv("TF_DS_DRAFT_WOA") orelse return true;
     return !std.mem.eql(u8, std.mem.span(v), "bf16");
+}
+
+/// TF_DS_WOA_W8 in effect (Model.open, before the load: asked, and mx.woaW8Off holds): each main layer whose FP8 wo_a
+/// the prompt path's kernel takes (w8Admits) loads it alone, without the bf16 rows (Layer.wo_a_rows false).
+pub var woa_w8: bool = false;
+
+/// The bf16 value of the loader's wo_a rows for an E4M3 code and its UE8M0 block scale (convert.py: weight * scale,
+/// then bfloat16): e4m3(code) * 2^(scale - 127) in f32, its top 16 bits (exact for every finite product: an E4M3
+/// value has 4 significant bits).
+pub fn woABf16(code: u8, scale: u8) u16 {
+    const sc: f32 = @bitCast(@as(u32, scale) << 23);
+    const v = e4m3(code) * sc;
+    return @truncate(@as(u32, @bitCast(v)) >> 16);
+}
+
+/// Why a layer's stacked FP8 wo_a (codes `w`, UE8M0 scales `s`) cannot replace its bf16 rows (null: it can): an E4M3
+/// NaN code (0x7f, 0xff: the loader reads them as +-480, the GPU's conversion as NaN) or a scale byte of 255 (2^128:
+/// infinite products, NaNs of other bits on the host and the GPU).
+pub fn w8Admits(w: []const u8, s: []const u8) ?[]const u8 {
+    for (w) |c| if (c & 0x7f == 0x7f) return "an E4M3 NaN code (0x7f / 0xff) in its FP8 rows";
+    for (s) |e| if (e == 255) return "a scale byte of 255 in its FP8 rows";
+    return null;
+}
+
+/// The largest K of a group tf_dsn_pf_bf16w8 takes: a tile's weight scales, (128 / 32) x K / 32 bytes, fill its static
+/// array of 2,048 (native.cu's pf::kW8MaxK, held at this value by its static_assert).
+pub const w8_max_k: usize = 16384;
+
+/// Whether the prompt path's FP8 wo_a kernel takes a layer's groups of K inputs and o_lora outputs each: whole
+/// 128-column tiles and 32-column stages, K at most w8_max_k (mx.w8Shape's rule on the stacked tensor).
+pub fn w8LayoutOk(k: usize, o_lora: usize) bool {
+    return o_lora % 128 == 0 and k % 32 == 0 and k > 0 and k <= w8_max_k;
 }
 
 /// An f32 (|v| <= 448) as E4M3, rounded to nearest even (subnormals below 2^-6).
@@ -370,6 +405,15 @@ const Loader = struct {
     host: std.ArrayList(u8) = .empty,
     aux: std.ArrayList(u8) = .empty,
     wo_a_fp8: bool = false, // blockNative: wo_a's groups as their FP8 rows (the drafter's blocks), not bf16
+    // TF_DS_WOA_W8 (woa_w8): the main layers loaded without wo_a's bf16 rows, those that kept them (and the first
+    // one's reason), and the bytes not loaded
+    w8_layers: usize = 0,
+    w8_kept: usize = 0,
+    w8_why: ?[]const u8 = null,
+    w8_saved: u64 = 0,
+    // tests: each upload's bytes kept on the host in place of a device buffer (the address returned: its index + 1)
+    host_uploads: ?*std.ArrayList([]u8) = null,
+    entries: u64 = 0, // entries asked for (entry)
 
     fn deinit(L: *Loader) void {
         L.host.deinit(L.gpa);
@@ -379,6 +423,10 @@ const Loader = struct {
     }
 
     fn upload(L: *Loader, name: []const u8, bytes: []const u8) !u64 {
+        if (L.host_uploads) |h| {
+            try h.append(L.gpa, try L.gpa.dupe(u8, bytes));
+            return h.items.len;
+        }
         var b = try cuda.DeviceBuffer.alloc(L.d, bytes.len);
         errdefer b.free();
         try b.upload(0, bytes);
@@ -449,6 +497,7 @@ const Loader = struct {
             if (L.span_buf) |b| std.heap.page_allocator.free(b);
             L.span_buf = null;
             L.span_buf = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(dio.alignment), need);
+        L.entries += 1;
         }
         try L.host.resize(L.gpa, try L.src.size(key));
         try L.src.read(key, L.host.items);
@@ -569,17 +618,32 @@ const Loader = struct {
         const w = try L.entry(wkey);
         try L.aux.resize(L.gpa, n * k * 2);
         for (0..n) |i| for (0..k) |j| {
+            std.mem.writeInt(u16, L.aux.items[(i * k + j) * 2 ..][0..2], woABf16(w[i * k + j], sc[(i / 32) * (k / 32) + j / 32]), .little);
         };
         const p = try L.upload(try std.fmt.bufPrint(&nb, "{s}.weight.{d}", .{ prefix, g }), L.aux.items);
         return .{ .words = p, .w = p, .k = @intCast(k), .n = @intCast(n), .fmt = .bf16 };
     }
 
     /// wo_a's groups ga[0] .. ga[0] + ga[1] - 1 (Format.native) as stored, FP8 rows and their UE8M0 scales, the groups
+    /// stacked in one tensor each (a group's rows are whole 32-row scale blocks: o_lora % 32 == 0). `why` (not null):
+    /// set to the reason the prompt path's kernel cannot take them in place of the bf16 rows (null: it can).
+    fn woA8(L: *Loader, prefix: []const u8, ga: [2]usize, o_lora: usize, why: ?*?[]const u8) !Linear {
         var nb: [256]u8 = undefined;
         var wbytes: std.ArrayList(u8) = .empty;
         defer wbytes.deinit(L.gpa);
         var sbytes: std.ArrayList(u8) = .empty;
         defer sbytes.deinit(L.gpa);
+        const k = try L.woA8Bytes(prefix, ga, o_lora, &wbytes, &sbytes);
+        const w = try L.upload(try std.fmt.bufPrint(&nb, "{s}.weight.fp8", .{prefix}), wbytes.items);
+        const sc = try L.upload(try std.fmt.bufPrint(&nb, "{s}.scale.fp8", .{prefix}), sbytes.items);
+        const l: Linear = .{ .words = w, .w = w, .s = sc, .k = @intCast(k), .n = @intCast(ga[1] * o_lora), .fmt = .fp8 };
+        if (why) |y| y.* = w8Admits(wbytes.items, sbytes.items) orelse if (!w8LayoutOk(k, o_lora)) "a layout the prompt path's FP8 kernel does not take" else null;
+        return l;
+    }
+
+    /// woA8's entries read into host bytes (each once): every group's FP8 rows, then its scales, stacked; K.
+    fn woA8Bytes(L: *Loader, prefix: []const u8, ga: [2]usize, o_lora: usize, wbytes: *std.ArrayList(u8), sbytes: *std.ArrayList(u8)) !usize {
+        var kb: [256]u8 = undefined;
         var k: usize = 0;
         for (ga[0]..ga[0] + ga[1]) |g| {
             const cols: [2]usize = .{ g * o_lora, (g + 1) * o_lora };
@@ -590,6 +654,14 @@ const Loader = struct {
             try wbytes.appendSlice(L.gpa, try L.entry(wkey));
             try sbytes.appendSlice(L.gpa, try L.entry(try plan.partKey(&kb, prefix, cols, null, "s8")));
         }
+        return k;
+    }
+
+    /// wo_a's group `g` without its rows: its shape (the FP8 part's, as woANative's), bf16, no bytes.
+    fn woAShape(L: *Loader, prefix: []const u8, g: usize, o_lora: usize) !Linear {
+        var kb: [256]u8 = undefined;
+        const sh = try L.shape2(try plan.partKey(&kb, prefix, .{ g * o_lora, (g + 1) * o_lora }, null, "w8"));
+        return .{ .words = 0, .w = 0, .k = @intCast(sh[1]), .n = @intCast(sh[0]), .fmt = .bf16 };
     }
 
     /// Format.native experts of block p: every expert's gate / up pack (main columns, then its rest when this node
@@ -910,6 +982,34 @@ const Loader = struct {
         return r;
     }
 
+    /// A Format.native block's wo_a (`p`.attn.wo_a): its groups ga[0] .. ga[0] + ga[1] - 1 of o_lora outputs and every
+    /// group's FP8 rows stacked (Layer.wo_a8). TF_DS_WOA_W8 on a main layer (`main`): the FP8 rows first, then the
+    /// groups' bf16 rows only for a layer whose FP8 bytes the prompt path's kernel cannot take (each entry read once
+    /// otherwise). Else (a drafter's block too) each group's bf16 rows (wo_a_fp8: its FP8 rows), then the FP8 rows.
+    fn woALayer(L: *Loader, lay: *Layer, p: []const u8, main: bool, ga: [2]usize, o_lora: usize) !void {
+        var pb: [256]u8 = undefined;
+        const pre = try std.fmt.bufPrint(&pb, "{s}.attn.wo_a", .{p});
+        if (woa_w8 and main) {
+            var why: ?[]const u8 = null;
+            lay.wo_a8 = try L.woA8(pre, ga, o_lora, &why);
+            for (0..ga[1]) |g| lay.wo_a[g] = if (why == null) try L.woAShape(pre, ga[0] + g, o_lora) else try L.woANative(pre, ga[0] + g, o_lora);
+            lay.wo_a_rows = why != null;
+            if (why) |y| {
+                L.w8_kept += 1;
+                if (L.w8_why == null) L.w8_why = y;
+            } else {
+                L.w8_layers += 1;
+                for (lay.wo_a[0..ga[1]]) |wo| L.w8_saved += @as(u64, wo.n) * wo.k * 2;
+            }
+        } else {
+            for (0..ga[1]) |g| {
+                const gc: [2]usize = .{ (ga[0] + g) * o_lora, (ga[0] + g + 1) * o_lora };
+                lay.wo_a[g] = if (L.wo_a_fp8) try L.native(pre, gc, null, .fp8) else try L.woANative(pre, ga[0] + g, o_lora);
+            }
+            lay.wo_a8 = try L.woA8(pre, ga, o_lora, null);
+        }
+    }
+
     /// load_block of a Format.native checkpoint (plan.blockNative's entries).
     fn blockNative(L: *Loader, c: Config, s: plan.Split, p: []const u8, i: usize, n_experts: usize) !Layer {
         var nb: [256]u8 = undefined;
@@ -936,6 +1036,7 @@ const Loader = struct {
         }
         const ga = s.woAGroups(c);
         lay.groups = @intCast(ga[1]);
+        try L.woALayer(&lay, p, i < c.layers, ga, c.o_lora);
         lay.wo_b = try L.native(try std.fmt.bufPrint(&pb, "{s}.attn.wo_b", .{p}), s.woBCols(c), s.range(gl * c.o_lora), .fp8);
         if (c.kv_sources.has(i)) {
             lay.comp_wkv = try L.native(try std.fmt.bufPrint(&pb, "{s}.attn.compressor.wkv", .{p}), null, null, .bf16);
@@ -1100,6 +1201,7 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, src: Source, c: Confi
         if (c.format == .native and draftHeadFp8()) w.dspark.?.head8 = try L.headFp8(vr);
     }
     if (L.span_bytes > 0) std.log.info("rank cache: {d:.1} GiB of expert entries read whole in {d:.1} s", .{ @as(f64, @floatFromInt(L.span_bytes)) / (1 << 30), @as(f64, @floatFromInt(L.span_ns)) / 1e9 });
+    if (woa_w8) std.log.info("TF_DS_WOA_W8=1: wo_a from its FP8 rows on {d} of {d} layers ({d:.1} MB of bf16 rows not loaded){s}{s}", .{ L.w8_layers, L.w8_layers + L.w8_kept, @as(f64, @floatFromInt(L.w8_saved)) / 1e6, if (L.w8_why != null) "; the others keep their rows: " else "", L.w8_why orelse "" });
     return w;
 }
 
@@ -1110,6 +1212,205 @@ fn e4m3(b: u8) f32 {
     const m: f32 = @floatFromInt(b & 7);
     if (e == 0) return sign * m / 8 * std.math.pow(f32, 2, -6);
     return sign * (1 + m / 8) * std.math.pow(f32, 2, @floatFromInt(e - 7));
+}
+
+/// tf_dsn_pf_bf16w8's B operand, written out as the GPU computes it: the E4M3 code widened to fp16 (cvt: exact, a
+/// subnormal code m * 2^-9 a normal fp16; the NaN codes 0x7f / 0xff an fp16 NaN), then to f32, times 2^(e - 127)
+/// (ue8m0), the top 16 bits.
+fn gpuW8(code: u8, scale: u8) u16 {
+    const sign: u16 = @as(u16, code & 0x80) << 8;
+    const e: u16 = (code >> 3) & 0xf;
+    const m: u16 = code & 7;
+    const h: u16 = if (e == 15 and m == 7) sign | 0x7e00 else if (e != 0) sign | (e + 8) << 10 | m << 7 else blk: {
+        if (m == 0) break :blk sign;
+        // m * 2^-9: the top bit of m sets the exponent, the bits below it the mantissa
+        const top: u4 = @intCast(15 - @clz(m));
+        break :blk sign | (@as(u16, top) + 6) << 10 | ((m << @intCast(10 - @as(u16, top))) & 0x3ff);
+    };
+    const v: f32 = @floatCast(@as(f16, @bitCast(h)));
+    const sc: f32 = @bitCast(@as(u32, scale) << 23);
+    return @truncate(@as(u32, @bitCast(v * sc)) >> 16);
+}
+
+test "the GPU's FP8 wo_a values are the loader's bf16 rows for every code and scale byte w8Admits lets through" {
+    for (0..256) |ci| for (0..255) |si| {
+        const code: u8 = @intCast(ci);
+        const scale: u8 = @intCast(si);
+        if (w8Admits(&.{code}, &.{scale}) != null) continue;
+        try std.testing.expectEqual(woABf16(code, scale), gpuW8(code, scale));
+    };
+    // the two codes it keeps out: the loader reads them as +-480, the GPU as NaN
+    try std.testing.expect(woABf16(0x7f, 127) != gpuW8(0x7f, 127));
+    try std.testing.expect(woABf16(0xff, 127) != gpuW8(0xff, 127));
+    // the rows are cut, not rounded: 3 * 2^-135 (code 0x03, scale byte 1) is 0 in bf16, not 2^-133
+    try std.testing.expectEqual(@as(u16, 0), woABf16(0x03, 1));
+    try std.testing.expectEqual(@as(u16, 0x3f80), woABf16(0x38, 127)); // 1.0
+    try std.testing.expectEqual(@as(u16, 0xc3e0), woABf16(0xfe, 127)); // -448
+}
+
+test "a layer's FP8 wo_a replaces its bf16 rows unless it holds an E4M3 NaN code or a scale byte 255, or its shape is not the kernel's" {
+    const w = [_]u8{ 0x00, 0x38, 0x7e, 0x80, 0xfe, 0x01 };
+    const sc = [_]u8{ 0, 118, 254 };
+    try std.testing.expectEqual(@as(?[]const u8, null), w8Admits(&w, &sc));
+    for ([_]u8{ 0x7f, 0xff }) |nan| {
+        var bad = w;
+        bad[3] = nan;
+        try std.testing.expectEqualStrings("an E4M3 NaN code (0x7f / 0xff) in its FP8 rows", w8Admits(&bad, &sc) orelse "admitted");
+    }
+    var bad_sc = sc;
+    bad_sc[1] = 255;
+    try std.testing.expectEqualStrings("a scale byte of 255 in its FP8 rows", w8Admits(&w, &bad_sc) orelse "admitted");
+    // the checkpoint's groups (o_lora 1,024 outputs of K 4,096) and shapes the kernel does not take
+    try std.testing.expect(w8LayoutOk(4096, 1024));
+    try std.testing.expect(!w8LayoutOk(4096, 1024 + 32));
+    try std.testing.expect(!w8LayoutOk(4096 + 16, 1024));
+    try std.testing.expect(!w8LayoutOk(0, 1024));
+    // K within the kernel's scale array (native.cu's static_assert holds pf::kW8MaxK at w8_max_k)
+    try std.testing.expectEqual(@as(usize, 16384), w8_max_k);
+    try std.testing.expect(w8LayoutOk(w8_max_k, 1024));
+    try std.testing.expect(!w8LayoutOk(w8_max_k + 32, 1024));
+}
+
+test "with TF_DS_WOA_W8 a layer's wo_a entries are read once: its FP8 rows and scales, then the groups' shapes without bytes" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // two groups of 64 outputs of K 96: each group's w8 [64, 96] and s8 [2, 3] (the rank cache's entries)
+    const prefix = "layers.0.attn.wo_a";
+    const o_lora = 64;
+    const k = 96;
+    var body: [2 * (o_lora * k + 6)]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = @truncate(i * 7 + 3);
+    try tmp.dir.writeFile(io, .{ .sub_path = "rank0of4-w.bin", .data = &body });
+    var json: std.ArrayList(u8) = .empty;
+    defer json.deinit(gpa);
+    try json.append(gpa, '[');
+    var off: usize = 0;
+    for (0..2) |g| for ([_][]const u8{ "w8", "s8" }) |part| {
+        var kb: [128]u8 = undefined;
+        const key = try plan.partKey(&kb, prefix, .{ g * o_lora, (g + 1) * o_lora }, null, part);
+        const rows: usize = if (part[0] == 'w') o_lora else o_lora / 32;
+        const cols: usize = if (part[0] == 'w') k else k / 32;
+        try json.print(gpa, "{s}[\"{s}\", \"uint8\", [{d}, {d}], {d}, {d}]", .{ if (off > 0) ", " else "", key, rows, cols, off, rows * cols });
+        off += rows * cols;
+    };
+    try json.append(gpa, ']');
+    var ix = try rank_cache.parseIndex(gpa, json.items, body.len);
+    defer ix.deinit();
+    var file = try tmp.dir.openFile(io, "rank0of4-w.bin", .{});
+    defer file.close(io);
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, ".zig-cache/tmp/{s}/rank0of4-w.bin", .{tmp.sub_path}, 0);
+    var direct = try dio.File.open(path);
+    defer direct.close();
+    var w: Weights = .{ .gpa = gpa };
+    var L: Loader = .{ .gpa = gpa, .d = undefined, .src = .{ .cache = .{ .file = file, .index = &ix, .io = io, .direct = direct } }, .w = &w, .window = 4 * dio.alignment };
+    defer L.deinit();
+    var wbytes: std.ArrayList(u8) = .empty;
+    defer wbytes.deinit(gpa);
+    var sbytes: std.ArrayList(u8) = .empty;
+    defer sbytes.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, k), try L.woA8Bytes(prefix, .{ 0, 2 }, o_lora, &wbytes, &sbytes));
+    // the groups stacked: group 0's rows then group 1's, their scales likewise
+    try std.testing.expectEqualSlices(u8, body[0 .. o_lora * k], wbytes.items[0 .. o_lora * k]);
+    try std.testing.expectEqualSlices(u8, body[o_lora * k + 6 ..][0 .. o_lora * k], wbytes.items[o_lora * k ..]);
+    try std.testing.expectEqual(@as(usize, 12), sbytes.items.len);
+    // each entry asked for once, each byte read once
+    try std.testing.expectEqual(@as(u64, 4), L.entries);
+    try std.testing.expectEqual(@as(u64, body.len), L.direct_bytes);
+    for (0..2) |g| {
+        const l = try L.woAShape(prefix, g, o_lora);
+        try std.testing.expectEqual(Linear{ .words = 0, .w = 0, .k = k, .n = o_lora, .fmt = .bf16 }, l);
+    }
+    // the groups' shapes ask for no entry
+    try std.testing.expectEqual(@as(u64, 4), L.entries);
+    try std.testing.expectEqual(@as(u64, body.len), L.direct_bytes);
+}
+
+test "with TF_DS_WOA_W8 a main layer's wo_a loads its FP8 rows alone, one the kernel cannot take keeps its bf16 rows, a drafter's block keeps them" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // three blocks' wo_a, two groups of 128 outputs of K 96 each: layers.0 (its FP8 bytes taken), layers.1 (an E4M3 NaN
+    // code: kept), mtp.0 (a drafter's block with its wo_a as bf16 rows, TF_DS_DRAFT_WOA=bf16)
+    const prefixes = [_][]const u8{ "layers.0.attn.wo_a", "layers.1.attn.wo_a", "mtp.0.attn.wo_a" };
+    const o_lora = 128;
+    const k = 96;
+    const wn = o_lora * k;
+    const sn = (o_lora / 32) * (k / 32);
+    var body: [3 * 2 * (wn + sn)]u8 = undefined;
+    var json: std.ArrayList(u8) = .empty;
+    defer json.deinit(gpa);
+    try json.append(gpa, '[');
+    var off: usize = 0;
+    for (prefixes) |prefix| for (0..2) |g| for ([_][]const u8{ "w8", "s8" }) |part| {
+        var kb: [128]u8 = undefined;
+        const key = try plan.partKey(&kb, prefix, .{ g * o_lora, (g + 1) * o_lora }, null, part);
+        const rows: usize = if (part[0] == 'w') o_lora else o_lora / 32;
+        const cols: usize = if (part[0] == 'w') k else k / 32;
+        for (body[off..][0 .. rows * cols], off..) |*b, i| {
+            // codes: every value but the E4M3 NaNs; scales 2^-17 .. 2^0
+            var c: u8 = @truncate(i * 37 + 11);
+            if (c & 0x7f == 0x7f) c ^= 1;
+            b.* = if (part[0] == 'w') c else @truncate(110 + i % 18);
+        }
+        try json.print(gpa, "{s}[\"{s}\", \"uint8\", [{d}, {d}], {d}, {d}]", .{ if (off > 0) ", " else "", key, rows, cols, off, rows * cols });
+        off += rows * cols;
+    };
+    try json.append(gpa, ']');
+    body[(wn + sn) * 2 + 1000] = 0x7f; // layers.1's group 0
+    try tmp.dir.writeFile(io, .{ .sub_path = "rank0of4-w.bin", .data = &body });
+    var ix = try rank_cache.parseIndex(gpa, json.items, body.len);
+    defer ix.deinit();
+    var file = try tmp.dir.openFile(io, "rank0of4-w.bin", .{});
+    defer file.close(io);
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, ".zig-cache/tmp/{s}/rank0of4-w.bin", .{tmp.sub_path}, 0);
+    var direct = try dio.File.open(path);
+    defer direct.close();
+    var ups: std.ArrayList([]u8) = .empty;
+    defer {
+        for (ups.items) |u| gpa.free(u);
+        ups.deinit(gpa);
+    }
+    var w: Weights = .{ .gpa = gpa };
+    var L: Loader = .{ .gpa = gpa, .d = undefined, .src = .{ .cache = .{ .file = file, .index = &ix, .io = io, .direct = direct } }, .w = &w, .window = 4 * dio.alignment, .host_uploads = &ups };
+    defer L.deinit();
+    woa_w8 = true;
+    defer woa_w8 = false;
+    var lays: [3]Layer = @splat(.{ .idx = 0, .ratio = 1 });
+    for (&lays, prefixes, [_]bool{ true, true, false }) |*lay, prefix, main| try L.woALayer(lay, prefix[0 .. prefix.len - ".attn.wo_a".len], main, .{ 0, 2 }, o_lora);
+    const fp8 = Linear{ .words = 0, .w = 0, .k = k, .n = 2 * o_lora, .fmt = .fp8 };
+    // layers.0: the FP8 rows (uploads 1, 2) and the groups' shapes, no bytes
+    try std.testing.expect(!lays[0].wo_a_rows);
+    try std.testing.expectEqual(Linear{ .words = 1, .w = 1, .s = 2, .k = fp8.k, .n = fp8.n, .fmt = .fp8 }, lays[0].wo_a8.?);
+    for (lays[0].wo_a[0..2]) |l| try std.testing.expectEqual(Linear{ .words = 0, .w = 0, .k = k, .n = o_lora, .fmt = .bf16 }, l);
+    // layers.1: the FP8 rows (3, 4), then each group's bf16 rows (5, 6): the loader's values of its codes and scales
+    try std.testing.expect(lays[1].wo_a_rows);
+    try std.testing.expectEqual(@as(u64, 3), lays[1].wo_a8.?.w);
+    for (lays[1].wo_a[0..2], 0..) |l, g| {
+        try std.testing.expectEqual(Linear{ .words = 5 + g, .w = 5 + g, .k = k, .n = o_lora, .fmt = .bf16 }, l);
+        const wb = body[(wn + sn) * 2 + g * (wn + sn) ..][0..wn];
+        const sb = body[(wn + sn) * 2 + g * (wn + sn) + wn ..][0..sn];
+        for (0..o_lora) |i| for (0..k) |j| {
+            const v = std.mem.readInt(u16, ups.items[4 + g][(i * k + j) * 2 ..][0..2], .little);
+            try std.testing.expectEqual(woABf16(wb[i * k + j], sb[(i / 32) * (k / 32) + j / 32]), v);
+        };
+    }
+    // mtp.0: each group's bf16 rows (7, 8), then the FP8 rows (9, 10); TF_DS_WOA_W8 leaves a drafter's block alone
+    try std.testing.expect(lays[2].wo_a_rows);
+    for (lays[2].wo_a[0..2], 0..) |l, g| try std.testing.expectEqual(@as(u64, 7 + g), l.words);
+    try std.testing.expectEqual(Linear{ .words = 9, .w = 9, .s = 10, .k = fp8.k, .n = fp8.n, .fmt = .fp8 }, lays[2].wo_a8.?);
+    try std.testing.expectEqual(@as(usize, 10), ups.items.len);
+    // the load line's counts: one layer without its rows (its bf16 bytes not loaded), one that kept them and why
+    try std.testing.expectEqual(@as(usize, 1), L.w8_layers);
+    try std.testing.expectEqual(@as(usize, 1), L.w8_kept);
+    try std.testing.expectEqualStrings("an E4M3 NaN code (0x7f / 0xff) in its FP8 rows", L.w8_why orelse "none");
+    try std.testing.expectEqual(@as(u64, 2 * o_lora * k * 2), L.w8_saved);
+    // entries: layers.0's four once; layers.1's four twice (the FP8 rows, then the bf16 rows of them); mtp.0's twice
+    try std.testing.expectEqual(@as(u64, 4 + 8 + 8), L.entries);
 }
 
 test "e4m3 values" {

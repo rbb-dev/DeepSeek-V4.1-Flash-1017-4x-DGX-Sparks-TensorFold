@@ -195,11 +195,16 @@ pub const Settings = extern struct {
     neighbor_rdma: u32 = 0, // TF_DS_NEIGHBOR_RDMA: the same exchange path on every rank
     reserved: u32 = 0,
     pool: u64, // rank 0's --context (a follower's --pool): a follower's holds rank 0's
+    exch: u32 = 0, // the exchange switches asked for, bit i exch_names[i] (exchAsked): the same
+    kern: u32 = 0, // the kernel switches asked for, bit i kern_names[i] (kernAsked): the same
     pf_split: u32 = 0, // TF_DS_PF_SPLIT asked for (mx.PfSplit): the same
     pass_rows: u32 = 2048, // TF_DS_PASS_ROWS (pass_rows_asked: a pass's rows at most, the chunk's allocation): the same
+    pf_raster: u32 = 0, // TF_DS_PF_RASTER's group of row tiles (pf_raster_asked; 0: off): the same (this word was the layout's padding, always 0)
 
     pub const tag: u32 = 0x31345344; // "DS41"
     // the fields or of the follower's answer bumps the last letter, so a follower refuses a rank 0 of another layout.
+    // A new exchange or kernel switch takes the next bit of exch or kern and keeps the letter: differ refuses every bit
+    // that differs, one this build has no name for included
 
     /// What follower `rank` (its Settings `mine`) would have to change to follow rank 0's `lead`, in words ("": none).
     pub fn differ(mine: Settings, lead: Settings, rank: u32, buf: []u8) []const u8 {
@@ -229,10 +234,24 @@ pub const Settings = extern struct {
             w.print("{s}rank {d} has TF_DS_NEIGHBOR_RDMA={d} and rank 0 {d}: set the same on every rank", .{ sepIf(&w, sep), rank, mine.neighbor_rdma, lead.neighbor_rdma }) catch {};
         if (mine.pass_rows != lead.pass_rows)
             w.print("{s}rank {d} has TF_DS_PASS_ROWS={d} and rank 0 {d}: set the same on every rank", .{ sepIf(&w, sep), rank, mine.pass_rows, lead.pass_rows }) catch {};
+        if (mine.exch != lead.exch) bitsDiffer(&w, sep, &exch_names, "exchange", mine.exch, lead.exch, rank);
+        if (mine.kern != lead.kern) bitsDiffer(&w, sep, &kern_names, "kernel", mine.kern, lead.kern, rank);
+        if (mine.pf_raster != lead.pf_raster)
+            w.print("{s}rank {d} has TF_DS_PF_RASTER={d} and rank 0 {d} (0: unset): set the same on every rank", .{ sepIf(&w, sep), rank, mine.pf_raster, lead.pf_raster }) catch {};
+        if (mine.pf_split != lead.pf_split) {
+            if (mx.PfSplit.name(mine.pf_split)) |m| if (mx.PfSplit.name(lead.pf_split)) |l|
+                w.print("{s}rank {d} has TF_DS_PF_SPLIT={s} and rank 0 {s}: set the same on every rank", .{ sepIf(&w, sep), rank, m, l }) catch {};
+            if (mx.PfSplit.name(mine.pf_split) == null or mx.PfSplit.name(lead.pf_split) == null)
+                w.print("{s}rank {d} and rank 0 differ in TF_DS_PF_SPLIT ({d} and {d}), a value this build has no name for: run every rank from the same image", .{ sepIf(&w, sep), rank, mine.pf_split, lead.pf_split }) catch {};
+        }
         return w.buffered();
     }
 
+    /// differ's words for a word of switches (`names[i]` bit i): each named one whose bit differs, then any other
+    /// differing bit.
+    fn bitsDiffer(w: *std.Io.Writer, sep: []const u8, names: []const []const u8, kind: []const u8, mine: u32, lead: u32, rank: u32) void {
         var named: u32 = 0; // (an empty name: a reserved bit, no switch of this build)
+        for (names, 0..) |name, i| {
             const bit = @as(u32, 1) << @intCast(i);
             if (name.len == 0) continue;
             named |= bit;
@@ -240,6 +259,7 @@ pub const Settings = extern struct {
             w.print("{s}rank {d} has {s}={d} and rank 0 {d}: set the same on every rank", .{ sepIf(w, sep), rank, name, @intFromBool(mine & bit != 0), @intFromBool(lead & bit != 0) }) catch {};
         }
         const other = (mine ^ lead) & ~named;
+        if (other != 0) w.print("{s}rank {d} and rank 0 differ in {s} switches this build has no name for (bits 0x{x}): run every rank from the same image", .{ sepIf(w, sep), rank, kind, other }) catch {};
     }
 
     fn sepIf(w: *const std.Io.Writer, sep: []const u8) []const u8 {
@@ -318,11 +338,23 @@ pub fn exchAsked() u32 {
     return x;
 }
 
+/// The kernel switches the start-up settings carry (Settings.kern): bit i is kern_names[i], set when asked for (the
 /// text "1", switchAsked; TF_DS_QGATE_CANARY's "1", "2" or "3", qgateAsked); an empty name is a reserved bit (kern_reserved). Each is read once by Model.open, before the
 /// settings.
+pub const kern_woa_w8: u32 = 1 << 0;
+pub const kern_quant_once: u32 = 1 << 1;
+pub const kern_pf_gemm5: u32 = 1 << 2;
+pub const kern_group_tiles: u32 = 1 << 3;
+pub const kern_topk_tiles: u32 = 1 << 4;
+pub const kern_idx_proj_owned: u32 = 1 << 5;
+pub const kern_bf16_rows: u32 = 1 << 6;
+pub const kern_pf_run128: u32 = 1 << 7;
+pub const kern_assemble_quant: u32 = 1 << 15;
 pub const kern_mma_sf: u32 = 1 << 18;
 pub const kern_mma_sf_exact: u32 = 1 << 22;
 pub const kern_pass_tail: u32 = 1 << 23;
+pub const kern_gemm_w16: u32 = 1 << 28;
+pub const kern_gemm_r2: u32 = 1 << 29;
 
 /// The kernel word's reserved bits: an empty name in kern_names, a bit kept for a switch this build does not carry,
 /// never asked for here.
@@ -334,12 +366,48 @@ pub const kern_reserved: u32 = blk: {
     break :blk x;
 };
 
+/// TF_DS_WOA_W8 as Model.open read it (switchAsked), once (Settings.kern, weights.woa_w8).
+pub var woa_w8_asked: bool = false;
+
+/// TF_DS_QUANT_ONCE as Model.open read it (switchAsked), once (Settings.kern, prompt.quant_once).
+pub var quant_once_asked: bool = false;
+
+/// TF_DS_PF_GEMM5 as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useGemm5).
+pub var pf_gemm5_asked: bool = false;
+
+/// TF_DS_GROUP_TILES as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useGroupTiles).
+pub var group_tiles_asked: bool = false;
+
+/// TF_DS_TOPK_TILES as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useTopkTiles).
+pub var topk_tiles_asked: bool = false;
+
+/// TF_DS_IDX_PROJ_OWNED as Model.open read it (switchAsked), once (Settings.kern, Two.agreeIdxProjOwned).
+pub var idx_proj_owned_asked: bool = false;
+
+/// TF_DS_BF16_ROWS as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.bf16_rows).
+pub var bf16_rows_asked: bool = false;
+
+/// TF_DS_PF_RUN128 as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useRun128).
+pub var pf_run128_asked: bool = false;
+
+/// TF_DS_ASSEMBLE_QUANT as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.assemble_quant).
+pub var assemble_quant_asked: bool = false;
+
 /// TF_DS_MMA_SF as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useMmaSf).
 pub var mma_sf_asked: bool = false;
 
 /// TF_DS_MMA_SF_EXACT as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useMmaSf).
 pub var mma_sf_exact_asked: bool = false;
 
+/// TF_DS_GEMM_W16 as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useGemmW16).
+pub var gemm_w16_asked: bool = false;
+
+/// TF_DS_PF_T64 as Model.open read it (switchAsked), once (mx.Kernels.usePfT64; not in Settings: the 64 x 64 tile's bytes are the 128 x 128
+/// tile's, so ranks may differ): the router's bf16 GEMM of a prompt chunk on a 64 x 64 tile.
+pub var pf_t64_asked: bool = false;
+
+/// TF_DS_GEMM_R2 as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useGemmR2).
+pub var gemm_r2_asked: bool = false;
 
 /// TF_DS_RING_WC as Model.open read it (switchAsked), once (Settings.exch, rdma.Settings.wc): the RDMA rings' send and
 /// landing slots from cudaHostAlloc(Mapped | WriteCombined).
@@ -370,6 +438,21 @@ pub var ring_wait_asked: bool = false;
 /// that cannot wait in the card refuses by name.
 pub var ring_wait_explicit: bool = false;
 
+/// TF_DS_PF_RASTER as Model.open read it (rasterSetting; 0: unset), once (Settings.pf_raster, mx.pf_raster): the group of
+/// row tiles the prompt tile GEMMs walk their grid in where a launch's activation slab reaches mx.raster_slab_bytes.
+pub var pf_raster_asked: u32 = 0;
+
+/// TF_DS_PF_RASTER's setting: unset is off (0), "2", "4", "8" or "16" the group of row tiles; any other text is no
+/// setting (null).
+pub fn rasterSetting(text: ?[]const u8) ?u32 {
+    const t = text orelse return 0;
+    for ([_]u32{ 2, 4, 8, 16 }) |g| {
+        var buf: [4]u8 = undefined;
+        if (std.mem.eql(u8, t, std.fmt.bufPrint(&buf, "{d}", .{g}) catch unreachable)) return g;
+    }
+    return null;
+}
+
 /// TF_DS_QGATE_CANARY's canaries, a quality gate's known perturbations, never a serving setting: the head's rows one
 /// more FP8 step (1: the ruler), or layer 0's MoE partials before their gather one more FP8 step (2) or one fp32 ulp
 /// away from zero (3: a reduction order's size), the body's floors.
@@ -390,10 +473,31 @@ pub fn qgateAsked(text: ?[]const u8) Qgate {
 /// TF_DS_QGATE_CANARY as Model.open read it (qgateAsked), once (Settings.kern: any canary; every rank's the same
 /// canary, Model.open's agreement; prompt.qgate_canary, prompt.qgate_body).
 pub var qgate_canary_asked: Qgate = .off;
+/// Settings.kern of the switches Model.open read.
+pub fn kernAsked() u32 {
+    var x: u32 = 0;
+    if (woa_w8_asked) x |= kern_woa_w8;
+    if (quant_once_asked) x |= kern_quant_once;
+    if (pf_gemm5_asked) x |= kern_pf_gemm5;
+    if (group_tiles_asked) x |= kern_group_tiles;
+    if (topk_tiles_asked) x |= kern_topk_tiles;
+    if (idx_proj_owned_asked) x |= kern_idx_proj_owned;
+    if (bf16_rows_asked) x |= kern_bf16_rows;
+    if (pf_run128_asked) x |= kern_pf_run128;
+    if (assemble_quant_asked) x |= kern_assemble_quant;
     if (mma_sf_asked) x |= kern_mma_sf;
     if (mma_sf_exact_asked) x |= kern_mma_sf_exact;
     if (pass_tail_asked) x |= kern_pass_tail;
+    if (gemm_w16_asked) x |= kern_gemm_w16;
+    if (gemm_r2_asked) x |= kern_gemm_r2;
     if (qgate_canary_asked != .off) x |= kern_qgate_canary;
+    return x;
+}
+
+/// TF_DS_PF_SPLIT as Model.open read it (mx.PfSplit.parse; text that is no setting: off), once (Settings.pf_split,
+/// mx.Kernels.useSplit).
+pub var pf_split_asked: mx.PfSplit = .off;
+
 /// TF_DS_PASS_ROWS as Model.open read it (passRowsSetting), once (Settings.pass_rows, Model.pass_rows): every rank's
 /// chunk is allocated for passes of this many rows.
 pub var pass_rows_asked: u32 = 2048;
@@ -612,6 +716,9 @@ pub const Two = struct {
     // the indexer's own scoring kernels, not the quarter-HC path's mix and gather.
     idx_shard: bool = false,
     rc: ?*roci_engine.Roci = null,
+    // TF_DS_IDX_PROJ_OWNED in effect (agreeIdxProjOwned): the indexer's projections of an idx_shard layer on the owned
+    // rows the scorer reads (prompt.projRows)
+    idx_proj_owned: bool = false,
 
     /// The widths from the split (both pairs'), and the buffers for chunks of up to `cap` rows (and rounds) from `a`.
     pub fn init(c: *const Config, w: *const weights.Weights, a: *prompt.Arena, s: plan.Split, cap: usize) !Two {
@@ -621,7 +728,7 @@ pub const Two = struct {
         const x0 = s0.expertParts(c.*);
         const x1 = s1.expertParts(c.*);
         var t: Two = undefined;
-        t.neighbor_gather = null;
+        t.idx_proj_owned = false; // agreeIdxProjOwned sets it on a model start; other callers project every row
         t.rc = null;
         t.r = s.rank;
         t.p = pp;
@@ -779,16 +886,18 @@ pub const Two = struct {
         if (t.idx_shard) std.log.info("TF_DS_IDX_SHARD=1: the indexer's scoring and top-k, for layers before the candidate source on a full chunk, run only each rank's owned quarter, all-gathering the picks", .{});
     }
 
-    /// Comm2D.gather (TP2 inside a pair: the DSpark drafter's sublayer partials): `src` [n, width] -> `dst` [2, n, width],
-    /// this pair's two ranks in TP2 rank order: over the row pair's ring, else the four-rank all-gather's pair half
-    /// (Comm2D.gather4(x)[2p:2p + 2]).
-    pub fn pairGather(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, width: usize, esize: usize) !void {
-        if (t.rings) |rs| if (try ringed(rs.pairGather(e.s, src, dst, n, width, esize))) return;
-        if (t.neighbor_gather) |ng| {
-            const bytes = try std.math.mul(usize, n, try std.math.mul(usize, width, esize));
-            if (neighbor.eligible(bytes)) {
-                try ng.pair(e.s, src, dst, bytes);
-                return;
+    /// TF_DS_IDX_PROJ_OWNED in effect: `asked` (the start-up Settings made it the same on every rank) and every rank's
+    /// start check (`why`: this rank's reason it cannot, null when it can; prompt.idxProjOwnedOff), one world all-gather
+    /// when asked: off on every rank when any rank cannot. One line says which.
+    pub fn agreeIdxProjOwned(t: *Two, d: *const cuda.Driver, comm: *const Comm, stream: cuda.Stream, asked: bool, why: ?[]const u8) !void {
+        t.idx_proj_owned = false;
+        if (!asked) return;
+        const cannot = try ranksThatCannot(d, comm, stream, why == null);
+        t.idx_proj_owned = agreedOn(asked, cannot);
+        var buf: [64]u8 = undefined;
+        if (t.idx_proj_owned) std.log.info("TF_DS_IDX_PROJ_OWNED=1: the indexer's queries and head weights of an idx_shard layer on the owned rows its scorer reads, on every rank", .{}) else std.log.info("TF_DS_IDX_PROJ_OWNED=1: off on every rank: {s} cannot run it (this rank: {s})", .{ rankList(cannot, &buf), why orelse "can" });
+    }
+
     /// TF_DS_ROCI in effect: `asked` (the start-up Settings made it the same on every rank) and rociOff's conditions on every
     /// rank (`why`: this rank's reason it cannot, null when it can), one world all-gather. A rank that cannot ends the start
     /// on every rank, naming which: Rocinante has no other transport to fall back to.
@@ -965,6 +1074,15 @@ pub const Two = struct {
         const k = e.mx.?;
         if (x_codes) try mx.gateUpCodes(k, e.s, e.d, ex, ch.mxe, pick, wts, rows, e.c.swiglu_limit, xd, ex.width) else try mx.gateUp(k, e.s, e.d, ex, ch.mxe, x, ldx, pick, wts, rows, e.c.swiglu_limit, xd, ex.width, split_k);
         if (!split_k) if (prompt.ptimer) |pt| pt.mark(e.s, .m_gu) catch {};
+        // TF_DS_ASSEMBLE_QUANT: the parity assembly and down's quant in one launch, down on the codes
+        if (t.ir != 0 and k.assemble_quant) {
+            try t.assembleParityCodes(e, k, ex, xd, pick, rows * ch.mxe.slots, ch.mxe);
+            if (!split_k) if (prompt.ptimer) |pt| pt.mark(e.s, .m_x) catch {};
+            if (cf) |f| {
+                if (split_k) return error.CombineFirstOnDecode;
+                return mx.downCodesFirst(k, e.s, ex, ch.mxe, pick, rows, out, t.dw[t.p], false, f);
+            }
+            return mx.downCodes(k, e.s, ex, ch.mxe, pick, rows, out, t.dw[t.p], false);
         }
         if (t.ir != 0) try t.assembleParity(e, ex, xd, pick, rows * ch.mxe.slots) else try t.catRank(e, xd, t.xd_full, rows * ch.mxe.slots, t.gu, 2);
         if (!split_k) if (prompt.ptimer) |pt| pt.mark(e.s, .m_x) catch {};
@@ -1918,6 +2036,7 @@ test "the exchange switches that remain: a named bit each in Settings.exch, aske
     odd.exch = 1 << 0; // the old TF_DS_OWNER_YX bit
     try std.testing.expect(std.mem.indexOf(u8, odd.differ(lead, 1, &buf), "switches this build has no name for") != null);
     try std.testing.expectEqualStrings("rank 1 decodes frame protocol 9 and rank 0 sends 11: run every rank from the same image", odd.differ(lead, 1, &buf));
+}
 
 test "a default-on switch (TF_DS_ROCI_WAIT, TF_DS_RING_WAIT): unset and 1 are on; 0, empty and any other text are off" {
     try std.testing.expect(switchDefaultOn(null));

@@ -382,19 +382,125 @@ fn readPassFrom() u32 {
     pub fn contextFailed(m: *Model) bool {
         _ = m.stream.done() catch return true;
         return false;
+/// TF_DS_PF_SPLIT's setting (mx.PfSplit.parse); text that is no setting runs off, said once.
+/// TF_DS_PF_RASTER's setting (prompt2d.rasterSetting): the group of row tiles, 0 unset. Text that is no setting refuses the
+/// start, and says so.
+fn readPfRaster() !u32 {
+    const v: ?[]const u8 = if (std.c.getenv("TF_DS_PF_RASTER")) |x| std.mem.span(x) else null;
+    return prompt2d.rasterSetting(v) orelse {
+        std.log.err("TF_DS_PF_RASTER={s}: not a setting (2, 4, 8 or 16 row tiles, or unset)", .{v.?});
+        return error.BadPfRaster;
+    };
+}
+
+fn readPfSplit() mx.PfSplit {
+    const v: ?[]const u8 = if (std.c.getenv("TF_DS_PF_SPLIT")) |x| std.mem.span(x) else null;
+    return mx.PfSplit.parse(v) orelse {
+        std.log.info("TF_DS_PF_SPLIT={s}: not a setting (0, 1, A, B, C6 or C7): off", .{v.?});
+        return .off;
+    };
+}
+
+/// TF_DS_PF_SPLIT `asked` in effect on this rank's kernels (none: not the checkpoint's own weights), one line when
+/// asked: its configuration, or off and why. Its bits are the fold kernel's either way.
+fn usePfSplit(k: ?*mx.Kernels, asked: mx.PfSplit) void {
+    if (asked == .off) return;
+    const name = mx.PfSplit.name(@backingInt(asked)).?;
+    if (mx.splitOff(k != null, if (k) |x| x.pf_off else false)) |why| return std.log.info("TF_DS_PF_SPLIT={s}: off: {s}", .{ name, why });
+    k.?.useSplit(asked) catch |e| return std.log.info("TF_DS_PF_SPLIT={s}: off: its kernels: {s}", .{ name, @errorName(e) });
+    std.log.info("TF_DS_PF_SPLIT={s}: a prompt chunk's split FP8 GEMMs (wq_a, wkv, wq_b, wo_b, the indexer's wq_b) on {s}", .{ name, if (asked == .table) "the per-shape table's configurations" else "that configuration where it divides the shape's split" });
+}
+
+/// TF_DS_PF_GEMM5 `asked` in effect on this rank's kernels, one line when asked: on, or off and why (as TF_DS_PF_SPLIT:
+/// the checkpoint's own weights and the tile kernels). Its bits are tf_dsn_pf_gemm's either way.
+fn usePfGemm5(k: ?*mx.Kernels, asked: bool) void {
+    if (!asked) return;
+    if (mx.splitOff(k != null, if (k) |x| x.pf_off else false)) |why| return std.log.info("TF_DS_PF_GEMM5=1: off: {s}", .{why});
+    k.?.useGemm5() catch |e| return std.log.info("TF_DS_PF_GEMM5=1: off: its kernel: {s}", .{@errorName(e)});
+    std.log.info("TF_DS_PF_GEMM5=1: a prompt chunk's dense FP8 GEMMs without a K split (Engram's wkv) at 5 stages", .{});
+}
+
+/// TF_DS_GROUP_TILES `asked` in effect on this rank's kernels, one line when asked: on, or off and why (the
+/// checkpoint's own weights and the tile kernels, whose list it builds). The grouping's outputs are the baseline either way.
+fn useGroupTiles(k: ?*mx.Kernels, asked: bool) void {
+    if (!asked) return;
+    if (mx.splitOff(k != null, if (k) |x| x.pf_off else false)) |why| return std.log.info("TF_DS_GROUP_TILES=1: off: {s}", .{why});
+    k.?.useGroupTiles() catch |e| return std.log.info("TF_DS_GROUP_TILES=1: off: its kernel: {s}", .{@errorName(e)});
+    std.log.info("TF_DS_GROUP_TILES=1: a prompt chunk's grouping builds the experts' tile list once (gate / up and down read it)", .{});
+}
+
+/// TF_DS_TOPK_TILES `asked` in effect on this rank's kernels, one line when asked: on, or off and why (the
+/// checkpoint's own weights; the indexer's k, config index_topk, at most the kernel's). Its picks are the chain's.
+fn useTopkTiles(k: ?*mx.Kernels, asked: bool, index_topk: usize) void {
+    if (!asked) return;
+    const why: ?[]const u8 = if (k == null) "needs the checkpoint's own FP8 / MXFP4 weights" else if (index_topk > mx.topk_tiles_max) "the indexer's k (index_topk) is past the kernel's 512" else null;
+    if (why) |w| return std.log.info("TF_DS_TOPK_TILES=1: off: {s}", .{w});
+    k.?.useTopkTiles() catch |e| return std.log.info("TF_DS_TOPK_TILES=1: off: its kernel: {s}", .{@errorName(e)});
+    std.log.info("TF_DS_TOPK_TILES=1: a prompt chunk's pruned indexer top-k (past 4,096 keys a row) in one launch a row block", .{});
+}
+
+/// TF_DS_GEMM_W16 `asked` in effect: on every rank or none (each rank's check: the checkpoint's own weights and the
+/// 16-warp kernels loaded beside the baseline, mx.Kernels.useGemmW16; one world all-gather when asked), one line when
+/// asked. A prompt chunk's exact GEMMs and wo_a's bf16 rows then launch 16 warps a block (512 threads): the 8-warp
+/// kernels' tiles, stages and shared memory, the same arithmetic in the same order, so the replies' bits without it.
+fn useGemmW16(d: *const cuda.Driver, comm: *const comm_mod.Comm, stream: cuda.Stream, k: ?*mx.Kernels, asked: bool) !void {
+    if (!asked) return;
+    var why: ?[]const u8 = if (k == null) "needs the checkpoint's own FP8 / MXFP4 weights" else null;
+    if (why == null) if (k) |x| {
+        if (!x.useGemmW16(true)) why = "its 16-warp kernels are not in this image or did not load on this GPU";
+    };
+    const cannot = try prompt2d.ranksThatCannot(d, comm, stream, why == null);
+    if (!prompt2d.agreedOn(asked, cannot)) {
+        if (k) |x| x.gemm_w16 = false;
     }
+    var buf: [512]u8 = undefined;
+    std.log.info("{s}", .{gemmW16Line(&buf, cannot, why, if (k) |x| x.sf == .exact else false)});
+}
 
     pub fn drafting(m: *const Model) bool {
         return m.dr != null;
+/// TF_DS_PF_T64 `asked` in effect (mx.Kernels.usePfT64): one line when asked, on, or off and why. The router's bf16 GEMM of a prompt chunk
+/// (384 columns) then runs on a 64 x 64 tile, two CTAs an SM; each output element's K chain is the 128 x 128 tile's, so the replies' bits
+/// without it. A rank's own launches: ranks may differ.
+fn usePfT64(k: ?*mx.Kernels, asked: bool) void {
+    if (!asked) return;
+    const x = k orelse return std.log.info("TF_DS_PF_T64=1: off: needs the checkpoint's own FP8 / MXFP4 weights", .{});
+    if (!x.usePfT64(true)) return std.log.info("TF_DS_PF_T64=1: off: the 64 x 64 bf16 tile is not in this image or did not load on this GPU", .{});
+    std.log.info("TF_DS_PF_T64=1: the router's bf16 GEMM of a prompt chunk (N 384) on a 64 x 64 tile (128 threads, two CTAs an SM), the 128 x 128 tile's bytes", .{});
+}
+
+/// TF_DS_GEMM_W16's start line: on every rank with what it covers, or off on every rank, the ranks that cannot and
+/// this rank's reason (`why`, null: it can).
+fn gemmW16Line(buf: []u8, cannot: u32, why: ?[]const u8, sf_exact: bool) []const u8 {
+    if (cannot != 0) {
+        var rb: [64]u8 = undefined;
+        return std.fmt.bufPrint(buf, "TF_DS_GEMM_W16=1: off on every rank: {s} cannot run it (this rank: {s})", .{ prompt2d.rankList(cannot, &rb), why orelse "can" }) catch buf[0..0];
     }
+    return std.fmt.bufPrint(buf, "TF_DS_GEMM_W16=1: a prompt chunk's {s} on 16 warps a block (512 threads), the 8-warp kernels' tiles, stages and shared memory, on every rank", .{if (sf_exact) "exact GEMMs and wo_a's bf16 rows" else "wo_a's bf16 rows alone (the exact GEMMs need TF_DS_MMA_SF_EXACT)"}) catch buf[0..0];
+}
 
     // -- the primitives (both ranks, in the same order) ----------------------------------------------------------
 
-    /// A stream's prompt is about to fill pool slot `slot`, its compressed rows in its extent from position `base`.
-    /// Wait for the next chunk's Engram read-ahead, if one runs (before the prompt it reads changes or goes).
-    pub fn joinAhead(m: *Model) void {
-        if (m.ahead) |th| th.join();
-        m.ahead = null;
+/// TF_DS_PF_RUN128 `asked` in effect on this rank's kernels, one line when asked: on, or off and why (the checkpoint's
+/// own weights and the tile kernels). Its bits are the baseline tiles' either way.
+fn useRun128(k: ?*mx.Kernels, asked: bool) void {
+    if (!asked) return;
+    if (mx.splitOff(k != null, if (k) |x| x.pf_off else false)) |why| return std.log.info("TF_DS_PF_RUN128=1: off: {s}", .{why});
+    k.?.useRun128() catch |e| return std.log.info("TF_DS_PF_RUN128=1: off: its kernels: {s}", .{@errorName(e)});
+    std.log.info("TF_DS_PF_RUN128=1: a prompt chunk's MXFP4 expert tiles (gate / up and down) stage each weight row 128 bytes at a time", .{});
+}
+
+/// TF_DS_GEMM_R2 `asked` in effect on this rank's kernels, one line when asked: on, or off and why (the checkpoint's
+/// own weights, TF_DS_MMA_SF_EXACT's exact arithmetic in effect, the R2 kernels this image carries). Its outputs are
+/// the baseline either way.
+fn useGemmR2(k: ?*mx.Kernels, asked: bool) void {
+    if (!asked) return;
+    if (k == null) return std.log.info("TF_DS_GEMM_R2=1: off: needs the checkpoint's own FP8 / MXFP4 weights", .{});
+    if (k.?.sf != .exact) return std.log.info("TF_DS_GEMM_R2=1: off: needs TF_DS_MMA_SF_EXACT=1 in effect (its exact kernels)", .{});
+    if (!k.?.useGemmR2(true)) return std.log.info("TF_DS_GEMM_R2=1: off: this image has none of its kernels (native_sf.cu's _r2 kernels)", .{});
+    std.log.info("TF_DS_GEMM_R2=1: the exact expert GEMMs' padding rows' copies left out, down on 128-row tiles", .{});
+}
+
 /// TF_DS_MMA_SF `asked` in effect: on every rank or none (each rank's check: the checkpoint's own weights, the prompt
 /// tile kernels, the block-scaled kernels loaded on this GPU, mx.Kernels.useMmaSf; one world all-gather when asked), one
 /// line when asked (mmaSfLine, `covers` the GEMMs it takes). Not the baseline bits: a prompt chunk's FP8 GEMMs accumulate
@@ -735,6 +841,9 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         .pool = o.pool,
         .replay_floor = @intFromBool(prompt.replay_floor),
         .exch = prompt2d.exchAsked(),
+        .kern = prompt2d.kernAsked(),
+        .pf_split = @backingInt(prompt2d.pf_split_asked),
+        .pf_raster = prompt2d.pf_raster_asked,
         .pass_rows = prompt2d.pass_rows_asked,
         .pass_from = prompt2d.pass_from_asked,
     };
@@ -1004,6 +1113,16 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             }
             prompt2d.roci_stagger3_asked = prompt2d.roci_stagger_lanes == 3; // every rank alike (Settings)
         }
+        prompt2d.pf_split_asked = readPfSplit(); // every rank alike (Settings)
+        prompt2d.pf_raster_asked = try readPfRaster(); // every rank alike (Settings)
+        prompt2d.woa_w8_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_WOA_W8")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.quant_once_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_QUANT_ONCE")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.pf_gemm5_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_PF_GEMM5")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.group_tiles_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_GROUP_TILES")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.topk_tiles_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_TOPK_TILES")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.idx_proj_owned_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_IDX_PROJ_OWNED")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.bf16_rows_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_BF16_ROWS")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.pf_run128_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_PF_RUN128")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.pass_from_asked = readPassFrom(); // rank 0's (Settings.pass_from: never compared)
         prompt2d.pass_beside_asked = try readPassBeside(prompt2d.pass_rows_asked); // rank 0's host decides it (never compared)
         rocinante_mod.setCap(prompt2d.pass_rows_asked); // (the transport's arenas and plans follow the pass rows, before any layout is read)
@@ -1013,6 +1132,10 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         try prompt2d.readPromptOrderEnv(); // rank 0's TF_DS_PROMPT_ORDER and TF_DS_PROMPT_QOS (the host's prompt-step order; its start line prints here)
         prompt2d.mma_sf_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_MMA_SF")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.mma_sf_exact_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_MMA_SF_EXACT")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.gemm_w16_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_GEMM_W16")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.pf_t64_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_PF_T64")) |v| std.mem.span(v) else null); // this rank's launches alone: its bytes are the 128 x 128 tile's
+        prompt2d.gemm_r2_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_GEMM_R2")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.assemble_quant_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ASSEMBLE_QUANT")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.ring_wc_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_RING_WC")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.ring_inplace_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_RING_INPLACE")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         const ring_word_text: ?[]const u8 = if (std.c.getenv("TF_DS_RING_WORD")) |v| std.mem.span(v) else null;
@@ -1174,6 +1297,12 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             if (std.c.getenv("TF_DS_DRAFT_DUMP_PASS")) |dp| draft.ddump_pass = std.fmt.parseInt(usize, std.mem.span(dp), 10) catch 2;
         }
         sp.parity = sp.pair != null and parityGU(); // TF_DS_2D_GU=parity: the balanced experts split
+        // TF_DS_WOA_W8: the main layers' wo_a from its FP8 rows alone where the prompt path's kernel takes them; the
+        // bits are the bf16 rows' either way, so each rank decides on its own
+        weights.woa_w8 = false;
+        if (prompt2d.woa_w8_asked) {
+            if (mx.woaW8Off(c.format == .native, mx.pfOffEnv(), mx.decOnEnv())) |why| std.log.info("TF_DS_WOA_W8=1: off: {s}", .{why}) else weights.woa_w8 = true;
+        }
         // the ranks' links (rank 0 takes its followers in order; a follower retries its connect for TF_DS_CONNECT_S)
 
         try m.fan.join(io, o.master, o.port, o.rank, o.world, prompt2d.connectSeconds());
@@ -1186,9 +1315,42 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         m.mxk = if (c.format == .native) try mx.Kernels.load(d, cuda.kernels.dsv41_native) else null;
         if (std.c.getenv("TF_DS_NACT_LOG")) |v| if (std.mem.eql(u8, std.mem.span(v), "1")) nactOpen(d);
         errdefer if (m.mxk) |*x| x.unload();
+        usePfSplit(if (m.mxk) |*x| x else null, prompt2d.pf_split_asked);
+        usePfGemm5(if (m.mxk) |*x| x else null, prompt2d.pf_gemm5_asked);
+        useGroupTiles(if (m.mxk) |*x| x else null, prompt2d.group_tiles_asked);
+        useTopkTiles(if (m.mxk) |*x| x else null, prompt2d.topk_tiles_asked, c.index_topk);
+        useRun128(if (m.mxk) |*x| x else null, prompt2d.pf_run128_asked);
+        mx.pf_raster = if (m.mxk != null) prompt2d.pf_raster_asked else 0;
+        if (prompt2d.pf_raster_asked != 0) {
+            if (mx.pf_raster != 0) std.log.info("TF_DS_PF_RASTER={d}: a prompt GEMM whose activation slab is {d} MiB or more (the tile FP8 GEMMs, the block-scaled MMA's and the bf16 tile GEMM) walks its tiles {d} row tiles at a time across all the column tiles; the output bytes are the default order's", .{ mx.pf_raster, mx.raster_slab_bytes >> 20, mx.pf_raster }) else std.log.info("TF_DS_PF_RASTER={d}: off: needs the checkpoint's own FP8 / MXFP4 weights (the EXL3 GEMMs are cuBLAS's)", .{prompt2d.pf_raster_asked});
+        }
         var sf_buf: [256]u8 = undefined;
         try useMmaSf(d, &m.comm, m.stream, if (m.mxk) |*x| x else null, prompt2d.mma_sf_asked, sfCovers(m.w.layers, false, &sf_buf));
         try useMmaSfExact(gpa, d, &m.comm, m.stream, if (m.mxk) |*x| x else null, prompt2d.mma_sf_exact_asked, m.w.layers, sfCovers(m.w.layers, true, &sf_buf));
+        try useGemmW16(d, &m.comm, m.stream, if (m.mxk) |*x| x else null, prompt2d.gemm_w16_asked);
+        usePfT64(if (m.mxk) |*x| x else null, prompt2d.pf_t64_asked);
+        useGemmR2(if (m.mxk) |*x| x else null, prompt2d.gemm_r2_asked);
+        if (prompt2d.bf16_rows_asked) {
+            if (m.mxk) |*x| {
+                x.bf16_rows = true;
+                std.log.info("TF_DS_BF16_ROWS=1: a prompt chunk's plain bf16 GEMMs (the indexer's weights_proj) take a CTA a 16-row tile", .{});
+            } else std.log.info("TF_DS_BF16_ROWS=1: off: needs the checkpoint's own FP8 / MXFP4 weights", .{});
+        }
+        prompt.quant_once = prompt2d.quant_once_asked and m.mxk != null;
+        if (prompt2d.quant_once_asked) {
+            if (prompt.quant_once) std.log.info("TF_DS_QUANT_ONCE=1: attention's front quantizes x once for wq_a and wkv (where TF_DS_FRONT_OWNED does not run it on owned rows)", .{}) else std.log.info("TF_DS_QUANT_ONCE=1: off: needs the checkpoint's own FP8 / MXFP4 weights", .{});
+        }
+        // a layer loaded without wo_a's bf16 rows runs wo_a on its FP8 rows: that kernel, or no start
+        for (m.w.layers) |lay| if (!lay.wo_a_rows) {
+            (m.mxk orelse return error.NoW8Kernel).useW8() catch |e| {
+                std.log.err("TF_DS_WOA_W8=1: the layers loaded without wo_a's bf16 rows have no kernel ({s}): start without it", .{@errorName(e)});
+                return e;
+            };
+            break;
+        };
+
+        // the RoPE tables (the served build's bits: torch CPU pow and polar), every position a stream reaches
+        const half = c.rope_dim / 2;
         // round over the host links)
         errdefer if (m.rdma_rings) |*x| x.close(gpa);
         // the first lane's proxy threads (Roci.openLane, below) run from its start: a later failure stops them before the arena and the
@@ -1235,7 +1397,17 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             // each rank's start check (its settings, then every launch of every layer at every slab of a decoder window in its kernel sets)
             try Two.require(d, &m.comm, m.stream, "the decoder half over Rocinante", prompt2d.rociDecOff(prompt.quant_once, c.dspark_taps.slice().len, c.hidden) orelse try any_check.decoderOff(gpa, a, KitFinds{ .set = &m.set, .extra = if (m.extra) |*x| x else null }, c.*, m.w.layers));
             std.log.info("Rocinante carries the decoder half (layers {d} to {d}) on owned rows of the decoder rows, its sums and gathers, the DSpark taps and the head's row, on every rank", .{ c.layers / 2, c.layers - 1 });
+            // TF_DS_IDX_PROJ_OWNED: each rank's start check (its kernel set included), then on every rank or none
             const proj_why: ?[]const u8 = if (prompt2d.idx_proj_owned_asked) try prompt.idxProjOwnedOff(gpa, SetFinds{ .set = &m.set }, m.mxk != null, m.two.?.idx_shard, m.w.layers, c.candidate_source, c.rope_dim, c.index_heads, c.index_head_dim, &rows4, m.comm.world) else null;
+            try m.two.?.agreeIdxProjOwned(d, &m.comm, m.stream, prompt2d.idx_proj_owned_asked, proj_why);
+            if (o.rdma_devices) |devs| {
+                const image: []const u8 = if (o.rdma_kernels) |path|
+                    try std.Io.Dir.cwd().readFileAllocOptions(io, path, a, .limited(1 << 26), .@"16", null)
+                else if (cuda.kernels.available) cuda.kernels.dsv41_rdma else return error.NoRdmaKernels;
+                m.rdma_mod = try cuda.Module.load(d, image);
+                var devices: std.ArrayList([]const u8) = .empty;
+                var dit = std.mem.splitScalar(u8, devs, ',');
+                while (dit.next()) |x| try devices.append(a, x);
                 const sw = ringSwitches(prompt2d.ring_wc_asked, prompt2d.ring_inplace_asked, rk.hasInplace());
                 if (prompt2d.ring_wc_asked) std.log.info("{s}", .{ringWcLine(sw.wc)});
                 if (prompt2d.ring_inplace_asked) {
@@ -1264,6 +1436,19 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
                 var lb: [256]u8 = undefined;
                 std.log.info("{s}", .{ringInplaceLine(&lb, .{ .wc = false, .inplace = false, .why = null })});
             }
+        }
+        if (sp.pair == null and prompt2d.idx_proj_owned_asked) std.log.info("TF_DS_IDX_PROJ_OWNED=1: off: the indexer's owned rows are the four-node 2D split's (TF_DS_IDX_SHARD)", .{});
+        // TF_DS_ASSEMBLE_QUANT: a parity chunk's intermediate assembly writes down's codes in the same launch
+        if (prompt2d.assemble_quant_asked) {
+            if (m.mxk) |*x| {
+                if (m.two != null and m.two.?.ir != 0) {
+                    x.useAssembleQuant() catch |e| {
+                        std.log.err("TF_DS_ASSEMBLE_QUANT=1: the assembly-and-quant kernel is missing ({s})", .{@errorName(e)});
+                        return e;
+                    };
+                    std.log.info("TF_DS_ASSEMBLE_QUANT=1: a 2D parity chunk's expert assembly writes down's codes in the same launch (the quant's read goes)", .{});
+                } else std.log.info("TF_DS_ASSEMBLE_QUANT=1: off: needs the four-node 2D split's parity experts (the rest block)", .{});
+            } else std.log.info("TF_DS_ASSEMBLE_QUANT=1: off: needs the checkpoint's own FP8 / MXFP4 weights", .{});
         }
         prompt.hc_stride = prompt2d.hc_stride_asked and m.two != null;
         logPdlControls(m.comm.rank);
@@ -2190,12 +2375,32 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             }
             if (n > 0) try dr.absorbMany(e, &m.ch, &m.dpool.?, items[0..n]);
         }
-        // no synchronize: the next chunk's host steps (its first Engram layer's hashing, table reads and decode, ~0.14 s
-        // at 2,048 rows) run while this chunk's kernels do; readers of the results (the prompt's logits) synchronize.
-        // The profile (--profile 2) times a chunk to its end, so it alone waits.
-        if (pt) |t| {
-            try m.synchronize();
-            try t.finish();
+    }
+
+    /// The rounds' GPU clocks (a profile): the forward's start and each stretch's ends, for its gaps.
+    pub fn useClock(m: *Model, marks: u8) !void {
+        m.rd.clk_marks = marks == 1 or marks == 3;
+        // TF_DS_CLOCK_RATIO: the compress ratio whose layers mode 3 times (2 unless set)
+        const r: u8 = if (std.c.getenv("TF_DS_CLOCK_RATIO")) |v| std.fmt.parseInt(u8, std.mem.span(v), 10) catch 2 else 2;
+        m.rd.clk_ratio = if (marks == 3) r else null;
+        m.rd.clk_layers = marks == 2 or marks == 3;
+        if (m.rd.clk == 0) m.rd.clk = try m.arena.take((1 + 2 * round.Round.max_clocks) * 8);
+    }
+
+    /// The rounds' GPU time by phase (eager rounds; --profile 2): a timer on the round.
+    pub fn usePhaseTimer(m: *Model) !void {
+        if (m.timer != null) return;
+        const t = try m.gpa.create(round.PhaseTimer);
+        errdefer m.gpa.destroy(t);
+        t.* = try round.PhaseTimer.init(m.gpa, m.ctx.d);
+        m.timer = t;
+        const pt = try m.gpa.create(round.PhaseTimer);
+        errdefer m.gpa.destroy(pt);
+        pt.* = try round.PhaseTimer.init(m.gpa, m.ctx.d);
+        m.ptimer = pt;
+        m.rd.timer = t;
+    }
+
     /// A primitive that carries exchanges failed on this rank alone: its peers wait for parts this rank will never send. Fails every
     /// Rocinante lane at once (the abort reaches the peers' queue pairs and releases their waits), so each rank says so within
     /// a second instead of at the watchdog's limit.
@@ -2253,6 +2458,56 @@ test "TF_DS_ROUNDS_BESIDE is read after TF_DS_PASS_BESIDE, refuses a bad value o
     try std.testing.expect(std.mem.indexOf(u8, @embedFile("native.zig"), ".rounds = prompt2d.rounds_beside_asked") != null);
 }
 
+test "the start-up settings carry TF_DS_PF_SPLIT and the kernel switches as Model.open read them: 0 by default (the baseline kernels)" {
+    const o: Options = .{ .model_dir = "", .cache_dir = "", .kit_dir = "", .rank = 3, .world = 4, .master = .{ 10, 255, 0, 33 }, .port = 29600, .pool = 1 << 24, .drafts = true, .graphs = true, .round_rows = 48, .streams = 16 };
+    const was = .{ prompt2d.pf_split_asked, prompt2d.woa_w8_asked };
+    defer {
+        prompt2d.pf_split_asked = was[0];
+        prompt2d.woa_w8_asked = was[1];
+    }
+    prompt2d.pf_split_asked = .off;
+    prompt2d.woa_w8_asked = false;
+    try std.testing.expectEqual(@as(u32, 0), startSettings(o).pf_split);
+    try std.testing.expectEqual(@as(u32, 0), startSettings(o).kern);
+    prompt2d.woa_w8_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_woa_w8, startSettings(o).kern);
+    prompt2d.woa_w8_asked = false;
+    const was_once = .{ prompt2d.quant_once_asked, prompt2d.pf_gemm5_asked };
+    defer {
+        prompt2d.quant_once_asked = was_once[0];
+        prompt2d.pf_gemm5_asked = was_once[1];
+    }
+    prompt2d.quant_once_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_quant_once, startSettings(o).kern);
+    prompt2d.quant_once_asked = false;
+    prompt2d.pf_gemm5_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_pf_gemm5, startSettings(o).kern);
+    prompt2d.pf_gemm5_asked = false;
+    const was_gt = prompt2d.group_tiles_asked;
+    defer prompt2d.group_tiles_asked = was_gt;
+    prompt2d.group_tiles_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_group_tiles, startSettings(o).kern);
+    prompt2d.group_tiles_asked = false;
+    const was_tk = prompt2d.topk_tiles_asked;
+    defer prompt2d.topk_tiles_asked = was_tk;
+    prompt2d.topk_tiles_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_topk_tiles, startSettings(o).kern);
+    prompt2d.topk_tiles_asked = false;
+    const was_po = prompt2d.idx_proj_owned_asked;
+    defer prompt2d.idx_proj_owned_asked = was_po;
+    prompt2d.idx_proj_owned_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_idx_proj_owned, startSettings(o).kern);
+    prompt2d.idx_proj_owned_asked = false;
+    const was_br = prompt2d.bf16_rows_asked;
+    defer prompt2d.bf16_rows_asked = was_br;
+    prompt2d.bf16_rows_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_bf16_rows, startSettings(o).kern);
+    prompt2d.bf16_rows_asked = false;
+    const was_r128 = prompt2d.pf_run128_asked;
+    defer prompt2d.pf_run128_asked = was_r128;
+    prompt2d.pf_run128_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_pf_run128, startSettings(o).kern);
+    prompt2d.pf_run128_asked = false;
     const was_sf = prompt2d.mma_sf_asked;
     defer prompt2d.mma_sf_asked = was_sf;
     prompt2d.mma_sf_asked = true;
@@ -2263,12 +2518,51 @@ test "TF_DS_ROUNDS_BESIDE is read after TF_DS_PASS_BESIDE, refuses a bad value o
     prompt2d.mma_sf_exact_asked = true;
     try std.testing.expectEqual(prompt2d.kern_mma_sf_exact, startSettings(o).kern);
     prompt2d.mma_sf_exact_asked = false;
+    const was_r2 = prompt2d.gemm_r2_asked;
+    defer prompt2d.gemm_r2_asked = was_r2;
+    prompt2d.gemm_r2_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_gemm_r2, startSettings(o).kern);
+    prompt2d.gemm_r2_asked = false;
     for ([_]prompt2d.Qgate{ .head, .body_fp8, .body_ulp }) |q| {
         prompt2d.qgate_canary_asked = q;
     }
     prompt2d.qgate_canary_asked = .off;
+    for ([_]mx.PfSplit{ .table, .a, .b, .c6, .c7 }) |sw| {
+        prompt2d.pf_split_asked = sw;
+        try std.testing.expectEqual(@backingInt(sw), startSettings(o).pf_split);
+    }
+}
+
         }
         return true;
+test "Model.open reads TF_DS_PF_RUN128 into the switch every rank compares, and puts it into effect once the kernels load" {
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    const read = std.mem.indexOf(u8, body, "prompt2d.pf_run128_asked = prompt2d.switchAsked(if (std.c.getenv(\"TF_DS_PF_RUN128\")) |v| std.mem.span(v) else null);").?;
+    const load = std.mem.indexOf(u8, body, "m.mxk = if (c.format == .native) try mx.Kernels.load(d, cuda.kernels.dsv41_native) else null;").?;
+    const use = std.mem.indexOf(u8, body, "useRun128(if (m.mxk) |*x| x else null, prompt2d.pf_run128_asked);").?;
+    try std.testing.expect(read < load and load < use);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "useRun128("));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\"TF_DS_PF_RUN128\""));
+}
+
+test "Model.open reads TF_DS_PF_RASTER before the kernels load, refuses text that is no setting, and puts the group into effect with them" {
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    const read = std.mem.indexOf(u8, body, "prompt2d.pf_raster_asked = try readPfRaster();").?;
+    const load = std.mem.indexOf(u8, body, "m.mxk = if (c.format == .native) try mx.Kernels.load(d, cuda.kernels.dsv41_native) else null;").?;
+    const use = std.mem.indexOf(u8, body, "mx.pf_raster = if (m.mxk != null) prompt2d.pf_raster_asked else 0;").?;
+    try std.testing.expect(read < load and load < use);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "std.c.getenv(\"TF_DS_PF_RASTER\")"));
+    try std.testing.expect(std.mem.indexOf(u8, src, "TF_DS_PF_RASTER={s}: not a setting (2, 4, 8 or 16 row tiles, or unset)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "TF_DS_PF_RASTER={d}: a prompt GEMM whose activation slab is") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "TF_DS_PF_RASTER={d}: off: needs the checkpoint's own FP8 / MXFP4 weights") != null);
+    // the start-up settings carry the asked group, the SSD tier's math the one in effect
+    try std.testing.expect(std.mem.indexOf(u8, src, ".pf_raster = prompt2d.pf_raster_asked,") != null);
+}
+
     const keep_b = prompt.qgate_body;
     defer prompt.qgate_body = keep_b;
     for ([_]prompt2d.Qgate{ .off, .head, .body_fp8, .body_ulp }) |q| {

@@ -217,6 +217,29 @@
    "seed": "name",
    "first_use": "families/dsv41/model.zig:974",
    "secret": false
+  },
+  {
+   "id": 994,
+   "name": "tf_ds_pf_t64",
+   "env": "TF_DS_PF_T64",
+   "group": "prompt",
+   "tab": "Advanced",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "0",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Router GEMM on a 64-row tile",
+   "doc": "The router's bf16 GEMM of a prompt chunk (384 experts, K 5,120; the owned rows) runs on a 64 x 64 tile of 128 threads, two blocks an SM, instead of the 128 x 128 tile of 256 threads: at a 4,096-row pass's 1,024 owned rows its grid is 24 blocks on 48 SMs, half the GPU idle, and 96 on the smaller tile. A warp's MMA chain and every output element's K chain are the same (no split-K), so the bytes are the 128 x 128 tile's (kernels replay pf_t64); each rank decides for itself. Off until the kernel time is measured on the Spark.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:2420",
+   "secret": false
  ],
  "retired": [
   {

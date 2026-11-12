@@ -1348,7 +1348,16 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     const ring_mode = mode.ring;
     const one_split = mode.one_split;
     // attn_in: wq_a and wkv of x, one prompt GEMM each, or one group up to 128 rows; TF_DS_FRONT_OWNED (frontRange):
+    // on owned rows with the q norm, then qr and y gathered (frontOwned); TF_DS_QUANT_ONCE: x quantized once for both
     const front = frontRange(e, ch, li);
+    switch (attnFront(front != null, quant_once, e.mx != null, frontCodes(lay), n)) {
+        .owned => try frontOwned(e, ch, lay, front.?),
+        .once => try frontLinears(e.mx.?, e.s, ch.mxs, lay, ch.x, c.hidden, .{ .start = 0, .n = n }, ch.qa, ch.y, hd),
+        .linears => {
+            try mm(e, ch, lay.wq_a, ch.x, c.hidden, ch.qa, .bf16, lay.wq_a.n);
+            try mm(e, ch, lay.wkv, ch.x, c.hidden, ch.y, .bf16, hd);
+        },
+        .grouped => try grouped(e, ch, n, &.{ lay.wq_a, lay.wkv }, &.{ ch.x, ch.x }, &.{ c.hidden, c.hidden }, &.{ ch.qa, ch.y }, &.{ lay.wq_a.n, hd }, &.{ .bf16, .bf16 }),
     }
     pmark(e, .a_in);
     dump(e, li, "x", ch.x, n * c.hidden * 2);
@@ -1447,8 +1456,14 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     const uw = groups * lay.wo_a[0].n;
     var col: usize = 0;
     if (e.mx) |k| {
+        if (lay.wo_a_rows) {
             dump(e, li, "o_fake", ch.mxs.fake, n * hl * hd * 2);
             dump(e, li, "wo_a0", lay.wo_a[0].w, @as(usize, lay.wo_a[0].n) * lay.wo_a[0].k * 2);
+        } else {
+            // a layer loaded without the bf16 rows (TF_DS_WOA_W8): the same values from the FP8 rows, woA's bits
+            const w8 = lay.wo_a8 orelse return error.NoWoA8;
+            dump(e, li, "wo_a8", w8.w, @as(usize, w8.n) * w8.k);
+        }
     } else if (n > decode_rows) {
         for (lay.wo_a[0..groups], 0..) |wo, g| {
             try mm(e, ch, wo, ch.o + g * gk * 2, hl * hd, ch.u + col * 2, .bf16, uw);
@@ -1503,6 +1518,15 @@ pub fn ownedRows(gpa: std.mem.Allocator, qs: []const usize, world: usize) ![]QRo
 
 /// wq_a and wkv FP8 / FP4 on one K (frontOwnedOff checks it at the start).
 pub fn frontRows(k: *const mx.Kernels, t: tri.Tri, s: cuda.Stream, sc: mx.Scratch, lay: weights.Layer, x: u64, ldx: usize, r: QRows, qa: u64, y: u64, qr: u64, hd: usize, eps: f32) !void {
+    try frontLinears(k, s, sc, lay, x, ldx, r, qa, y, hd);
+    try frontNorm(t, lay, qa, qr, r, eps);
+}
+
+/// wq_a and wkv of x's rows `r` [*, ldx] bf16 on one quant: the rows quantized once (act_quant into the linears'
+/// scratch, a row's 32-value groups each on its own), then each linear's GEMM on those codes (mx.linear's GEMM) into
+/// qa's rows r [*, wq_a.n] and y's [*, hd]: mx.linear's launches for each, the second quant (the same codes) left out.
+/// wq_a and wkv FP8 / FP4 on one K (frontCodes).
+pub fn frontLinears(k: *const mx.Kernels, s: cuda.Stream, sc: mx.Scratch, lay: weights.Layer, x: u64, ldx: usize, r: QRows, qa: u64, y: u64, hd: usize) !void {
     if (!frontCodes(lay)) return error.NotAnMxLinear;
     const kd: usize = lay.wq_a.k;
     if (r.n > sc.rows or kd > sc.max_k) return error.ScratchTooSmall;
@@ -1510,6 +1534,19 @@ pub fn frontRows(k: *const mx.Kernels, t: tri.Tri, s: cuda.Stream, sc: mx.Scratc
     try mx.quant(k, s, x + r.start * ldx * 2, .bf16, ldx, r.n, kd, sc.q, kd, sc.s, kd / 32);
     try mx.gemm(k, s, lay.wq_a, sc.q, kd, sc.s, kd / 32, r.n, qa + r.start * qw * 2, qw, .bf16, false, sc.z);
     try mx.gemm(k, s, lay.wkv, sc.q, kd, sc.s, kd / 32, r.n, y + r.start * hd * 2, hd, .bf16, false, sc.z);
+}
+
+/// TF_DS_QUANT_ONCE in effect (Model.open: asked, with the checkpoint's own weights): attention's front not on owned
+/// rows quantizes x once for wq_a and wkv (attnFront's .once).
+pub var quant_once = false;
+
+/// How attention computes wq_a and wkv of x: on owned rows (TF_DS_FRONT_OWNED's frontOwned), on x quantized once
+/// (TF_DS_QUANT_ONCE: frontLinears over the chunk's rows), or the baseline: each linear on its own (mm, which quantizes x for
+/// each FP8 linear) above 128 rows, the layer's group (grouped) up to 128. `codes`: frontCodes of the layer.
+pub const Front = enum { owned, once, linears, grouped };
+pub fn attnFront(owned: bool, once: bool, native: bool, codes: bool, n: usize) Front {
+    if (owned) return .owned;
+    if (once and native and codes) return .once;
     return if (n > decode_rows) .linears else .grouped;
 }
 
@@ -1760,12 +1797,20 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
         return;
     }
     if (n_comp_end > ch.max_comp) return error.ChunkTooLong;
+    const idxr = idxShardRange(e, ch, li);
+    // the queries and the heads' weights on the rows the scorer reads: TF_DS_IDX_PROJ_OWNED with idx_shard's owned rows,
+    // else every row (projRows); each launch a row's own arithmetic, at the rows' offsets
+    const pr = projRows(idxr, if (e.two) |t| t.idx_proj_owned else false, n);
+    const qw: usize = lay.wq_a.n;
     if (pr.n != 0) {
+        try mmRows(e, ch, pr.n, wqb, ch.qr + pr.start * qw * 2, qw, ch.iq + pr.start * ih * id * 2, .bf16, ih * id);
+        try idxQueries(e.t, ch.iq, ch.iq4, rope.cos, rope.sin, ch.pos, pr, c.rope_dim, ih, id);
     }
     if (pr.n == 0) {
         // (an empty owned slab: nothing to project, the scorer below reads none either)
     } else if (e.mx) |k| {
         // Format.native: weights_proj, a bf16 Linear, times the scale (Indexer.forward), at any row count
+        try mx.bf16Gemm(k, e.s, ch.x + pr.start * c.hidden * 2, c.hidden, lay.idx_proj, c.hidden, pr.n, ih, c.hidden, ch.iw + pr.start * ih * 2, ih, .bf16, exact.indexScale(id, ih), true, 1, 0, 0, 0, null);
     } else {
         if (n <= tri.decode_rows) {
             // a decode-sized chunk: the row-invariant matmul of the fp16 projection (rowmm2)
@@ -1797,11 +1842,9 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     const pooled = !keyed and nbk > c.candidate_blocks;
     if (pooled and (ch.pool == 0 or nbk > ch.pool_ms)) return error.ChunkTooLong;
     const pk = @min(c.candidate_blocks, nbk);
-    var r0: usize = 0;
-    while (r0 < n) : (r0 += rb) {
-        // the block's rows: iq[r0:r1] and wts[r0:r1] as views (their offsets the served pointers'), vis[r0:r1] at a
-        // 16-byte-aligned address (visBlock), its selection into cidx[r0:r1]
-        const m = @min(n, r0 + rb) - r0;
+    dump(e, li, "iq", ch.iq, n * ih * id * 2);
+    dump(e, li, "iq4", ch.iq4, n * ih * id * 2);
+    dump(e, li, "iw", ch.iw, n * ih * 2);
     var r0: usize = if (idxr) |r| r.start else 0;
     const r_end: usize = if (idxr) |r| r.start + r.n else n;
     while (r0 < r_end) : (r0 += rb) {
@@ -1814,7 +1857,9 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
         const out = ch.cidx + r0 * kk * 8;
         if (keyed) {
             try tri_index.indexScore(e.t, q, k, wb, vr, n_comp_end, ch.keys, null, true, ch.tmax, false, m, ih, id);
-            try tri_index.topkSelectPruned(e.t, ch.keys, n_comp_end, ch.tmax, kk, vr, out, ch.pbufs, torch_topk, m, n_comp_end);
+            if (prunedOnTiles(if (e.mx) |x| x.topk_tiles else false, n_comp_end, kk)) {
+                try mx.topkTiles(e.mx.?, e.s, ch.keys, n_comp_end, ch.tmax, n_comp_end, kk, vr, out, m);
+            } else try tri_index.topkSelectPruned(e.t, ch.keys, n_comp_end, ch.tmax, kk, vr, out, ch.pbufs, torch_topk, m, n_comp_end);
         } else {
             try tri_index.indexScore(e.t, q, k, wb, vr, n_comp_end, ch.score, null, false, null, false, m, ih, id);
             const mrows = ch.pool + r0 * ch.pool_ms;
@@ -1840,31 +1885,59 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
         _ = r;
         try rociGather(e, .gi, try rociShape(e, ch, kk));
     }
+    dump(e, li, "cidx", ch.cidx, n * kk * 8);
     sh.kk = kk;
 }
 
-/// TF_DS_IDX_SPLIT's keyed selection on this node (idx_split.zig): its columns' k largest keys a row in the served row
-/// blocks of rb rows, every node's over NCCL into ch.keys, and the k largest of those into cidx.
-fn splitKeyed(e: *const Engine, ch: *Chunk, k: tri_index.IndexK, n_comp_end: usize, kk: usize, ratio: usize, rb: usize, top: tri_index.TopK) !void {
-    const c = e.c;
-    const n = ch.n;
-    const world: usize = e.comm.world;
-    const sp = idx_split.span(n_comp_end, world, e.comm.rank);
-    // the node's vis (host-made, as vis: the same integers on every node)
-    var vis_host: [max_pass_rows]i64 = undefined;
-    if (n > vis_host.len) return error.ChunkTooLong;
-    for (0..n) |i| vis_host[i] = idx_split.nodeVis((ch.start + i + 1) / ratio, sp);
-    try upload(e, ch.split_vis, &vis_host, n * 8);
-    try idx_split.nodeTop(e.t, e.ops, e.s, ch.iq4, k, ch.iw, ch.split_vis, ch.vis_blk, sp, ch.keys, ch.tmax, ch.pbufs, top, ch.split_top, n, rb, kk, c.index_heads, c.index_head_dim);
-    try e.comm.allGather(ch.split_top, ch.keys, n * kk, .i64, e.s);
-    try idx_split.merge(e.t, e.ops, e.s, ch.keys, ch.keys + world * n * kk * 8, world, n, kk, ch.vis, ch.cidx, top);
+/// The rows the indexer's projections run on: idx_shard's owned rows when TF_DS_IDX_PROJ_OWNED is in effect (`on`)
+/// and the layer has them (`idxr`: the scorer reads only those), else all n.
+pub fn projRows(idxr: ?QRows, on: bool, n: usize) QRows {
+    if (on) if (idxr) |r| return r;
+    return .{ .start = 0, .n = n };
+}
+
+/// The index queries' launches at rows r: the RoPE of iq's rows r (POS from row r.start) and fp4_qd's bytes of them
+/// into iq4's rows r (switch "idx": one launch), the whole chunk's launches at the rows' offsets.
+pub fn idxQueries(t: tri.Tri, iq: u64, iq4: u64, cos: u64, sin: u64, pos: u64, r: QRows, rd: usize, ih: usize, id: usize) !void {
+    const off = r.start * ih * id * 2;
+    try tri_norm.ropeHeads(t, iq + off, cos, sin, pos + r.start * 8, rd, false, r.n, ih, id);
+    try tri_attn.fp4QdP2(t, iq + off, iq4 + off, r.n * ih * id);
+}
+
+/// TF_DS_IDX_PROJ_OWNED's start check on this rank (null: it can run; else the reason, for Two.agreeIdxProjOwned):
+/// idx_shard in effect, the checkpoint's own weights, and every index query launch idxQueries makes at each of the
+/// `world` ranks' owned rows of each row count in `qs`, on every index layer before the candidate source, found in this
+/// rank's kernel set (`finds.has`: aot.Set.find, as a launch finds its variant).
+pub fn idxProjOwnedOff(gpa: std.mem.Allocator, finds: anytype, native: bool, idx_shard: bool, layers: []const weights.Layer, candidate_source: usize, rd: usize, ih: usize, id: usize, qs: []const usize, world: usize) !?[]const u8 {
     const rows = try ownedRows(gpa, qs, world);
     defer gpa.free(rows);
     return idxProjOwnedOffAt(gpa, finds, native, idx_shard, layers, candidate_source, rd, ih, id, rows);
 }
 
 pub fn idxProjOwnedOffAt(gpa: std.mem.Allocator, finds: anytype, native: bool, idx_shard: bool, layers: []const weights.Layer, candidate_source: usize, rd: usize, ih: usize, id: usize, rows: []const QRows) !?[]const u8 {
+    if (!idx_shard) return "needs TF_DS_IDX_SHARD=1";
+    if (!native) return "needs the checkpoint's own FP8 / MXFP4 weights";
+    var log: tri.Log = .{ .gpa = gpa };
+    defer log.deinit();
+    const t: tri.Tri = .{ .log = &log };
+    // the buffers as the arena aligns a chunk's (256 bytes)
+    const iq: u64 = 1 << 32;
+    const iq4: u64 = 2 << 32;
+    const pos: u64 = 3 << 32;
+    const cos: u64 = 4 << 32;
+    const sin: u64 = 5 << 32;
+    for (layers[0..@min(candidate_source, layers.len)]) |lay| {
+        if (lay.idx_wq_b == null) continue;
         for (rows) |r| try idxQueries(t, iq, iq4, cos, sin, pos, r, rd, ih, id);
+    }
+    return null;
+}
+
+/// Whether the indexer's keyed top-k of a row block over n keys takes tf_dsn_topk_tiles (TF_DS_TOPK_TILES `on`): where
+/// the chain prunes (tri_index.prunes: past TOPK_FUSED_MAX keys and more tiles than k) and k fits the kernel; elsewhere
+/// topkSelectPruned's own choice (topkSelect) as in the baseline.
+pub fn prunedOnTiles(on: bool, n: usize, k: usize) bool {
+    return on and tri_index.prunes(n, k) and k <= mx.topk_tiles_max;
 }
 
 /// topk_select's torch step, keys.topk(k).values: the top-k set of the unique int64 keys (ops.topkI64).
@@ -3134,7 +3207,113 @@ fn checkpointLayers(lays: *[40]weights.Layer) !void {
     }
 }
 
+test "TF_DS_QUANT_ONCE: attention's front quantizes x once where the owned front does not run, with the checkpoint's own weights; unset, the baseline front" {
+    for ([_]usize{ 1, 17, 63, 64, 128, 129, 1000, 2048 }) |n| {
         const today: Front = if (n > decode_rows) .linears else .grouped;
+        // unset: the baseline front whatever else holds
+        for ([_]bool{ false, true }) |native| for ([_]bool{ false, true }) |codes| try std.testing.expectEqual(today, attnFront(false, false, native, codes, n));
+        // set: once on the checkpoint's own FP8 / FP4 front linears, else the baseline
+        try std.testing.expectEqual(Front.once, attnFront(false, true, true, true, n));
+        try std.testing.expectEqual(today, attnFront(false, true, false, true, n));
+        try std.testing.expectEqual(today, attnFront(false, true, true, false, n));
+        // the owned front first (TF_DS_FRONT_OWNED quantizes its owned rows once already)
+        for ([_]bool{ false, true }) |once| try std.testing.expectEqual(Front.owned, attnFront(true, once, true, true, n));
+    }
+    try std.testing.expect(!quant_once); // Model.open's starting value
+}
+
+test "attention takes its front through attnFront, and the quant-once front through frontLinears at the chunk's rows" {
+    const src = @embedFile("prompt.zig");
+    const at = std.mem.indexOf(u8, src, "pub fn attention(").?;
+    const end = at + std.mem.indexOf(u8, src[at..], "\n}\n").?;
+    const body = src[at..end];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "switch (attnFront(front != null, quant_once, e.mx != null, frontCodes(lay), n))"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, ".once => try frontLinears(e.mx.?, e.s, ch.mxs, lay, ch.x, c.hidden, .{ .start = 0, .n = n }, ch.qa, ch.y, hd)"));
+    // frontRows (the owned front) is frontLinears then the norm
+    const fr = std.mem.indexOf(u8, src, "pub fn frontRows(").?;
+    const fr_body = src[fr .. fr + std.mem.indexOf(u8, src[fr..], "\n}\n").?];
+    try std.testing.expect(std.mem.indexOf(u8, fr_body, "try frontLinears(k, s, sc, lay, x, ldx, r, qa, y, hd);\n    try frontNorm(t, lay, qa, qr, r, eps);") != null);
+}
+
+test "TF_DS_TOPK_TILES: the indexer's keyed top-k takes the one-launch kernel exactly where the chain prunes and k fits it; unset, the chain" {
+    // the chain prunes past TOPK_FUSED_MAX keys and more tiles than k (tri_index.prunes)
+    for ([_]usize{ 64, 512 }) |k| for ([_]usize{ 4096, 4097, 32768, 32769, 65536, 524288 }) |n| {
+        try std.testing.expect(!prunedOnTiles(false, n, k));
+        try std.testing.expectEqual(tri_index.prunes(n, k), prunedOnTiles(true, n, k));
+    };
+    try std.testing.expect(!prunedOnTiles(true, 32768, 512)); // 512 tiles: not pruned
+    try std.testing.expect(prunedOnTiles(true, 32769, 512));
+    try std.testing.expect(!prunedOnTiles(true, 1 << 20, 1024)); // past the kernel's k
+}
+
+test "TF_DS_IDX_PROJ_OWNED: the indexer's projections run on idx_shard's owned rows only with the switch and those rows; else every row" {
+    const own: QRows = .{ .start = 1024, .n = 512 };
+    try std.testing.expectEqual(own, projRows(own, true, 2048));
+    try std.testing.expectEqual(QRows{ .start = 0, .n = 2048 }, projRows(own, false, 2048)); // unset: the baseline rows
+    try std.testing.expectEqual(QRows{ .start = 0, .n = 1000 }, projRows(null, true, 1000)); // a partial chunk
+    try std.testing.expectEqual(QRows{ .start = 0, .n = 2048 }, projRows(null, false, 2048));
+}
+
+test "the index queries at owned rows are the whole chunk's launches at the rows' offsets: RoPE (POS from the first row) and fp4_qd" {
+    const gpa = std.testing.allocator;
+    var whole: tri.Log = .{ .gpa = gpa };
+    defer whole.deinit();
+    var part: tri.Log = .{ .gpa = gpa };
+    defer part.deinit();
+    const iq: u64 = 0x1000_0000;
+    const iq4: u64 = 0x2000_0000;
+    const pos: u64 = 0x3000_0000;
+    try idxQueries(.{ .log = &whole }, iq, iq4, 0x4000_0000, 0x5000_0000, pos, .{ .start = 0, .n = 2048 }, 64, 32, 128);
+    const r: QRows = .{ .start = 1536, .n = 512 };
+    try idxQueries(.{ .log = &part }, iq, iq4, 0x4000_0000, 0x5000_0000, pos, r, 64, 32, 128);
+    try std.testing.expectEqual(@as(usize, 2), whole.items.items.len);
+    try std.testing.expectEqual(@as(usize, 2), part.items.items.len);
+    const row = 32 * 128 * 2; // iq / iq4 bytes a row
+    for (whole.items.items, part.items.items) |w, p| {
+        try std.testing.expectEqualStrings(w.name, p.name);
+        try std.testing.expectEqual(w.consts.len, p.consts.len);
+        for (w.consts, p.consts) |a, b| try std.testing.expectEqual(a, b);
+        for (w.args, p.args) |a, b| {
+            const name = a.name;
+            if (std.mem.eql(u8, name, "X") or std.mem.eql(u8, name, "OUT")) {
+                try std.testing.expectEqual(a.value.ptr.addr + r.start * row, b.value.ptr.addr);
+            } else if (std.mem.eql(u8, name, "POS")) {
+                try std.testing.expectEqual(a.value.ptr.addr + r.start * 8, b.value.ptr.addr);
+            } else if (std.mem.eql(u8, name, "nblk")) {
+                try std.testing.expectEqual(@as(i32, @intCast(r.n * 32 * 128 / 32)), b.value.i32);
+            } else try std.testing.expectEqualDeep(a, b);
+        }
+    }
+    // the RoPE's rows are its grid's
+    try std.testing.expectEqual(@as(u32, 2048), whole.items.items[0].grid[0]);
+    try std.testing.expectEqual(@as(u32, 512), part.items.items[0].grid[0]);
+}
+
+test "TF_DS_IDX_PROJ_OWNED's start check: idx_shard, native weights, every owned-row query launch of every index layer found" {
+    var lays: [40]weights.Layer = undefined;
+    try checkpointLayers(&lays);
+    const gpa = std.testing.allocator;
+    const qs = [_]usize{ 256, 512, 1024, 512 };
+    var n: usize = 0;
+    try std.testing.expectEqual(@as(?[]const u8, null), try idxProjOwnedOff(gpa, FakeFinds{ .asked = &n }, true, true, &lays, 20, 64, 32, 128, &qs, 4));
+    // index layers 2, 8, 14 before the candidate source: two launches at every rank's owned rows of every row count
+    try std.testing.expectEqual(@as(usize, 3 * qs.len * 4 * 2), n);
+    try std.testing.expectEqualStrings("needs TF_DS_IDX_SHARD=1", (try idxProjOwnedOff(gpa, FakeFinds{ .asked = &n }, true, false, &lays, 20, 64, 32, 128, &qs, 4)) orelse "can");
+    try std.testing.expectEqualStrings("needs the checkpoint's own FP8 / MXFP4 weights", (try idxProjOwnedOff(gpa, FakeFinds{ .asked = &n }, false, true, &lays, 20, 64, 32, 128, &qs, 4)) orelse "can");
+    for ([_][]const u8{ "_rope_heads", "_fp4qd_p2" }) |missing|
+        try std.testing.expectEqualStrings("this rank's kernel set has no _rope_heads / _fp4qd_p2 variant for the owned rows", (try idxProjOwnedOff(gpa, FakeFinds{ .asked = &n, .missing = missing }, true, true, &lays, 20, 64, 32, 128, &qs, 4)) orelse "can");
+}
+
+test "the indexer projects through projRows and idxQueries: wq_b, the queries and weights_proj on the same rows" {
+    const src = @embedFile("prompt.zig");
+    const at = std.mem.indexOf(u8, src, "fn indexer(").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n}\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "const pr = projRows(idxr, if (e.two) |t| t.idx_proj_owned else false, n);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "try mmRows(e, ch, pr.n, wqb, ch.qr + pr.start * qw * 2, qw, ch.iq + pr.start * ih * id * 2, .bf16, ih * id);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "try idxQueries(e.t, ch.iq, ch.iq4, rope.cos, rope.sin, ch.pos, pr, c.rope_dim, ih, id);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "ch.x + pr.start * c.hidden * 2, c.hidden, lay.idx_proj, c.hidden, pr.n, ih, c.hidden, ch.iw + pr.start * ih * 2"));
+}
+
 test "the owned front's q norm is the whole chunk's launch at the owned rows' offsets: one _rmsnorm program a row" {
     var log: tri.Log = .{ .gpa = std.testing.allocator };
     defer log.deinit();
@@ -3332,6 +3511,23 @@ test "a pass's view: its own rows when whole, the resume rows under them" {
     try std.testing.expectEqual(@as(usize, 2048), viewRows(1, 2048));
 }
 
+test "the pruned top-k in one launch reads tile maxima its chunk's index score wrote from the keys: unique, no dead tile padded" {
+    // indexer: the keyed index score of a row block, then tf_dsn_topk_tiles on the same keys and maxima
+    const src = @embedFile("prompt.zig");
+    const at = std.mem.indexOf(u8, src, "\nfn indexer(e: *const Engine").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n}\n").?];
+    const score = std.mem.indexOf(u8, body, "try tri_index.indexScore(e.t, q, k, wb, vr, n_comp_end, ch.keys, null, true, ch.tmax, false, m, ih, id);").?;
+    const tiles = std.mem.indexOf(u8, body, "try mx.topkTiles(e.mx.?, e.s, ch.keys, n_comp_end, ch.tmax, n_comp_end, kk, vr, out, m);").?;
+    try std.testing.expect(score < tiles);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "mx.topkTiles("));
+    // index_score's launches for a prompt chunk: _index_score with DEAD_PAD off (on, every dead tile's maximum one
+    // constant: tied maxima), _index_score_rows with none
+    const ti = @embedFile("tri_index.zig");
+    const fs = std.mem.indexOf(u8, ti, "pub fn indexScore(").?;
+    const fb = ti[fs .. fs + std.mem.indexOf(u8, ti[fs..], "\n}\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, fb, "cb(\"DEAD_PAD\","));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, fb, "cb(\"DEAD_PAD\", false)"));
+}
 test "TF_DS_PASS_FILLING: two fills alternating 4,096-row passes read each pass two chunks a layer, its own slots" {
     // a fill from the prompt's first row and one resumed at 4,096 (an alternating prompt's next pass): each pass is
     // two units, layer-major from its own start, and a pass's two chunks take the worker's two ring slots (wk_rows[2])
