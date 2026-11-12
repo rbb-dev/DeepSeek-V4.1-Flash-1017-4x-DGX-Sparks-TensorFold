@@ -51,7 +51,11 @@ pub const Sink = struct {
     keep: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
 };
 
+/// A JSON answer is data; offered tools still belong in its prompt.
+pub const ResponseChannel = enum { automatic, structured_json };
+
 pub const Reply = struct {
+    response_channel: ResponseChannel,
     content: []const u8,
     stop_sequence: ?[]const u8,
     reasoning: ?[]const u8,
@@ -89,6 +93,7 @@ fn flag(f: Value, key: []const u8) ?bool {
 
 /// A request rendered and checked but not submitted; it holds the preparing count until generate or release.
 pub const Prepared = struct {
+    response_channel: ResponseChannel,
     input: Input,
     request: api.Request,
     prompt_len: usize,
@@ -172,7 +177,10 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     }
     if (input.logprobs) |count| request.logprobs = try @import("logprobs.zig").admit(srv, cx, thinking, request.think_budget, count);
     request.prompt_logprobs = input.prompt_logprobs;
-    return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .stops = stops_opt, .preparing = preparing };
+    const response_channel: ResponseChannel = if (request.structure) |st| switch (st.kind) {
+        .json, .json_schema => .structured_json,
+        else => .automatic,
+    } else .automatic;
 }
 
 /// Submit a prepared request and collect its reply; ``sink`` hears the stream (null: not streamed).
@@ -249,6 +257,7 @@ pub fn release(srv: *Server, preparing: bool) void {
 
 /// The token loop and the text it streams.
 const Generation = struct {
+    response_channel: ResponseChannel,
     srv: *Server,
     a: Allocator,
     box: *Mailbox,
@@ -354,7 +363,7 @@ const Generation = struct {
             answer = split.answer;
         }
         const shown = if (g.calls != null) try reply_text.hideIntoMarked(g.a, &g.hidden, answer, false, mp) else answer;
-        const vis = reply_text.heldBack(reply_text.streamingVisible(shown), g.calls != null);
+        const visible_content = if (g.response_channel == .structured_json) shown else reply_text.streamingVisible(shown);
         const copied = @intFromPtr(vis.ptr) >= @intFromPtr(g.hidden.items.ptr) and @intFromPtr(vis.ptr) <= @intFromPtr(g.hidden.items.ptr) + g.hidden.items.len;
         const delta = g.streamed.after(vis, !copied);
         if (delta.len > 0) {
@@ -490,7 +499,7 @@ const Generation = struct {
             const r = reply_text.pyStrip(split.reasoning);
             reasoning = if (r.len > 0) r else null;
             content = split.answer;
-        } else {
+        } else if (g.response_channel != .structured_json) {
             const h = reply_text.parseHarmony(text);
             content = h.content;
             reasoning = h.reasoning;
@@ -561,6 +570,7 @@ const Generation = struct {
         };
         const think_end: ?u32 = if (thinking) g.srv.text.tokenId(g.srv.markers.close) else null;
         const reply: Reply = .{
+            .response_channel = g.response_channel,
             .content = content,
             .stop_sequence = g.stops.matched(raw),
             .reasoning = reasoning,
