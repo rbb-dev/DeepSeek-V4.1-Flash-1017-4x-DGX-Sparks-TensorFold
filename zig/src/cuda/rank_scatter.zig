@@ -1,6 +1,5 @@
-//! A reduce-scatter by rows in rank order: an all-gather plus a rank-order sum's bits (not ncclReduceScatter's order).
+//! A reduce-scatter by rows in rank order: the rank-order sum's bits (the exchange itself is the caller's; this engine has no NCCL).
 const std = @import("std");
-const nccl = @import("nccl.zig");
 const driver = @import("driver.zig");
 const module = @import("module.zig");
 const launch_ = @import("launch.zig");
@@ -35,37 +34,6 @@ pub const RankScatter = struct {
 
     pub fn unload(k: *RankScatter) void {
         k.mod.unload();
-    }
-
-    /// `partial` [rows][width] fp32 summed over the ranks into `out` [own rows][width]: a send/recv group, then a sum.
-    pub fn run(
-        k: *const RankScatter,
-        lib: *const nccl.Library,
-        comm: nccl.Comm,
-        world: usize,
-        rank: usize,
-        s: Stream,
-        partial: u64,
-        rows: usize,
-        width: usize,
-        scratch: u64,
-        out: u64,
-    ) !void {
-        const mine = share(rows, world, rank);
-        const n = (mine[1] - mine[0]) * width;
-        try lib.check(lib.api.ncclGroupStart(), "ncclGroupStart");
-        for (0..world) |peer| {
-            if (peer == rank) continue;
-            const theirs = share(rows, world, peer);
-            const count = (theirs[1] - theirs[0]) * width;
-            const send = partial + theirs[0] * width * 4;
-            const slot = scratch + peer * n * 4;
-            const to: c_int = @intCast(peer);
-            if (count > 0) try lib.check(lib.api.ncclSend(send, count, .f32, to, comm, s.handle), "ncclSend");
-            if (n > 0) try lib.check(lib.api.ncclRecv(slot, n, .f32, to, comm, s.handle), "ncclRecv");
-        }
-        try lib.check(lib.api.ncclGroupEnd(), "ncclGroupEnd");
-        if (n > 0) try k.rankSum(s, scratch, partial + mine[0] * width * 4, world, rank, n, out);
     }
 
     /// out[i]: the ranks' terms added rank 0 first, `peers`' slot r (n apart) for every rank but `rank`, `own` for it.

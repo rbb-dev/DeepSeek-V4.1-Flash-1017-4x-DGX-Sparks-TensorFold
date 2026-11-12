@@ -617,6 +617,7 @@ test "a message's own text holding the image placeholder is escaped" {
     try std.testing.expectEqualStrings("see <|deepseek_image|> above\n\n" ++ ph, text);
     try std.testing.expectEqual(@as(usize, 1), images.list.items.len);
 }
+}
 
 test "maskControls marks a client's control spellings in every string, and copies nothing when there are none" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);

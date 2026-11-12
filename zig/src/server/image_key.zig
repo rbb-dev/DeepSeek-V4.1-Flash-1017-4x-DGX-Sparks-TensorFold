@@ -81,7 +81,7 @@ test "one-token images whose row words collide share no kept state; the same ima
     };
     var store = pc.Store.init(std.testing.allocator, .{ .ptr = &Snaps.state, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .min_gap = 1, .min_prompt = 0 }, 1 << 20);
     defer store.deinit();
-    try std.testing.expect(store.keep(first, 4, null, &.{}, &.{})); // a state kept past the image and its markers
-    try std.testing.expect(store.find(other, &.{}, &.{}) == null);
-    try std.testing.expectEqual(@as(?u32, 4), if (store.find(try keyOf(a, ids[0]), &.{}, &.{})) |e| e.at else null);
+    try std.testing.expect(store.keep(first, 4, null, &.{})); // a state kept past the image and its markers
+    try std.testing.expect(store.find(other, &.{}) == null);
+    try std.testing.expectEqual(@as(?u32, 4), if (store.find(try keyOf(a, ids[0]), &.{})) |e| e.at else null);
 }

@@ -1,7 +1,16 @@
 //! The Mac app's questions about a conversation's kept states (/v1/imprint), answered on the engine thread.
 const std = @import("std");
 const pc = @import("prompt_cache.zig");
-const rows = pc.rows;
+
+/// Where a prompt's next request would resume.
+pub const Resume = struct {
+    tokens: u32 = 0, // the prompt's tokens
+    ram: u32 = 0, // tokens a kept state in RAM covers
+    disk: u32 = 0, // tokens a state on disk covers
+    disk_bytes: u64 = 0,
+    from: enum { ram, disk, none } = .none,
+    seconds: f64 = 0, // the estimated wait: the disk read, then prefilling what is left
+};
 
 pub const Op = enum { where, load, forget };
 
@@ -14,36 +23,26 @@ pub const Ask = struct {
     prompt: []const u32 = &.{},
     starts: []const u32 = &.{},
     spans: []const [2]u32 = &.{},
-    out: rows.read.Resume = .{},
+    out: Resume = .{},
     loaded: u32 = 0, // load: the tokens a disk read brought into RAM (0: none was needed, or it did not pay)
     load_seconds: f64 = 0,
     freed: u64 = 0, // forget: bytes removed from disk
     disk: bool = false, // the engine keeps conversation states on disk
     done: std.atomic.Value(bool) = .init(false),
 
-    /// The engine thread's answer from its kept states (`store` null: it keeps none), keyed as its lookups are.
+    /// The engine thread's answer from its kept states (`store` null: it keeps none), keyed as its lookups are. This engine
+    /// keeps no conversation states on disk through this route (TensorFold's --learn-conversations is not in the merge): the
+    /// answer is what its RAM states cover, and `load` and `forget` change nothing.
     pub fn answer(a: *Ask, store: ?*pc.Store, keys: Keys) void {
         defer a.done.store(true, .release);
         const s = store orelse return;
-        a.disk = s.disk != null;
+        a.disk = false;
         const starts: []const u32 = if (keys.starts) a.starts else &.{};
-        const spans: []const [2]u32 = if (keys.spans) a.spans else &.{};
-        switch (a.op) {
-            .where => {},
-            .load => {
-                const have = s.find(a.prompt, starts, spans);
-                const t0 = rows.write.nowNs();
-                const got = rows.read.recall(s, a.prompt, @intCast(a.prompt.len), starts, spans, have);
-                if (got != null and got != have) {
-                    a.loaded = got.?.at;
-                    a.load_seconds = @as(f64, @floatFromInt(rows.write.nowNs() - t0)) / 1e9;
-                }
-            },
-            .forget => if (s.disk) |r| {
-                a.freed = r.forgetAll();
-            },
+        a.out = .{ .tokens = @intCast(a.prompt.len) };
+        if (s.find(a.prompt, starts)) |e| {
+            a.out.ram = e.at;
+            a.out.from = .ram;
         }
-        a.out = rows.read.resumable(s, a.prompt, starts, spans);
     }
 
     /// The answer within `ms` milliseconds (false: none came).

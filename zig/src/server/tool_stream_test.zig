@@ -187,3 +187,46 @@ test "malformed closed DSML masks its nested XML and resumes the next legitimate
     try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expectEqualStrings("{}", try sentArguments(a, out.items));
 }
+
+test "a DSML template's reply streams no call, so its parsed calls reach the client, tool markup in a value or not" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"write\"}}]")).ok.array;
+    const D = "\u{ff5c}DSML\u{ff5c}";
+    const qwen = "<tool_call><function=write></function></tool_call>";
+    for ([_]bool{ true, false }) |v41| {
+        const x = if (v41) " " else "";
+        const bn = if (v41) "calls" else "tool_calls";
+        const call = struct {
+            fn one(al: Allocator, sp: []const u8, value: []const u8) ![]const u8 {
+                return std.mem.concat(al, u8, &.{ "\n<", D, sp, "invoke name=\"write\">\n<", D, sp, "parameter name=\"content\" string=\"true\">", value, "</", D, sp, "parameter>\n</", D, sp, "invoke>" });
+            }
+        };
+        const open = try std.mem.concat(a, u8, &.{ "<", D, x, bn, ">" });
+        const close = try std.mem.concat(a, u8, &.{ "</", D, x, bn, ">" });
+        // a value holding Qwen markup; one holding the block's closer and Qwen markup, then a second call (the review
+        // case); Qwen markup in prose after a block
+        const replies = [_][]const u8{
+            try std.mem.concat(a, u8, &.{ open, try call.one(a, x, qwen), "\n", close }),
+            try std.mem.concat(a, u8, &.{ open, try call.one(a, x, try std.mem.concat(a, u8, &.{ close, qwen })), try call.one(a, x, "two"), "\n", close }),
+            try std.mem.concat(a, u8, &.{ open, try call.one(a, x, "one"), "\n", close, "\nThe other format: ", qwen }),
+        };
+        for (replies) |text| {
+            var st = try Streamer.init(a, tools);
+            st.calls_off = true;
+            var out: std.ArrayList(Value) = .empty;
+            for (1..text.len + 1) |n| try st.feed(text[0..n], &out);
+            try std.testing.expect(!st.streamed); // the route then sends the parsed calls
+            try std.testing.expectEqual(@as(usize, 0), out.items.len);
+            const r = try tool_parse.parse(a, text, tools, null);
+            for (r.calls.?) |c| try std.testing.expectEqualStrings("write", c.get("function").?.get("name").?.string);
+        }
+        // the review case: the two intended calls, the first value intact
+        const two = (try tool_parse.parse(a, replies[1], tools, null)).calls.?;
+        try std.testing.expectEqual(@as(usize, 2), two.len);
+        try std.testing.expectEqualStrings(try std.mem.concat(a, u8, &.{ "{\"content\":\"", close, qwen, "\"}" }), two[0].get("function").?.get("arguments").?.string);
+    }
+    // a template that writes <tool_call> calls still streams them as they are written
+    try std.testing.expect((try streamed(a, tools, &.{qwen})).len > 0);
+}

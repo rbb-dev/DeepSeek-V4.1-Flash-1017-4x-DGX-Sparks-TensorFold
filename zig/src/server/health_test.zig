@@ -230,7 +230,7 @@ fn quiesce(srv: *server.Server, stop: *std.atomic.Value(bool), accept: std.Threa
     }
 }
 
-test "with keys configured, /health sends only its status, with and without a valid key, whatever the identity" {
+test "with keys configured, /health sends only its status without a valid key and the whole answer, identity included, with one" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -256,11 +256,15 @@ test "with keys configured, /health sends only its status, with and without a va
     const accept = try std.Thread.spawn(.{}, server.Server.serve, .{ srv, lis, &stop });
     defer quiesce(srv, &stop, accept);
     const port = lis.port();
-    for ([_][]const u8{ health_open, health_keyed }) |request| {
-        const reply = try exchange(a, port, request);
-        try std.testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 200 "));
-        try std.testing.expectEqualStrings("{\"status\": \"ok\"}", try bodyOf(reply));
-    }
+    const open_reply = try exchange(a, port, health_open);
+    try std.testing.expect(std.mem.startsWith(u8, open_reply, "HTTP/1.1 200 "));
+    try std.testing.expectEqualStrings("{\"status\": \"ok\"}", try bodyOf(open_reply));
+    // a key holder (a dashboard's key) gets the whole answer, as the engine's status page reads it
+    const keyed_reply = try exchange(a, port, health_keyed);
+    try std.testing.expect(std.mem.startsWith(u8, keyed_reply, "HTTP/1.1 200 "));
+    const keyed_body = try bodyOf(keyed_reply);
+    try std.testing.expect(std.mem.indexOf(u8, keyed_body, "\"model\": \"m\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, keyed_body, "\"version\": \"9.8.7\"") != null);
     // the gate is on and the key is valid: a gated route refuses the request without it and serves it with it
     try std.testing.expect(std.mem.startsWith(u8, try exchange(a, port, models_open), "HTTP/1.1 401 "));
     try std.testing.expect(std.mem.startsWith(u8, try exchange(a, port, models_keyed), "HTTP/1.1 200 "));

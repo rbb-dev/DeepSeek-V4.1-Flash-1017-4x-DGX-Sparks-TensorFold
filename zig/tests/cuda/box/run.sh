@@ -68,11 +68,6 @@ for t in "info" "smoke" "graph" "launch-ex" "ptx" "symbols" "overhead 1000 20" "
 done 2>&1 | tee "${OUT:?}/tests.log"
 grep -q '^FAIL\|^rc=' "${OUT:?}/tests.log" && rc=1
 
-step "NCCL in the image (the host has no libnccl)"
-container nccl --gpus all --network none -e NCCL_DEBUG=WARN -v "${OUT:?}:/out:ro" \
-  --entrypoint /out/zig-out/bin/tf-cuda-test "$IMAGE" nccl > "${OUT:?}/nccl.log" 2>&1 || rc=1
-cat "${OUT:?}/nccl.log"
-
 cleanup
 step "done rc=$rc"
 journal END ", \"rc\": $rc"

@@ -14,6 +14,8 @@ pub const Mailbox = struct {
     prompt_rows: ?[]api.LogprobRow = null, // one a prompt token after the first, for requests with prompt_logprobs
     cached: ?u32 = null,
     prefilled_ns: ?i96 = null,
+    /// The engine gave the request a lane (its `admitted` call).
+    admitted: bool = false,
     finished: bool = false,
     reason: api.Reason = .stop,
     stats: api.Stats = .{},
@@ -21,6 +23,14 @@ pub const Mailbox = struct {
     raised: []bool = &.{},
     telemetry: []u8 = "",
     message: []u8 = "",
+
+    pub fn onAdmitted(ctx: *anyopaque, _: api.Id) void {
+        const m: *Mailbox = @ptrCast(@alignCast(ctx));
+        m.mutex.lockUncancelable(m.io);
+        defer m.mutex.unlock(m.io);
+        m.admitted = true;
+        m.cond.signal(m.io);
+    }
 
     pub fn onEvent(ctx: *anyopaque, _: api.Id, event: *const api.Event) void {
         const m: *Mailbox = @ptrCast(@alignCast(ctx));

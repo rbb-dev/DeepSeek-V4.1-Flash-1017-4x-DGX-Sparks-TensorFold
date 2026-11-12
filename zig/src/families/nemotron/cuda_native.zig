@@ -37,7 +37,7 @@ pub const lone_min_budget = @import("cuda_lone.zig").min_budget;
 pub const warm_quiet: u64 = 150 * std.time.ns_per_ms;
 
 /// A lone drafted stream's own driver: decodes it until it finishes (false) or `yield` hands it over (true).
-pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool, resumed: bool) anyerror!bool;
+pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
 
 /// What the native server drives: the lane backend, the facts its round loop reads, and how to free it.
 pub const Loaded = struct {
@@ -123,9 +123,9 @@ pub fn learnModel(p: *anyopaque, dir: []const u8) slide.Model {
     return .{ .e = own.e, .dir = dir, .living = &own.living };
 }
 
-fn loneRun(p: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool, resumed: bool) anyerror!bool {
+fn loneRun(p: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool {
     const own: *Owned = @ptrCast(@alignCast(p));
-    return lone.run(own.gpa, &own.lanes, s, .{ .ctx = hooks, .committed = committed, .yield = yield, .resumed = resumed });
+    return lone.run(own.gpa, &own.lanes, s, .{ .ctx = hooks, .committed = committed, .yield = yield, .resumed = false }); // (this engine's lane host never hands a warm resume)
 }
 
 /// A request this engine refuses, in words; null: none of its own.
