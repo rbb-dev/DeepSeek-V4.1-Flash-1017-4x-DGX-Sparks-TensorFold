@@ -1,0 +1,33 @@
+#!/bin/sh
+# The setup's one root helper, for a Spark where passwordless sudo does not already work. The setup installs it
+# root-owned as /usr/local/sbin/dsv41-root, with a sudo rule that lets the setup's user run this file and nothing else
+# (/etc/sudoers.d/90-dsv41-start), so that every ./start.sh can do its two root commands without a password:
+#   dsv41-root check          exits 0 and prints this file's SHA-256 (the setup compares it with its own copy)
+#   dsv41-root drop           page caches dropped and memory compacted (the start does it on every Spark)
+#   dsv41-root clock <MHz>    the GPU clock limited to <MHz> (nvidia-smi -lgc 0,<MHz>; whole MHz only)
+#   dsv41-root uninstall      the rule and this file removed (./setup.sh remove)
+# The arguments are checked before anything runs; nothing else is accepted.
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+RULE=/etc/sudoers.d/90-dsv41-start
+SELF=/usr/local/sbin/dsv41-root
+
+usage() { echo "usage: dsv41-root check | drop | clock <MHz> | uninstall" >&2; exit 2; }
+case "${1:-}" in
+  check|drop|uninstall) [ $# -eq 1 ] || usage ;;
+  clock) [ $# -eq 2 ] || usage
+         case "$2" in ''|*[!0-9]*) usage ;; esac
+         [ "${#2}" -le 5 ] || usage ;;
+  *) usage ;;
+esac
+[ "$(id -u)" -eq 0 ] || { echo "dsv41-root: run it with sudo" >&2; exit 3; }
+
+case "$1" in
+  check) sha256sum < "$SELF" | cut -d' ' -f1 ;;
+  drop) sync
+        echo 3 > /proc/sys/vm/drop_caches
+        if [ -e /proc/sys/vm/compact_memory ]; then echo 1 > /proc/sys/vm/compact_memory; fi ;;
+  clock) exec nvidia-smi -lgc "0,$2" ;;
+  uninstall) rm -f "$RULE" "$SELF" ;;
+esac

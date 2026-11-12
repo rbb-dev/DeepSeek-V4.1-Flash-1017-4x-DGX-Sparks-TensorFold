@@ -1,19 +1,39 @@
-# Copy to scripts/local.sh (not in git) and fill in this setup's values; scripts/config.sh reads it first.
-# The three other Sparks, key-based ssh (ssh-copy-id), on a ring in its order: this Spark (spark1) - WORKER - WORKER2
-# - WORKER3 - back to this Spark. On a switch any order works.
-WORKER=user@192.0.2.2          # NCCL rank 1 (spark2)
-WORKER2=user@192.0.2.3         # NCCL rank 2 (spark3)
-WORKER3=user@192.0.2.4         # NCCL rank 3 (spark4)
-# FABRIC_PEER=192.0.2.12       # a worker's CX7 address when WORKER is reached over another network (FABRIC_PEER2/3 too)
-# NFS_SERVER3=192.0.2.21       # the head's address a worker mounts the weights from, when the link's is not the one
-# NFS_PATH=/huggingface        # HF_CACHE's path in this Spark's NFS export (an export with fsid=0 at its root)
-# PORT=8888
-# DERISKED=1                  # use Blackfrost-AI/DeepSeek-V4.1-Flash-1017-DERISKED-FP8
-# export TF_DS_PAIR_SUM=1     # pair-sum gathers (zig/patches/0008, 0010): validate on your own ring first
-# export TF_DS_IDX_RB=2       # the indexer's kit kernel, its own RB=2 capture (zig/patches/0014): validate on
-#                             # your own ring first
-# export TF_DS_QUARTER_HC=1  # row-sharded HC-mix, each node its own quarter (zig/patches/0015): validate on
-#                             # your own ring first
-# export TF_DS_OWNER_GATHER=1 # owner-row transport over the column link, needs TF_DS_QUARTER_HC=1 (zig/patches/
-#                             # 0016): validate on your own ring first
-# export TF_DS_IDX_SHARD=1    # the indexer's own row-sharding (zig/patches/0025): validate on your own ring first
+# This setup's own values. Copy to scripts/local.sh (not in git), fill in the blocks below, then run ./setup.sh: it sets
+# up the four Sparks and starts the engine. It needs key-based ssh from this Spark to the three others (ssh-copy-id) and
+# the switch set up as NETWORK.md describes. ./stop.sh stops every rank, ./start.sh starts them again.
+source "$(dirname "${BASH_SOURCE[0]}")/served.sh"   # every setting this fork's numbers ran with; your lines below win
+
+# ---------------------------------------------------------------- your four Sparks (required)
+WORKER1=user@192.0.2.2           # rank 1's Spark (an ssh target)
+WORKER2=user@192.0.2.3           # rank 2's
+WORKER3=user@192.0.2.4           # rank 3's
+# Each worker keeps its own copy of what its rank reads, on its own disk (./setup.sh sends it over the fabric): the path
+# on that worker, laid out as HF_CACHE is here. $HOME is this Spark's home: right when the user is the same on all four.
+# Empty: that worker reads this Spark's copy over NFS instead, an export you set up yourself (slower to start).
+WORKER_HF_CACHE1=$HOME/.cache/huggingface
+WORKER_HF_CACHE2=$HOME/.cache/huggingface
+WORKER_HF_CACHE3=$HOME/.cache/huggingface
+
+# ---------------------------------------------------------------- the model, on this Spark
+# Where deepseek-ai/DeepSeek-V4.1-Flash-1017 is, or will be downloaded to: a Hugging Face cache folder (the one that
+# holds hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/). Downloaded it already with `hf download` (without
+# --local-dir)? Set the cache it went to. Not yet: ./setup.sh downloads it there (~510 GB, resumable). A folder made with
+# `hf download --local-dir` is not a cache: the setup would download the model again. The workers get their copies from
+# this Spark (above).
+HF_CACHE=$HOME/.cache/huggingface
+# The abliteration, your choice: 0 (the default) serves DeepSeek's weights unchanged. 1 adds drowzeys's Keys overlay, one
+# ~1.1 GB sidecar grafted onto layers 10-35, which removes the model's safety refusals (you provide any guardrails; it
+# is gated: accept its terms on Hugging Face and run `hf auth login` first). Changing it makes new weight files.
+ABLIT=0
+
+# The fabric rails (./setup.sh writes them; NETWORK.md): this Spark's addresses first, then WORKER1's, WORKER2's, WORKER3's.
+# The defaults suit a fabric of its own (an isolated VLAN); change them only if they clash with your network.
+# RAIL_A_ADDRS="10.255.0.1 10.255.0.2 10.255.0.3 10.255.0.4"
+# RAIL_B_ADDRS="10.255.1.1 10.255.1.2 10.255.1.3 10.255.1.4"
+
+# ---------------------------------------------------------------- optional
+# MASTER_ADDR=192.0.2.1          # the ranks' rendezvous, an address of this Spark every worker reaches (default: its rail
+#                                # A address when it has it, else what its hostname resolves to)
+# KEY_DIR=$HOME/.config/dsv41    # where ./setup.sh makes the API key and the admin key when the two lines below are unset
+# API_KEY_FILE=$HOME/.config/dsv41/api-keys   # labelled keys, one a line: /v1 then needs one (README, "API keys")
+# GPU_CLOCK=                     # empty: leave the GPU clocks as they are (served.sh limits them to 2200 MHz)
