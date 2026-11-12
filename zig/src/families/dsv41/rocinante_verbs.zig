@@ -27,8 +27,16 @@ pub const Info = extern struct {
     arena_base: u64 = 0,
     ctl_base: u64 = 0,
     layout_hash: u64 = 0,
+    /// Whether the node's queue pairs wait in the card (TF_DS_ROCI_WAIT, rocinante_cd.zig): 1, else 0 (this file's queue pairs). The nodes compare it at connect.
+    wait: u64 = 0,
+    /// The card-waiting backend's connection data, zero here: each rail's port MAC (RoCE v2's destination MAC for a queue pair made
+    /// through DEVX) and the number of the queue pair that carries the abort notice to each peer.
+    mac: [roci.rails][8]u8 = @splat(@splat(0)),
+    abort_qpn: [roci.rails][roci.world]u32 = @splat(@splat(0)),
 };
 
+pub const Error = error{ VerbsFailed, PortDown, LayoutMismatch, SignalMismatch, DepthMismatch, NoGid, AtomicUnsupported, Misaligned, WaitMismatch };
+    for (all) |a| if (a.wait != mine.wait) return error.WaitMismatch;
 
 const Rail = struct {
     ctx: *vabi.Context,

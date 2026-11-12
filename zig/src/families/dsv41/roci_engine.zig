@@ -6,6 +6,8 @@ const cuda = @import("cuda");
 const fabric = @import("fabric");
 const roci = @import("rocinante.zig");
 const rv = @import("rocinante_verbs.zig");
+const cd = @import("rocinante_cd.zig");
+const mx = @import("mlx5_devx.zig");
 const nap = @import("rdma_nap.zig");
 const prompt2d = @import("prompt2d.zig");
 
@@ -35,6 +37,40 @@ const HostMem = struct {
 /// How the transport's arena (the regions it sends from and lands into) is allocated: `mmap` anonymous pages, locked, registered with
 /// cuMemHostRegister (mapped, portable), the type the decode rings use; `wc` cuMemHostAlloc, mapped and write-combined, which only the
 /// transport's own host tests open. The bytes the engine computes do not depend on it.
+/// The NIC a lane runs on: the verbs one, or (TF_DS_ROCI_WAIT=1) the one whose queue pairs wait in the card.
+const NicBox = union(enum) {
+    verbs: *rv.VerbsNic,
+    cd: *cd.CdNic,
+
+    fn info(b: NicBox) !rv.Info {
+        return switch (b) {
+            .verbs => |n| n.info(),
+            .cd => |n| n.info(),
+        };
+    }
+
+    fn connect(b: NicBox, all: *const [roci.world]rv.Info) !void {
+        return switch (b) {
+            .verbs => |n| n.connect(all),
+            .cd => |n| n.connect(all),
+        };
+    }
+
+    fn nic(b: NicBox) roci.Nic {
+        return switch (b) {
+            .verbs => |n| n.nic(),
+            .cd => |n| n.nic(),
+        };
+    }
+
+    fn close(b: NicBox) void {
+        switch (b) {
+            .verbs => |n| n.close(),
+            .cd => |n| n.close(),
+        }
+    }
+};
+
 pub const Roci = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
@@ -43,6 +79,9 @@ pub const Roci = struct {
     arena: HostMem,
     ctl_mem: HostMem,
     verbs: fabric.verbs.Verbs,
+    /// libmlx5, loaded when the queue pairs wait in the card (TF_DS_ROCI_WAIT=1).
+    mlx: ?mx.Mlx5 = null,
+    nic: NicBox,
     t: *roci.Transport,
     passes: u64 = 0,
     prev: roci.Counters = .{},
@@ -59,6 +98,26 @@ pub const Roci = struct {
         r.verbs = try fabric.verbs.Verbs.open(null);
         errdefer r.verbs.close();
         const t0 = nowNs();
+        const wtext: ?[]const u8 = if (std.c.getenv("TF_DS_ROCI_WAIT")) |v| std.mem.span(v) else null;
+        // libmlx5 is probed only when the card's WAIT is wanted; the probe is the library the lanes then use
+        var probe: ?mx.Mlx5 = if (prompt2d.switchDefaultOn(wtext)) (mx.Mlx5.open() catch null) else null;
+        errdefer if (probe) |*m| m.close();
+        const mode = waitMode(wtext, signal, probe != null);
+        const in_card = mode.on;
+        if (mode.refuse) {
+            std.log.err("TF_DS_ROCI_WAIT=1: {s} does not load: the queue pairs that wait in the card need its DEVX entry points", .{mx.library});
+            return error.DevxUnavailable;
+        }
+        std.log.info("TF_DS_ROCI_WAIT: {s}", .{mode.note});
+        if (!in_card) {
+            if (probe) |*m| m.close();
+            probe = null;
+        }
+        errdefer if (r.mlx) |*m| m.close();
+        if (in_card) {
+            r.mlx = probe;
+            probe = null;
+        } else r.nic = .{ .verbs = try rv.VerbsNic.open(gpa, &r.verbs, .{ .devices = devices, .gid_index = gid, .signal = signal }, r.g, r.arena.bytes, r.ctl_mem.bytes[0..@sizeOf(roci.Control)], r.layout.hash()) };
         errdefer r.nic.close();
         const mine = try r.nic.info();
         var table: [roci.world]rv.Info = undefined;
@@ -73,6 +132,7 @@ pub const Roci = struct {
         try gatherOverLinks(fan, rank, world, &one, &seen);
         var o: roci.Order = undefined;
         for (&o, order) |*x, y| x.* = @intCast(y);
+        const set: roci.Settings = .{ .nap = nap.wanted() and !in_card, .codes = true, .gathers = true, .park = layout_set == .host, .idle_park_us = envU32("TF_DS_ROCI_IDLE_PARK_US", 0), .housekeep_every = @max(1, envU32("TF_DS_ROCI_HOUSEKEEP", 16)), .backstop_us = backstopUs(envU32("TF_DS_ROCI_BACKSTOP_US", 100)), .wait_qp = in_card };
         r.t = try roci.Transport.init(gpa, r.g, o, ctl, r.ctl_mem.dev, r.nic.nic(), set);
         errdefer r.t.deinit();
         var buf: [768]u8 = undefined;
@@ -85,6 +145,7 @@ pub const Roci = struct {
     pub fn close(r: *Roci) void {
         r.t.deinit();
         r.nic.close();
+        if (r.mlx) |*m| m.close();
         r.verbs.close();
         _ = r.d.api.cuMemFreeHost(r.ctl_mem.bytes.ptr);
         r.gpa.destroy(r);
@@ -106,6 +167,7 @@ pub const Roci = struct {
     /// The send of an event on `s`, queued behind the producer: one stream write.
     }
 
+        if (r.t.set.wait_qp) return .{ .ticket = r.t.go(ticket), .door = r.t.doorbellAddr(), .cnt = r.sent_cnt.ptr };
     /// The consumers on `s` wait for the event's words from every source, on both rails.
     pub fn wait(r: *Roci, s: cuda.Stream, class: Class) !void {
         try r.t.wait(s, class);
@@ -128,6 +190,25 @@ pub const Roci = struct {
         std.log.info("{s}", .{w.buffered()});
     }
 };
+
+test "wait mode: a lane opens and closes on either NIC (the whole of openLane is type-checked here, not only by an engine build)" {
+    _ = &Roci.openLane;
+    _ = &Roci.close;
+}
+
+/// Which transport runs and why (the start line says it): `on` the queue pairs wait in the card (rocinante_cd.zig, no proxy threads), else the
+/// verbs queue pairs and the proxies; `refuse` the switch was asked for with 1 and cannot run (the start refuses by name).
+pub const WaitMode = struct { on: bool, refuse: bool = false, note: []const u8 };
+
+/// `TF_DS_ROCI_WAIT`: unset or 1 is the card's WAIT, the default; 0 (or any other text) is the verbs path with the proxies. Unset (the default)
+pub fn waitMode(text: ?[]const u8, signal: roci.Signal, mlx_ok: bool) WaitMode {
+    const explicit = text != null;
+    if (!prompt2d.switchDefaultOn(text)) return .{ .on = false, .note = "off (set to something but 1): the verbs queue pairs and the proxy threads" };
+    if (!mlx_ok) {
+        if (explicit) return .{ .on = true, .refuse = true, .note = "" };
+        return .{ .on = false, .note = "unset (the default is the card's WAIT) but libmlx5.so.1 does not load: the verbs queue pairs and the proxy threads run" };
+    }
+}
 
 /// `TF_DS_ROCI_CPUS_B=a,b`: the second lane's two proxy cores (default 1,2: small cores that neither the decode rings' proxies nor the
 /// `TF_DS_ROCI_CPUS=a,b`: the two rails' proxy cores; unset, the scheduler's choice.
@@ -168,4 +249,23 @@ pub fn gatherOverLinks(fan: *const prompt2d.Fan, rank: u32, world: u32, mine: []
         if (got.len != table.len) return error.BadInfo;
         @memcpy(table, got);
     }
+}
+
+test "TF_DS_ROCI_WAIT: unset and 1 are the card's WAIT, 0 is the proxies; unset falls back to the proxies with its reason where the WAIT cannot run, 1 refuses there" {
+    // unset: the default
+    const d = waitMode(null, .write, true);
+    try std.testing.expect(d.on and !d.refuse and std.mem.indexOf(u8, d.note, "the default") != null);
+    const one = waitMode("1", .write, true);
+    try std.testing.expect(one.on and !one.refuse);
+    // 0, empty or any other text: the verbs path
+    for ([_][]const u8{ "0", "", "no" }) |t| {
+        const m = waitMode(t, .write, true);
+        try std.testing.expect(!m.on and !m.refuse);
+    }
+    const a = waitMode(null, .atomic, true);
+    try std.testing.expect(!waitMode("0", .atomic, true).on);
+    // no libmlx5: the same
+    const n = waitMode(null, .write, false);
+    try std.testing.expect(!n.on and !n.refuse and std.mem.indexOf(u8, n.note, "libmlx5") != null);
+    try std.testing.expect(waitMode("1", .write, false).refuse);
 }

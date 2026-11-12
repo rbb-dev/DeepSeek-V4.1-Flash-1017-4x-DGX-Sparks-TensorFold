@@ -4,6 +4,48 @@
    "first_use": "families/dsv41/model.zig:1685",
   },
   {
+   "id": 923,
+   "name": "tf_ds_roci_wait",
+   "env": "TF_DS_ROCI_WAIT",
+   "group": "transport",
+   "tab": "Transport",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "1",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/roci_engine.zig:188",
+   "secret": false
+  },
+  {
+   "id": 924,
+   "name": "tf_ds_ring_wait",
+   "env": "TF_DS_RING_WAIT",
+   "group": "transport",
+   "tab": "Transport",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "1",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:1864",
+   "secret": false
+  },
+  {
    "id": 981,
    "name": "tf_ds_roci_xlog",
    "env": "TF_DS_ROCI_XLOG",

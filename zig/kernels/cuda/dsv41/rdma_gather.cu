@@ -226,6 +226,74 @@ extern "C" __global__ void __launch_bounds__(COLLECT_THREADS) dsv41_rdma_collect
     }
 }
 
+
+
+// ---- TF_DS_RING_WAIT: the decode rings with no proxy thread (ring_wait.zig) ---------------------------------------------------------
+// The card waits on the doorbell word (stored BIG-ENDIAN: it compares the 64-bit word as a big-endian number) and sends the chains the
+// engine thread wrote into its queues at launch. The send credit is the card's completion of exchange q's word WRITE, read here from
+// the queue pairs' completion queues (host memory): entry q - 1 of every queue pair's queue, present with its lap's owner bit and not an
+// error. `sent[]` and `send_done[]` are not used in this mode. The kernels below are the staging, publish and await_send kernels above
+// with those two changes and no others.
+
+struct CqRef {                                   // ring_wait.zig CqRef: one queue pair's completion queue as the card writes it
+    const unsigned char* base;
+    unsigned cnt;                                // entries, a power of two
+    unsigned size;                               // an entry's bytes: 64, or 128 with the entry in the second half
+};
+static_assert(sizeof(CqRef) == 16, "ring_wait.zig's CqRef is 16 bytes");
+
+// ring_wait.zig cqeState: 0 empty (not written by the card, or the last lap's), 1 ready (a successful completion of this lap), -1 failed
+__host__ __device__ __forceinline__ int cqe_state(unsigned op_own, uint64_t idx, unsigned cnt) {
+    const unsigned opc = op_own >> 4;
+    if (opc == 0xf) return 0;
+    const unsigned lap = (idx & cnt) ? 1u : 0u;      // the lap bit: bit log2(cnt) of the entry number (cnt is a power of two)
+    if ((op_own & 1u) != lap) return 0;
+    if (opc == 0xd || opc == 0xe) return -1;
+    return 1;
+}
+
+constexpr int MAX_CQ = 16;
+
+__device__ __forceinline__ uint64_t bswap64_dev(uint64_t v) {
+    const uint32_t lo = (uint32_t)v, hi = (uint32_t)(v >> 32);
+    return ((uint64_t)__byte_perm(lo, 0, 0x0123) << 32) | (uint64_t)__byte_perm(hi, 0, 0x0123);
+}
+
+struct CqTab {                                   // ring_wait.zig CqTab: the lanes' queues, passed by value (no load of the table from host memory)
+    unsigned n;
+    unsigned pad;
+    CqRef e[MAX_CQ];
+};
+static_assert(sizeof(CqTab) == 264, "ring_wait.zig's CqTab is 264 bytes");
+
+// Wait, with warp 0 (all 32 lanes call it together), until entry `idx` of every queue pair's completion queue is a ready completion: lane c reads
+// queue pair c's entry, so the lanes' loads are in flight together (one latency, not one a lane). Gives up (returns false) on an error completion
+// or when the abort word is set (checked every 1024 rounds, as the proxy path's credit spin). An entry's last 8 bytes carry op_own as the top byte.
+__device__ __forceinline__ bool cq_wait_warp(const CqTab& t, uint64_t idx, const uint64_t* abort_word) {
+    const int lane = threadIdx.x & 31;
+    const int n = t.n > (unsigned)MAX_CQ ? MAX_CQ : (int)t.n;
+    for (uint32_t i = 1;; ++i) {
+        int s = 1;
+        if (lane < n) {
+            const CqRef r = t.e[lane];
+            const unsigned char* e = r.base + (size_t)(idx & (r.cnt - 1)) * r.size + (r.size == 128 ? 64 : 0);
+            const unsigned own = (unsigned)(load_sys(reinterpret_cast<const uint64_t*>(e + 56)) >> 56);
+            s = cqe_state(own, idx, r.cnt);
+        }
+        if (__any_sync(0xffffffffu, s < 0)) return false;
+        if (!__any_sync(0xffffffffu, s == 0)) return true;
+        const int ab = ((i & 1023) == 0 && load_sys(abort_word) != 0) ? 1 : 0;
+        if (__any_sync(0xffffffffu, ab)) return false;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(STAGE_THREADS) dsv41_rdma_stage_wait(const float4* __restrict__ src, int n4,
+        char* send_ring, uint64_t* sizes, uint64_t* doorbell, const CqTab cq, uint64_t* seq, int slots,
+        uint64_t max_bytes, uint64_t* probe, const uint64_t* abort_word, unsigned* staged, int fence_mode,
+        float4* __restrict__ own_dst, int own_row4, long long own_stride4, int pdl) {
+    __shared__ uint64_t s_seq;
+    __shared__ int s_last;
+    pdl_enter(pdl);
     const uint64_t t0 = probe ? now_ns() : 0;     // (the probe is null in a served engine)
     if (threadIdx.x < 32) {                      // warp 0: its lanes read the queue pairs' completions together
         const uint64_t q = *seq + 1;
@@ -337,19 +405,98 @@ extern "C" __global__ void __launch_bounds__(STAGE_THREADS) dsv41_rdma_stage_wai
     // doorbell}); no probe then (it is null in a served engine) (xlog)
     uint64_t* xlog_pub = (reinterpret_cast<uintptr_t>(probe) & 1) ? reinterpret_cast<uint64_t*>(reinterpret_cast<uintptr_t>(probe) & ~uintptr_t(1)) : nullptr;
     if (xlog_pub) probe = nullptr;
+    if (threadIdx.x < 32) {                      // warp 0: its lanes read the queue pairs' completions together
+        const uint64_t q = *seq + 1;
+        if (q > (uint64_t)slots) cq_wait_warp(cq, q - slots - 1, abort_word);
+    }
+    __syncthreads();
+    const uint64_t q = s_seq;
+    const int slot = (int)(q % slots);
+    float4* dst = reinterpret_cast<float4*>(send_ring + (size_t)slot * max_bytes);
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) dst[i] = src[i];
+    if (fence_mode) {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            s_last = atomicAdd(staged, 1u) == gridDim.x - 1;
+        }
+    } else {
+        __threadfence_system();
+        __syncthreads();
+        if (threadIdx.x == 0) s_last = atomicAdd(staged, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && s_last) {
+        __threadfence_system();
+        *staged = 0;
+        *seq = q;
+        if (fence_mode) {
+            store_relaxed_sys(doorbell, bswap64_dev(q));
+        } else {
+            store_sys(doorbell, bswap64_dev(q));
+        }
         if (xlog_pub) {
             xlog_pub[(q & 8191) * 2] = q;
             xlog_pub[(q & 8191) * 2 + 1] = now_ns();
         }  // xlog
+        if (probe) {
+            probe[0] += now_ns() - t0;
+            probe[4] = now_ns();
+        }
+    }
+    if (own_dst) {
+        if (s_last) __syncthreads();
+        if (own_stride4 == own_row4) {
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) own_dst[i] = src[i];
+        } else {
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) {
+                const int r = i / own_row4;
+                own_dst[(size_t)r * own_stride4 + (i - r * own_row4)] = src[i];
+            }
+        }
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(STAGE_THREADS) dsv41_rdma_publish_wait_x(uint64_t* sizes, uint64_t* doorbell,
+        uint64_t* seq, uint64_t* send_q, uint64_t* send_slot, uint64_t* send_last, int slots, int user,
+        const CqTab cq, const uint64_t* abort_word, const float4* __restrict__ own_src,
+        float4* __restrict__ own_dst, int own_row4, long long own_stride4, uint64_t nbytes, uint64_t* probe, int pdl) {
+    pdl_enter(pdl);
     // TF_DS_ROCI_XLOG: the host tags `probe` with bit 0 and points it at the doorbell log (8,192 records of {sequence, this GPU's globaltimer after the
     // doorbell}); no probe then (it is null in a served engine) (xlog)
     uint64_t* xlog_pub = (reinterpret_cast<uintptr_t>(probe) & 1) ? reinterpret_cast<uint64_t*>(reinterpret_cast<uintptr_t>(probe) & ~uintptr_t(1)) : nullptr;
     if (xlog_pub) probe = nullptr;
+    const uint64_t q = *seq + 1;
+    if (blockIdx.x == 0 && threadIdx.x < 32) {   // warp 0 of block 0
+        if (q > (uint64_t)slots) cq_wait_warp(cq, q - slots - 1, abort_word);
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        store_relaxed_sys(send_last + user, q);
+        *seq = q;
+        __threadfence_system();
+        store_relaxed_sys(doorbell, bswap64_dev(q));
         if (xlog_pub) {
             xlog_pub[(q & 8191) * 2] = q;
             xlog_pub[(q & 8191) * 2 + 1] = now_ns();
         }  // xlog
+        if (probe) {
+            probe[0] += now_ns() - t0;
+            probe[4] = now_ns();
+        }
+    }
+    if (own_dst) {
+        const int n4 = (int)(nbytes / 16);
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) {
+            if (own_stride4 == own_row4) {
+                own_dst[i] = own_src[i];
+            } else {
+                const int r = i / own_row4;
+                own_dst[(size_t)r * own_stride4 + (i - r * own_row4)] = own_src[i];
+            }
+        }
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(COLLECT_THREADS) dsv41_rdma_collect_peers_roci_x(Dsts d, int rows,
         const char* recv_ring, const uint64_t* gen, const unsigned* lanes, const uint64_t* seq, int rank, int world,
         int slots, uint64_t max_bytes, uint64_t* abort_word, uint64_t deadline_ns, uint64_t* fault, int pdl,
@@ -435,3 +582,4 @@ extern "C" __global__ void __launch_bounds__(COLLECT_THREADS) dsv41_rdma_collect
         __syncthreads();  // xlog
         if (threadIdx.x == 0) fault[8 + ((q * 8 + (uint64_t)p) & 65535) * 4 + 3] = now_ns();  // xlog
     }  // xlog
+}

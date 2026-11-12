@@ -11,6 +11,7 @@
 //! RDMA gathers are the rings' gathers (the same bytes).
 const std = @import("std");
 const cuda = @import("cuda");
+const ring_wait = @import("ring_wait.zig");
 const prompt = @import("prompt.zig");
 const weights = @import("weights.zig");
 const plan = @import("plan.zig");
@@ -270,7 +271,10 @@ pub const PassGraphs = struct {
 
     pub fn deinit(g: *PassGraphs) void {
         var it = g.map.valueIterator();
-        while (it.next()) |x| x.deinit();
+        while (it.next()) |x| {
+            ring_wait.forget(@intFromPtr(x.handle));
+            x.deinit();
+        }
         g.map.deinit(g.gpa);
         g.lazy.deinit(g.gpa);
         g.* = undefined;
@@ -297,6 +301,7 @@ pub const PassGraphs = struct {
         errdefer exec.deinit();
         try g.map.put(g.gpa, key, exec);
         try exec.launchOn(e.s);
+        if (g.map.getPtr(key)) |x| return ring_wait.launchGraph(x.*, e.s);
         // G0.3, as round.Graphs.run: every rank captures and instantiates, then all agree before any launch
         // (graph_fallback: launch and keep, every rank eager, or the pass failed on every rank)
         var site: Site = .{ .dr = dr, .e = e, .ch = ch, .pool = pool, .N = N, .steps = steps };

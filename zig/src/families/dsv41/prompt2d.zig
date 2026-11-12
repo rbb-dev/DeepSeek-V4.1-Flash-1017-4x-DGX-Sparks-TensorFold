@@ -236,12 +236,30 @@ pub const Settings = extern struct {
     fn sepIf(w: *const std.Io.Writer, sep: []const u8) []const u8 {
         return if (w.end > 0) sep else "";
     }
+pub const exch_ring_wait: u32 = 1 << 27; // TF_DS_RING_WAIT: the rings' queue pairs wait in the card (no proxy threads)
+/// A switch that is on unless set otherwise (TF_DS_ROCI_WAIT, TF_DS_RING_WAIT): unset or "1" is on; any other text, "0" included, is off (a typo
+/// takes the fallback path, never the new one by accident).
+pub fn switchDefaultOn(text: ?[]const u8) bool {
+    const v = text orelse return true;
+    return std.mem.eql(u8, v, "1");
+}
+
 /// TF_DS_ROCI_P2_FIRST as Model.open read it (switchAsked), once (Settings.exch; Two.p2First): an owner sum's
 /// TF_DS_ROCI_ENGRAM_AHEAD as Model.open read it (switchAsked), once (Settings.exch; Two.engramAhead): an
 /// TF_DS_ROCI_SENT_FIRST as Model.open read it (switchAsked), once (Settings.exch; Two.sentFirst): wo_b runs in
 /// TF_DS_ROCI_COMBINE_DOOR as Model.open read it (switchAsked), once (Settings.exch; Two.combineDoor): the MoE's
+    if (ring_wait_asked) x |= exch_ring_wait;
 };
 
+
+/// TF_DS_RING_WAIT as Model.open read it, once (Settings.exch bit 27, rdma.Settings.wait): the rings' queue pairs are Core Direct masters that wait
+/// in the card on the doorbell word, their chains written when an exchange launches, so no proxy thread runs. Needs TF_DS_RING_WORD with the
+/// word signal; every rank alike.
+pub var ring_wait_asked: bool = false;
+
+/// TF_DS_RING_WAIT was set (to 1): not the default's silence. A fallback to the proxy threads is for the default only; asked for outright, a ring
+/// that cannot wait in the card refuses by name.
+pub var ring_wait_explicit: bool = false;
 
 /// TF_DS_2D_ORDER: the 2D node (role) each rank serves, "g0,g1,g2,g3" (rank 0 must serve node 0: it serves the
 /// API); unset, rank g serves node g. On four GB10s cabled as a ring 0-1-2-3-0 without a switch, "0,1,3,2" makes every
@@ -1075,4 +1093,13 @@ test "the exchange switches that remain: a named bit each in Settings.exch, aske
     var odd = lead;
     odd.exch = 1 << 0; // the old TF_DS_OWNER_YX bit
     try std.testing.expect(std.mem.indexOf(u8, odd.differ(lead, 1, &buf), "switches this build has no name for") != null);
+
+test "a default-on switch (TF_DS_ROCI_WAIT, TF_DS_RING_WAIT): unset and 1 are on; 0, empty and any other text are off" {
+    try std.testing.expect(switchDefaultOn(null));
+    try std.testing.expect(switchDefaultOn("1"));
+    for ([_][]const u8{ "0", "", "yes", "true", " 1", "11" }) |t| try std.testing.expect(!switchDefaultOn(t));
+    // the other switches are unchanged: off unless 1
+    try std.testing.expect(!switchAsked(null));
+    try std.testing.expect(switchAsked("1"));
+}
 }

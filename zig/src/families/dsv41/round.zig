@@ -29,6 +29,7 @@ const engram = @import("engram.zig");
 const exact = @import("exact.zig");
 const ops_mod = @import("ops.zig");
 const graph_cache = @import("graph_cache.zig");
+const ring_wait = @import("ring_wait.zig");
 const graph_fallback = @import("graph_fallback.zig");
 
 const Engine = prompt.Engine;
@@ -1002,6 +1003,10 @@ pub const Graphs = struct {
 
     pub fn deinit(g: *Graphs) void {
         var it = g.lru.valueIterator();
+        while (it.next()) |en| {
+            ring_wait.forget(@intFromPtr(en.exec.handle));
+            en.exec.deinit();
+        }
         g.lru.deinit(g.gpa);
         g.lazy.deinit(g.gpa);
         g.* = undefined;
@@ -1019,7 +1024,7 @@ pub const Graphs = struct {
         try rd.joinPrefetch(e);
         if (g.lru.get(key)) |en| {
             if (!std.meta.eql(en.start, cy.*)) return error.GraphStateMismatch;
-            try en.exec.launchOn(e.s);
+            try ring_wait.launchGraph(en.exec, e.s); // (TF_DS_RING_WAIT: the stretch's exchanges are posted first)
             cy.* = en.end;
             rd.kk = cy.kk;
             rd.has_cand = cy.has_cand;
@@ -1047,6 +1052,7 @@ pub const Graphs = struct {
             const g = st.g;
             if (g.lru.putAssumeCapacity(key, en)) |old| {
                 var x = old.exec;
+                ring_wait.forget(@intFromPtr(x.handle));
                 x.deinit();
                 if (std.math.isPowerOfTwo(g.lru.evicted)) std.log.info("dsv41: CUDA graphs: {d} kept (the cap), {d} destroyed for newer ones so far; a count that keeps rising means TF_DS_GRAPH_CAP is below the working set", .{ g.lru.count(), g.lru.evicted });
             } else if (std.math.isPowerOfTwo(g.lru.count()) and g.lru.count() >= 64) std.log.info("dsv41: CUDA graphs: {d} kept", .{g.lru.count()});

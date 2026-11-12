@@ -9,6 +9,8 @@
 //! This file holds the pieces that need no device: the arena's layout, the events' chains, the control block, the
 //! proxies, the watchdog and the abort. The NIC behind a post is an interface (`Nic`); the verbs implementation is in
 //! rocinante_verbs.zig, a loopback one in the tests.
+//! With TF_DS_ROCI_WAIT=1 (Settings.wait_qp) there is no proxy: the engine thread writes every chain into its queue pair when it reserves the
+//! send, behind a WAIT on the doorbell word that the card runs, and one janitor thread watches and reaps (rocinante_cd.zig).
 
 const std = @import("std");
 const nap = @import("rdma_nap.zig");
@@ -345,6 +347,9 @@ pub const Nic = struct {
     fail_fn: *const fn (ctx: *anyopaque) void,
     /// The proxy's chance to reap completions: an error completion fails the transport.
     reap_fn: *const fn (ctx: *anyopaque, rail: u8) PostError!void,
+    /// The card-waiting backend's post (Settings.wait_qp; null for the others): write the chain into the send queue of (rail, peer) now,
+    /// behind a WAIT for the doorbell word to reach `wait_for` (0: no WAIT, the chain is on its way at once), and ring the queue.
+    prepost_fn: ?*const fn (ctx: *anyopaque, rail: u8, peer: u8, class: Class, chain: *const Chain, word: u64, wait_for: u64) PostError!void = null,
 
     fn post(n: Nic, rail: u8, peer: u8, class: Class, chain: *const Chain, word: u64) PostError!void {
         return n.post_fn(n.ctx, rail, peer, class, chain, word);
@@ -399,6 +404,7 @@ const pending_len = 512;
 
 /// The start line (once, on every rank): the name, the arena, the rails and the plan hash.
     const l = layout();
+    try w.print("{s} (Roci) on: node {d}, arena {d} bytes in {d} regions, control block {d} bytes, rails {s} (GID {d}), layout hash {x}, watchdog {d} ms, backstop {d} us, idle park {d} us, housekeeping every {d} turns, arrival signal {s}, carrying {s}{s}\n", .{ transport_name, g, l.total, n_regions, @sizeOf(Control), rails_text, gid_index, l.hash(), s.dead_ms, s.backstop_us, s.idle_park_us, s.housekeep_every, signalText(signal), carriesText(&cb, s.codes, s.gathers), if (s.wait_qp) ", waiting in the card (TF_DS_ROCI_WAIT, the default; =0 for the proxy threads: every chain pre-posted behind a WAIT on the doorbell, no proxy threads, one janitor)" else "" });
 }
 
 pub const Settings = struct {
@@ -408,6 +414,12 @@ pub const Settings = struct {
     dead_ms: u64 = 5_000,
     /// The two rails' proxies nap on the doorbell (TF_DS_RDMA_WFE's way) or poll.
     nap: bool = true,
+    /// The queue pairs wait in the card (TF_DS_ROCI_WAIT, rocinante_cd.zig): the engine thread writes every chain into its send queue behind a
+    /// WAIT for the GPU's doorbell write when it reserves the send, so no proxy thread runs; one janitor thread, which sleeps in the kernel
+    /// between 100 ms looks, watches the peers and reaps the completions. The proxy-only settings above are not read.
+    wait_qp: bool = false,
+    /// The janitor's period.
+    janitor_ms: u32 = 100,
 };
 
 
@@ -437,9 +449,18 @@ pub const Transport = struct {
     fail_class: std.atomic.Value(u8) = .init(0),
     fail_peer: std.atomic.Value(u8) = .init(0),
     threads: [rails]?std.Thread = @splat(null),
+    /// Settings.wait_qp: the janitor, the words the engine thread has written into the send queues (the generation of each (rail, class)),
+    /// whether it is inside a reservation (a failure waits for it to be out before the NIC takes the queues away) and which thread it is, and
+    /// how far the janitor has walked the scheduling ring.
+    janitor: ?std.Thread = null,
+    wait_words: [rails][n_classes]u64 = @splat(@splat(0)),
+    posting: std.atomic.Value(u32) = .init(0),
+    poster_tid: std.atomic.Value(u32) = .init(0),
+    cursor: std.atomic.Value(u64) = .init(0),
 
 
     pub fn init(gpa: std.mem.Allocator, g: u8, order: Order, ctl: *Control, ctl_dev: u64, nic: Nic, set: Settings) !*Transport {
+        if (set.wait_qp and nic.prepost_fn == null) return error.NicCannotWait;
         const t = try gpa.create(Transport);
         t.* = .{ .gpa = gpa, .g = g, .order = order, .ctl = ctl, .ctl_dev = ctl_dev, .nic = nic, .set = set, .events = undefined };
         for (0..2) |s| for (0..n_classes) |c| {
@@ -450,6 +471,10 @@ pub const Transport = struct {
 
     /// Starts the two proxy threads; `cpus` are the cores to pin them to (null: no pinning).
     pub fn start(t: *Transport, cpus: ?[rails]u16) !void {
+        if (t.set.wait_qp) {
+            t.janitor = try std.Thread.spawn(.{}, janitorMain, .{t});
+            return;
+        }
     }
 
     pub fn deinit(t: *Transport) void {
@@ -457,6 +482,10 @@ pub const Transport = struct {
         for (&t.threads) |*th| if (th.*) |x| {
             th.* = null;
         };
+        if (t.janitor) |x| {
+            where.joinThread(x);
+            t.janitor = null;
+        }
         t.gpa.destroy(t);
     }
 
@@ -471,6 +500,32 @@ pub const Transport = struct {
     /// The sender's side of an event, queued behind the producer on `stream`: the scheduling entry, then one stream
     /// write of the ticket. `stream` has writeValue64(addr, value).
     pub fn send(t: *Transport, stream: anytype, class: Class, shape: u8) !void {
+        if (t.set.wait_qp) return t.sendBig(stream, ticket);
+    /// The stream write of a send's ticket in the card-waiting mode: the doorbell word that says it (see `go`).
+    fn sendBig(t: *Transport, stream: anytype, ticket: u64) !void {
+        try stream.writeValue64(t.devAddr(&t.ctl.doorbell.v), t.go(ticket));
+        t.host.stream_writes += 1;
+    }
+
+    /// The doorbell word that says `ticket`: the ticket itself, or in the card-waiting mode its big-endian bytes (the card compares a WAIT's
+    /// word as a big-endian number, measured, so the doorbell is stored that way by every writer: the host's stream write, a producer
+    /// kernel's store of the value the host hands it (Roci.reserve), the host lane's store, the failure's abort value).
+    pub fn go(t: *const Transport, ticket: u64) u64 {
+        return if (t.set.wait_qp) std.mem.nativeToBig(u64, ticket) else ticket;
+    }
+
+    /// The ticket a doorbell word says (the inverse of `go`).
+    pub fn ticketOf(t: *const Transport, w: u64) u64 {
+        return if (t.set.wait_qp) std.mem.bigToNative(u64, w) else w;
+    }
+
+        if (t.set.wait_qp) return t.sendBig(stream, ticket);
+        if (t.set.wait_qp) {
+            @atomicStore(u64, &t.ctl.doorbell.v, t.go(ticket), .release);
+            t.host.stream_writes += 1;
+            return;
+        }
+        if (t.set.wait_qp) return t.reserveWait(class, shape, rows, x);
         try t.check();
         // the host may run ahead of the proxies by half the ring: past that it waits for them (they advance as the stream
         // reaches the doorbells), and a transport that does not advance in `dead_ms` has failed
@@ -490,6 +545,77 @@ pub const Transport = struct {
         const slot = &t.ctl.sched[t.ticket % sched_len];
         t.host.events += 1;
         t.host.doorbells += 1;
+    /// The event a scheduling entry names, as a proxy builds it: the host lane's record events, the plan of any row count, or a fixed plan.
+    /// (Settings.wait_qp only: the engine thread builds the chains the proxies would have.)
+    fn eventOf(t: *Transport, e: u64, x: usize, built: *Event) *const Event {
+        if (schedClass(e) == .rec or schedClass(e) == .rech) {
+            built.* = buildRecEvent(schedClass(e), t.g, schedShape(e), schedRows(e));
+            return built;
+        }
+        if (schedShape(e) == any_shape) {
+            built.* = buildEventX(schedClass(e), schedRows(e), x, t.g, t.order);
+            return built;
+        }
+        return &t.events[schedShape(e)][@backingInt(schedClass(e))];
+    }
+
+    /// reserveEntry when the queue pairs wait in the card: the ticket and its scheduling entry as always, then every chain of the event on
+    /// every rail written into its send queue behind a WAIT for the doorbell word to reach this ticket (the host lane's record events,
+    /// which nothing else rings, with no WAIT: they leave at once), one ring of the queue a chain. The GPU's write of the ticket into
+    /// the doorbell, which `send` makes next, is what lets them go. `posting` says the engine thread is inside this: a failure waits for it
+    /// before the NIC takes the queues away.
+    fn reserveWait(t: *Transport, class: Class, shape: u8, rows: usize, x: usize) !u64 {
+        t.poster_tid.store(@intCast(std.Thread.getCurrentId()), .monotonic);
+        t.posting.store(1, .seq_cst);
+        defer t.posting.store(0, .seq_cst);
+        if (t.failed.load(.seq_cst) != 0) return error.RociFailed;
+        try t.check();
+        // the janitor reads the scheduling ring from its cursor: the host does not lap it
+        if (t.ticket -% t.cursor.load(.acquire) >= sched_len / 2) {
+            const t0 = nowNs();
+            const prev_place = where.enter(.roci_reserve, @as(u32, @backingInt(class)), 0);
+            defer where.leave(prev_place);
+            while (t.ticket -% t.cursor.load(.acquire) >= sched_len / 2) {
+                try t.check();
+                if (nowNs() - t0 > t.set.dead_ms * std.time.ns_per_ms) {
+                    t.fail(.host_wait, .own1, 0);
+                    return error.RociFailed;
+                }
+                const ts: std.c.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_us };
+                _ = std.c.nanosleep(&ts, null);
+            }
+        }
+        t.ticket += 1;
+        const ticket = t.ticket;
+        const entry = if (shape == any_shape) schedEntryN(ticket, class, rows) else schedEntry(ticket, class, shape) | (@as(u64, @intCast(rows)) << 48);
+        @atomicStore(u32, &t.ctl.sched_x[ticket % sched_len], @intCast(x), .monotonic);
+        @atomicStore(u64, &t.ctl.sched[ticket % sched_len], entry, .release);
+        t.host.events += 1;
+        t.host.doorbells += 1;
+        t.reserved.store(ticket, .seq_cst);
+        var built: Event = undefined;
+        const ev = t.eventOf(entry, x, &built);
+        const cls = @backingInt(ev.class);
+        const wait_for: u64 = if (class == .rec or class == .rech) 0 else ticket;
+        for (0..rails) |r| t.wait_words[r][cls] += 1;
+        for (ev.peerSlice(), 0..) |peer, k| for (0..rails) |r| {
+            const ch = &ev.chains[k][r];
+            t.nic.prepost_fn.?(t.nic.ctx, @intCast(r), peer, ev.class, ch, t.wait_words[r][cls], wait_for) catch {
+                t.fail(.post, ev.class, peer);
+                return error.RociFailed;
+            };
+            t.host.posts += 1;
+            t.host.data_writes += ch.n;
+            t.host.words += 1;
+            t.host.bytes_out += ch.bytes();
+        };
+        return ticket;
+    }
+
+    /// Host tests only: a failure that stores the abort value into the doorbell BEFORE the card has taken the queue pairs away, the order the
+    /// design forbids (every armed WAIT would release its chain), to see that the ordering test can fail.
+    pub var abort_doorbell_first: bool = false;
+
     }
 
     /// The receiver's side: the next consumer on `stream` waits for every source's words on both rails.
@@ -530,8 +656,28 @@ pub const Transport = struct {
         t.fail_class.store(@backingInt(class), .monotonic);
         t.fail_peer.store(peer, .monotonic);
         @atomicStore(u64, &t.ctl.abort.v, 1, .release);
+        if (t.set.wait_qp) t.awaitPostingOut();
+        if (builtin.is_test and abort_doorbell_first) @atomicStore(u64, &t.ctl.doorbell.v, t.go(abort_value), .release);
         t.nic.fail_fn(t.nic.ctx);
         @atomicStore(u64, &t.ctl.doorbell.v, abort_value, .release);
+        // (the card-waiting mode stores it big-endian; the queue pairs are gone by now, so the native word just above releases nothing)
+        if (t.set.wait_qp) @atomicStore(u64, &t.ctl.doorbell.v, t.go(abort_value), .release);
+    }
+
+    /// awaitProxiesOut for the card-waiting mode: waits (short sleeps, at most `proxy_out_ms`) for the engine thread to be out of its
+    /// reservation, so no chain is being written into a send queue the NIC takes away. A failure the engine thread raises itself, inside
+    /// its reservation, does not wait for itself.
+    fn awaitPostingOut(t: *Transport) void {
+        const me: u32 = @intCast(std.Thread.getCurrentId());
+        const t0 = nowNs();
+        while (t.posting.load(.seq_cst) != 0 and t.poster_tid.load(.monotonic) != me) {
+            if (nowNs() - t0 > t.set.proxy_out_ms * std.time.ns_per_ms) {
+                std.log.err("ROCI failed on node {d}: the engine thread was still posting after {d} ms; the failure goes on", .{ t.g, t.set.proxy_out_ms });
+                break;
+            }
+            const ts: std.c.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_us };
+            _ = std.c.nanosleep(&ts, null);
+        }
     }
 
     /// The per-peer progress watchdog of one rail: for any class where this rail has posted more than a peer's words
@@ -681,6 +827,55 @@ fn nowNs() u64 {
         }
         ctr.post_ns_max = @max(ctr.post_ns_max, nowNs() - t0);
         last_progress = nowNs();
+    }
+}
+
+/// The card-waiting mode's one thread a transport. It owns no posting: the engine thread wrote every chain when it reserved it. Each
+/// period (`janitor_ms`, in a futex wait that a stop or a failure ends at once, so the thread is asleep in the kernel in between) it
+/// walks the scheduling ring up to the doorbell (the releases the card has been given, which the watchdog's `sent` counts), runs the
+/// peers' watchdog on both rails and reaps the completions of both rails, where an error completion fails the transport.
+fn janitorMain(t: *Transport) void {
+    var last_progress: [rails]u64 = @splat(nowNs());
+    var progress_sum: [rails]u64 = @splat(0);
+    var walked: u64 = 0;
+    var line_at: u64 = 0;
+    var line_prev: Counters = .{};
+    const ctr = &t.rail_counters[0];
+    const ts: std.os.linux.timespec = .{ .sec = t.set.janitor_ms / 1000, .nsec = (t.set.janitor_ms % 1000) * std.time.ns_per_ms };
+    while (!t.stop.load(.acquire)) {
+        const seq = t.wake_seq[0].load(.acquire);
+        if (!t.stop.load(.acquire) and t.failed.load(.acquire) == 0) _ = std.os.linux.futex_4arg(&t.wake_seq[0].raw, .{ .cmd = .WAIT, .private = true }, seq, &ts);
+        ctr.wakes += 1;
+        if (t.stop.load(.acquire) or t.failed.load(.acquire) != 0) break;
+        const d = t.ticketOf(@atomicLoad(u64, &t.ctl.doorbell.v, .acquire));
+        if (d >= abort_value) break;
+        const upto = @min(d, t.reserved.load(.acquire));
+        while (walked < upto) {
+            const i = walked + 1;
+            const e = @atomicLoad(u64, &t.ctl.sched[i % sched_len], .acquire);
+            if (schedTicket(e) != @as(u32, @truncate(i))) {
+                t.fail(.stamp, .own1, 0);
+                return;
+            }
+            const cls = @backingInt(schedClass(e));
+            for (0..rails) |r| t.sent[r][cls] += 1;
+            walked = i;
+        }
+        t.cursor.store(walked, .release);
+        for (0..rails) |r| {
+            t.watch(@intCast(r), &last_progress[r], &progress_sum[r], ctr);
+            t.nic.reap_fn(t.nic.ctx, @intCast(r)) catch {
+                t.fail(.qp, .own1, 0);
+                return;
+            };
+        }
+        if (walked / eventsPerPass(t.set.codes, t.set.gathers) != line_at) {
+            line_at = walked / eventsPerPass(t.set.codes, t.set.gathers);
+            const now = t.host;
+            std.log.info("ROCI wait line, released {d}: posts {d} data_writes {d} words {d} bytes_out {d} janitor_wakes {d}", .{ walked, now.posts - line_prev.posts, now.data_writes - line_prev.data_writes, now.words - line_prev.words, now.bytes_out - line_prev.bytes_out, ctr.wakes - line_prev.wakes });
+            line_prev = now;
+            line_prev.wakes = ctr.wakes;
+        }
     }
 }
 

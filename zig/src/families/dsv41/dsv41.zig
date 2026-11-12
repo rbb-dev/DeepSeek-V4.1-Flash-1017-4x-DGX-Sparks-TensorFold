@@ -58,6 +58,12 @@ pub const replay_runner = @import("replay_runner.zig");
 pub const rocinante = @import("rocinante.zig");
 /// Rocinante on ibverbs.
 pub const rocinante_verbs = @import("rocinante_verbs.zig");
+/// The ConnectX's DEVX interface: a queue pair the card waits on a word with, its entries written by hand.
+pub const mlx5_devx = @import("mlx5_devx.zig");
+/// Rocinante on queue pairs that wait in the card.
+pub const rocinante_cd = @import("rocinante_cd.zig");
+/// The decode rings' queue pairs that wait in the card (TF_DS_RING_WAIT).
+pub const ring_wait = @import("ring_wait.zig");
 /// Rocinante inside the engine.
 pub const roci_engine = @import("roci_engine.zig");
 
@@ -113,8 +119,12 @@ test {
     refAll(lanes);
     refAll(rocinante);
     refAll(rocinante_verbs);
+    refAll(mlx5_devx);
+    refAll(rocinante_cd);
+    refAll(ring_wait);
     refAll(roci_engine);
     _ = @import("pair_spans.zig");
     _ = @import("rocinante_test.zig");
+    _ = @import("rocinante_cd_test.zig");
     refAll(replay_runner);
 }

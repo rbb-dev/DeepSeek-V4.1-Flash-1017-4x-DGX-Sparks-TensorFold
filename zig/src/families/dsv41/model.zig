@@ -42,6 +42,7 @@ const exl3_linear = @import("exl3_linear.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const exl3_experts2d = @import("exl3_experts2d.zig");
 const mx = @import("mx.zig");
+const mx5 = @import("mlx5_devx.zig");
 const ops_mod = @import("ops.zig");
 const exact = @import("exact.zig");
 const cublas = @import("cublas.zig");
@@ -390,6 +391,7 @@ const KitFinds = struct {
         }
         try m.synchronize();
         try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize"); // the setup's legacy-stream copies too
+    if (!is_default or text == null or !std.mem.eql(u8, text.?, "4096")) return null;
 
         // Engram on the host: the compressed token map, the multipliers, the tables and 64 readers
         if (o.engram_dir) |edir| {
@@ -740,6 +742,7 @@ pub fn startSettings(o: Options) prompt2d.Settings {
 
         why = "needs the four-node 2D split with Rocinante";
     const rc = try roci_engine.Roci.openLane(gpa, d, m.comm.rank, node, m.comm.world, m.two.?.rank_of, &m.fan, rails, Model.rdmaGid() orelse 3, 1, m.two.?.rc.?, .host);
+        const is_default = speed_defaults.defaulted("TF_DS_ROCI_STAGGER");
     m.two_b = try prompt2d.Two.init(c, &m.w, &m.arena, sp, m.pass_rows);
     m.two_b.?.rc = try roci_engine.Roci.openLane(gpa, d, m.comm.rank, @intCast(m.two.?.node()), m.comm.world, m.two.?.rank_of, &m.fan, rails, Model.rdmaGid() orelse 3, 2, m.two.?.rc.?, .prompt);
     if (m.pair_log) {
@@ -793,6 +796,12 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         // never captured RB above 2. Off (RB=1, today's behavior) unless set; validate on your own ring first.
         if (std.c.getenv("TF_DS_IDX_RB")) |v| tri_index.idx_rb = std.fmt.parseInt(usize, std.mem.span(v), 10) catch tri_index.idx_rb;
         if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
+        const ring_wait_text: ?[]const u8 = if (std.c.getenv("TF_DS_RING_WAIT")) |v| std.mem.span(v) else null;
+        prompt2d.ring_wait_asked = prompt2d.switchDefaultOn(ring_wait_text); // on unless set to something but 1; every rank alike (Settings)
+        if (!prompt2d.ring_wait_asked) std.log.info("TF_DS_RING_WAIT: off (set to something but 1): the rings run their proxy threads", .{});
+            prompt2d.ring_wait_asked = false;
+        }
+        prompt2d.ring_wait_explicit = ring_wait_text != null;
         if (std.c.getenv("TF_DS_ROCI_XLOG")) |v| rdma.xlog = std.mem.eql(u8, std.mem.span(v), "1");
         if (std.c.getenv("TF_DS_L2_DN_MB")) |v| round.l2_dn_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dn_mb;
         if (std.c.getenv("TF_DS_L2_DEC_MB")) |v| round.l2_dec_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dec_mb;
@@ -898,6 +907,10 @@ pub fn startSettings(o: Options) prompt2d.Settings {
             try Two.require(d, &m.comm, m.stream, "the decoder half over Rocinante", prompt2d.rociDecOff(prompt.quant_once, c.dspark_taps.slice().len, c.hidden) orelse try any_check.decoderOff(gpa, a, KitFinds{ .set = &m.set, .extra = if (m.extra) |*x| x else null }, c.*, m.w.layers));
             std.log.info("Rocinante carries the decoder half (layers {d} to {d}) on owned rows of the decoder rows, its sums and gathers, the DSpark taps and the head's row, on every rank", .{ c.layers / 2, c.layers - 1 });
             const proj_why: ?[]const u8 = if (prompt2d.idx_proj_owned_asked) try prompt.idxProjOwnedOff(gpa, SetFinds{ .set = &m.set }, m.mxk != null, m.two.?.idx_shard, m.w.layers, c.candidate_source, c.rope_dim, c.index_heads, c.index_head_dim, &rows4, m.comm.world) else null;
+                const ring_wait_on = ringWaitOn(rk.hasWait(), devices.items);
+                m.rdma_rings = try ring2d.Rings.open(gpa, d, rk, devices.items, role, ord, .{ .max_bytes = ring_bytes, .gid_index = rdmaGid(), .pdl = rdmaPdl(), .collect_peers = peers and rk.collect_peers != null, .wc = sw.wc, .inplace = sw.inplace, .roci = ringWordOf(), .roci_deadline_ns = ringWordDeadlineNs(), .wait = ring_wait_on, .wait_explicit = prompt2d.ring_wait_explicit }, &m.comm, m.stream, !weights.draft_4way);
+                m.two.?.rings = &m.rdma_rings.?;
+            }
             // the decode exchanges: each rank's start check (the rings, the shapes), then on every rank or the start ends
             {
                 try Two.require(d, &m.comm, m.stream, "the decode exchanges on the rings", decodeOff(m.two.?.rings != null, shape));
@@ -991,6 +1004,36 @@ pub fn startSettings(o: Options) prompt2d.Settings {
     /// pdl argument 0 (no griddepcontrol in them): the decode plan's G0.2 control (b). Unset or any other value: as served.
     pub fn rdmaPdl() bool {
         for ([_][*:0]const u8{ "TF_DS_RDMA_PDL", "TF_RDMA_PDL" }) |name| if (std.c.getenv(name)) |v| return !std.mem.eql(u8, std.mem.span(v), "0");
+        return true;
+    }
+
+    /// Why the card's WAIT cannot run on the rings when it is wanted, for the fallback to the proxy threads when TF_DS_RING_WAIT is unset (the
+    /// default); null when it can. Asked for with 1 it is never a fallback: Ring.create refuses by name.
+    pub fn ringWaitFallback(explicit: bool, has_kernels: bool, mlx_ok: bool, atomic_why: ?[]const u8) ?[]const u8 {
+        if (explicit) return null;
+        if (atomic_why) |why| return why; // (TF_DS_RING_WORD_SIGNAL=atomic on a card that cannot do ATOMICs)
+        if (!has_kernels) return "the rings' kernels have no dsv41_rdma_stage_wait / publish_wait / await_send_wait";
+        if (!mlx_ok) return "libmlx5.so.1 does not load (the card's WAIT needs its DEVX entry points)";
+        return null;
+    }
+
+    /// Whether the rings' queue pairs wait in the card: the switch after its checks (ring_wait_asked), and the fallback; each outcome has its line.
+    fn ringWaitOn(has_kernels: bool, devices: []const []const u8) bool {
+        if (!prompt2d.ring_wait_asked) return false;
+        var mlx_ok = false;
+        if (mx5.Mlx5.open()) |m0| {
+            var m = m0;
+            m.close();
+            mlx_ok = true;
+        } else |_| {}
+        var ab: [300]u8 = undefined;
+        const atomic_why: ?[]const u8 = if (prompt2d.ring_word_atomic_asked) rdma.probeAtomic(&ab, devices) else null;
+        if (ringWaitFallback(prompt2d.ring_wait_explicit, has_kernels, mlx_ok, atomic_why)) |why| {
+            std.log.info("TF_DS_RING_WAIT: unset (the default is the card's WAIT) but {s}: the rings run their proxy threads", .{why});
+            prompt2d.ring_wait_asked = false;
+            return false;
+        }
+        std.log.info("TF_DS_RING_WAIT: {s}: the rings' queue pairs wait in the card (no proxy threads; =0 for the proxy threads)", .{if (prompt2d.ring_wait_explicit) "1" else "unset (the default)"});
         return true;
     }
 
@@ -1211,6 +1254,7 @@ pub fn startSettings(o: Options) prompt2d.Settings {
 
         }
         return true;
+    const open = std.mem.indexOf(u8, code, "m.rdma_rings = try ring2d.Rings.open(gpa, d, rk, devices.items, role, ord, .{ .max_bytes = ring_bytes, .gid_index = rdmaGid(), .pdl = rdmaPdl(), .collect_peers = peers and rk.collect_peers != null, .wc = sw.wc, .inplace = sw.inplace, .roci = ringWordOf(), .roci_deadline_ns = ringWordDeadlineNs(), .wait = ring_wait_on, .wait_explicit = prompt2d.ring_wait_explicit }, &m.comm, m.stream, !weights.draft_4way);") orelse return error.TestUnexpectedResult;
     }
 
     /// fillChunk's pass of n > wave_rows rows with TF_DS_WAVES: wave A (rows [start, start + wave_rows), in ch2) and
@@ -1481,6 +1525,20 @@ test "the start-up settings carry this rank's options and the math switches it r
         try m.synchronize();
         try d.check(d.api.cuMemcpyDtoH_v2(m.logits.ptr, m.rd.logits, R * m.vocab * 4), "cuMemcpyDtoH");
         return m.logits[0 .. R * m.vocab];
+
+test "TF_DS_RING_WAIT's fallback to the proxy threads is for the default only: unset without the kernels or libmlx5 says why, 1 is left to Ring.create to refuse by name" {
+    try std.testing.expect(Model.ringWaitFallback(false, true, true, null) == null);
+    try std.testing.expect(std.mem.indexOf(u8, Model.ringWaitFallback(false, false, true, null).?, "stage_wait") != null);
+    try std.testing.expect(std.mem.indexOf(u8, Model.ringWaitFallback(false, true, false, null).?, "libmlx5") != null);
+    try std.testing.expect(Model.ringWaitFallback(true, false, false, null) == null);
+    // a card that cannot do the atomic signal: unset falls back with the card's own reason, 1 is left to refuse by name
+    try std.testing.expectEqualStrings("device mlx5_0 reports atomic_cap 0", Model.ringWaitFallback(false, true, true, "device mlx5_0 reports atomic_cap 0").?);
+    try std.testing.expect(Model.ringWaitFallback(true, true, true, "device mlx5_0 reports atomic_cap 0") == null);
+    // the parse: unset is on, and the start lines name the mode
+    const src = @embedFile("model.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, "prompt2d.ring_wait_asked = prompt2d.switchDefaultOn(ring_wait_text);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "unset (the default)") != null);
+}
     }
 
     /// The prompt's logits on the host (after a fill's last chunk).
@@ -1511,5 +1569,13 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
         const pool = &m.dpool.?;
         for (q0, slots) |q, s| pool.absorbed[@intCast(s)] = @intCast(q);
         try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
+    const kv = std.mem.indexOf(u8, kb, "speed_defaults.verdict(why, speed_defaults.defaulted(\"TF_DS_ENGRAM_KEEP_AHEAD\")) == .fallback").?;
+    const kerr = std.mem.indexOf(u8, kb[kv..], "return error.KeepAheadSharesReader;").?;
+    try std.testing.expect(passRowsFallback("2048", true, 64 * gib) == null);
+    try std.testing.expect(passRowsFallback(null, true, 64 * gib) == null);
+}
+
+    try std.testing.expect(std.mem.indexOf(u8, src, "set TF_DS_DRAFT_MAIN_4WAY=0 on every Spark") != null);
+}
     }
 };

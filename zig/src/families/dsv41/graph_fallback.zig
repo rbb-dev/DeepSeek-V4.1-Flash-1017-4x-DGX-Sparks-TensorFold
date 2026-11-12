@@ -5,6 +5,7 @@
 //! acts on the same vote, so every rank takes the same path and the exchanges stay matched.
 const std = @import("std");
 const cuda = @import("cuda");
+const ring_wait = @import("ring_wait.zig");
 
 /// A failed key's first hold in uses (each one eager), doubled at each further failure up to `max_hold`.
 pub const first_hold: u32 = 1024;
@@ -110,16 +111,24 @@ pub const Cuda = struct {
     pub const Exec = cuda.graph.Exec;
 
     pub fn begin(s: Stream) !void {
+        ring_wait.recordBegin(); // TF_DS_RING_WAIT: the exchanges this capture launches are noted, not posted
         return cuda.graph.beginCapture(s, .thread_local);
     }
 
     pub fn end(s: Stream) !Graph {
+        const g = try cuda.graph.endCapture(s);
+        ring_wait.recordEnd();
+        return g;
     }
 
     pub fn instantiate(g: Graph) !Exec {
+        const x = try g.instantiate();
+        ring_wait.recordInstantiate(@intFromPtr(x.handle)); // the graph's plan: what each launch of it posts first
+        return x;
     }
 
     pub fn launch(x: Exec, s: Stream) !void {
+        return ring_wait.launchGraph(x, s);
     }
 
     pub fn dropGraph(g: *Graph) void {
@@ -127,6 +136,7 @@ pub const Cuda = struct {
     }
 
     pub fn dropExec(x: *Exec) void {
+        ring_wait.forget(@intFromPtr(x.handle));
         x.deinit();
     }
 };
