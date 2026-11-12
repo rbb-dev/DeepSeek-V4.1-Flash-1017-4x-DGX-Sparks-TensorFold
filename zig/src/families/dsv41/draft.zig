@@ -28,6 +28,8 @@ const mx = @import("mx.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const markov_tokens = @import("markov_tokens.zig");
 const draft2d = @import("draft2d.zig");
+const readback = @import("readback.zig");
+const hybrid_wait = @import("hybrid_wait.zig");
 const draft_vocab = @import("draft_vocab.zig");
 const land_mod = @import("land.zig");
 const graph_fallback = @import("graph_fallback.zig");
@@ -490,6 +492,10 @@ pub const Drafter = struct {
     confw_host: []f32 = &.{}, // the head's fp32 weight on the host: the confidence dot runs there (pass)
     xc_host: []u16 = &.{}, // bf16 [max_rows, D]: the collapsed rows read back
     em_host: []u16 = &.{}, // bf16 [max_rows, rank]: the embedding rows read back
+    ho_host: []i64 = &.{}, // the pass's out [max_streams, max_block + 1] read back (pinned, with xc_host and em_host)
+    hw: ?*hybrid_wait.Hybrid = null, // TF_DS_HYBRID_WAIT: the pass's wait for its reads (set by Model.pass), with its event
+    hw_ev: ?cuda.Event = null,
+    pin: ?cuda.HostBuffer = null, // the page-locked block ho_host, xc_host and em_host are cut from: the pass reads all three with one wait
     // absorbs: the taps rows (one item's or the items' cat), main_proj's rows, main_x, each stage's wkv rows, the
     // keys' normed rows (kv_norm_rope's out, not read), positions and ring rows
     at: u64,
@@ -688,8 +694,18 @@ pub const Drafter = struct {
         dr.confw_host = &.{};
         dr.xc_host = &.{};
         dr.em_host = &.{};
+        dr.ho_host = &.{};
+        dr.pin = null;
+        dr.hw = null; // (a Drafter starts undefined: no field default applies)
+        dr.hw_ev = null;
         errdefer dr.deinit();
         dr.confw_host = try std.heap.page_allocator.alloc(f32, d + rank);
+        // the pass's three reads land in one page-locked block (ho, xc, em; 16-byte aligned parts)
+        const ho_bytes = std.mem.alignForward(usize, max_streams * (max_block + 1) * 8, 16);
+        const xc_bytes = std.mem.alignForward(usize, R * d * 2, 16);
+        const em_bytes = std.mem.alignForward(usize, R * rank * 2, 16);
+        dr.pin = try cuda.HostBuffer.alloc(e.d, ho_bytes + xc_bytes + em_bytes);
+        const pb = dr.pin.?.bytes;
         // (the parts start at multiples of 16 in a 16-aligned block: the casts check what the types cannot see)
         dr.ho_host = @alignCast(std.mem.bytesAsSlice(i64, pb[0..ho_bytes]));
         dr.xc_host = @alignCast(std.mem.bytesAsSlice(u16, pb[ho_bytes..][0 .. R * d * 2]));
@@ -719,6 +735,9 @@ pub const Drafter = struct {
     pub fn deinit(dr: *Drafter) void {
         const pa = std.heap.page_allocator;
         if (dr.confw_host.len > 0) pa.free(dr.confw_host);
+        if (dr.pin) |*p| p.free();
+        dr.pin = null;
+        dr.ho_host = &.{};
         dr.confw_host = &.{};
         dr.xc_host = &.{};
         dr.em_host = &.{};
@@ -990,12 +1009,20 @@ pub const Drafter = struct {
             try dr.body(e, ch, pool, N, steps, null);
             prof_passes += 1;
         } else if (dr.graphs != null and probe == null) try dr.graphs.?.run(dr, e, ch, pool, N, steps) else try dr.body(e, ch, pool, N, steps, probe);
+        // one host read: the drafts, and the collapsed rows and embeddings the confidences are made of, queued behind the pass and waited for once
+        const n_xc = N * dr.n * e.c.hidden * 2;
+        const n_em = N * steps * e.c.markov_rank * 2;
+        try readback.readAll(StreamIo{ .e = e, .hw = dr.hw, .hw_ev = dr.hw_ev }, &.{
+            .{ .dst = @ptrCast(dr.ho_host.ptr), .src = dr.out, .bytes = N * ts * 8 },
+            .{ .dst = @ptrCast(dr.xc_host.ptr), .src = dr.xc, .bytes = n_xc },
+            .{ .dst = @ptrCast(dr.em_host.ptr), .src = dr.embs, .bytes = n_em },
+        });
         var hc: [max_streams * max_block]f32 = undefined;
-        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&ho, dr.out, N * ts * 8), "cuMemcpyDtoH");
-        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&hc, dr.conf, N * steps * 4), "cuMemcpyDtoH");
+        dr.confidence(e, N, steps, &hc);
+        const hr = dr.ho_host;
         if (dumping) ddHost("conf", std.mem.sliceAsBytes(hc[0 .. N * steps]));
         for (0..N) |i| for (0..steps) |j| {
-            dr.drafts[i][j] = ho[i * ts + 1 + j];
+            dr.drafts[i][j] = hr[i * ts + 1 + j];
             dr.confs[i][j] = hc[i * steps + j];
         };
         dr.streams = N;
@@ -1024,8 +1051,29 @@ pub const Drafter = struct {
         };
     }
 
+    /// The engine stream as readback's `io`: the copies queue behind the pass on it, the wait is the stream's.
+    const StreamIo = struct {
+        e: *const Engine,
+        hw: ?*hybrid_wait.Hybrid = null,
+        hw_ev: ?cuda.Event = null,
+
+        pub fn copyAsync(io: StreamIo, dst: [*]u8, src: u64, bytes: usize) !void {
+            if (bytes == 0) return;
+            try io.e.d.check(io.e.d.api.cuMemcpyDtoHAsync_v2(dst, src, bytes, io.e.s.handle), "cuMemcpyDtoHAsync");
+        }
+
+        pub fn synchronize(io: StreamIo) !void {
+            if (io.hw) |h| if (io.hw_ev) |ev| {
+                try ev.record(io.e.s);
+                return h.wait(hybrid_wait.SystemClock{}, ev);
+            };
+            try io.e.s.synchronize();
+        }
+    };
+
     /// DSparkConfidenceHead on the host: conf[i * steps + j] = [xc row (i, j), the Markov embedding row of the token step
     /// j read] . w, fp32 products summed in fp64 (the collapsed rows and the embedding rows read back as bf16).
+    fn confidence(dr: *const Drafter, e: *const Engine, N: usize, steps: usize, out: []f32) void {
         const d = e.c.hidden;
         const rank = e.c.markov_rank;
         const n = dr.n;

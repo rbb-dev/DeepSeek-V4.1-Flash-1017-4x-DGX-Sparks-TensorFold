@@ -147,10 +147,12 @@ pub fn recordStart(a: std.mem.Allocator, io: std.Io, cfg_path: []const u8, repor
     }
     try row.appendSlice(a, "],\"lease\":null,\"active_after_ms\":0}\n");
 
+    const handed = appendLine(a, p, row.items) catch |e| {
         Log.line("{s}: cannot write it ({s}): the change to engine.cfg is not recorded", .{ p, @errorName(e) });
         return .{ .version = st.version, .written = false };
     };
     version.store(v, .release);
+    Log.line("{s}: version {d}: engine.cfg imported, {d} change{s}; the file is {s}, mode 0640", .{ p, v, n, if (n == 1) "" else "s", if (handed) "owned by the folder's owner and group" else "left with its creator as owner (this process may not hand it over)" });
     return .{ .version = v, .written = true, .changes = n };
 }
 
@@ -273,9 +275,29 @@ fn change(a: std.mem.Allocator, row: *std.ArrayList(u8), n: *usize, id: u16, fro
 }
 
 /// One line appended and synced; the row ends with a newline, so a partial write is a damaged last line, never a merged one.
+pub const Owner = struct { uid: u32, gid: u32, mode: u32 };
+
+/// The owner, group and permission bits of the file or folder at `pathz` (null when it cannot be read).
+pub fn ownerOf(pathz: [*:0]const u8) ?Owner {
+    var sx: std.os.linux.Statx = undefined;
+    const rc = std.os.linux.statx(std.posix.AT.FDCWD, pathz, 0, .{ .MODE = true, .UID = true, .GID = true }, &sx);
+    if (std.os.linux.errno(rc) != .SUCCESS) return null;
+    return .{ .uid = sx.uid, .gid = sx.gid, .mode = sx.mode };
+}
+
+/// The file is handed to the folder's owner and group, mode 0640: the engine may run as root in a container while the operator who
+/// owns the folder reads the history. Returns whether the hand-over was done (it is not when the process may not chown).
+fn appendLine(a: std.mem.Allocator, p: []const u8, line: []const u8) !bool {
     const pz = try a.dupeSentinel(u8, p, 0);
     const fd = try std.posix.openatZ(std.posix.AT.FDCWD, pz, .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true }, 0o640);
     defer _ = std.posix.system.close(fd);
+    var handed = false;
+    const dir = std.fs.path.dirname(p) orelse ".";
+    const dz = try a.dupeSentinel(u8, dir, 0);
+    if (ownerOf(dz)) |o| {
+        handed = std.c.fchown(fd, o.uid, o.gid) == 0;
+        _ = std.c.fchmod(fd, 0o640);
+    }
     var done: usize = 0;
     while (done < line.len) {
         const w = std.posix.system.write(fd, line.ptr + done, line.len - done);
@@ -283,4 +305,5 @@ fn change(a: std.mem.Allocator, row: *std.ArrayList(u8), n: *usize, id: u16, fro
         done += @intCast(w);
     }
     if (std.posix.system.fsync(fd) != 0) return error.SyncFailed;
+    return handed;
 }

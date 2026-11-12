@@ -201,6 +201,8 @@ test {
     _ = @import("ring_hotpath_test.zig");
     _ = @import("kv_vote_test.zig");
     refAll(@import("kv_vmm.zig"));
+    _ = @import("readback.zig");
+    _ = @import("hybrid_wait.zig");
     refAll(@import("spill_identity.zig"));
     _ = @import("spill_identity_test.zig");
     refAll(@import("probe.zig"));

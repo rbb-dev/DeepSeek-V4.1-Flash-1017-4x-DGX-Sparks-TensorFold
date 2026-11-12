@@ -53,6 +53,8 @@ const mx5 = @import("mlx5_devx.zig");
 const ops_mod = @import("ops.zig");
 const exact = @import("exact.zig");
 const cublas = @import("cublas.zig");
+const hybrid_wait = @import("hybrid_wait.zig");
+const rocinante = @import("rocinante.zig");
 const comm_mod = @import("comm.zig");
 const api = @import("engine_api");
 const link = @import("link.zig");
@@ -1975,6 +1977,23 @@ pub const Model = struct {
     prof: bool = false,
     cand_first: bool = false, // TF_DS_CAND_FIRST: the leader's verifyHead (a round's head reads before the absorb)
     head_ready: ?cuda.Event = null, // verifyHead's event after the head reads
+    /// TF_DS_HYBRID_WAIT (on unless 0): the waits for a round's head reads and for the drafter pass's reads sleep until shortly before they are due and poll
+    /// the rest (hybrid_wait.zig); rank-local. hw_ev is the pass's event (recorded behind its reads).
+    hw_head: hybrid_wait.Hybrid = .{},
+    hw_pass: hybrid_wait.Hybrid = .{},
+    hw_ev: ?cuda.Event = null,
+    timer: ?*round.PhaseTimer = null, // a profile's GPU time by phase (eager rounds)
+    ptimer: ?*round.PhaseTimer = null, // the same for prompt chunks (fills), a chunk a 'round'
+    t_enqueue: u64 = 0, // the host's time to issue the forward (the GPU idle before it)
+    // Model.useClock: the rounds' GPU clock gaps summed (ns; gap i = clock i + 1 - clock i: the forward's start to
+    // the first stretch, then each stretch, then the wait before the next), and the rounds counted
+    clk_ph: [256]u64 = @splat(0), // by the phase of the clock that ends it
+    clk_cnt: [256]u64 = @splat(0),
+    clk_rounds: u64 = 0,
+    t_forward: u64 = 0,
+    t_absorb: u64 = 0,
+    // world 4: the 2D split's exchanges (prompt2d.zig, TP4's), with the RDMA rings when asked
+    two: ?prompt2d.Two = null,
     // TF_DS_ROCI_STAGGER: the second lane of a pair of passes in flight: its node of the 2D split (own scratch, own transport), chunk,
     // stream, cuBLAS handle, the per-layer cache events and its host id and position arrays.
     pair: bool = false,
@@ -2340,6 +2359,20 @@ pub const Model = struct {
             std.log.info("{s}", .{candFirstLine()});
         }
         errdefer if (m.head_ready) |*x| x.deinit();
+        m.overlap_ctx = null;
+        m.overlap_run = null;
+        m.hw_head = .{};
+        m.hw_pass = .{};
+        m.hw_ev = null;
+        // default ON (bit-identical: only when the host wakes changes); TF_DS_HYBRID_WAIT=0 is the blocking wait
+        const hybrid_off = if (std.c.getenv("TF_DS_HYBRID_WAIT")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
+        if (!hybrid_off) {
+            m.hw_head.on = true;
+            m.hw_pass.on = true;
+            m.hw_ev = try cuda.Event.init(d, false);
+            std.log.info("TF_DS_HYBRID_WAIT on (TF_DS_HYBRID_WAIT=0 turns it off): rank {d}: a round's head reads and the drafter pass's reads are waited for asleep until {d} us before their learned end, then polled (a wait past {d} ms of polling blocks as before)", .{ o.rank, m.hw_head.margin_ns / 1000, m.hw_head.poll_max_ns / 1_000_000 });
+        }
+        errdefer if (m.hw_ev) |*x| x.deinit();
         // TF_DS_WINDOW_ONCE (on unless 0): a chunk uploads its window indices and low position once, not in every layer. Bytes unchanged.
         prompt.window_once = prompt.windowOnceWanted(if (std.c.getenv("TF_DS_WINDOW_ONCE")) |v| std.mem.span(v) else null);
         std.log.info("TF_DS_WINDOW_ONCE={s}: rank {d}: a prompt chunk's window gather indices, window low position and ring-write indices are uploaded {s}", .{ if (prompt.window_once) "1" else "0", o.rank, if (prompt.window_once) "once per chunk, into buffers of their own" else "in every layer, as before" });
@@ -3067,6 +3100,12 @@ pub const Model = struct {
         m.ix.deinit();
         m.cache_dir.close(m.io);
         if (m.head_ready) |*x| x.deinit();
+        if (m.hw_ev) |*x| x.deinit();
+        m.stream.deinit();
+        m.host.deinit();
+        m.gpa.destroy(m);
+    }
+
     /// The decode plan's G0.2 controls (TF_DS_DEC_PDL, TF_DS_RDMA_PDL, TF_DS_TRITON_PDL_ATTR, TF_DS_PDL), one line on each
     /// rank when any is off, so a run can show that every rank has the same ones.
     fn logPdlControls(rank: usize) void {
@@ -4459,6 +4498,7 @@ pub const Model = struct {
         if (hb == 0) try m.launchHead(head, R); // (hb != 0: round.forward's last stretch ran it)
         try m.head_ready.?.record(m.stream);
         try m.absorbRows(rows, absorb);
+        try m.hw_head.wait(hybrid_wait.SystemClock{}, m.head_ready.?);
         if (m.erows) |r| try r.roundCheck(); // the forward's stream host steps came before the event
     }
 
@@ -4689,6 +4729,11 @@ pub const Model = struct {
         const dr = &m.dr.?;
         const pool = &m.dpool.?;
         for (q0, slots) |q, s| pool.absorbed[@intCast(s)] = @intCast(q);
+        dr.hw = if (m.hw_pass.on) &m.hw_pass else null;
+        dr.hw_ev = m.hw_ev;
+        try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
+    }
+};
 
 test "TF_DS_PASS_BESIDE is read after TF_DS_PASS_ROWS, refuses a bad start, and reaches the host as its beside rows" {
     const src = @embedFile("model.zig");
@@ -5458,6 +5503,7 @@ test "verifyHead (TF_DS_CAND_FIRST): the forward, the head's reads, their event,
     const at = std.mem.indexOf(u8, src, "    pub fn verifyHead(") orelse return error.TestUnexpectedResult;
     const body = src[at .. at + (std.mem.indexOf(u8, src[at..], "\n    }\n") orelse return error.TestUnexpectedResult)];
     var last: usize = 0;
+    for ([_][]const u8{ "if (head == .none or m.prof) {", "try m.verify(rows, absorb, hb);", "if (hb == 0) try m.launchHead(head, R);", "try m.stream.synchronize();", "return;", "try m.forwardRows(rows);", "if (hb == 0) try m.launchHead(head, R);", "try m.head_ready.?.record(m.stream);", "try m.absorbRows(rows, absorb);", "try m.hw_head.wait(hybrid_wait.SystemClock{}, m.head_ready.?);", "if (m.erows) |r| try r.roundCheck();" }) |step| {
         const i = std.mem.indexOf(u8, body[last..], step) orelse return error.TestUnexpectedResult;
         last += i + step.len;
     }

@@ -456,5 +456,31 @@ test "cfgDigest: 0 without a file; with one it follows what the file set, not it
     try std.testing.expect(base != try digest(&tmp, a, "TF_DS_SPILL_READERS = 8\n"));
     try std.testing.expect(try digest(&tmp, a, "# a file that sets nothing\n") != 0); // a rank that read a file differs from one that read none
 }
+
+test "rows whose parser clamps or refuses carry the parser's own bounds (read from the parsers, 11-09)" {
+    const Want = struct { env: []const u8, kind: settings.Kind, min: ?f64, max: ?f64, default: []const u8 };
+    const want = [_]Want{
+        .{ .env = "TF_DS_ROCI_BACKSTOP_US", .kind = .int, .min = 10, .max = 2500, .default = "100" }, // roci_engine.zig backstopUs
+        .{ .env = "TF_DS_ROCI_HOUSEKEEP", .kind = .int, .min = 1, .max = 4294967295, .default = "16" }, // @max(1, envU32(..))
+        .{ .env = "TF_DS_ROCI_IDLE_PARK_US", .kind = .int, .min = 0, .max = 4294967295, .default = "2000" }, // on by default (speed_defaults)
+        .{ .env = "TENSORFOLD_MEMORY_RESERVE_GIB", .kind = .float, .min = 2, .max = null, .default = "" }, // cuda_memory.reserveBytes: g >= 2
         .{ .env = "TF_CUDA_DEVICE", .kind = .int, .min = 0, .max = 4294967295, .default = "0" }, // envNumber: u32
         .{ .env = "TF_DS_ARENA_GIB", .kind = .int, .min = 0, .max = null, .default = "0" }, // parseInt(usize)
+        .{ .env = "TF_VIDEO_MAX_FRAMES", .kind = .int, .min = 1, .max = null, .default = "32" },
+        .{ .env = "TF_VIDEO_MAX_SIDE", .kind = .int, .min = 32, .max = null, .default = "768" },
+    };
+    var buf: [300]u8 = undefined;
+    for (want) |w| {
+        const o = settings.byEnv(w.env) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(w.kind, o.kind);
+        try std.testing.expectEqual(w.min, o.min);
+        try std.testing.expectEqual(w.max, o.max);
+        try std.testing.expectEqualStrings(w.default, o.default);
+        // the bounds are the schema's refusal: one inside is taken, one outside is refused
+        if (w.min) |lo| if (lo >= 1) {
+            var t: [24]u8 = undefined;
+            const below = std.fmt.bufPrint(&t, "{d}", .{lo - 1}) catch unreachable;
+            try std.testing.expect(settings.refusal(o, below, &buf) != null);
+        };
+    }
+}

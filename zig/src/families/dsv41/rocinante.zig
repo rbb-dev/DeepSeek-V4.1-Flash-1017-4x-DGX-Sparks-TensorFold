@@ -13,6 +13,7 @@
 //! send, behind a WAIT on the doorbell word that the card runs, and one janitor thread watches and reaps (rocinante_cd.zig).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const nap = @import("rdma_nap.zig");
 const slabs = @import("slab_plan.zig");
 
@@ -598,6 +599,14 @@ pub const Counters = struct {
     backstop_wakes: u64 = 0,
     post_ns_max: u64 = 0,
     watchdog_max_age_ms: u64 = 0,
+    sleeps: u64 = 0, // idle looks the proxy slept through (Settings.park)
+    // how a proxy's nap ended: the doorbell had moved, the deadline had passed, or neither (an event or an interrupt)
+    wake_bell: u64 = 0,
+    wake_deadline: u64 = 0,
+    wake_early: u64 = 0,
+    // the idle park (Settings.idle_park_us): entries into a futex sleep, and the sleeps the safety timeout ended
+    parks: u64 = 0,
+    park_timeouts: u64 = 0,
 
     pub fn add(a: *Counters, b: Counters) void {
         inline for (@typeInfo(Counters).@"struct".field_names) |name| {
@@ -666,6 +675,17 @@ pub const Settings = struct {
     /// start line says so and the proxies' lines come once a pass of that many events.
     codes: bool = false,
     gathers: bool = false,
+    /// The proxies sleep in the kernel between looks (the host lane: its waits are milliseconds of reads, and a thread that naps with
+    /// the Arm wait never leaves its core's run queue, so it would take its share from whatever else runs there).
+    park: bool = false,
+    /// A proxy with no send scheduled for this long sleeps in the kernel (a futex: no CPU while asleep) until the host schedules
+    /// the next send or the transport stops or fails. 0: never (the proxy naps on the doorbell between sends).
+    idle_park_us: u32 = 0,
+    /// An idle proxy reads the clock for its watchdog and reaps its completions every this many turns (1: every turn).
+    housekeep_every: u32 = 16,
+    /// The longest a parked proxy sleeps before it looks again: the net under a wake that never came (a doorbell rung with no
+    /// scheduling entry behind it is seen this late).
+    park_safety_ms: u32 = 1_000,
     /// After a failure stores the abort value into the words, the words are looked at again after this long (the fence is the NIC's word that
     /// the card is out of the control block; this looks at the result): a word that changed is stored again, and the look repeats until one
     /// whole settle passes with every word as stored, at most `abort_rounds` times (0: no look). The longest a failure waits: rounds x settle.
@@ -725,6 +745,12 @@ pub const Transport = struct {
     fail_class: std.atomic.Value(u8) = .init(0),
     fail_peer: std.atomic.Value(u8) = .init(0),
     threads: [rails]?std.Thread = @splat(null),
+    /// The last ticket the host has published (written after its scheduling entry). A proxy that parks reads it after announcing
+    /// itself in `asleep`; the host reads `asleep` after publishing: one of the two sees the other.
+    reserved: std.atomic.Value(u64) = .init(0),
+    asleep: [rails]std.atomic.Value(u32) = @splat(.init(0)),
+    /// The futex word of a rail's park: the host bumps it before waking, so a wake between a proxy's read and its wait is not slept through.
+    wake_seq: [rails]std.atomic.Value(u32) = @splat(.init(0)),
     /// The other lane's transport when two passes of a prompt are in flight (each its own arena, control block, queue pairs and
     /// proxies): a failure on either stops both, and the host's check reads both.
     sibling: ?*Transport = null,
@@ -769,6 +795,7 @@ pub const Transport = struct {
 
     pub fn deinit(t: *Transport) void {
         t.stop.store(true, .release);
+        t.wakeAll();
         t.unlink();
         for (&t.threads) |*th| if (th.*) |x| {
             where.joinThread(x);
@@ -951,6 +978,9 @@ pub const Transport = struct {
         @atomicStore(u64, slot, if (shape == any_shape) schedEntryN(t.ticket, class, rows) else schedEntry(t.ticket, class, shape) | (@as(u64, @intCast(rows)) << 48), .release);
         t.host.events += 1;
         t.host.doorbells += 1;
+        // before the ring can reach the doorbell: a parked proxy is awake by the time the send is behind it
+        t.reserved.store(t.ticket, .seq_cst);
+        if (t.set.idle_park_us != 0) for (0..rails) |r| if (t.asleep[r].load(.seq_cst) != 0) t.wake(r);
         return t.ticket;
     }
 
@@ -1024,6 +1054,45 @@ pub const Transport = struct {
     /// Host tests only: a failure that stores the abort value into the doorbell BEFORE the card has taken the queue pairs away, the order the
     /// design forbids (every armed WAIT would release its chain), to see that the ordering test can fail.
     pub var abort_doorbell_first: bool = false;
+
+    /// Host tests only: a wake that is dropped, to see that the lost-wake test can fail.
+    pub var drop_wakes: bool = false;
+
+    fn wake(t: *Transport, rail: usize) void {
+        if (builtin.is_test and drop_wakes) return;
+        _ = t.wake_seq[rail].fetchAdd(1, .release);
+        _ = std.os.linux.futex_3arg(&t.wake_seq[rail].raw, .{ .cmd = .WAKE, .private = true }, 1);
+    }
+
+    /// Wakes every parked proxy whether or not it announced itself (a stop or a failure).
+    fn wakeAll(t: *Transport) void {
+        for (0..rails) |r| t.wake(r);
+    }
+
+    /// Whether this rail owes nothing: every peer's word it is waiting for has arrived and no send is in flight.
+    fn railQuiet(t: *Transport, rail: u8) bool {
+        for (0..n_classes) |c| {
+            var srcs: [world]u8 = undefined;
+            for (sourcesOf(@fromBackingInt(@intCast(c)), t.g, &srcs)) |p| {
+                if (@atomicLoad(u64, &t.word(@fromBackingInt(@intCast(c)), p, rail).v, .acquire) < t.sent[rail][c]) return false;
+            }
+        }
+        return true;
+    }
+
+    /// A proxy's park: announce, look once more for what would have woken it, then sleep on the futex. True when it slept.
+    fn park(t: *Transport, rail: u8, done: u64, ctr: *Counters) bool {
+        const seq = t.wake_seq[rail].load(.acquire);
+        t.asleep[rail].store(1, .seq_cst);
+        defer t.asleep[rail].store(0, .seq_cst);
+        if (t.reserved.load(.seq_cst) != done or @atomicLoad(u64, &t.ctl.doorbell.v, .acquire) != done) return false;
+        if (t.stop.load(.acquire) or t.failed.load(.acquire) != 0 or @atomicLoad(u64, &t.ctl.abort.v, .acquire) != 0) return false;
+        const ts: std.os.linux.timespec = .{ .sec = t.set.park_safety_ms / 1000, .nsec = (t.set.park_safety_ms % 1000) * std.time.ns_per_ms };
+        ctr.parks += 1;
+        const rc = std.os.linux.futex_4arg(&t.wake_seq[rail].raw, .{ .cmd = .WAIT, .private = true }, seq, &ts);
+        if (std.os.linux.errno(rc) == .TIMEDOUT) ctr.park_timeouts += 1;
+        return true;
+    }
 
     /// The device address of the doorbell line (where a stream write, or a kernel's ring, stores a ticket).
     pub fn doorbellAddr(t: *const Transport) u64 {
@@ -1126,6 +1195,7 @@ pub const Transport = struct {
         @atomicStore(u64, &t.ctl.doorbell.v, abort_value, .release);
         // (the card-waiting mode stores it big-endian; the queue pairs are gone by now, so the native word just above releases nothing)
         if (t.set.wait_qp) @atomicStore(u64, &t.ctl.doorbell.v, t.go(abort_value), .release);
+        t.wakeAll(); // (a parked proxy sees the abort and ends)
         // the other lane's streams may wait on words its peers will not send once this rank stops: stop it too (it fails
         // once; its own sibling call returns at the first line)
         // The sibling is taken under the ring lock and held by its `failing` count from there, so its deinit (which unlinks, then waits
@@ -1246,6 +1316,7 @@ pub const Transport = struct {
         const prev = t.rail_prev[rail];
         t.rail_prev[rail] = now;
         var w = std.Io.Writer.fixed(&buf);
+        w.print("ROCI rail {c} event {d}: posts {d} data_writes {d} words {d} bytes_out {d} backstop_wakes {d} wake_bell {d} wake_deadline {d} wake_early {d} parks {d} park_timeouts {d} post_ns_max {d} wire_us(mean/max n)", .{ @as(u8, 'A') + rail, t.ctl.done[rail].v, now.posts - prev.posts, now.data_writes - prev.data_writes, now.words - prev.words, now.bytes_out - prev.bytes_out, now.backstop_wakes - prev.backstop_wakes, now.wake_bell - prev.wake_bell, now.wake_deadline - prev.wake_deadline, now.wake_early - prev.wake_early, now.parks - prev.parks, now.park_timeouts - prev.park_timeouts, now.post_ns_max }) catch return;
         for (0..n_classes) |c| {
             const cur = t.wire[rail][c];
             const pw = t.wire_prev[rail][c];
@@ -1266,8 +1337,11 @@ pub const Transport = struct {
     /// The pass's counter line.
     pub fn counterLine(t: *const Transport, w: *std.Io.Writer, label: []const u8) !void {
         const c = t.counters();
+        try w.print("ROCI {s}: events {d} doorbells {d} stream_writes {d} wait_groups {d} data_writes {d} words {d} posts {d} bytes_out {d} wakes {d} backstop_wakes {d} wake_bell {d} wake_deadline {d} wake_early {d} parks {d} park_timeouts {d} post_ns_max {d} watchdog_max_age_ms {d} abort {d}\n", .{
             label,            c.events,      c.doorbells,           c.stream_writes,                              c.wait_groups,
             c.data_writes,    c.words,       c.posts,               c.bytes_out,                                  c.wakes,
+            c.backstop_wakes, c.wake_bell,   c.wake_deadline,       c.wake_early,                                 c.parks,
+            c.park_timeouts,  c.post_ns_max, c.watchdog_max_age_ms, @atomicLoad(u64, &t.ctl.abort.v, .monotonic),
         });
     }
 };
@@ -1280,7 +1354,11 @@ fn pinCpu(c: u16) void {
     std.os.linux.sched_setaffinity(0, &set) catch {};
 }
 
+/// Host tests only: the clock reads of nowNs (the proxy's loop is asserted not to make one a turn).
+pub var clock_reads: std.atomic.Value(u64) = .init(0);
+
 fn nowNs() u64 {
+    if (builtin.is_test) _ = clock_reads.fetchAdd(1, .monotonic);
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
@@ -1299,19 +1377,48 @@ fn nowNs() u64 {
     var progress_sum: u64 = 0;
     const ticks = nap.ticksPerUs();
     const can_nap = t.set.nap and nap.available() and nap.clock() == .fine;
+    // the idle park's clock is the virtual counter (a register read, no system call)
+    const park_ticks: u64 = if (t.set.idle_park_us != 0 and nap.clock() == .fine) ticks * t.set.idle_park_us else 0;
+    const housekeep: u32 = @max(1, t.set.housekeep_every);
+    var turn: u32 = 0;
+    var idle_from: u64 = if (park_ticks != 0) nap.now() else 0;
     while (!t.stop.load(.acquire)) {
         t.reapWire(rail);
         const d = @atomicLoad(u64, &t.ctl.doorbell.v, .acquire);
         if (d == abort_value or t.failed.load(.acquire) != 0) break;
         if (d == done) {
+            turn +%= 1;
+            if (park_ticks != 0 and nap.now() -% idle_from >= park_ticks and t.railQuiet(rail)) {
+                // the last look before sleeping: a completion that failed must not wait for the next wake
+                t.nic.reap_fn(t.nic.ctx, rail) catch {
+                    t.fail(.qp, .own1, 0);
+                    break;
+                };
+                if (t.park(rail, done, ctr)) {
+                    ctr.wakes += 1;
+                    continue;
+                }
+            }
+            if (t.set.park) {
+                const ts: std.c.timespec = .{ .sec = 0, .nsec = @as(isize, t.set.backstop_us) * std.time.ns_per_us };
+                _ = std.c.nanosleep(&ts, null);
+                ctr.sleeps += 1;
+            } else if (can_nap) {
                 const dl = nap.now() + ticks * t.set.backstop_us;
+                if (@atomicLoad(u64, &t.ctl.doorbell.v, .acquire) != d) {
+                    ctr.wake_bell += 1;
+                } else {
+                    ctr.backstop_wakes += 1;
+                }
             } else std.atomic.spinLoopHint();
             ctr.wakes += 1;
+            if (turn % housekeep == 0) {
                 t.watch(rail, &last_progress, &progress_sum, ctr);
                 t.nic.reap_fn(t.nic.ctx, rail) catch {
                     t.fail(.qp, .own1, 0);
                     break;
                 };
+            }
             continue;
         }
         const t0 = nowNs();
@@ -1358,6 +1465,7 @@ fn nowNs() u64 {
         }
         ctr.post_ns_max = @max(ctr.post_ns_max, nowNs() - t0);
         last_progress = nowNs();
+        if (park_ticks != 0) idle_from = nap.now();
     }
 }
 

@@ -1268,12 +1268,160 @@ test "the counter line names every counter the gates read" {
     var w = std.Io.Writer.fixed(&buf);
     try net.nodes[0].t.counterLine(&w, "pass 1");
     const text = w.buffered();
+    for ([_][]const u8{ "events", "doorbells", "stream_writes", "wait_groups", "data_writes", "words", "posts", "bytes_out", "backstop_wakes", "wake_bell", "wake_deadline", "wake_early", "parks", "park_timeouts", "post_ns_max", "watchdog_max_age_ms", "abort" }) |k|
         try std.testing.expect(std.mem.indexOf(u8, text, k) != null);
 }
 
+// -- the proxies' idle park, their wake causes and their loop's clock reads ---------------------------------------------
+
+/// Every node sends and waits `rounds` times with `gap_ns` of nothing between rounds (the proxies' idle).
+const GapRun = struct {
+    net: *Net,
+    rounds: u32,
+    gap_ns: u64,
+    err: [roci.world]?anyerror = @splat(null),
+
+    fn main(r: *GapRun, g: usize) void {
+        r.body(g) catch |e| {
+            r.err[g] = e;
+        };
+    }
+    fn body(r: *GapRun, g: usize) !void {
+        const nd = &r.net.nodes[g];
+        const s: FakeStream = .{};
+        for (0..r.rounds) |_| {
+            try nd.t.send(s, .own1, 0);
+            try nd.t.wait(s, .own1);
+            sleep(r.gap_ns);
+        }
+    }
+};
+
+fn runGaps(net: *Net, rounds: u32, gap_ns: u64) !void {
+    var run: GapRun = .{ .net = net, .rounds = rounds, .gap_ns = gap_ns };
+    var th: [roci.world]std.Thread = undefined;
+    for (&th, 0..) |*t, g| t.* = try std.Thread.spawn(.{}, GapRun.main, .{ &run, g });
+    for (th) |t| t.join();
+    for (run.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+}
+
+fn allParked(net: *Net) bool {
+    for (&net.nodes) |*nd| for (0..roci.rails) |r| if (nd.t.asleep[r].load(.acquire) == 0) return false;
+    return true;
+}
+
+fn waitParked(net: *Net) !void {
+    var tries: u32 = 0;
+    while (!allParked(net) and tries < 2000) : (tries += 1) sleep(1_000_000);
+    try std.testing.expect(allParked(net));
+}
+
+fn totalCounters(net: *Net) roci.Counters {
+    var c: roci.Counters = .{};
+    for (&net.nodes) |*nd| c.add(nd.t.counters());
+    return c;
+}
+
+test "the idle park: proxies sleep between sends, every send after a sleep is posted at once (no wake waits for the safety timeout), the words land" {
+    const net = try Net.open(.{}, .{ .nap = true, .idle_park_us = 200, .park_safety_ms = 3000 }, roci.identity);
+    defer net.close();
+    try net.start();
+    const t0 = std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds;
+    try runGaps(net, 40, 3 * std.time.ns_per_ms);
+    const took_ms = @divTrunc(std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds - t0, std.time.ns_per_ms);
+    const c = totalCounters(net);
+    try std.testing.expect(c.parks > 0);
+    try std.testing.expectEqual(@as(u64, 0), c.park_timeouts); // no sleep ended by the net: every wake came from the host
+    try std.testing.expect(took_ms < 2500); // (a lost wake costs 3 s)
+}
+
+test "control: a host that never wakes the parked proxies leaves every send to the safety timeout" {
+    roci.Transport.drop_wakes = true;
+    defer roci.Transport.drop_wakes = false;
+    const net = try Net.open(.{}, .{ .nap = true, .idle_park_us = 200, .park_safety_ms = 100 }, roci.identity);
+    defer net.close();
+    try net.start();
+    try runGaps(net, 6, 3 * std.time.ns_per_ms);
+    const c = totalCounters(net);
+    try std.testing.expect(c.park_timeouts > 0);
+}
+
+test "a parked proxy ends on a failure: the abort wakes it before the safety timeout" {
+    const net = try Net.open(.{}, .{ .nap = true, .idle_park_us = 200, .park_safety_ms = 5000 }, roci.identity);
+    defer net.close();
+    try net.start();
+    try waitParked(net);
+    net.nodes[0].t.fail(.peer, .own1, 1);
+    var tries: u32 = 0;
+    while (net.nodes[0].t.asleep[0].load(.acquire) + net.nodes[0].t.asleep[1].load(.acquire) != 0 and tries < 400) : (tries += 1) sleep(1_000_000);
+    try std.testing.expectEqual(@as(u32, 0), net.nodes[0].t.asleep[0].load(.acquire) + net.nodes[0].t.asleep[1].load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), net.nodes[0].t.counters().park_timeouts);
+    try std.testing.expectError(error.RociFailed, net.nodes[0].t.check());
+}
+
+test "a parked proxy ends on a stop: closing the transport does not wait for the safety timeout" {
+    const net = try Net.open(.{}, .{ .nap = true, .idle_park_us = 200, .park_safety_ms = 5000 }, roci.identity);
+    try net.start();
+    try waitParked(net);
+    const t0 = std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds;
+    net.close();
+    const ms = @divTrunc(std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds - t0, std.time.ns_per_ms);
+    try std.testing.expect(ms < 1000);
+}
+
+test "a proxy that owes a peer's word does not park (the watchdog still has a thread to run on)" {
+    const net = try Net.open(.{ .silent = 1 }, .{ .nap = true, .idle_park_us = 200, .dead_ms = 150 }, roci.identity);
+    defer net.close();
+    try net.start();
+    const nd = &net.nodes[0];
+    const s: FakeStream = .{};
+    try nd.t.send(s, .own1, 0);
+    try nd.t.wait(s, .own1); // released by the watchdog's abort
+    try std.testing.expectEqual(roci.FailReason.watchdog, nd.t.failure().?.reason);
+}
+
+test "the wake causes: an idle nap ends at its deadline or early, never by a doorbell, and backstop_wakes is their sum" {
+    const net = try Net.open(.{}, .{ .nap = true }, roci.identity);
+    defer net.close();
+    try net.start();
+    sleep(30 * std.time.ns_per_ms);
     // The proxies are still running: a nap's cause is counted in steps (backstop_wakes, then deadline or early), so a reading
     // taken between the steps shows one more backstop wake than causes. Read once they have stopped (the counters are plain).
     joinProxies(net);
+    const c = totalCounters(net);
+    try std.testing.expect(c.wake_deadline + c.wake_early > 0);
+    try std.testing.expectEqual(@as(u64, 0), c.wake_bell);
+    try std.testing.expectEqual(c.backstop_wakes, c.wake_deadline + c.wake_early);
+}
+
+test "the wake causes: a nap that a doorbell ends counts as a bell wake" {
+    const net = try Net.open(.{}, .{ .nap = true, .backstop_us = 100_000 }, roci.identity);
+    defer net.close();
+    try net.start();
+    sleep(5 * std.time.ns_per_ms); // (every proxy is in its 100 ms nap)
+    const s: FakeStream = .{};
+    for (&net.nodes) |*nd| try nd.t.send(s, .own1, 0);
+    for (&net.nodes) |*nd| try nd.t.wait(s, .own1);
+    try std.testing.expect(totalCounters(net).wake_bell > 0);
+}
+
+test "the idle loop reads the clock once every housekeep_every turns, not every turn (control: every turn reads it every turn)" {
+    var reads: [2]u64 = undefined;
+    var wakes: [2]u64 = undefined;
+    for ([_]u32{ 16, 1 }, 0..) |every, i| {
+        const net = try Net.open(.{}, .{ .nap = true, .housekeep_every = every }, roci.identity);
+        try net.start();
+        const r0 = roci.clock_reads.load(.monotonic);
+        sleep(60 * std.time.ns_per_ms);
+        reads[i] = roci.clock_reads.load(.monotonic) - r0;
+        wakes[i] = totalCounters(net).wakes;
+        net.close();
+    }
+    try std.testing.expect(wakes[0] > 100 and wakes[1] > 100);
+    try std.testing.expect(reads[0] * 4 < wakes[0]); // housekeeping only
+    try std.testing.expect(reads[1] * 2 > wakes[1]); // the control reads at every wake
+}
+
 // -- the device chain on a real driver (skipped without one) ---------------------------------------------------------
 
 const cuda = @import("cuda");
@@ -1370,6 +1518,7 @@ test "the start line names the Rocinante transport, the arena and the layout has
     var w = std.Io.Writer.fixed(&buf);
     try roci.startLine(&w, 2, "mlx5_0,mlx5_2", 3, .{}, .write);
     const text = w.buffered();
+    for ([_][]const u8{ "Rocinante transport", "639893504", "mlx5_0,mlx5_2", "GID 3", "layout hash", "idle park 0 us", "housekeeping every 16 turns" }) |k| try std.testing.expect(std.mem.indexOf(u8, text, k) != null);
 }
 
 test "the start line says what the transport carries: the owner sums, and the codes and the gathers where the arena holds their regions; the event counts follow" {
@@ -2305,6 +2454,33 @@ test "waitHostStats: a word written while the host waits ends the wait, which co
     var st2: roci.Transport.HostWait = .{};
     try std.testing.expect(try nd.t.waitHostStats(.rech, 1, 5 * std.time.ns_per_ms, &st2));
     try std.testing.expectEqual(@as(u32, 0), st2.naps);
+}
+
+test "the host lane parks its proxies in the kernel: they sleep between looks (counted), and the records and headers still land byte for byte" {
+    const net = try Net.open(.{ .host = true }, .{ .nap = true, .park = true, .gathers = false }, roci.identity);
+    defer net.close();
+    try net.start();
+    var run: HostRun = .{ .net = net, .steps = 20 };
+    var th: [2]std.Thread = undefined;
+    for (&th, 0..) |*t, who| t.* = try std.Thread.spawn(.{}, hostMain, .{ &run, who });
+    for (th) |t| t.join();
+    for (run.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+    for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+    sleep(20 * std.time.ns_per_ms);
+    const c = net.nodes[0].t.counters();
+    try std.testing.expect(c.sleeps > 0);
+    try std.testing.expectEqual(@as(u64, 0), c.backstop_wakes); // (no nap on a doorbell)
+}
+
+test "the host lane's cores: unpinned by default, and a pin that is another lane's or a ring's refuses by the core" {
+    const roci_engine = @import("roci_engine.zig");
+    try std.testing.expectEqual(@as(?u16, null), roci_engine.hostPinClash(null, .{ 3, 4 }, .{ 1, 2 }, &.{ 0, 10, 11 }));
+    try std.testing.expectEqual(@as(?u16, null), roci_engine.hostPinClash(.{ 15, 16 }, .{ 3, 4 }, .{ 1, 2 }, &.{ 0, 10, 11 }));
+    try std.testing.expectEqual(@as(?u16, 4), roci_engine.hostPinClash(.{ 15, 4 }, .{ 3, 4 }, .{ 1, 2 }, &.{ 0, 10, 11 }));
+    try std.testing.expectEqual(@as(?u16, 2), roci_engine.hostPinClash(.{ 2, 16 }, null, .{ 1, 2 }, &.{ 0, 10, 11 }));
+    try std.testing.expectEqual(@as(?u16, 10), roci_engine.hostPinClash(.{ 16, 10 }, null, null, &.{ 0, 10, 11 }));
+    // the two host proxies on one core also share it
+    try std.testing.expectEqual(@as(?u16, 16), roci_engine.hostPinClash(.{ 16, 16 }, null, null, &.{}));
 }
 
 test "waitHost naps on the word it waits for (the Arm wait the proxies use), and sleeps a fixed time only where the CPU cannot nap" {

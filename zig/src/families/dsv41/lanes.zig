@@ -1589,6 +1589,10 @@ pub const Lanes = struct {
         where.set(.round, @intCast(windows.len), 0);
         defer where.set(.after_backend, 0, 0); // (the lane core's own work until the next backend call or the gate's next mark)
         defer m.flushDiag(false); // (TF_DS_ROCI_XLOG / TF_DS_NACT_LOG's files, every 256th call: nothing when both are off)
+            if (self.instr.note(&lb, (m.now() - t0) / std.time.ns_per_us, m)) |line| {
+                std.log.info("{s}", .{line});
+                if (m.hw_head.on) std.log.info("hybrid wait (since the start): head: {d} polled ({d} already done), {d} fell back, {d} blocking, expects {d:.0} us; pass: {d} polled ({d} already done), {d} fell back, {d} blocking, expects {d:.0} us", .{ m.hw_head.polled, m.hw_head.early, m.hw_head.fell_back, m.hw_head.blocked, m.hw_head.ema_ns / 1000, m.hw_pass.polled, m.hw_pass.early, m.hw_pass.fell_back, m.hw_pass.blocked, m.hw_pass.ema_ns / 1000 });
+            }
         if (try self.begin(.verify)) {
             try self.wire.int(gpa, u32, @intCast(windows.len));
             if (m.head_cand or m.head_key) try self.wire.int(gpa, u8, head);
@@ -3404,6 +3408,7 @@ test "a prompt step the host bills to decoders ends on the device before prefill
     // (a pair's second pass runs on its own stream: pairJoin makes the model's stream wait for its end before the host waits on the stream,
     // or the second pass's tail would land in the next round's time)
 }
+    try std.testing.expect(std.mem.indexOf(u8, vb, "defer if (m.rank == 0) {\n            var lb: [512]u8 = undefined;\n            if (self.instr.note(&lb, (m.now() - t0) / std.time.ns_per_us, m)) |line| {\n                std.log.info(\"{s}\", .{line});") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "if (self.spill) |t| t.bump(lane.base + f.start, lane.base + f.start + n + n2 + n3);\n        self.instr.chunk(m.now() / std.time.ns_per_us, n);") != null);
 
 test "every wait that can hold a host names itself, and each rank journals the frames it sends and takes" {

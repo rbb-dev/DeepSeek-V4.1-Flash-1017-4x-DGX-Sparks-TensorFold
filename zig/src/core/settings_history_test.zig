@@ -173,6 +173,25 @@ test "the version is the newest recorded row's, and a missing file is version 0"
     try std.testing.expectEqual(@as(u64, 1), (try history.state(a, std.testing.io, try history.pathFor(a, cfg))).version);
 }
 
+test "the history file is owned by the folder's owner and group, mode 0640, and the start line says so" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try cfgIn(&tmp, a);
+    Cap.reset();
+    _ = try history.recordStart(a, std.testing.io, cfg, rep(1, &.{.{ .id = id("TF_DS_SPILL_READERS"), .value = "8" }}), "r", 1, Cap);
+    const dirz = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    const filez = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dirz, history.file_name }, 0);
+    const d = history.ownerOf(dirz).?;
+    const f = history.ownerOf(filez).?;
+    try std.testing.expectEqual(d.uid, f.uid);
+    try std.testing.expectEqual(d.gid, f.gid);
+    try std.testing.expectEqual(@as(u32, 0o640), f.mode & 0o777);
+    try std.testing.expect(std.mem.indexOf(u8, Cap.text(), "owned by the folder's owner") != null);
+}
+
 test "a write row is one line; its persisted values are the replayed state, an unpersisted one is not, and its sha is the file's so the next start imports nothing" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();

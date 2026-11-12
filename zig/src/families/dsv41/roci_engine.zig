@@ -140,6 +140,13 @@ pub const Roci = struct {
         if (world != roci.world) return error.NotFourRanks;
         if (lanes < 1 or lanes > 3) return error.BadLanes;
         if (layout_set == .host and first == null) return error.NoFirstLane;
+        if (layout_set == .host) {
+            var rb: [8]u16 = undefined;
+            if (hostPinClash(cpusFromEnvH(), cpusFromEnv(), cpusFromEnvB(), ringCpus(&rb))) |c| {
+                std.log.err("TF_DS_ROCI_CPUS_H: core {d} is already a proxy's (the first lane TF_DS_ROCI_CPUS, the second TF_DS_ROCI_CPUS_B, a decode ring TF_DS_RDMA_CPUS, or the host lane's other proxy): the host lane's proxies need cores of their own, or none", .{c});
+                return error.HostLaneCoreShared;
+            }
+        }
         const r = try gpa.create(Roci);
         errdefer gpa.destroy(r);
         r.* = .{ .gpa = gpa, .d = d, .g = node, .layout = roci.layoutOf(layout_set), .arena = undefined, .arena_mem = undefined, .pages = pages, .ctl_mem = undefined, .verbs = undefined, .nic = undefined, .t = undefined };
@@ -372,6 +379,35 @@ pub fn waitMode(text: ?[]const u8, signal: roci.Signal, mlx_ok: bool) WaitMode {
     };
 }
 
+/// A whole-number setting: unset, empty or unreadable gives `default`.
+fn envU32(name: [:0]const u8, default: u32) u32 {
+    const v = std.c.getenv(name) orelse return default;
+    return std.fmt.parseInt(u32, std.mem.trim(u8, std.mem.span(v), " \t"), 10) catch default;
+}
+
+/// A proxy's WFET deadline in microseconds: at least 10 (shorter is a poll), at most 2,500 (a stopping proxy ends within
+/// one nap, as the rings' teardown bound).
+pub fn backstopUs(v: u32) u32 {
+    return @min(@max(v, 10), 2_500);
+}
+
+test "the schema's bounds of TF_DS_ROCI_BACKSTOP_US are the clamp's: inside they pass through, outside the clamp would change the value" {
+    const o = @import("engine_api").settings.byEnv("TF_DS_ROCI_BACKSTOP_US").?;
+    const lo: u32 = @intFromFloat(o.min.?);
+    const hi: u32 = @intFromFloat(o.max.?);
+    try std.testing.expectEqual(lo, backstopUs(lo));
+    try std.testing.expectEqual(hi, backstopUs(hi));
+    try std.testing.expect(backstopUs(lo - 1) != lo - 1);
+    try std.testing.expect(backstopUs(hi + 1) != hi + 1);
+}
+
+test "a proxy's WFET deadline is held between 10 and 2,500 us" {
+    try std.testing.expectEqual(@as(u32, 100), backstopUs(100));
+    try std.testing.expectEqual(@as(u32, 10), backstopUs(0));
+    try std.testing.expectEqual(@as(u32, 2_500), backstopUs(100_000));
+    try std.testing.expectEqual(@as(u32, 1_000), backstopUs(1_000));
+}
+
 /// `TF_DS_ROCI_CPUS_B=a,b`: the second lane's two proxy cores (default 1,2: small cores that neither the decode rings' proxies nor the
 /// threads use).
 fn cpusFromEnvB() ?[roci.rails]u16 {
@@ -382,11 +418,41 @@ fn cpusFromEnvB() ?[roci.rails]u16 {
     return out;
 }
 
+/// `TF_DS_ROCI_CPUS_H=a,b`: the host lane's two proxy cores. Unset, they are not pinned: they sleep in the kernel between looks
+/// (Settings.park), so they take no core from the lanes that nap on theirs. A pin names cores no other lane or ring uses.
 fn cpusFromEnvH() ?[roci.rails]u16 {
+    const v = std.c.getenv("TF_DS_ROCI_CPUS_H") orelse return null;
     var it = std.mem.splitScalar(u8, std.mem.span(v), ',');
     var out: [roci.rails]u16 = undefined;
     for (&out) |*c| c.* = std.fmt.parseInt(u16, it.next() orelse return null, 10) catch return null;
     return out;
+}
+
+/// The first core of the host lane's pin `h` that another proxy already holds: the first lane's (`lane0`), the second lane's (`lane_b`), a
+/// decode ring's (`rings`), or the host lane's other proxy. Null when `h` is unset or shares nothing. A proxy that naps never gives
+/// its core up, so two on one core each get half of it.
+pub fn hostPinClash(h: ?[roci.rails]u16, lane0: ?[roci.rails]u16, lane_b: ?[roci.rails]u16, rings: []const u16) ?u16 {
+    const pin = h orelse return null;
+    if (pin[0] == pin[1]) return pin[0];
+    for (pin) |c| {
+        if (lane0) |o| for (o) |x| if (x == c) return c;
+        if (lane_b) |o| for (o) |x| if (x == c) return c;
+        for (rings) |x| if (x == c) return c;
+    }
+    return null;
+}
+
+/// TF_DS_RDMA_CPUS: the decode rings' proxy cores.
+fn ringCpus(buf: []u16) []const u16 {
+    const v = std.c.getenv("TF_DS_RDMA_CPUS") orelse return buf[0..0];
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, std.mem.span(v), ',');
+    while (it.next()) |x| {
+        if (n == buf.len) break;
+        buf[n] = std.fmt.parseInt(u16, std.mem.trim(u8, x, " "), 10) catch continue;
+        n += 1;
+    }
+    return buf[0..n];
 }
 
 /// `TF_DS_ROCI_CPUS=a,b`: the two rails' proxy cores; unset, the scheduler's choice.
