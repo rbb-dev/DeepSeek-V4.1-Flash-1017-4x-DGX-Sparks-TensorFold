@@ -723,10 +723,25 @@ pub const Model = struct {
         if (n == 0 or n > chunk_rows or seq.len != start + n) return error.BadChunk;
         if (m.waves and n > wave_rows) return m.fillPair(seq, start, n, replay);
         const e = &m.eng;
+pub fn startSettings(o: Options) prompt2d.Settings {
+    return .{
+        .world = o.world,
+        .streams = @intCast(o.streams),
+        .round_rows = @intCast(o.round_rows),
+        .rails = if (o.rdma_devices) |list| @intCast(std.mem.count(u8, list, ",") + 1) else 0,
+        .drafts = @intFromBool(o.drafts),
+        .graphs = @intFromBool(o.graphs),
+        .graph_cap = @intCast(@min(o.graph_cap, std.math.maxInt(u32))),
+        .pool = o.pool,
+        .replay_floor = @intFromBool(prompt.replay_floor),
+    };
+}
+
     mxk: ?mx.Kernels = null, // Format.native: DeepSeek's own FP8 / MXFP4 checkpoint's kernels (mx.zig)
     rope_buf: cuda.DeviceBuffer,
     arena: prompt.Arena,
         readWorkerEnv();
+        if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
         if (std.c.getenv("TF_DS_L2_DN_MB")) |v| round.l2_dn_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dn_mb;
         if (std.c.getenv("TF_DS_L2_DEC_MB")) |v| round.l2_dec_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dec_mb;
         const ord = if (o.world == 4) try prompt2d.order() else [4]u32{ 0, 1, 2, 3 };
@@ -933,6 +948,7 @@ pub const Model = struct {
         if (pt) |t| {
             try m.synchronize();
             try t.finish();
+
         }
         return true;
     }

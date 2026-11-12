@@ -71,6 +71,12 @@ pub const Attn = struct {
     one_split: bool = false,
 };
 
+/// sparse_attn's key splits for a call of `rows` rows: a decode window's (decode_rows rows or fewer) split the keys and
+/// merge them; a prompt chunk, and a small chunk run as one (`one_split`), take one split that writes out directly.
+pub fn splits(rows: usize, one_split: bool) usize {
+    return if (rows <= tri.decode_rows and !one_split) attn_splits else 1;
+}
+
 /// sparse_attn: q -> out (o [R, H, HD]); window keys from wsrc, compressed keys comp[idx[r, j]].
 pub fn sparseAttn(t: Tri, a: Attn) !void {
     const hb = 16;
@@ -85,7 +91,7 @@ pub fn sparseAttn(t: Tri, a: Attn) !void {
     const csc: u64 = if (pack) a.comp.fp4.scales else a.wsrc;
     const ct: []const u8 = if (pack) "*u8" else "*bf16";
     var n_idx: usize = if (has) a.n_idx else 0;
-    const sp: usize = if (a.rows <= tri.decode_rows and !a.one_split) attn_splits else 1;
+    const sp: usize = splits(a.rows, a.one_split);
     const groups = a.h / hb;
     const final = sp == 1;
     var picks: usize = if (has) tri.cdiv(n_idx, bn) else 0;
@@ -240,6 +246,43 @@ test "a prompt chunk's pick list is padded to 16 entries and its pick blocks to 
     } else return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(i32, 80), n_idx);
     try std.testing.expectEqual(@as(?i64, 128 / 32 + 4), nblk);
+}
+
+test "a decode window's rows split the keys; a prompt chunk, and a small chunk run as one, take one split" {
+    try std.testing.expectEqual(@as(usize, attn_splits), splits(16, false));
+    try std.testing.expectEqual(@as(usize, attn_splits), splits(1, false));
+    try std.testing.expectEqual(@as(usize, 1), splits(16, true));
+    try std.testing.expectEqual(@as(usize, 1), splits(1, true));
+    try std.testing.expectEqual(@as(usize, 1), splits(17, false));
+    try std.testing.expectEqual(@as(usize, 1), splits(17, true));
+}
+
+test "a small chunk run as one split launches the prompt chunks' variant: one pass, its pick list padded, no merge" {
+    const comp: Comp = .{ .fp4 = .{ .codes = 0x600, .scales = 0x700 } };
+    const a: Attn = .{ .q = 0x100, .out = 0x200, .rows = 16, .h = 32, .hd = 512, .sink = 0x300, .wsrc = 0x400, .wsrc_rows = 16, .wlo = 0x500, .ring = false, .comp = comp, .idx = 0x800, .n_idx = 70, .pos = 0x900, .scale = 0.044194173, .window = 128, .one_split = true };
+    for ([_]bool{ true, false }) |one| {
+        var log: tri.Log = .{ .gpa = std.testing.allocator };
+        defer log.deinit();
+        var b = a;
+        b.one_split = one;
+        try sparseAttn(.{ .log = &log }, b);
+        // one split: the part kernel alone, FINAL; split keys: the part kernel, then the merge
+        try std.testing.expectEqual(@as(usize, if (one) 1 else 2), log.items.items.len);
+        const k = log.items.items[0];
+        try std.testing.expectEqualStrings("_sparse_attn_part", k.name);
+        const n_idx = for (k.args) |x| {
+            if (std.mem.eql(u8, x.name, "n_idx")) break x.value.i32;
+        } else return error.TestUnexpectedResult;
+        var got: [2]?i64 = .{ null, null };
+        for (k.consts) |x| {
+            if (std.mem.eql(u8, x.name, "SPLITS")) got[0] = x.int;
+            if (std.mem.eql(u8, x.name, "FINAL")) got[1] = x.int;
+        }
+        try std.testing.expectEqual(@as(?i64, if (one) 1 else attn_splits), got[0]);
+        try std.testing.expectEqual(@as(?i64, @intFromBool(one)), got[1]);
+        try std.testing.expectEqual(@as(i32, if (one) 80 else 70), n_idx);
+        try std.testing.expectEqual(@as(u32, 16), k.grid[0]);
+    }
 }
 
 test "fp4_store launches as recorded" {

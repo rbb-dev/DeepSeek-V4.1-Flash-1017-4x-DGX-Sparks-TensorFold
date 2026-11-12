@@ -867,8 +867,23 @@ pub fn mm(e: *const Engine, ch: *const Chunk, l: weights.Linear, x: u64, ldx: us
 /// by the gather path (off: ring mode, as the served lane reads, the slot's previous request's keys below the floor).
 pub var replay_floor = false;
 
-/// TF_DS_WAVES (model.zig sets it): a pass's two waves each apply their part of the Engram rows read ahead for the pass.
-pub var waves = false;
+/// How attention reads a chunk's window keys (chunkMode).
+pub const ChunkMode = struct {
+    /// ring mode: the rows' keys into the ring first, the attention reads the ring
+    ring: bool,
+    /// a chunk of decode_rows rows or fewer off ring mode: the prompt chunks' one-split variant (tri_attn.Attn.one_split)
+    one_split: bool,
+};
+
+/// ring mode (a chunk of RING_EXTRA rows or fewer): the rows' keys into the ring first, the attention reads the ring.
+/// With replay_floor (`on`), not when the window reaches below `floor` (the replay's cut: below it the ring holds the slot's
+/// previous request's keys): such a chunk reads by the gather path from the floor, as one large chunk's rows would.
+pub fn chunkMode(n: usize, start: usize, floor: usize, window: usize, on: bool) ChunkMode {
+    const below = floor > start -| (window - 1);
+    const ring = n <= ring_extra and !(on and below);
+    return .{ .ring = ring, .one_split = !ring and n <= tri.decode_rows };
+}
+
 
 /// TF_DS_IDX_SPLIT (idx_split.zig; model.zig and the layer gate set it on every rank, the ranks' settings check it): the
 /// keyed indexer layers' rows of at least this many columns split by columns over the run's nodes, the same columns
@@ -898,18 +913,10 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     // _cs: the layer's RoPE kind (compressed layers rotate by the compressed table) for every rotation it makes
     const rope = if (lay.ratio != 0) e.compressed else e.plain;
     const ring_rows = c.window + ring_extra;
-    // ring mode (a chunk of RING_EXTRA rows or fewer): the rows' keys into the ring first, the attention reads the ring.
-    // With replay_floor, not when the window reaches below `floor` (the replay's cut: below it the ring holds the slot's
-    // previous request's keys): such a chunk reads by the gather path from the floor, as one large chunk's rows would
-    const below = floor > start -| (c.window - 1);
-    const ring_mode = n <= ring_extra and !(replay_floor and below);
-    const one_split = !ring_mode and n <= tri.decode_rows;
-    // attn_in: wq_a and wkv of x, one prompt GEMM each, or one group up to 128 rows
-    if (n > 128) {
-        try mm(e, ch, lay.wq_a, ch.x, c.hidden, ch.qa, .bf16, lay.wq_a.n);
-        try mm(e, ch, lay.wkv, ch.x, c.hidden, ch.y, .bf16, hd);
-    } else {
-        try grouped(e, ch, n, &.{ lay.wq_a, lay.wkv }, &.{ ch.x, ch.x }, &.{ c.hidden, c.hidden }, &.{ ch.qa, ch.y }, &.{ lay.wq_a.n, hd }, &.{ .bf16, .bf16 });
+    // ring mode, or the gather path from the floor (replay_floor: a small chunk whose window reaches below it): chunkMode
+    const mode = chunkMode(n, start, floor, c.window, replay_floor);
+    const ring_mode = mode.ring;
+    const one_split = mode.one_split;
     }
     pmark(e, .a_in);
     dump(e, li, "x", ch.x, n * c.hidden * 2);
@@ -960,8 +967,9 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         const kk = sh.kk orelse return error.NoIndexerSelection;
         comp = .{ .fp4 = .{ .codes = cs.comp_codes[src], .scales = cs.comp_scales[src] } };
         n_idx = kk;
-        if (kk % 16 != 0 and (n > tri.decode_rows or one_split)) {
-            // sparse_attn: a prompt chunk's pick list padded with -1 to whole 16-column tiles (F.pad), read from there
+        if (kk % 16 != 0 and tri_attn.splits(n, one_split) == 1) {
+            // sparse_attn's one pass (a prompt chunk, or a small chunk run as one): its pick list padded with -1 to whole
+            // 16-column tiles (F.pad), read from there
             const kp = (kk + 15) / 16 * 16;
             try fill(e, ch.cidxp, 0xff, n * kp * 8);
             try e.ops.copyRows(e.s, ch.cidx, kk * 8, ch.cidxp, kp * 8, kk * 8, n);
@@ -1666,6 +1674,68 @@ pub fn head(e: *const Engine, ch: *Chunk) !void {
 pub fn endLayer(ch: *Chunk) void {
     ch.pending = true;
     std.mem.swap(u64, &ch.pre, &ch.pre_f);
+}
+
+test "a small chunk at the replay's cut reads its window from the ring with the floor off, from the floor with it on" {
+    const window = 128; // config.json's sliding_window
+    for ([_]bool{ false, true }) |on| {
+        // replayCut leaves 1 .. 16 rows from the floor (start = floor = replay): its window reaches below the floor
+        for (1..ring_extra + 1) |n| {
+            const m = chunkMode(n, 4096 - 16, 4096 - 16, window, on);
+            try std.testing.expectEqual(!on, m.ring);
+            try std.testing.expectEqual(on, m.one_split);
+        }
+        // a last chunk of 2 .. 16 rows whose window reaches below the floor (replay = the prompt's length - window)
+        for (2..ring_extra + 1) |n| {
+            const m = chunkMode(n, 6144, 6144 + n - window, window, on);
+            try std.testing.expectEqual(!on, m.ring);
+            try std.testing.expectEqual(on, m.one_split);
+        }
+        // a window that stays at or above the floor: ring mode either way (a last chunk of one row, the floor 0)
+        for ([_][2]usize{ .{ 1, 6144 - window + 1 }, .{ 16, 0 }, .{ 7, 6144 - window + 1 } }) |nf| {
+            const m = chunkMode(nf[0], 6144, nf[1], window, on);
+            try std.testing.expect(m.ring and !m.one_split);
+        }
+        // past RING_EXTRA rows: never ring mode, never one split
+        for ([_]usize{ 17, 112, 2048 }) |n| {
+            for ([_]usize{ 0, 6144 - 16, 6144 }) |floor| {
+                const m = chunkMode(n, 6144, floor, window, on);
+                try std.testing.expect(!m.ring and !m.one_split);
+            }
+        }
+    }
+}
+
+test "the replay floor on: no prompt length's decoder chunk reads a key below the floor from the ring; off: exactly two classes do" {
+    // fillChunk's chunks start at the prompt's multiples of model.chunk_rows; the decoder layers run each one's rows at
+    // positions >= replay (replayCut), with replay = the prompt's length - window and no window key before it
+    const window = 128;
+    const chunk = 2048;
+    var stale_lengths: usize = 0;
+    for (1..64 * chunk + 128) |len| {
+        const replay = len -| window;
+        var stale = [2]bool{ false, false }; // the floor off, on
+        var start = replay / chunk * chunk; // the chunks before it are encoder-only
+        while (start < len) : (start += chunk) {
+            const at = @max(start, replay);
+            const n = @min(start + chunk, len) - at;
+            for ([_]bool{ false, true }, 0..) |on, k| {
+                const m = chunkMode(n, at, replay, window, on);
+                // ring mode reads the ring's last window - 1 positions before the chunk, below the floor too
+                if (m.ring and replay > at -| (window - 1)) stale[k] = true;
+                try std.testing.expect(!m.ring or n <= ring_extra);
+                try std.testing.expect(!m.one_split or (!m.ring and n <= tri.decode_rows));
+                if (!on) try std.testing.expect(m.ring == (n <= ring_extra) and !m.one_split); // off: the lane's bits
+            }
+        }
+        try std.testing.expect(!stale[1]);
+        // the two classes: 2048k + 112 .. 127 tokens (the cut leaves 1 .. 16 rows) and a last chunk of 2 .. 16 rows
+        const r = len % chunk;
+        const class = len > chunk and ((r >= 112 and r <= 127) or (r >= 2 and r <= 16));
+        try std.testing.expectEqual(class, stale[0]);
+        stale_lengths += @intFromBool(stale[0]);
+    }
+    try std.testing.expectEqual(@as(usize, 64 * 31), stale_lengths);
 }
 
 test "hd ** -0.5 as the served build passes it" {

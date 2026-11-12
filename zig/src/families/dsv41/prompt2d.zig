@@ -573,14 +573,18 @@ test "a follower holds rank 0's streams and pool and runs its round rows and gra
     try std.testing.expectEqualStrings("", off2.differ(off, 1, &buf));
 }
 
-test "a follower splits the keyed indexer rows as rank 0 does, or says to set the same" {
-    const served: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .replay_floor = 0, .pool = 1 << 21 };
+test "a follower runs rank 0's replay floor, or says to set the same on every rank" {
     var buf: [1024]u8 = undefined;
-    var lead = served;
-    lead.idx_split = 32768;
-    try std.testing.expectEqualStrings("", lead.differ(lead, 2, &buf));
-    try std.testing.expectEqualStrings("rank 2 splits the keyed indexer rows from 0 columns and rank 0 from 32768 (TF_DS_IDX_SPLIT, 0: unset): set the same on every rank", served.differ(lead, 2, &buf));
-    try std.testing.expectEqual(@as(usize, 48), @sizeOf(Settings));
+    try std.testing.expectEqualStrings("", on.differ(on, 2, &buf));
+    var off = on;
+    off.replay_floor = 0;
+    try std.testing.expectEqualStrings("", off.differ(off, 2, &buf));
+    try std.testing.expectEqualStrings("rank 2 has TF_DS_REPLAY_FLOOR=0 and rank 0 1: set the same on every rank", off.differ(on, 2, &buf));
+    try std.testing.expectEqualStrings("rank 1 has TF_DS_REPLAY_FLOOR=1 and rank 0 0: set the same on every rank", on.differ(off, 1, &buf));
+    // with the other words, one separator each
+    var both = off;
+    both.streams = 4;
+    try std.testing.expectEqualStrings("rank 3 holds 4 streams and rank 0 serves 16: start rank 3 with --streams 16 (or TF_DS_STREAMS=16); rank 3 has TF_DS_REPLAY_FLOOR=0 and rank 0 1: set the same on every rank", both.differ(on, 3, &buf));
 }
 
 test "rank 0's settings go with NCCL's id: the follower answers, and an older rank 0's id alone is taken as before" {
