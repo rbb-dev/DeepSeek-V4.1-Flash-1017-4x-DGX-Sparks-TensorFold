@@ -1321,6 +1321,7 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         .pf_raster = prompt2d.pf_raster_asked,
         .pass_rows = prompt2d.pass_rows_asked,
         .pass_from = prompt2d.pass_from_asked,
+        .sched = cuda.context.schedCode(),
         .cfg = engine_api.settings.cfgDigest(),
     };
 }

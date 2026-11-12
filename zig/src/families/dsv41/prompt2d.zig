@@ -259,6 +259,8 @@ pub const Settings = extern struct {
     kern2: u32 = 0, // the kernel switches beyond kern's 32 bits, bit i kern2_names[i] (kern2Asked): the same
     pf_split: u32 = 0, // TF_DS_PF_SPLIT asked for (mx.PfSplit): the same
     pass_rows: u32 = 2048, // TF_DS_PASS_ROWS (pass_rows_asked: a pass's rows at most, the chunk's allocation): the same
+    pass_from: u32 = 0, // rank 0's TF_DS_PASS_FROM (its pass rule's): every follower takes it, never compared
+    sched: u32 = 0, // TF_DS_CUDA_SCHED's request and what the primary context showed (cuda.context.schedCode): the same
     pf_raster: u32 = 0, // TF_DS_PF_RASTER's group of row tiles (pf_raster_asked; 0: off): the same (this word was the layout's padding, always 0)
     cfg: u64 = 0, // the digest of what engine.cfg set on this rank (settings.cfgDigest; 0: no file read): the same on every rank
 
@@ -294,6 +296,14 @@ pub const Settings = extern struct {
             w.print("{s}rank {d} has TF_DS_IDX_RB={d} and rank 0 {d}: set the same on every rank", .{ sepIf(&w, sep), rank, mine.idx_rb, lead.idx_rb }) catch {};
         if (mine.pass_rows != lead.pass_rows)
             w.print("{s}rank {d} has TF_DS_PASS_ROWS={d} and rank 0 {d}: set the same on every rank", .{ sepIf(&w, sep), rank, mine.pass_rows, lead.pass_rows }) catch {};
+        if (mine.sched != lead.sched)
+            w.print("{s}rank {d} has TF_DS_CUDA_SCHED {s} and rank 0 {s}: set the same on every rank", .{ sepIf(&w, sep), rank, cuda.context.schedWord(mine.sched), cuda.context.schedWord(lead.sched) }) catch {}
+        else if (mine.sched == cuda.context.sched_invalid)
+            w.print("{s}rank {d} and rank 0 have TF_DS_CUDA_SCHED text that is not one of auto, spin, yield, blocking: correct it on every rank", .{ sepIf(&w, sep), rank }) catch {}
+        else if (mine.sched == cuda.context.sched_active_mismatch)
+            w.print("{s}rank {d} and rank 0 asked for TF_DS_CUDA_SCHED and the primary context was already active with different scheduling flags: release it or set the same on every rank", .{ sepIf(&w, sep), rank }) catch {}
+        else if (mine.sched == cuda.context.sched_after_mismatch)
+            w.print("{s}rank {d} and rank 0 asked for TF_DS_CUDA_SCHED and the primary context did not take it: check the driver on every rank", .{ sepIf(&w, sep), rank }) catch {};
         if (mine.exch != lead.exch) bitsDiffer(&w, sep, &exch_names, "exchange", mine.exch, lead.exch, rank);
         if (mine.kern != lead.kern) bitsDiffer(&w, sep, &kern_names, "kernel", mine.kern, lead.kern, rank);
         if (mine.kern2 != lead.kern2) bitsDiffer(&w, sep, &kern2_names, "kernel (second word)", mine.kern2, lead.kern2, rank);
@@ -2350,6 +2360,36 @@ test "four ranks with the digests shared: the store's name computed from each ra
 
 test "a follower runs rank 0's TF_DS_CUDA_SCHED, or says what differs" {
     const lead: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 1, .sched = cuda.context.sched_blocking };
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings("", lead.differ(lead, 1, &buf));
+
+    // TF_DS_CUDA_SCHED: a valid but different name on one rank
+    var mine = lead;
+    mine.sched = cuda.context.sched_spin;
+    try std.testing.expectEqualStrings("rank 1 has TF_DS_CUDA_SCHED spin and rank 0 blocking: set the same on every rank", mine.differ(lead, 1, &buf));
+
+    // TF_DS_CUDA_SCHED: a text this build has no name for on one rank
+    mine = lead;
+    mine.sched = cuda.context.sched_invalid;
+    try std.testing.expectEqualStrings("rank 2 has TF_DS_CUDA_SCHED text that is not one of auto, spin, yield, blocking and rank 0 blocking: set the same on every rank", mine.differ(lead, 2, &buf));
+
+    // TF_DS_CUDA_SCHED: both ranks invalid: refused even though they agree
+    var both = mine;
+    try std.testing.expectEqualStrings("rank 3 and rank 0 have TF_DS_CUDA_SCHED text that is not one of auto, spin, yield, blocking: correct it on every rank", both.differ(mine, 3, &buf));
+
+    // TF_DS_CUDA_SCHED: the primary context was already active with other flags on one rank
+    mine = lead;
+    mine.sched = cuda.context.sched_active_mismatch;
+    try std.testing.expectEqualStrings("rank 1 has TF_DS_CUDA_SCHED a request the already-active primary context did not match and rank 0 blocking: set the same on every rank", mine.differ(lead, 1, &buf));
+
+    // TF_DS_CUDA_SCHED: both ranks active-mismatched: refused even though they agree
+    var both_active = mine;
+    try std.testing.expectEqualStrings("rank 2 and rank 0 asked for TF_DS_CUDA_SCHED and the primary context was already active with different scheduling flags: release it or set the same on every rank", both_active.differ(mine, 2, &buf));
+
+    // TF_DS_CUDA_SCHED: the set did not take effect on one rank
+    mine = lead;
+    mine.sched = cuda.context.sched_after_mismatch;
+    try std.testing.expectEqualStrings("rank 1 has TF_DS_CUDA_SCHED a request the primary context did not take and rank 0 blocking: set the same on every rank", mine.differ(lead, 1, &buf));
 }
 
 test "a follower runs rank 0's indexer score rows, or says to set the same on every rank" {

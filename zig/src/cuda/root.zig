@@ -4,6 +4,7 @@ pub const abi = @import("abi.zig");
 pub const Driver = @import("driver.zig").Driver;
 pub const Error = @import("driver.zig").Error;
 pub const Context = @import("context.zig").Context;
+pub const context = @import("context.zig");
 pub const DeviceBuffer = @import("memory.zig").DeviceBuffer;
 pub const HostBuffer = @import("memory.zig").HostBuffer;
 pub const usage = @import("memory.zig").usage;
