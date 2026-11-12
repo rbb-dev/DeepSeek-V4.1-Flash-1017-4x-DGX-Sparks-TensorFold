@@ -12,6 +12,10 @@
 //! when it has no --streams / --round-rows / --graph-cap; every rank checks its settings against rank 0's at the start
 //! and stops on a difference (prompt2d.Settings), so a follower of fewer streams than the server says so instead of
 //! hanging at the first stream past its own.
+//! A request with `force` (reference ids, as many as its max_tokens) is teacher-forced: the lane core feeds those
+//! tokens as the reply (its forced windows); with --logits-log FILE rank 0 writes each such stream's scored rows there
+//! (logits_log.zig's records: the prompt's last row, then every round's rows, each with its reference token), --topk K
+//! of each row (default 128), --full-every N whole rows (default 0), --row-sha 1 each row's sha256 (xp/qgate.py reads them).
 //! A follower serving `tensorfold serve` takes TF_DS_STREAMS and TF_DS_ROUND_ROWS from its environment when it has no
 //! --streams / --round-rows; every rank checks its settings against rank 0's at the start and stops on a difference
 //! (prompt2d.Settings), so a follower of fewer streams than the server says so instead of hanging at the first stream
@@ -21,7 +25,7 @@ const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
 const lanes = @import("lanes");
 
-const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--context C] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN] [--fix-k K] [--round-rows R] [--streams S]\n";
+const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--context C] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN] [--fix-k K] [--round-rows R] [--streams S] [--graph-cap N] [--logits-log FILE [--topk K] [--full-every N] [--row-sha 0|1]]\n";
 
 const Request = struct {
     name: []const u8 = "",
@@ -33,6 +37,7 @@ const Request = struct {
     top_p: f64 = 0.95,
     expect_sha: ?[]const u8 = null,
     images: []const ImageRows = &.{}, // a vision request: its spans' rows ready (zrec_v3req.py from a recording)
+    force: []const u32 = &.{}, // reference ids fed as the reply (the lane core's forced windows), max_tokens of them
 };
 
 /// An image span of a request's prompt and its rows: bf16 [tokens, hidden] from row `row` of `rows_file`.
@@ -62,6 +67,34 @@ const Quiet = struct {
     }
 };
 var quiet_token: u8 = 0;
+
+/// The log goes where it always went; a switch line ("TF_NAME=1: off: why") is also noted for the speed report, as the server's
+/// does (server/main.zig), so the report the log keeps says "cannot run" where a start line said it.
+pub const std_options: std.Options = .{ .logFn = speedLog };
+
+fn speedLog(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+    if (comptime dsv41.model.speed_report.watches(format)) {
+        var b: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&b, format, args)) |m| dsv41.model.speed_report.noteLine(m) else |_| {}
+    }
+    std.log.defaultLog(level, scope, format, args);
+}
+
+/// The settings a logits-log keeps beside it (<log>.settings): the engine's own start report as this process has it now, one
+/// line a speed feature with its value and why it runs or not (core/speed_report.zig), then the kernel switches asked for.
+/// The log's header carries the text's hash. `buf` holds it.
+fn settingsText(buf: []u8) []const u8 {
+    var r: dsv41.model.speed_report.Report = undefined;
+    dsv41.model.speed_report.current(&r);
+    var w = std.Io.Writer.fixed(buf);
+    r.writeBlock(&w) catch {};
+    w.print("kernel switches asked (word 0x{x}):", .{dsv41.prompt2d.kernAsked()}) catch {};
+    for (dsv41.prompt2d.kern_names, 0..) |n, i| if (dsv41.prompt2d.kernAsked() >> @intCast(i) & 1 != 0) w.print(" {s}", .{n}) catch {};
+    w.print("\nsecond kernel switches asked (word 0x{x}):", .{dsv41.prompt2d.kern2Asked()}) catch {};
+    for (dsv41.prompt2d.kern2_names, 0..) |n, i| if (dsv41.prompt2d.kern2Asked() >> @intCast(i) & 1 != 0) w.print(" {s}", .{n}) catch {};
+    w.writeByte('\n') catch {};
+    return w.buffered();
+}
 
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
@@ -122,6 +155,10 @@ pub fn main(init: std.process.Init) !u8 {
     var phases = false; // --profile 2: also the rounds' GPU time by phase (eager rounds)
     var serial = false; // --serial 1: every stream without drafts (one row a round)
     var fix_k: ?usize = null; // --fix-k K: every drafted stream verifies K drafts a round (a cost measurement)
+    var log_path: ?[]const u8 = null; // --logits-log FILE: rank 0's records of the forced streams' rows
+    var topk: u32 = 128;
+    var full_every: u32 = 0;
+    var row_sha = false;
     var ai: usize = 8;
     while (ai + 1 < args.len) : (ai += 2) {
         const key = args[ai];
@@ -178,6 +215,14 @@ pub fn main(init: std.process.Init) !u8 {
             o.vision_bias = val;
         } else if (std.mem.eql(u8, key, "--logits-sha")) {
             dsv41.lanes.logits_sha = dsv41.lanes.logitsSha(val) orelse return error.BadLogitsSha;
+        } else if (std.mem.eql(u8, key, "--logits-log")) {
+            log_path = val;
+        } else if (std.mem.eql(u8, key, "--topk")) {
+            topk = try std.fmt.parseInt(u32, val, 10);
+        } else if (std.mem.eql(u8, key, "--full-every")) {
+            full_every = try std.fmt.parseInt(u32, val, 10);
+        } else if (std.mem.eql(u8, key, "--row-sha")) {
+            row_sha = !std.mem.eql(u8, val, "0");
         } else return error.BadArgument;
     }
     // with a free target the vote sizes the pool: a follower without --pool starts from the context, not the options' default
@@ -250,12 +295,28 @@ pub fn main(init: std.process.Init) !u8 {
     const text = try std.Io.Dir.cwd().readFileAlloc(io, requests_file orelse return error.NoRequests, a, .limited(1 << 30));
     const Requests = struct { requests: []Request };
     const reqs = (try std.json.parseFromSliceLeaky(Requests, a, text, .{ .ignore_unknown_fields = true })).requests;
+    for (reqs, 0..) |r, i| if (r.force.len > 0 and r.force.len != r.max_tokens) {
+        try w.print("{{\"rank\": 0, \"request\": {d}, \"name\": \"{s}\", \"error\": \"force holds {d} ids, max_tokens {d}: give as many\"}}\n", .{ i, r.name, r.force.len, r.max_tokens });
+        try w.flush();
+        return 1;
+    };
     // rows read whole on the host need the whole head (a sharded head leaves rd.logits unwritten)
     if (dsv41.lanes.wholeRowsRefusal(log_path != null or dsv41.lanes.logits_sha >= 2, m.head_key, m.head_cand)) |why| {
         try w.print("{{\"rank\": 0, \"error\": \"{s}\"}}\n", .{why});
         try w.flush();
         return 1;
     }
+    // the logits-log: the header (the requests file's sha256, the run's switch words), then the records
+    var log_buf: [1 << 16]u8 = undefined;
+    var log_file: ?std.Io.File = null;
+    var log_w: std.Io.File.Writer = undefined;
+    var sink: dsv41.logits_log.Sink = undefined;
+    if (log_path) |p| {
+        log_file = try std.Io.Dir.cwd().createFile(io, p, .{});
+        log_w = log_file.?.writer(io, &log_buf);
+        sink = try dsv41.logits_log.Sink.init(gpa, &log_w.interface, @intCast(m.vocab), topk, full_every, row_sha);
+        var rsha: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(text, &rsha, .{});
         const mxk: ?*const dsv41.mx.Kernels = if (m.mxk) |*k| k else null; // (the rank's kernels: the two decode defaults read in mx.Kernels.open)
         const speed = dsv41.logits_log.speedWord(.{
             .twin = @backingInt(dsv41.tri_attn.attn_twin),
@@ -265,7 +326,28 @@ pub fn main(init: std.process.Init) !u8 {
             .expert_exit = if (mxk) |k| k.expert_exit else false,
             .pack_epilogue = dsv41.prompt2d.pack_epilogue_asked,
             .hc_2s = dsv41.tri_hc.hc_2s,
+            .qkv_plain = dsv41.round.qkv_plain,
         });
+        // the settings beside the log: the start report as this rank 0 process has it, and its hash in the header
+        const settings_text = settingsText(&settings_buf);
+        {
+            const sp = try std.fmt.allocPrint(gpa, "{s}.settings", .{p});
+            defer gpa.free(sp);
+            const sf = try std.Io.Dir.cwd().createFile(io, sp, .{});
+            defer sf.close(io);
+            var sw_buf: [4096]u8 = undefined;
+            var sw = sf.writer(io, &sw_buf);
+            try sw.interface.writeAll(settings_text);
+            try sw.interface.flush();
+        }
+        try sink.header(rsha, dsv41.prompt2d.kernAsked(), dsv41.prompt2d.exchAsked(), dsv41.prompt2d.kern2Asked(), speed, dsv41.logits_log.settingsHash(settings_text));
+        dsv41.lanes.logits_log = &sink;
+    }
+    defer if (log_file) |f| {
+        dsv41.lanes.logits_log = null;
+        sink.deinit();
+        f.close(io);
+    };
     var ln = dsv41.lanes.Lanes.init(gpa, m);
     defer ln.deinit();
     ln.fix_k = fix_k;
@@ -317,6 +399,8 @@ pub fn main(init: std.process.Init) !u8 {
                 .proposer = j.proposer.proposer(),
             });
             j.stream.between = .{ .ptr = &quiet_token, .run = Quiet.run, .ready = Quiet.ready, .facts = Quiet.facts, .next = Quiet.next };
+            try j.stream.force.appendSlice(gpa, r.force);
+            if (log_file != null and r.force.len > 0) try sink.register(&j.stream, .{ .request = @intCast(j.index), .prompt_len = @intCast(r.prompt.len), .ref = r.force });
             admitted += 1;
             core.addStream(&j.stream) catch |err| {
                 try w.print("{{\"rank\": 0, \"request\": {d}, \"name\": \"{s}\", \"error\": \"{s}\"}}\n", .{ j.index, r.name, @errorName(err) });
@@ -390,6 +474,10 @@ pub fn main(init: std.process.Init) !u8 {
             try w.print("{{\"rank\": 0, \"engram\": {{\"calls_a_round\": {d:.2}, \"hash_ms\": {d:.3}, \"read_ms\": {d:.3}, \"decode_ms\": {d:.3}, \"upload_ms\": {d:.3}}}}}\n", .{ ms(eh.calls * 1000000, p.rounds), ms(eh.t_hash, p.rounds), ms(eh.t_read, p.rounds), ms(eh.t_decode, p.rounds), ms(eh.t_upload, p.rounds) });
             try w.flush();
         }
+    }
+    if (log_file != null) {
+        try log_w.interface.flush();
+        try w.print("{{\"rank\": 0, \"logits_log\": \"{s}\", \"records\": {d}, \"unlabeled\": {d}, \"bytes\": {d}, \"topk\": {d}}}\n", .{ log_path.?, sink.records, sink.unlabeled, sink.bytes, sink.topk });
     }
     try w.print("{{\"rank\": 0, \"requests\": {d}, \"tokens\": {d}, \"steps\": {d}, \"shared_rounds\": {d}, \"drafted\": {d}, \"accepted\": {d}, \"seconds\": {d:.2}, \"all_equal\": {}}}\n", .{ reqs.len, tokens_out, core.steps, core.shared_rounds, core.drafted, core.accepted, total_s, all_equal });
     try w.flush();

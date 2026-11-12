@@ -77,6 +77,8 @@ pub const ring_watch = @import("ring_watch.zig");
 /// Where this rank's host is, for a failure that names it.
 pub const where = @import("where.zig");
 pub const pass_replay = @import("pass_replay.zig");
+/// A test driver's logits-log (tf-dsv41-lanes --logits-log): the forced streams' scored rows as records.
+pub const logits_log = @import("logits_log.zig");
 pub const qgemv = @import("qgemv.zig");
 /// The owned-rows plan of a chunk of any row count.
 pub const slab_plan = @import("slab_plan.zig");
@@ -165,6 +167,7 @@ test {
     refAll(ring_watch);
     refAll(where);
     refAll(pass_replay);
+    refAll(logits_log);
     refAll(qgemv);
     refAll(slab_plan);
     refAll(rocinante);

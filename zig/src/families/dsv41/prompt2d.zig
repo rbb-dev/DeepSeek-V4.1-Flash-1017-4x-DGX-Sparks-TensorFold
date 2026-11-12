@@ -476,6 +476,7 @@ pub const kern_hc_fused: u32 = 1 << 21;
 pub const kern_attn_epi_fused: u32 = 1 << 27;
 pub const kern_gemm_r2: u32 = 1 << 29;
 pub const kern_gemm_halves: u32 = 1 << 30;
+pub const kern_qgate_canary: u32 = 1 << 31; // a quality gate's ruler (TF_DS_QGATE_CANARY), not a serving setting
 
 /// The kernel switches beyond kern's 32 bits (Settings.kern2): bit i is kern2_names[i], set when asked for. Same rules as
 /// kern_names: read once by Model.open, differ refuses every bit that differs, one this build has no name for included.
@@ -672,6 +673,7 @@ pub fn qgateAsked(text: ?[]const u8) Qgate {
 /// TF_DS_QGATE_CANARY as Model.open read it (qgateAsked), once (Settings.kern: any canary; every rank's the same
 /// canary, Model.open's agreement; prompt.qgate_canary, prompt.qgate_body).
 pub var qgate_canary_asked: Qgate = .off;
+
 /// TF_DS_DRAFT_VOCAB as Model.open read it (switchAsked), once (Settings.kern, draft.Drafter.vocab).
 pub var draft_vocab_asked: bool = false;
 
@@ -2563,6 +2565,7 @@ test "a default-on switch (TF_DS_ROCI_WAIT, TF_DS_RING_WAIT): unset and 1 are on
     try std.testing.expect(!switchAsked(null));
     try std.testing.expect(switchAsked("1"));
 }
+
 test "TF_DS_DRAFT_VOCAB: kern2 bit 1: a follower differing only in that bit is refused and the switch named; no bit of either word is two switches'" {
     const lead: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 2 };
     var buf: [1024]u8 = undefined;
@@ -2621,7 +2624,24 @@ test "the second kernel word: a follower differing only in kern2 is refused, and
     for (kern2_names, 0..) |n, i| if (n.len > 0) try std.testing.expect(seen2 & (@as(u32, 1) << @intCast(i)) != 0);
 }
 
+test "TF_DS_QGATE_CANARY: kern bit 31 (the quality gate's ruler), named in the settings' difference and in kern_names" {
+    try std.testing.expectEqual(@as(u32, 1 << 31), kern_qgate_canary);
+    try std.testing.expectEqual(@as(usize, 32), kern_names.len);
+    try std.testing.expectEqualStrings("TF_DS_QGATE_CANARY", kern_names[@ctz(kern_qgate_canary)]);
+    const lead: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 2 };
+    var qc = lead;
+    qc.kern = kern_qgate_canary;
+    var buf: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings("rank 3 has TF_DS_QGATE_CANARY=1 and rank 0 0: set the same on every rank", qc.differ(lead, 3, &buf));
+    // no two kernel switches share a bit, and every bit kern_names names is one of them
     const all = [_]u32{ kern_woa_w8, kern_quant_once, kern_pf_gemm5, kern_group_tiles, kern_topk_tiles, kern_idx_proj_owned, kern_bf16_rows, kern_pf_run128, kern_decode_fuse, kern_draft_4way, kern_head_pack12, kern_hc_late_fork, kern_attn_u, kern_idx_u, kern_idx_v, kern_attn_u_decode, kern_assemble_quant, kern_hc_stride, kern_draft_main_4way, kern_mma_sf, kern_attn_epilogue, kern_mma_sf_exact, kern_pass_tail, kern_head_cand, kern_head_key, kern_decode_ksplit, kern_attn_epi_fused, kern_gemm_w16, kern_hc_fused, kern_gemm_r2, kern_gemm_halves, kern_qgate_canary };
+    var seen: u32 = 0;
+    for (all) |v| {
+        try std.testing.expect(@popCount(v) == 1 and seen & v == 0);
+        seen |= v;
+    }
+    for (kern_names, 0..) |n, i| if (n.len > 0) try std.testing.expect(seen & (@as(u32, 1) << @intCast(i)) != 0);
+}
 
 test "TF_DS_QGATE_CANARY's text: 1 the head, 2 and 3 the body; unset or other text none; any canary is kern bit 31" {
     try std.testing.expectEqual(Qgate.off, qgateAsked(null));

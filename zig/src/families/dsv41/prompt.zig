@@ -3637,6 +3637,22 @@ pub fn tapRows(e: *const Engine, ch: *const Chunk, j: usize) u64 {
     return ch.taps + j * e.c.hidden * 2;
 }
 
+/// TF_DS_QGATE_CANARY in effect (Model.open: asked, with the checkpoint's own kernels): the head reads its rows after
+/// one more FP8 step, act_quant's quant-dequant (mx.fake: E4M3 codes of 32-value groups with power-of-two scales, back
+/// to bf16), a known perturbation of the logits alone for a quality gate to measure against; every rank the same
+/// (Settings.kern). Off: the head reads collapse_norm's rows.
+pub var qgate_canary = false;
+
+/// The rows the head reads: `x` (bf16 [m, d], row stride d) itself, or with qgate_canary their quant-dequant rows in
+/// the chunk's fake rows (mx.Scratch.fake).
+pub fn headInput(e: *const Engine, ch: *const Chunk, x: u64, m: usize, d: usize) !u64 {
+    if (!qgate_canary) return x;
+    const k = e.mx orelse return error.NotAnMxCheckpoint;
+    if (m > ch.mxs.rows or d > ch.mxs.max_k or d % 32 != 0) return error.CanaryRows;
+    try mx.fake(k, e.s, x, .bf16, d, m, d, ch.mxs.fake, d);
+    return ch.mxs.fake;
+}
+
 /// TF_DS_QGATE_CANARY 2 or 3 in effect (Model.open: the same canary asked on every rank, with the checkpoint's own
 /// kernels): layer body_layer's MoE partials, each rank's own before their gather, perturbed on purpose in every prompt
 /// chunk and every round (mx.qgateBody): one more FP8 step, act_quant's quant-dequant of each 32-value group (body_fp8),
@@ -3673,6 +3689,9 @@ pub fn head(e: *const Engine, ch: *Chunk) !void {
     const c = e.c;
     try headOwned(e, ch);
     const hl = e.w.head;
+    const hx = try headInput(e, ch, ch.head_x, 1, c.hidden);
+    try mmRows(e, ch, 1, hl, hx, c.hidden, ch.head_l, .fp32, hl.n);
+    dump(e, 0, "head_x", hx, c.hidden * 2);
     dump(e, 0, "head_l", ch.head_l, hl.n * 4);
     try e.two.?.quarters(e, ch.head_l, ch.head_g, 1, e.two.?.hw, 4); // the vocabulary quarters, over the decode rings
 }
@@ -3700,6 +3719,28 @@ fn headOwned(e: *const Engine, ch: *Chunk) !void {
 pub fn endLayer(ch: *Chunk) void {
     ch.pending = true;
     std.mem.swap(u64, &ch.pre, &ch.pre_f);
+}
+
+test "both heads read their rows through headInput: the rows themselves unless TF_DS_QGATE_CANARY, nothing else reads the switch" {
+    const p = @embedFile("prompt.zig");
+    const r = @embedFile("round.zig");
+    // the off path launches nothing: the head's GEMM reads the baseline rows
+    const at = std.mem.indexOf(u8, p, "pub fn headInput(").?;
+    const body = p[at .. at + std.mem.indexOf(u8, p[at..], "\n}\n").?];
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\n    if (!qgate_canary) return x;\n") != null);
+    // the prompt's last row and a round's rows: collapse_norm, the canary's choice, the head's GEMM on that choice
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, p, "const hx = try headInput(e, ch, ch.head_x, 1, c.hidden);\n    try mmRows(e, ch, 1, hl, hx, c.hidden, ch.head_l, .fp32, hl.n);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r, "const hx = try prompt.headInput(e, ch, rd.xc, R, d);\n    try prompt.groupedDecode(e, ch, R, &.{w.head}, &.{hx}, &.{d}, &.{rd.hl}, &.{hn}, &.{.f32});"));
+    // the switch is read by headInput alone: in code, its declaration and the off path (model.zig's useQgateCanary sets it)
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, r, "qgate_canary"));
+    var code: usize = 0;
+    var lines = std.mem.splitScalar(u8, p, '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trimStart(u8, line, " ");
+        if (std.mem.indexOf(u8, t, "qgate_canary") == null or std.mem.startsWith(u8, t, "//") or std.mem.indexOf(u8, t, "std.mem.") != null) continue;
+        code += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), code);
 }
 
 test "a small chunk at the replay's cut reads its window from the ring with the floor off, from the floor with it on" {

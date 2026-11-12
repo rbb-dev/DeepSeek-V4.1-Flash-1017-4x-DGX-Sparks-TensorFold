@@ -111,6 +111,8 @@ pub fn readWorkerEnv() void {
 }
 /// The settings table and the engine.cfg reader, which every rank runs (the followers call it from lanes_main).
 pub const cfg_settings = engine_api.settings;
+/// The speed report (core/speed_report.zig): the start report the quality gate's log keeps beside it (lanes_main).
+pub const speed_report = engine_api.speed_report;
 /// The KV pool's vote and ledger (core/kv_pool.zig), where the followers' flags parse their numbers.
 pub const kv_pool = engine_api.kv_pool;
 pub const live_config = engine_api.live_config;
@@ -1303,12 +1305,15 @@ fn agreeQgateCanary(d: *const cuda.Driver, comm: *const comm_mod.Comm, stream: c
 /// the body's (prompt.qgate_body: layer 0's MoE partials perturbed before their gather, a quality gate's floor), or off
 /// and why. Never a serving setting.
 fn useQgateCanary(asked: prompt2d.Qgate, native: bool) void {
+    prompt.qgate_canary = false;
     prompt.qgate_body = .off;
     if (asked == .off) return;
     if (!native) return std.log.info("TF_DS_QGATE_CANARY={d}: off: needs the checkpoint's own FP8 / MXFP4 kernels (act_quant)", .{@backingInt(asked)});
     switch (asked) {
         .off => {},
         .head => {
+            prompt.qgate_canary = true;
+            std.log.info("TF_DS_QGATE_CANARY=1: the head reads its rows after one more FP8 step (act_quant's quant-dequant): every logit perturbed on purpose, a quality gate's ruler, not a serving setting", .{});
         },
         .body_fp8 => {
             prompt.qgate_body = .body_fp8;
@@ -1319,6 +1324,8 @@ fn useQgateCanary(asked: prompt2d.Qgate, native: bool) void {
             std.log.info("TF_DS_QGATE_CANARY=3: layer 0's MoE partials move one fp32 ulp away from zero (a reduction order's size) before their gather, in every prompt chunk and every round: the body perturbed on purpose, a quality gate's floor, not a serving setting", .{});
         },
     }
+}
+
 /// TF_DS_HC_LATE_FORK `asked` in effect on this rank's round, one line when asked: on, or off and why (the
 /// checkpoint's own weights and the mixes' side stream). The same kernels on the same inputs either way.
 fn useLateFork(rd: *round.Round, asked: bool, native: bool) void {
@@ -2889,6 +2896,7 @@ pub const Model = struct {
         m.ledger.record(@src(), .transport, free_before_transport -| freeNow(ctx), 0); // the arena's first block, the exchanges' buffers and rings
         const free_before_chunk = freeNow(ctx);
         try agreeQgateCanary(d, &m.comm, m.stream, prompt2d.qgate_canary_asked);
+        useQgateCanary(prompt2d.qgate_canary_asked, m.eng.mx != null);
         if (prompt.qgate_body != .off) try m.mxk.?.useQgateBody();
         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, m.pass_rows, m.ctx_cap); // a stream's keys at most
         m.ledger.record(@src(), .chunk, free_before_chunk -| freeNow(ctx), 0);
@@ -4990,8 +4998,11 @@ test "the start-up settings carry TF_DS_PF_SPLIT and the kernel switches as Mode
     prompt2d.decode_ksplit_asked = true;
     try std.testing.expectEqual(prompt2d.kern_decode_ksplit, startSettings(o).kern);
     prompt2d.decode_ksplit_asked = false;
+    const was_qc = prompt2d.qgate_canary_asked;
+    defer prompt2d.qgate_canary_asked = was_qc;
     for ([_]prompt2d.Qgate{ .head, .body_fp8, .body_ulp }) |q| {
         prompt2d.qgate_canary_asked = q;
+        try std.testing.expectEqual(prompt2d.kern_qgate_canary, startSettings(o).kern);
     }
     prompt2d.qgate_canary_asked = .off;
     // the second kernel word: TF_DS_HC_2S travels in kern2, never in kern
@@ -5345,10 +5356,14 @@ test "TF_DS_ATTN_U_DECODE takes effect with the kit's extra set loaded, else sta
     try std.testing.expect(read < load and load < use);
 }
 
+test "TF_DS_QGATE_CANARY takes effect with the checkpoint's own kernels, else stays off; unset, never" {
+    const keep = prompt.qgate_canary;
+    defer prompt.qgate_canary = keep;
     const keep_b = prompt.qgate_body;
     defer prompt.qgate_body = keep_b;
     for ([_]prompt2d.Qgate{ .off, .head, .body_fp8, .body_ulp }) |q| {
         // not asked, or no FP8 kernels (an EXL3 checkpoint): no canary
+        prompt.qgate_canary = true;
         prompt.qgate_body = .body_ulp;
         useQgateCanary(q, false);
         try std.testing.expect(!prompt.qgate_canary);
@@ -5360,8 +5375,13 @@ test "TF_DS_ATTN_U_DECODE takes effect with the kit's extra set loaded, else sta
     }
     // Model.open: the switch read with the others; once the checkpoint's kernels are the engine's, every rank's canary
     // the same (else the start is refused), in effect, and the body's kernel loaded when it is the body's
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
     const read = std.mem.indexOf(u8, body, "prompt2d.qgate_canary_asked = readQgate();").?;
+    const kernels = std.mem.indexOf(u8, body, "if (m.mxk) |*x| m.eng.mx = x;").?;
     const agree = std.mem.indexOf(u8, body, "try agreeQgateCanary(d, &m.comm, m.stream, prompt2d.qgate_canary_asked);").?;
+    const use = std.mem.indexOf(u8, body, "useQgateCanary(prompt2d.qgate_canary_asked, m.eng.mx != null);").?;
     const load = std.mem.indexOf(u8, body, "if (prompt.qgate_body != .off) try m.mxk.?.useQgateBody();").?;
     try std.testing.expect(read < kernels and kernels < agree and agree < use and use < load);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "useQgateBody("));
@@ -5380,6 +5400,8 @@ test "TF_DS_QGATE_CANARY: the text read once (none asked, no collective); anothe
     const same = std.mem.indexOf(u8, body, "    if (differ == 0) return;\n").?;
     const refuse = std.mem.indexOf(u8, body, "return error.CanariesDiffer;").?;
     try std.testing.expect(off < gather and gather < same and same < refuse);
+}
+
 test "TF_DS_HC_LATE_FORK takes effect with the checkpoint's own weights and the mixes' side stream, else stays off" {
     var rd: round.Round = undefined;
     rd.late_fork = false;
@@ -6947,16 +6969,37 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
     try std.testing.expect(std.mem.indexOf(u8, loop, "defer m.flushDiag(false);") != null);
 }
 
+test "the quality-gate log's settings: every default-on row is in the start report the log's sidecar holds, and lanes_main writes it with its hash" {
     const ll = @import("logits_log.zig");
+    var r: api.speed_report.Report = undefined;
+    api.speed_report.reset();
+    api.speed_report.build(&r, .{}, struct {
+        fn f(_: []const u8) ?[]const u8 {
+            return null;
         }
+    }.f);
+    var buf: [32 * 1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try r.writeBlock(&w);
+    const text = w.buffered();
+    // the report is the sidecar's source of truth: it must not miss a default-on switch, whatever the switch does
     for (speed_defaults.table) |d| {
+        if (std.mem.indexOf(u8, text, d.env) == null) {
+            std.debug.print("{s} is on by default and the start report does not name it\n", .{d.env});
+            return error.SwitchMissingFromTheReport;
         }
     }
+    // the speed word's names are default-on rows too
     for (ll.speed_names) |n| {
         var found = false;
         for (speed_defaults.table) |d| found = found or std.mem.eql(u8, d.env, n);
         try std.testing.expect(found);
     }
+    // lanes_main: the report block into <log>.settings, its hash in the header, the log hook that notes "off" lines
+    const lm = @embedFile("lanes_main.zig");
+    try std.testing.expect(std.mem.indexOf(u8, lm, "pub const std_options: std.Options = .{ .logFn = speedLog };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lm, "\"{s}.settings\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lm, "dsv41.logits_log.settingsHash(settings_text)") != null);
 }
 
 test "TF_DS_ENGRAM_PARTNER and TF_DS_ENGRAM_KEEP_AHEAD: a failed precondition falls back with one warning when it is the default and refuses by name when the operator set it" {

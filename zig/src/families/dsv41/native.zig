@@ -244,6 +244,10 @@
 //!                                               tiles changes, so the replies' bits are unchanged. It does not need
 //!                                               TF_DS_GEMM_HALVES and may run with it (each 4,096-row block is a
 //!                                               launch of its own); the SSD tier's math names it; every rank the same
+//!   TF_DS_QGATE_CANARY=1                        not a serving setting: the head reads its rows after one more FP8
+//!                                               step (act_quant's quant-dequant), every logit perturbed on purpose,
+//!                                               the ruler of a quality gate's runs (tf-dsv41-lanes --logits-log);
+//!                                               with the checkpoint's own kernels; every rank the same
 //!   TF_DS_QGATE_CANARY=2 or 3                   not a serving setting: layer 0's MoE partials, each rank's before
 //!                                               their gather, in every prompt chunk and every round, take one more
 //!                                               FP8 step (2: act_quant's quant-dequant of each 32-value group) or
@@ -330,6 +334,7 @@ pub const Options = struct {
     segments: usize = 1,
     /// The SSD tier's settings (engine_api.Spill.fromEnv, parsed once by the server; not asked: off).
     spill: api.Spill = .{},
+    slide: bool = false, // no learner here
 };
 
 /// A lone drafted stream's own driver: decodes it until it finishes (false) or `yield` hands it over (true).
@@ -467,7 +472,8 @@ pub fn weightBytes(io: std.Io, dir: []const u8) u64 {
 
 /// Loads rank 0 and links rank 1 (which must start against TF_TP_MASTER:TF_TP_PORT); the pool holds TF_DS_WINDOW
 /// positions (else `o.context`), a stream at most `o.context`. Needs `ctx` current.
-pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
+/// The engine's own process settings the shared CUDA context reads (host threads and event waits sleep for the GPU, 16 hardware queues):
+/// set here, before the context is made, for this family alone.
 pub fn applyFamilyDefaults() void {
     api.speed_defaults.applyFamily();
 }
@@ -968,6 +974,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.BadGraphCap => "TF_DS_GRAPH_CAP: the captured CUDA graphs kept at most, a count (0: all)",
         error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 32",
         error.BadWindow => "TF_DS_WINDOW (the recipe's POOL): the streams' shared positions, at least --context: the pool must hold one full request, the context is never lowered",
+        error.SettingsDiffer => "a follower rank runs other settings than this server (the line above says which): give every rank the same TF_DS_STREAMS (the followers: --streams), TF_DS_ROUND_ROWS (--round-rows), RDMA devices, drafter, TF_DS_GRAPHS (--graphs), TF_DS_GRAPH_CAP (--graph-cap), TF_DS_REPLAY_FLOOR, TF_DS_IDX_RB, TF_DS_PF_SPLIT, TF_DS_WOA_W8, TF_DS_QUANT_ONCE, TF_DS_PF_GEMM5, TF_DS_GROUP_TILES, TF_DS_TOPK_TILES, TF_DS_IDX_PROJ_OWNED, TF_DS_BF16_ROWS, TF_DS_PF_RUN128, TF_DS_DECODE_FUSE, TF_DS_DRAFT_4WAY, TF_DS_HC_LATE_FORK, TF_DS_ATTN_U, TF_DS_IDX_U, TF_DS_IDX_V, TF_DS_ATTN_U_DECODE, TF_DS_MMA_SF, TF_DS_MMA_SF_EXACT, TF_DS_GEMM_W16, TF_DS_GEMM_R2, TF_DS_ASSEMBLE_QUANT, TF_DS_ATTN_EPILOGUE, TF_DS_HC_STRIDE, TF_DS_HC_FUSED, TF_DS_RING_WC, TF_DS_RING_INPLACE, TF_DS_RING_WORD, TF_DS_RING_WORD_SIGNAL, TF_DS_DRAFT_MAIN_4WAY, TF_DS_HEAD_CAND, TF_DS_GEMM_HALVES, TF_DS_PF_RASTER, TF_DS_DECODE_KSPLIT, TF_DS_HEAD_KEY and TF_DS_QGATE_CANARY, and every follower a --pool of at least the window (--context, or TF_DS_WINDOW)",
         error.BadKvTarget => "TF_DS_KV_FREE_TARGET_GIB: the free memory to keep on each Spark, a number of GiB above 0 and at most 1024 (unset: the pool is TF_DS_WINDOW's, or the context)",
         error.BadKvGrowth => "TF_DS_KV_GROWTH_MIB: the memory left for what the engine takes after the pool, a whole number of MiB (unset: 6144)",
         error.KvTargetAndWindow => "TF_DS_KV_FREE_TARGET_GIB sizes the pool from the free memory; TF_DS_WINDOW (the recipe's POOL) names a fixed one: set one of them",
@@ -1026,10 +1033,14 @@ test "every kernel switch the start-up settings carry and a prompt pass computes
     tri_index.idx_v = false;
     try std.testing.expect(!tierMath(null, null).idx_v);
     // TF_DS_QGATE_CANARY: the canary in effect, the head's 1, the body's 2 or 3, none 0
+    const keep_qc = prompt.qgate_canary;
+    defer prompt.qgate_canary = keep_qc;
     const keep_qb = prompt.qgate_body;
     defer prompt.qgate_body = keep_qb;
     prompt.qgate_body = .off;
+    prompt.qgate_canary = true;
     try std.testing.expectEqual(@as(u8, 1), tierMath(null, null).qgate_canary);
+    prompt.qgate_canary = false;
     try std.testing.expectEqual(@as(u8, 0), tierMath(null, null).qgate_canary);
     prompt.qgate_body = .body_fp8;
     try std.testing.expectEqual(@as(u8, 2), tierMath(null, null).qgate_canary);
@@ -1146,6 +1157,7 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_HC_FUSED") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_RING_WORD") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_RING_WORD_SIGNAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_QGATE_CANARY") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.DraftersDiffer).?, "aot-extra") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.CanariesDiffer) orelse "", "TF_DS_QGATE_CANARY") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));

@@ -32,6 +32,7 @@ const spill_tier = @import("spill_tier.zig");
 const spill_mirror = @import("spill_mirror.zig");
 const land = @import("land.zig");
 const probe = @import("probe.zig");
+const qlog = @import("logits_log.zig");
 const cuda = @import("cuda");
 const live_config = model.live_config;
 
@@ -66,6 +67,10 @@ pub fn rowShaLine(buf: []u8, id: []const u8, round_n: u64, row: usize, rows: usi
     std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &dg, .{});
     return std.fmt.bufPrint(buf, "{{\"row_logits\": \"{s}\", \"round\": {d}, \"row\": {d}, \"rows\": {d}, \"position\": {d}, \"input\": {d}, \"sha256\": \"{s}\"}}", .{ id, round_n, row, rows, position, input, std.fmt.bytesToHex(dg, .lower) });
 }
+
+/// A test driver's logits-log (tf-dsv41-lanes --logits-log): its registered streams' rows recorded, each prompt's last
+/// row and every round's rows (null: none, the server's case).
+pub var logits_log: ?*qlog.Sink = null;
 
 /// Why a run that reads every round's whole rows on the host (`reads_rows`: --logits-log, --logits-sha 2) cannot, or null.
 /// TF_DS_HEAD_KEY (`head_key`) and TF_DS_HEAD_CAND (`head_cand_on`) make a round's head each node's own bests or candidates,
@@ -1497,6 +1502,9 @@ pub const Lanes = struct {
             std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &dg, .{});
             std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\"}}\n", .{ s.id, std.fmt.bytesToHex(dg, .lower) });
         }
+        if (logits_log) |lg| try lg.row(s, len, @intCast(seq.items[len - 1]), logits);
+        const token = try draw(logits, len, s.sampling);
+        self.streams.getPtr(s).?.first = self.take(token);
         // a stream with a grammar: the row stays for its first token's draw among the grammar's tokens
         if (s.grammar != null) {
             self.first_row = try self.gpa.realloc(self.first_row, logits.len);
@@ -1638,7 +1646,13 @@ pub const Lanes = struct {
         if (cand) |cd| for (cd.flags) |fl| {
             whole = whole or fl != 0;
         };
+        // the host reads the whole logits for its draws, or for the logits-log's records
+        const logits: []const f32 = if ((greedy or !whole) and logits_log == null) &.{} else try m.roundLogits(rows.ids.len);
         _ = self.head_rounds[@backingInt(headPath(greedy, keyed, cand != null, merged, whole))].fetchAdd(1, .monotonic);
+        if (logits_log) |lg| for (windows, 0..) |w, k| {
+            const row0 = self.built.wins[k].row;
+            for (0..w.rows()) |r| try lg.row(w.stream, w.positions[r], @intCast(ids[k][r]), logits[(row0 + r) * m.vocab ..][0..m.vocab]);
+        };
         const t3 = if (self.prof != null) m.now() else 0;
         defer if (self.prof) |*p| {
             p.send += t1 - t0;
@@ -3270,6 +3284,7 @@ test "a decode round's head path: argmax when greedy, the nodes' merged candidat
     // the round counts its path once, right after its choices (the round's code comes before this test's text)
     const src = @embedFile("lanes.zig");
     const line = "_ = self.head_rounds[@backingInt(headPath(greedy, keyed, cand != null, merged, whole))].fetchAdd(1, .monotonic);";
+    const logits = std.mem.indexOf(u8, src, "const logits: []const f32 = if ((greedy or !whole) and logits_log == null) &.{} else try m.roundLogits(rows.ids.len);\n") orelse return error.TestUnexpectedResult;
     const at = std.mem.indexOf(u8, src, line) orelse return error.TestUnexpectedResult;
     try std.testing.expect(logits < at and at - logits < 200);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, line)); // the round's, and this test's text

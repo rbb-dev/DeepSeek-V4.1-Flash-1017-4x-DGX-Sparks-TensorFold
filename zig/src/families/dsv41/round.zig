@@ -1363,6 +1363,8 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
     try tri_basic.collapseNorm(t, h, pre, w.norm, rd.xc, c.eps, R, d);
     const hn: usize = w.head.n;
     try e.prepareRingSend(e.s); // the head's columns are written into the ring's send slot
+    const hx = try prompt.headInput(e, ch, rd.xc, R, d);
+    try prompt.groupedDecode(e, ch, R, &.{w.head}, &.{hx}, &.{d}, &.{rd.hl}, &.{hn}, &.{.f32});
     try Probe.check(probe, .head_cols, w.layers.len, rd.hl);
     if (rd.head_k == 0) try headWhole(e, rd, R, probe) else if (rd.head_k == head_cand.key) try headKeys(e, rd, R) else try headCandidates(e, rd, R, rd.head_k);
     try rd.mark(e, .head);

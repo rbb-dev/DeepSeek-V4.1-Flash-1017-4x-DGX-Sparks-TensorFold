@@ -199,6 +199,7 @@ test "the math text names TF_DS_PF_RASTER with its group only when it is on, aft
     m.pf_raster = 0;
     const off = try start.mathText(&off_buf, m);
     try std.testing.expect(std.mem.indexOf(u8, off, "pf_raster") == null);
+    try std.testing.expect(std.mem.endsWith(u8, off, " qgate_canary=1")); // the last optional switch in the shared math (TF_DS_QGATE_CANARY)
     for ([_]u32{ 2, 4, 8, 16 }) |g| {
         m.pf_raster = g;
         const on = try start.mathText(&on_buf, m);
@@ -207,7 +208,18 @@ test "the math text names TF_DS_PF_RASTER with its group only when it is on, aft
         try std.testing.expectEqualStrings(try std.fmt.bufPrint(&want, " pf_raster={d}", .{g}), on[off.len..]);
     }
 }
+
+test "TF_DS_QGATE_CANARY names itself in the tier's math only when on (stored states' names unchanged without it)" {
+    var buf: [1024]u8 = undefined;
+    const off: start.Math = .{ .pair_sum = true, .qhc = true, .owner_gather = true, .idx_shard = true, .idx_rb = 2, .negzero = false, .replay_floor = true, .owner_yx = true, .cat_partner = true, .front_owned = true, .ffn_codes = true, .pack_codes = true, .engram_owner_sum = true, .boundary_owned = true, .cat_codes = true, .pf_split = "C7", .woa_w8 = true, .quant_once = true, .pf_gemm5 = true, .group_tiles = true, .topk_tiles = true, .idx_proj_owned = true, .bf16_rows = true, .pf_run128 = true, .pass_rows = 4096, .pass_from = 8192, .pass_tail = true, .decode_fuse = true, .attn_u = true, .idx_u = true, .mma_sf = true, .mma_sf_exact = true };
+    const a = try start.mathText(&buf, off);
+    try std.testing.expect(std.mem.indexOf(u8, a, "qgate_canary") == null);
+    var on = off;
     on.qgate_canary = 1;
+    var buf2: [1024]u8 = undefined;
+    const b = try start.mathText(&buf2, on);
+    try std.testing.expect(std.mem.endsWith(u8, b, " qgate_canary=1") or std.mem.indexOf(u8, b, " qgate_canary=1") != null);
+}
 
 test "the canary in the tier's math is a number: the head's 1 keeps its old name, the body's 2 and 3 name themselves, and none is the same text as before" {
     var base_buf: [1024]u8 = undefined;
