@@ -121,3 +121,21 @@ pub const Pil = struct {
         };
     }
 };
+
+test "a Pillow child that died is started again, and the picture decoded" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // as the server ignores it (serve.zig): a write to a dead child's pipe is then BrokenPipe, not a signal
+    const ignore: std.posix.Sigaction = .{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    std.posix.sigaction(.PIPE, &ignore, null);
+    const p = Pil.start(gpa, io) catch return error.SkipZigTest; // no python3 with Pillow here
+    defer p.stop(gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ppm = "P6\n2 1\n255\n\x10\x20\x30\x40\x50\x60"; // two pixels, in a format picture.zig leaves to Pillow
+    try std.testing.expectEqualSlices(u8, ppm[11..], (try p.decode(arena.allocator(), ppm)).rgb.px);
+    // the child dies on its own (killed, out of memory) and nothing has waited for it yet
+    try std.posix.kill(p.child.id.?, .KILL);
+    std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+    try std.testing.expectEqualSlices(u8, ppm[11..], (try p.decode(arena.allocator(), ppm)).rgb.px);
+}
