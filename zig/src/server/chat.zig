@@ -7,6 +7,7 @@ const fields_mod = @import("fields.zig");
 const reply_text = @import("reply_text.zig");
 const tool_stream = @import("tool_stream.zig");
 const tool_parse = @import("tool_parse.zig");
+const output_diagnostics = @import("output_diagnostics.zig");
 const prompt_mod = @import("prompt.zig");
 const log = @import("log.zig");
 const ids = @import("ids.zig");
@@ -525,6 +526,11 @@ const Generation = struct {
         const decode_s: f64 = if (prefilled) |p| @max(0, seconds(finished_ns - p)) else 0;
         const decode_tokens = g.collected.items.len -| 1;
         const runtime = try json.newObject(a);
+        if (g.tools.len > 0) if (output_diagnostics.toolWarning(content)) |warning| {
+            const code = @tagName(warning);
+            try runtime.put(a, "tool_parse_warning", .{ .string = code });
+            log.line("warning: {s} tool_parse_warning={s}", .{ g.reply_id, code });
+        };
         try runtime.put(a, "enable_thinking", .{ .bool = thinking });
         try runtime.put(a, "reasoning_effort", if (!thinking) .{ .string = "none" } else if (effort) |e| .{ .string = e } else .null);
         try runtime.put(a, "engine", .{ .string = g.srv.info.name });
