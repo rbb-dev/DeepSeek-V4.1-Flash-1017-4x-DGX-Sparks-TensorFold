@@ -839,13 +839,25 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
         ch.pending = false;
     } else {
         try tri_basic.hcPre(e.t, ch.h, lay.hc_attn[0], lay.hc_attn[1], lay.hc_attn[2], ch.pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, ch.x, ch.pre_a, ch.post, ch.comb, ch.part, ch.n, c.hidden);
+/// TF_DS_DUMP=DIR (a debugging aid, off in service): TF_DS_DUMP_LAYER's layers' (a comma list, default just "0")
+/// intermediates of the first prompt chunk, each written as DIR/n<node>-<name>.bin (raw device bytes) after the
+/// stream drains. WP1's exit gate (a tensor dump at layers 0, 8 and 19) is TF_DS_DUMP_LAYER=0,8,19.
 pub var dump_dir: ?[:0]const u8 = null;
+pub var dump_layers: [8]i64 = .{ 0, -1, -1, -1, -1, -1, -1, -1 };
 pub var dump_done: bool = false;
 pub var dump_node: u32 = 0;
 
+fn wantLayer(li: usize) bool {
+    const l: i64 = @intCast(li);
+    for (dump_layers) |d| {
+        if (d == l) return true;
     }
+    return false;
+}
+
 pub fn dump(e: *const Engine, li: usize, name: []const u8, ptr: u64, bytes: usize) void {
     const dir = dump_dir orelse return;
+    if (!wantLayer(li) or dump_done or bytes == 0) return;
     e.s.synchronize() catch return;
     const host = std.heap.page_allocator.alloc(u8, bytes) catch return;
     defer std.heap.page_allocator.free(host);

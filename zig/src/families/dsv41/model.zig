@@ -755,6 +755,16 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         if (std.c.getenv("TF_DS_DUMP")) |dd| {
             prompt.dump_dir = std.mem.span(dd);
             prompt.dump_node = role;
+            // WP1's exit gate wants several layers' tensors in one dump (x, pa, pm, h at layers 0, 8, 19): accept a
+            // comma list, not just one layer, so one instrumented restart covers all of them.
+            if (std.c.getenv("TF_DS_DUMP_LAYER")) |dl| {
+                var it = std.mem.splitScalar(u8, std.mem.span(dl), ',');
+                var i: usize = 0;
+                while (it.next()) |tok| : (i += 1) {
+                    if (i >= prompt.dump_layers.len) break;
+                    prompt.dump_layers[i] = std.fmt.parseInt(i64, tok, 10) catch -1;
+                }
+            }
         }
         if (std.c.getenv("TF_DS_DRAFT_PROF")) |v| draft.dprof = v[0] == '1';
         if (std.c.getenv("TF_DS_CONF_CAL")) |v| {
@@ -894,11 +904,19 @@ pub fn startSettings(o: Options) prompt2d.Settings {
                 if (ahead) |th| {
                     th.join();
                     ahead = null;
+            // The gathers' own output, both sublayers, at every requested layer of the first chunk of at least 64 rows
+            // (prompt.dump_layers; dump_done stops it after that chunk, below). The >= 64 guard keeps a smoke test or
+            // validate.py's short prompts from spending the one-shot dump on a chunk too short to compare.
+            if (prompt.dump_dir != null and !prompt.dump_done and ch.n >= 64) {
+                prompt.dump(e, li, "ga", ch.ga, 2 * ch.n * c.hidden * 4);
                 prompt.dump(e, li, "gm", ch.gm, 2 * ch.n * c.hidden * 4);
             }
             prompt.endLayer(ch);
         }
         try prompt.head(e, ch);
+        if (ch.n >= 64) prompt.dump_done = prompt.dump_dir != null;
+        if (pt) |t| try t.mark(e.s, .head);
+        if (m.dr) |*dr| {
                 }
                 if (eh.ahead_err) |err| return err;
                 try prompt.engramApply(e, ch, eh, li, seq);
