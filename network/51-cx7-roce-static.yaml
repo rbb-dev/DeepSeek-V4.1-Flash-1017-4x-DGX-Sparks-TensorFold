@@ -1,0 +1,14 @@
+# /etc/netplan/51-cx7-roce-static.yaml (mode 600) on Spark N (N = 1..254, one per Spark): static RoCE addressing on the
+# fabric, one subnet per rail (rail A, rail B), MTU 9000. Apply with: sudo netplan generate && sudo netplan apply
+# Replace N with the Spark's own number (the example in ../NETWORK.md uses 33..36).
+network:
+  version: 2
+  ethernets:
+    enp1s0f0np0:
+      addresses: [10.255.0.N/24]
+      mtu: 9000
+      link-local: [ ipv4 ]
+    enP2p1s0f0np0:
+      addresses: [10.255.1.N/24]
+      mtu: 9000
+      link-local: [ ipv4 ]

@@ -1,0 +1,22 @@
+# Priority flow control for RoCE on a DGX Spark's ConnectX-7 fabric rails (../NETWORK.md, "Each Spark"): DSCP 0 and DSCP
+# 26 (AF31) to priority 3, PFC on priority 3, on both PCIe functions of the one 200G port. The card switches to DSCP
+# trust when the first DSCP entry is added. It matches the switch: traffic class 3 with PFC, DSCP 0 and 26 mapped into
+# it. These settings do not survive a reboot or a driver reload on their own; this unit puts them back at every boot.
+# Setting PFC can restart the port's link once (a few seconds), and both rails are functions of that one port: a
+# command that lands while it settles fails ("Attribute write: Protocol error"), so each is tried up to 15 times, a
+# second apart; one that keeps failing fails the unit.
+[Unit]
+Description=RoCE priority flow control (DSCP 0/26 -> priority 3, PFC on priority 3) on the CX-7 fabric rails
+After=network-online.target sys-subsystem-net-devices-enp1s0f0np0.device sys-subsystem-net-devices-enP2p1s0f0np0.device
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do /usr/sbin/dcb app replace dev enp1s0f0np0 dscp-prio 0:3 26:3 && exit 0; sleep 1; done; exit 1'
+ExecStart=/bin/sh -c 'for try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do /usr/sbin/dcb app replace dev enP2p1s0f0np0 dscp-prio 0:3 26:3 && exit 0; sleep 1; done; exit 1'
+ExecStart=/bin/sh -c 'for try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do /usr/sbin/dcb pfc set dev enp1s0f0np0 prio-pfc 3:on && exit 0; sleep 1; done; exit 1'
+ExecStart=/bin/sh -c 'for try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do /usr/sbin/dcb pfc set dev enP2p1s0f0np0 prio-pfc 3:on && exit 0; sleep 1; done; exit 1'
+
+[Install]
+WantedBy=multi-user.target
