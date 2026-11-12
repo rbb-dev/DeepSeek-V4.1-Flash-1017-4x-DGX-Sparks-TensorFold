@@ -50,6 +50,9 @@ pub const Streamer = struct {
     held: []const u8 = "",
     streamed: bool = false,
     searched: usize = 0, // the answer is only ever extended, so prose already searched holds no opener
+    /// The template writes DSML calls (`tool_grammar.writesDsml`): no call is streamed, and the reply's calls reach the
+    /// client from the parse at its end, as they reach a non-streaming one.
+    calls_off: bool = false,
     tools: []const Value,
     dsml_start: ?usize = null,
     dsml_close: []const u8 = reply_text.calls[2][1], // the closer of the DSML block at `dsml_start`: V4's or V4.1's
@@ -100,6 +103,7 @@ pub const Streamer = struct {
 
     /// The deltas the reply's ``text`` (its whole answer so far) adds.
     pub fn feed(s: *Streamer, text: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
+        if (s.calls_off) return;
         while (s.state != .abort) {
             const rest = text[@min(s.pos, text.len)..];
             switch (s.state) {
@@ -114,7 +118,7 @@ pub const Streamer = struct {
                         }
                     }
                     const dsml_open = reply_text.calls[2][0];
-                    const dsml41_open = reply_text.calls[3][0];
+                    const dsml41_open = reply_text.calls[4][0];
                     if (s.dsml_start) |start| {
                         const from = @max(s.pos, s.dsml_searched -| (s.dsml_close.len - 1));
                         const end = reply_text.findTag(text, from, s.dsml_close) orelse {
@@ -149,7 +153,7 @@ pub const Streamer = struct {
                             }
                             s.dsml_seen = true;
                             s.dsml_start = start;
-                            s.dsml_close = reply_text.calls[3][1];
+                            s.dsml_close = reply_text.calls[4][1];
                             s.pos = start + dsml41_open.len;
                             s.dsml_searched = s.pos;
                             break;

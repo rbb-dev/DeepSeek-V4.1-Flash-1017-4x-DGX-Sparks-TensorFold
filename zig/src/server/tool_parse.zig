@@ -16,7 +16,7 @@ pub const wrapCalls = tool_streaming.wrapCalls;
 
 const Error = error{ Invalid, OutOfMemory };
 const Call = struct { name: []const u8, arguments: Value };
-const Envelope = struct { start: usize, end: usize, payload: []const u8, complete: bool = true };
+const Envelope = struct { start: usize, end: usize, payload: []const u8 };
 
 pub const Parsed = struct { content: []const u8, calls: ?[]Value };
 
@@ -45,12 +45,6 @@ fn find(hay: []const u8, needle: []const u8, from: usize) ?usize {
     return std.mem.indexOfPos(u8, hay, from, needle);
 }
 
-/// ``find`` of a call block's opener where it is markup (``reply_text.Marks``); null marks: ``find``.
-fn markup(hay: []const u8, needle: []const u8, from: usize, marks: ?*const reply_text.Marks) ?usize {
-    if (from > hay.len) return null;
-    return reply_text.findMarkup(hay, from, needle, marks);
-}
-
 /// Python's ``\w`` on one byte, non-ASCII bytes counting as letters.
 fn word(ch: u8) bool {
     return std.ascii.isAlphanumeric(ch) or ch == '_' or ch >= 0x80;
@@ -71,6 +65,9 @@ const open41 = reply_text.open41;
 /// the prose or in an argument moves no block's bounds. An unclosed one stays text, whole, as V4's does. With marks, a
 /// DSML block whose opener is spelled in ordinary tokens is no block.
 fn envelopes(a: Allocator, text: []const u8, marks: ?*const reply_text.Marks) Allocator.Error![]Envelope {
+/// A DSML block ends at its first closer, or with ``extend`` where ``reply_text.blockEnd`` ends it (past a closer
+/// inside a value).
+fn envelopes(a: Allocator, text: []const u8, extend: bool) Allocator.Error![]Envelope {
     var found: std.ArrayList(Envelope) = .empty;
     var gap: usize = 0;
     while (open41(text, gap, marks)) |s| {
@@ -79,8 +76,10 @@ fn envelopes(a: Allocator, text: []const u8, marks: ?*const reply_text.Marks) Al
         const end = if (e) |at| at + dsml41_close.len else text.len;
         try found.append(a, .{ .start = s, .end = end, .payload = text[s..end], .complete = e != null });
         gap = end;
+        const e = (if (extend) reply_text.blockEnd(text, s + dsml41_open.len, dsml41_open, dsml41_close, true) else find(text, dsml41_close, s + dsml41_open.len)) orelse break;
+        try tagged(a, text[gap..s], gap, &found, extend);
     }
-    try tagged(a, text[gap..], gap, marks, &found);
+    try tagged(a, text[gap..], gap, &found, extend);
     std.mem.sort(Envelope, found.items, {}, struct {
         fn less(_: void, x: Envelope, y: Envelope) bool {
             if (x.start != y.start) return x.start < y.start;
@@ -95,14 +94,9 @@ fn envelopes(a: Allocator, text: []const u8, marks: ?*const reply_text.Marks) Al
 
 /// The envelopes other than DeepSeek-V4.1's blocks in ``text``, a stretch of the reply that starts at ``base``.
 fn tagged(a: Allocator, text: []const u8, base: usize, marks: ?*const reply_text.Marks, out: *std.ArrayList(Envelope)) Allocator.Error!void {
+fn tagged(a: Allocator, text: []const u8, base: usize, out: *std.ArrayList(Envelope), extend: bool) Allocator.Error!void {
     var pos: usize = 0;
-    var dsml = markup(text, dsml_open, 0, marks); // the DSML opener at or after `pos`, searched again only once `pos` passes it
     while (findCI(text, "<tool_call>", pos)) |s| {
-        if (dsml != null and dsml.? < pos) dsml = markup(text, dsml_open, pos, marks);
-        if (dsml) |outer| if (outer < s) {
-            pos = (find(text, dsml_close, outer + dsml_open.len) orelse break) + dsml_close.len;
-            continue;
-        };
         const e = findCI(text, "</tool_call>", s + 11) orelse break;
         try out.append(a, .{ .start = base + s, .end = base + e + 12, .payload = strip(text[s + 11 .. e]) });
         pos = e + 12;
@@ -127,37 +121,52 @@ fn tagged(a: Allocator, text: []const u8, base: usize, marks: ?*const reply_text
         pos = e + 12;
     }
     pos = 0;
-    while (markup(text, dsml_open, pos, marks)) |s| {
-        const e = find(text, dsml_close, s + dsml_open.len);
-        const end = if (e) |at| at + dsml_close.len else text.len;
-        try out.append(a, .{ .start = base + s, .end = base + end, .payload = text[s..end], .complete = e != null });
-        pos = end;
+    while (find(text, dsml_open, pos)) |s| {
+        const e = (if (extend) reply_text.blockEnd(text, s + dsml_open.len, dsml_open, dsml_close, true) else find(text, dsml_close, s + dsml_open.len)) orelse break;
     }
 }
 
-/// ``block`` is one whole DSML block, ``open`` to ``close``. A <tool_call> whose text only starts with a DSML opener is
-/// not one: its inside, cut at the closer's length from its end, would start past its end.
-fn whole(block: []const u8, open: []const u8, close: []const u8) bool {
-    return block.len >= open.len + close.len and std.mem.startsWith(u8, block, open) and std.mem.endsWith(u8, block, close);
+/// `parse` where a reply's marker-token marks (TENSORFOLD_REPLY_IDS) would be consulted: this reader does not (reply_text.zig's note).
+pub fn parseMarked(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize, marks: ?*const reply_text.Marks) Allocator.Error!Parsed {
+    _ = marks;
+    return parse(a, text, tools, max_calls);
 }
 
 /// ``parse_tool_calls_from_content``: the reply's content and its calls (null when it makes none).
 pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize) Allocator.Error!Parsed {
-    return parseMarked(a, text, tools, max_calls, null);
-}
-
-/// ``parse`` with the reply's marks (TENSORFOLD_REPLY_IDS): a DSML block spelled in ordinary tokens stays content.
-pub fn parseMarked(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize, marks: ?*const reply_text.Marks) Allocator.Error!Parsed {
     if (tools.len == 0) return .{ .content = text, .calls = null };
     var known: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     for (tools) |tool| {
         const name = try tool_specs.toolName(a, tool);
         try known.put(a, try std.ascii.allocLowerString(a, name), name);
     }
-    if (try bareCalls(a, text, &known, max_calls)) |calls| return .{ .content = "", .calls = calls };
     const schemas = try tool_params.schemas(a, tools);
-    const envs = try envelopes(a, text, marks);
-    if (envs.len == 0) return .{ .content = text, .calls = null };
+    // DSML values are not escaped, so a value can hold its block's closer: the blocks read past such closers (each one
+    // taken only where it gives more whole invokes than the cut, reply_text.blockEnd) win unless the cut gives more
+    // calls, so no reply loses a call. A tie goes to them: this reader also reads a block cut inside a value as a call,
+    // with the value cut short and the rest of the block left in the text
+    const first = try envelopes(a, text, false);
+    const cut = try parseEnvelopes(a, text, first, &known, &schemas, max_calls);
+    const longer = try envelopes(a, text, true);
+    if (sameEnvelopes(first, longer)) return cut;
+    const read = try parseEnvelopes(a, text, longer, &known, &schemas, max_calls);
+    const n_read = if (read.calls) |c| c.len else 0;
+    const n_cut = if (cut.calls) |c| c.len else 0;
+    return if (n_read >= n_cut) read else cut;
+}
+
+fn sameEnvelopes(x: []const Envelope, y: []const Envelope) bool {
+    if (x.len != y.len) return false;
+    for (x, y) |p, q| if (p.start != q.start or p.end != q.end) return false;
+    return true;
+}
+
+/// The content and calls of ``text`` split into ``envs``.
+fn parseEnvelopes(a: Allocator, text: []const u8, envs: []const Envelope, known: *const std.StringArrayHashMapUnmanaged([]const u8), schemas: *const tool_params.Schemas, max_calls: ?usize) Allocator.Error!Parsed {
+    if (envs.len == 0) {
+        if (try bareCalls(a, text, known, max_calls)) |calls| return .{ .content = "", .calls = calls };
+        return .{ .content = text, .calls = null };
+    }
     var calls: std.ArrayList(Value) = .empty;
     var residue: std.ArrayList(u8) = .empty;
     var cursor: usize = 0;
@@ -170,6 +179,7 @@ pub fn parseMarked(a: Allocator, text: []const u8, tools: []const Value, max_cal
         }
         if (whole(env.payload, dsml41_open, dsml41_close)) {
             try dsml41Calls(a, env.payload[dsml41_open.len .. env.payload.len - dsml41_close.len], &known, max_calls, &calls, &residue);
+            try dsml41Calls(a, inner, known, max_calls, &calls);
             continue;
         }
         if (max_calls) |m| if (calls.items.len >= m) continue;
@@ -181,7 +191,7 @@ pub fn parseMarked(a: Allocator, text: []const u8, tools: []const Value, max_cal
                     error.Invalid => null,
                 };
             }
-            const one = payload(a, env.payload, &schemas, max_calls != null) catch |e| switch (e) {
+            const one = payload(a, env.payload, schemas, max_calls != null) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Invalid => break :blk null,
             };
@@ -193,7 +203,7 @@ pub fn parseMarked(a: Allocator, text: []const u8, tools: []const Value, max_cal
             break :blk null;
         };
         const good = if (parsed) |list| list.len > 0 and for (list) |c| {
-            if ((try callName(a, c, &known)) == null) break false;
+            if ((try callName(a, c, known)) == null) break false;
         } else true else false;
         if (!good) {
             // a malformed or unoffered call stays text when calls are unlimited, and drops out of a one-call reply
@@ -201,7 +211,7 @@ pub fn parseMarked(a: Allocator, text: []const u8, tools: []const Value, max_cal
             continue;
         }
         for (parsed.?) |c| {
-            if (max_calls == null or calls.items.len < max_calls.?) try calls.append(a, try openaiCall(a, (try callName(a, c, &known)).?, c.arguments));
+            if (max_calls == null or calls.items.len < max_calls.?) try calls.append(a, try openaiCall(a, (try callName(a, c, known)).?, c.arguments));
         }
     }
     try residue.appendSlice(a, text[cursor..]);
@@ -210,13 +220,13 @@ pub fn parseMarked(a: Allocator, text: []const u8, tools: []const Value, max_cal
 
 /// What closes the call ``reply`` ends inside (the model's end token came before its ``
 pub fn closeCall(a: Allocator, reply: []const u8, tools: []const Value) Allocator.Error![]const u8 {
-    // a call it can close lies past the last DeepSeek-V4.1 block (``envelopes`` reads the other forms around them); a
-    // reply that ends inside one leaves that block text
+    // a call it can close lies past the last DeepSeek-V4.1 block (``envelopes`` reads the other forms around them); a reply
+    // that ends inside one leaves that block text, and a ``<tool_call>`` inside a V4 block is the block's argument text
     var gap: usize = 0;
-    while (open41(reply, gap, null)) |s| gap = (find(reply, dsml41_close, s + dsml41_open.len) orelse return "") + dsml41_close.len;
+    while (find(reply, dsml41_open, gap)) |s| gap = (find(reply, dsml41_close, s + dsml41_open.len) orelse return "") + dsml41_close.len;
     const text = reply[gap..];
     var pos: usize = 0;
-    var dsml = find(text, dsml_open, 0); // as in ``envelopes``
+    var dsml = find(text, dsml_open, 0);
     // the opener ``envelopes`` leaves without a closer, so the one appended pairs with it
     const start = while (findCI(text, "<tool_call>", pos)) |s| {
         if (dsml != null and dsml.? < pos) dsml = find(text, dsml_open, pos);
@@ -237,11 +247,6 @@ pub fn closeCall(a: Allocator, reply: []const u8, tools: []const Value) Allocato
 /// What a call's arguments lack to close: XML's ``
 fn argumentsClose(a: Allocator, body: []const u8) Allocator.Error![]const u8 {
     if (std.ascii.startsWithIgnoreCase(body, "<function=")) return if (std.ascii.endsWithIgnoreCase(body, "</function>")) "" else "</function>";
-    // GLM's value the end token left open closes as #285 closed it; the strict parse then decides
-    if (std.mem.lastIndexOf(u8, body, "<arg_value>")) |v| {
-        const closed = std.mem.lastIndexOf(u8, body, "</arg_value>");
-        if (closed == null or closed.? < v) return "</arg_value>";
-    }
     if (body.len == 0 or (body[0] != '{' and body[0] != '[')) return "";
     const closed = try tool_params.closedJson(a, body) orelse return "";
     return closed[body.len..];
@@ -433,70 +438,32 @@ fn parameterBlocks(a: Allocator, body: []const u8) Allocator.Error!Params {
     return .{ .items = items.items, .residue = residue.items };
 }
 
-const GlmTag = enum { key_open, key_close, value_open, value_close };
-const glm_tags = [_]struct { GlmTag, []const u8 }{ .{ .key_open, "<arg_key>" }, .{ .key_close, "</arg_key>" }, .{ .value_open, "<arg_value>" }, .{ .value_close, "</arg_value>" } };
-
-/// The next GLM argument tag at or after `from`: which, and where it starts and ends.
-fn nextGlmTag(block: []const u8, from: usize) ?struct { tag: GlmTag, start: usize, end: usize } {
-    var i = std.mem.indexOfScalarPos(u8, block, from, '<') orelse return null;
-    while (true) : (i = std.mem.indexOfScalarPos(u8, block, i + 1, '<') orelse return null) {
-        for (glm_tags) |t| if (std.mem.startsWith(u8, block[i..], t[1])) return .{ .tag = t[0], .start = i, .end = i + t[1].len };
-    }
-}
-
-/// A GLM call whose ``<arg_key>`` the model wrote as whitespace gets it back before the word ahead of each lone tag.
-pub fn repairGlmKeys(a: Allocator, block: []const u8) Allocator.Error![]const u8 {
-    if (std.mem.count(u8, block, "</arg_key>") <= std.mem.count(u8, block, "<arg_key>")) return block;
-    var out: std.ArrayList(u8) = .empty;
-    var copied: usize = 0;
-    var prev: ?GlmTag = null;
-    var prev_end: usize = 0;
-    var pos: usize = 0;
-    while (nextGlmTag(block, pos)) |t| : (pos = t.end) {
-        if (t.tag == .key_close and (prev == null or prev.? == .value_close)) {
-            const seg = prev_end; // 0 before the first tag: the call's name lives there
-            var e = t.start;
-            while (e > seg and space(block[e - 1])) e -= 1;
-            var w = e;
-            while (w > seg and !space(block[w - 1])) w -= 1;
-            // no word, or (before any tag) no name left ahead of the word: not a key we can put back
-            if (w == e or (prev == null and allSpace(block[seg..w]))) return block;
-            try out.appendSlice(a, block[copied..w]);
-            try out.appendSlice(a, "<arg_key>");
-            copied = w;
-        }
-        prev = t.tag;
-        prev_end = t.end;
-    }
-    try out.appendSlice(a, block[copied..]);
-    return out.items;
-}
-
 /// GLM's ``NAME<arg_key>K</arg_key><arg_value>V</arg_value>...``, values decoded as Qwen's (without Python spellings).
-fn glmCall(a: Allocator, written: []const u8, schemas: ?*const tool_params.Schemas, complete: bool) Error!?Call {
-    const block = try repairGlmKeys(a, written);
+fn glmCall(a: Allocator, block: []const u8, schemas: ?*const tool_params.Schemas, complete: bool) Error!?Call {
     const cut = std.mem.indexOf(u8, block, "<arg_key>") orelse block.len;
     const name = strip(block[0..cut]);
     if (name.len == 0) return null;
-    // any one-line name, spaces included: parse keeps a name the request did not declare as text
-    for (name) |ch| if (ch == '<' or ch == '>' or ch == '\n' or ch == '\r') return null;
+    for (name) |ch| if (!(word(ch) or ch == '.' or ch == ':' or ch == '-')) return null;
     const rest = block[cut..];
     var pairs: std.ArrayList(Param) = .empty;
     var residue: std.ArrayList(u8) = .empty;
     var pos: usize = 0;
     var kept: usize = 0;
-    var key_end = valueKey(rest, 9); // the first </arg_key> an <arg_value> follows, searched again only once passed
-    var value_end = find(rest, "</arg_value>", 0); // likewise the first </arg_value>
-    while (find(rest, "<arg_key>", pos)) |s| {
+    outer: while (find(rest, "<arg_key>", pos)) |s| {
         pos = s + 1;
-        if (key_end != null and key_end.?[0] < s + 9) key_end = valueKey(rest, s + 9);
-        const k = key_end orelse continue;
-        if (value_end != null and value_end.? < k[1]) value_end = find(rest, "</arg_value>", k[1]);
-        const ve = value_end orelse continue;
-        try pairs.append(a, .{ .key = rest[s + 9 .. k[0]], .value = rest[k[1]..ve] });
-        try residue.appendSlice(a, rest[kept..s]);
-        kept = ve + 12;
-        pos = kept;
+        var key_end_at = s + 9;
+        while (find(rest, "</arg_key>", key_end_at)) |ke| : (key_end_at = ke + 1) {
+            var j = ke + 10;
+            while (j < rest.len and space(rest[j])) j += 1;
+            if (!std.mem.startsWith(u8, rest[j..], "<arg_value>")) continue;
+            const v_start = j + 11;
+            const ve = find(rest, "</arg_value>", v_start) orelse continue :outer;
+            try pairs.append(a, .{ .key = rest[s + 9 .. ke], .value = rest[v_start..ve] });
+            try residue.appendSlice(a, rest[kept..s]);
+            kept = ve + 12;
+            pos = kept;
+            continue :outer;
+        }
     }
     try residue.appendSlice(a, rest[kept..]);
     if (complete and !allSpace(residue.items)) return null;
@@ -507,17 +474,6 @@ fn glmCall(a: Allocator, written: []const u8, schemas: ?*const tool_params.Schem
         try arguments.put(a, key, try tool_params.decode(a, p.value, schema, false));
     }
     return .{ .name = name, .arguments = .{ .object = arguments } };
-}
-
-/// The first ``</arg_key>`` at or after `from` that an ``<arg_value>`` follows, and where that value starts.
-fn valueKey(rest: []const u8, from: usize) ?[2]usize {
-    var at = from;
-    while (find(rest, "</arg_key>", at)) |ke| : (at = ke + 1) {
-        var j = ke + 10;
-        while (j < rest.len and space(rest[j])) j += 1;
-        if (std.mem.startsWith(u8, rest[j..], "<arg_value>")) return .{ ke, j + 11 };
-    }
-    return null;
 }
 
 /// Gemma 4's ``call:NAME{key:value,...}`` (or bare ``:NAME{...}``): strings between ``<|"|>``, keys bare.
@@ -567,40 +523,12 @@ fn gemmaCall(a: Allocator, block: []const u8) Error!?Call {
         p = j;
     }
     try keyed.appendSlice(a, src[copied..]);
-    const quoted = try a.alloc([]const u8, strings.items.len);
-    for (strings.items, quoted) |value, *q| q.* = try json.quote(a, value, .{ .ascii = false });
-    return .{ .name = name, .arguments = try jsonObject(a, .{ .string = try putBack(a, keyed.items, quoted) }) };
-}
-
-/// Each mark ``\x00{i}\x00`` in `text` as `quoted[i]`, as replacing i = 0, 1, ... in turn does; no `quoted` has a NUL.
-pub fn putBack(a: Allocator, text: []const u8, quoted: []const []const u8) Allocator.Error![]const u8 {
-    var nul: std.ArrayList(usize) = .empty;
-    for (text, 0..) |ch, at| if (ch == 0) try nul.append(a, at);
-    const n = nul.items;
-    var marks: std.ArrayList(u128) = .empty; // index << 64 | the NUL that opens the mark
-    for (0..n.len -| 1) |k| {
-        const digits = text[n[k] + 1 .. n[k + 1]];
-        if (digits.len == 0 or (digits.len > 1 and digits[0] == '0') or std.mem.indexOfNone(u8, digits, "0123456789") != null) continue;
-        const index = std.fmt.parseInt(usize, digits, 10) catch continue;
-        if (index < quoted.len) try marks.append(a, @as(u128, index) << 64 | k);
+    var text: []const u8 = keyed.items;
+    for (strings.items, 0..) |value, idx| {
+        const mark = try std.fmt.allocPrint(a, "\x00{d}\x00", .{idx});
+        text = try std.mem.replaceOwned(u8, a, text, mark, try json.quote(a, value, .{ .ascii = false }));
     }
-    // two marks share a NUL only where the call's own text has NULs: the lower index went first, then the leftmost
-    std.mem.sort(u128, marks.items, {}, std.sort.asc(u128)); // one pass over the text, then M log M for M marks
-    const opens = try a.alloc(?usize, n.len); // the index of the mark each NUL opens
-    @memset(opens, null);
-    for (marks.items) |m| {
-        const k: usize = @truncate(m); // a NUL is taken when it opens a mark or closes the one before it
-        if (opens[k] == null and opens[k + 1] == null and (k == 0 or opens[k - 1] == null)) opens[k] = @intCast(m >> 64);
-    }
-    var out: std.ArrayList(u8) = .empty;
-    var cursor: usize = 0;
-    for (opens, 0..) |open, k| if (open) |index| {
-        try out.appendSlice(a, text[cursor..n[k]]);
-        try out.appendSlice(a, quoted[index]);
-        cursor = n[k + 1] + 1;
-    };
-    try out.appendSlice(a, text[cursor..]);
-    return out.items;
+    return .{ .name = name, .arguments = try jsonObject(a, .{ .string = text }) };
 }
 
 /// DeepSeek-V4.1's calls block as the served lane reads it (reply_text.py: dsml_to_tool_calls, then parse_tool_calls on

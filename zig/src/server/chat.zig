@@ -7,6 +7,7 @@ const fields_mod = @import("fields.zig");
 const reply_text = @import("reply_text.zig");
 const tool_stream = @import("tool_stream.zig");
 const tool_parse = @import("tool_parse.zig");
+const tool_grammar = @import("tool_grammar.zig");
 const output_diagnostics = @import("output_diagnostics.zig");
 const prompt_mod = @import("prompt.zig");
 const log = @import("log.zig");
@@ -226,8 +227,12 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, &box.stats.depths, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {
-        if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
-        gen.loop(gone) catch |e| break :blk e;
+        if (sink != null and gen.tools.len > 0) {
+            gen.calls = tool_stream.Streamer.init(a, gen.tools) catch |e| break :blk e;
+            // a DSML template's calls are DSML blocks, which the streamer does not read: it streams none, so a streaming
+            // client gets the parsed calls at the end, the ones a non-streaming client gets
+            gen.calls.?.calls_off = tool_grammar.writesDsml(srv, a);
+        }
         break :blk gen.finish(cx, prepared.prompt_len, received, thinking, effort, prepared.sampled, prepared.drafts);
     };
     if (result) |_| {} else |e| logEnded(input.id, e, cx.message, prepared.prompt_len, gen.collected.items.len, seconds(nowNs(io) - received));

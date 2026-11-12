@@ -54,9 +54,23 @@ pub fn style(rendered: []const u8) ?Style {
     return null;
 }
 
+/// A turn that calls `probe` with {key: "v"}, for rendering through the served chat template.
+const probe_turn_json = "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"" ++ probe ++ "\", \"arguments\": {\"" ++ key ++ "\": \"v\"}}}]}]";
+
+/// Whether the served chat template writes DeepSeek's DSML calls (`style` of the probe turn it renders); false when
+/// the probe does not render. A reply's calls are then read by the parse at the reply's end.
+pub fn writesDsml(srv: *Server, a: Allocator) bool {
+    const parsed = json.parse(a, probe_turn_json) catch return false;
+    var scratch: Cx = .{ .a = a };
+    const ids = prompt.renderIds(srv, &scratch, parsed.ok, &.{}, false, null, false) catch return false;
+    const rendered = srv.text.decode(a, ids) catch return false;
+    const s = style(rendered) orelse return false;
+    return s == .dsml or s == .dsml41;
+}
+
 /// The grammar for a reply that must call one of `tools`: one call, or (`parallel`) one or more, then the end.
 pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, thinking: bool) errors.Refused!api.Structure {
-    const probe_turn = (try json.parse(cx.a, "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"" ++ probe ++ "\", \"arguments\": {\"" ++ key ++ "\": \"v\"}}}]}]")).ok;
+    const probe_turn = (try json.parse(cx.a, probe_turn_json)).ok;
     var scratch: Cx = .{ .a = cx.a };
     const rendered = if (prompt.renderIds(srv, &scratch, probe_turn, &.{}, false, null, false)) |ids| try srv.text.decode(cx.a, ids) else |_| "";
     const s = style(rendered) orelse return cx.refuse("tool_choice \"required\" or a named function needs a chat template that writes <tool_call> calls (XML parameters or a JSON object) or DeepSeek's DSML calls, and this one does not: send \"auto\"");

@@ -32,83 +32,126 @@ fn find(text: []const u8, tag: []const u8) ?usize {
     return findTag(text, 0, tag);
 }
 
-/// Where a reply's marker tokens decoded (TENSORFOLD_REPLY_IDS): a marker token's text in a tag is markup only at the
-/// offset its own token decoded to, so the same text spelled in ordinary tokens (a reply quoting a think end or a DSML
-/// call) stays words. Null marks read every tag as its text does.
-pub const Marks = struct {
-    base: [*]const u8, // the decoded reply the offsets count in
-    len: usize,
-    at: []const Mark, // in reply order
-    pieces: []const Piece, // the marker tokens (Server.reply_pieces)
+/// The invoke and parameter tags of a DSML spelling, by its block's opener (null: not a DSML block). V4's parser
+/// requires a parameter's ``string`` attribute; V4.1's reads one when it is there.
+const Dsml = struct { invoke_open: []const u8, invoke_close: []const u8, param_open: []const u8, param_close: []const u8, attr_required: bool };
 
-    pub const Mark = struct { offset: usize, id: u32 };
-    pub const Piece = struct { text: []const u8, id: u32 };
+fn dsmlTags(opener: []const u8) ?Dsml {
+    const D = "\u{ff5c}DSML\u{ff5c}";
+    if (std.mem.eql(u8, opener, "<" ++ D ++ " calls>")) return .{ .invoke_open = "<" ++ D ++ " invoke name=\"", .invoke_close = "</" ++ D ++ " invoke>", .param_open = "<" ++ D ++ " parameter name=\"", .param_close = "</" ++ D ++ " parameter>", .attr_required = false };
+    if (std.mem.eql(u8, opener, "<" ++ D ++ "tool_calls>")) return .{ .invoke_open = "<" ++ D ++ "invoke name=\"", .invoke_close = "</" ++ D ++ "invoke>", .param_open = "<" ++ D ++ "parameter name=\"", .param_close = "</" ++ D ++ "parameter>", .attr_required = true };
+    return null;
+}
 
-    /// Whether `tag` at `text[i..]` is markup: each marker token's text in it lies where that token decoded. Text
-    /// outside the decoded reply (a copy) reads as its text does.
-    pub fn real(m: *const Marks, text: []const u8, i: usize, tag: []const u8) bool {
-        const p = @intFromPtr(text.ptr);
-        const b = @intFromPtr(m.base);
-        if (p < b or p > b + m.len) return true;
-        const at = p - b + i;
-        for (m.pieces) |piece| {
-            var k: usize = 0;
-            while (std.mem.indexOfPos(u8, tag, k, piece.text)) |j| : (k = j + piece.text.len) {
-                if (!m.has(at + j, piece.id)) return false;
+/// Whether every ``closer`` in an invoke's ``body`` lies inside a parameter value, as the parser reads values: from
+/// the ``>`` after a parameter's name (and ``string`` attribute) to the first parameter closer after it.
+fn closersInValues(body: []const u8, closer: []const u8, t: Dsml) bool {
+    var c = findTag(body, 0, closer);
+    var p: usize = 0;
+    while (c) |at| {
+        const ps = findTag(body, p, t.param_open) orelse return false;
+        p = ps + 1;
+        const ns = ps + t.param_open.len;
+        const nq = std.mem.indexOfScalarPos(u8, body, ns, '"') orelse continue;
+        if (!t.attr_required and nq == ns) continue;
+        var v = nq + 1;
+        if (std.mem.startsWith(u8, body[v..], " string=\"true\"")) {
+            v += " string=\"true\"".len;
+        } else if (std.mem.startsWith(u8, body[v..], " string=\"false\"")) {
+            v += " string=\"false\"".len;
+        } else if (t.attr_required) continue;
+        if (v >= body.len or body[v] != '>') continue;
+        v += 1;
+        const pe = findTag(body, v, t.param_close) orelse continue;
+        if (at < v) return false; // a closer before this value, outside any value
+        var next: ?usize = at;
+        while (next) |n| {
+            if (n >= pe) break;
+            next = findTag(body, n + closer.len, closer);
+        }
+        c = next;
+        p = pe + t.param_close.len;
+    }
+    return true;
+}
+
+/// Whether ``rest`` is a proper start of ``tag``: the tag may still be being written.
+fn begins(rest: []const u8, tag: []const u8) bool {
+    return rest.len < tag.len and std.mem.startsWith(u8, tag, rest);
+}
+
+const Walk = union(enum) { closer: usize, more, broken };
+
+/// Reads a DSML block from ``from`` (just past its opener) the way the parser reads it: invokes, each a name up to the
+/// first quote followed by ``">``, each running to the first invoke closer after it, with only whitespace between them.
+/// The block's closer is the first one met between invokes, so a closer or an opener inside a parameter value (a file
+/// about DSML) neither ends nor splits the block. ``more``: the text ends inside the block; ``broken``: something else
+/// appears, a name holds a tag, or an invoke holds the block's closer outside its values.
+fn walkDsml(text: []const u8, from: usize, t: Dsml, closer: []const u8) Walk {
+    var p = from;
+    while (true) {
+        while (p < text.len and isSpaceByte(text[p])) p += 1;
+        if (p >= text.len) return .more;
+        const rest = text[p..];
+        if (std.mem.startsWith(u8, rest, closer)) return .{ .closer = p };
+        if (!std.mem.startsWith(u8, rest, t.invoke_open)) return if (begins(rest, closer) or begins(rest, t.invoke_open)) .more else .broken;
+        const ns = p + t.invoke_open.len;
+        const q = std.mem.indexOfScalarPos(u8, text, ns, '"') orelse
+            return if (std.mem.indexOfScalar(u8, text[ns..], '<') != null) .broken else .more;
+        if (std.mem.indexOfScalar(u8, text[ns..q], '<') != null) return .broken;
+        if (q + 2 > text.len) return .more;
+        if (!std.mem.startsWith(u8, text[q..], "\">")) return .broken;
+        const e = findTag(text, q + 2, t.invoke_close) orelse return .more;
+        // the invoke may hold the block's closer only inside its parameter values (a file about DSML)
+        if (!closersInValues(text[q + 2 .. e], closer, t)) return .broken;
+        p = e + t.invoke_close.len;
+    }
+}
+
+/// How many invokes in ``region`` the parser reads whole: a name up to its quote, then ``">``, then the first invoke
+/// closer after it (``dsml41Calls``' reading, which skips any invoke that does not complete).
+fn wholeInvokes(region: []const u8, t: Dsml) usize {
+    var n: usize = 0;
+    var pos: usize = 0;
+    while (findTag(region, pos, t.invoke_open)) |s| {
+        pos = s + 1;
+        const ns = s + t.invoke_open.len;
+        const q = std.mem.indexOfScalarPos(u8, region, ns, '"') orelse continue;
+        if (q == ns or !std.mem.startsWith(u8, region[q..], "\">")) continue;
+        const e = findTag(region, q + 2, t.invoke_close) orelse continue;
+        pos = e + t.invoke_close.len;
+        n += 1;
+    }
+    return n;
+}
+
+/// Where the call block opened before ``from`` closes: the index of its closer, or null while it may still close. A
+/// DSML block's string values are not escaped, so a value can hold the block's own closer (a file about DSML). A block
+/// that reads as the parser reads it (``walkDsml``) closes at the first closer between its invokes, not at one inside
+/// an invoke, but only when that reading gives the parser more whole invokes than the first-closer rule gives over the
+/// same text (that block and the blocks it would have been split into): otherwise, and in every other case (a block
+/// that does not read that way, a reply that ended inside one, Qwen's and Gemma's markup), the first closer closes it.
+/// While the reply streams, a DSML block still being written stays hidden.
+pub fn blockEnd(text: []const u8, from: usize, opener: []const u8, closer: []const u8, finished: bool) ?usize {
+    const first = findTag(text, from, closer);
+    // the V4.1 opener may come with the two newlines its template writes before it (``calls``): the block is the same
+    const bare = std.mem.trimStart(u8, opener, "\n");
+    const t = dsmlTags(bare) orelse return first;
+    switch (walkDsml(text, from, t, closer)) {
+        .closer => |at| {
+            if (first == null or at == first.?) return at;
+            // the first-closer rule over the same text: the block to the first closer, then each block it opens after it
+            var split = wholeInvokes(text[from..first.?], t);
+            var pos = first.? + closer.len;
+            while (findTag(text[0..at], pos, bare)) |o| {
+                const e = findTag(text, o + bare.len, closer) orelse break;
+                split += wholeInvokes(text[o + opener.len .. e], t);
+                pos = e + closer.len;
             }
-        }
-        return true;
-    }
-
-    fn has(m: *const Marks, offset: usize, id: u32) bool {
-        for (m.at) |x| {
-            if (x.offset == offset and x.id == id) return true;
-            if (x.offset > offset) return false;
-        }
-        return false;
-    }
-};
-
-/// ``findTag`` of a tag where it is markup (``Marks.real``); null marks: ``findTag``.
-pub fn findMarkup(text: []const u8, from: usize, tag: []const u8, marks: ?*const Marks) ?usize {
-    const m = marks orelse return findTag(text, from, tag);
-    var at = from;
-    while (findTag(text, at, tag)) |i| {
-        if (m.real(text, i, tag)) return i;
-        at = i + 1;
-    }
-    return null;
-}
-
-fn startsMarkup(text: []const u8, tag: []const u8, marks: ?*const Marks) bool {
-    return std.mem.startsWith(u8, text, tag) and (marks == null or marks.?.real(text, 0, tag));
-}
-
-/// The first DeepSeek-V4.1 calls opener at or after `from` that opens a block, or null: markup, and not inside a
-/// DeepSeek-V4 block that opened first (its argument's text). Such a block is read from its own tags: the parser, the
-/// streamer and the prose hider find it first, and the other forms only in the text around it.
-pub fn open41(text: []const u8, from: usize, marks: ?*const Marks) ?usize {
-    const v41 = calls[3];
-    const v4 = calls[2];
-    var at = from;
-    while (findMarkup(text, at, v41[0], marks)) |s| {
-        const outer = findMarkup(text, at, v4[0], marks) orelse return s;
-        if (outer > s) return s;
-        at = (findTag(text, outer + v4[0].len, v4[1]) orelse return null) + v4[1].len; // unclosed, it runs to the end
-    }
-    return null;
-}
-
-/// Appends where `tokens[from..]`'s marker tokens decoded: each one's text ends the decode of the tokens through it
-/// (`text`: the model's tokenizer; each decode is `scratch`'s and freed at once).
-pub fn markTokens(a: Allocator, scratch: Allocator, text: anytype, pieces: []const Marks.Piece, tokens: []const u32, from: usize, out: *std.ArrayList(Marks.Mark)) Allocator.Error!void {
-    for (tokens[from..], from..) |t, j| {
-        const piece = for (pieces) |p| {
-            if (p.id == t) break p;
-        } else continue;
-        const through = try text.decode(scratch, tokens[0 .. j + 1]);
-        defer scratch.free(through);
-        if (std.mem.endsWith(u8, through, piece.text)) try out.append(a, .{ .offset = through.len - piece.text.len, .id = t });
+            return if (wholeInvokes(text[from..at], t) > split) at else first;
+        },
+        .more => return if (finished) first else null,
+        .broken => return first,
     }
 }
 
@@ -238,8 +281,7 @@ fn hideForms(a: Allocator, out: *std.ArrayList(u8), whole: []const u8, from: usi
         }
         try out.appendSlice(a, text[pos..start.?]);
         const opener = calls[which][0];
-        const end = findTag(text, start.? + opener.len, calls[which][1]) orelse {
-            if (to < whole.len) try out.appendSlice(a, text[start.?..]);
+        const end = blockEnd(text, start.? + opener.len, opener, calls[which][1], finished) orelse {
             return out.items;
         };
         pos = end + calls[which][1].len;
@@ -414,6 +456,28 @@ pub const Stops = struct {
     }
 };
 
+    /// outside the decoded reply (a copy) reads as its text does.
+    pub fn real(m: *const Marks, text: []const u8, i: usize, tag: []const u8) bool {
+        const p = @intFromPtr(text.ptr);
+        const b = @intFromPtr(m.base);
+        if (p < b or p > b + m.len) return true;
+        const at = p - b + i;
+        for (m.pieces) |piece| {
+            var k: usize = 0;
+            while (std.mem.indexOfPos(u8, tag, k, piece.text)) |j| : (k = j + piece.text.len) {
+                if (!m.has(at + j, piece.id)) return false;
+            }
+        }
+        return true;
+    }
+
+            if (x.offset == offset and x.id == id) return true;
+            if (x.offset > offset) return false;
+        }
+        return false;
+    }
+};
+
 /// The text a stream has sent: Python's ``streamed = visible``, grown by its delta while it only grows.
 pub const Shown = struct {
     text: std.ArrayList(u8) = .empty,
@@ -449,23 +513,21 @@ pub const Incremental = struct {
     text: std.ArrayList(u8) = .empty,
     prefix: usize = 0,
     read: usize = 0,
+pub fn findMarkup(text: []const u8, from: usize, tag: []const u8, marks: ?*const Marks) ?usize {
+    _ = marks;
+    return findTag(text, from, tag);
+}
 
-    pub fn extend(inc: *Incremental, a: Allocator, ctx: anytype, decode: anytype, more: []const u32) ![]const u8 {
-        try inc.tokens.appendSlice(a, more);
-        const before = try decode(ctx, a, inc.tokens.items[inc.prefix..inc.read]);
-        const after = try decode(ctx, a, inc.tokens.items[inc.prefix..]);
-        const nb = charCount(before);
-        if (charCount(after) > nb and !std.mem.endsWith(u8, after, "\u{fffd}")) {
-            try inc.text.appendSlice(a, afterChars(after, nb));
-            inc.prefix = inc.read;
-            inc.read = inc.tokens.items.len;
-        }
-        return inc.text.items;
-    }
+/// `hideInto`; the marks are not consulted.
+pub fn hideIntoMarked(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finished: bool, marks: ?*const Marks) Allocator.Error![]const u8 {
+    _ = marks;
+    return hideInto(a, out, text, finished);
+}
 
     /// A character is still split across tokens, so streaming waits for the rest.
     pub fn pending(inc: *const Incremental) bool {
         return inc.tokens.items.len > 0 and inc.read < inc.tokens.items.len;
+        } else continue;
     }
 };
 
