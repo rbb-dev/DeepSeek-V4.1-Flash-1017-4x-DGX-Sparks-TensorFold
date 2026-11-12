@@ -50,6 +50,10 @@
 //!   TF_DS_ENGRAM_AIO=1                          a round's Engram reads by Linux AIO on O_DIRECT
 //!   TF_DS_ENGRAM_PACKED=DIR                     Engram rows from tf-dsv41-engram-pack's shards in DIR: a record a row,
 //!                                               a row cache (TF_DS_ENGRAM_CACHE_MIB, 2048), decoded on the GPU;
+//!                                               TF_DS_ENGRAM_INSTREAM=1: a round's landing as a stream host step;
+//!                                               TF_DS_ENGRAM_PREFAULT=1: the row cache faulted in at the start (2 MiB
+//!                                               pages where the kernel gives them), not by its first rows (the
+//!                                               replies' bits as without; one line at the start says how long)
 //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
 //!   TF_DS_SERVED_K=all|solo                     a stream verifies at most the served lane's choice of drafts (its
 //!                                               round table and draft ms): at any streams, or one stream alone

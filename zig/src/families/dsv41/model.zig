@@ -823,14 +823,32 @@ pub fn sfGuard(gpa: std.mem.Allocator, d: *const cuda.Driver, s: cuda.Stream, k:
     return sfKeptText(buf, dense, experts);
 }
 
-    /// The prompt's chunk of n rows from position `start` (seq: the stream's ids through the chunk's end) through every
-    /// layer with the served bounded replay (replay = the prompt's length - the window: an encoder-only chunk stops at
-    /// the decoder's first layer). A chunk that reaches the head leaves the logits of its last row in ch.head_g and,
-    /// drafting, its DSpark taps absorbed into the slot's drafter rings. True when it reached the head.
-    pub fn fillChunk(m: *Model, seq: []const i32, start: usize, n: usize, replay: usize) !bool {
-        if (n == 0 or n > chunk_rows or seq.len != start + n) return error.BadChunk;
-        if (m.waves and n > wave_rows) return m.fillPair(seq, start, n, replay);
-        const e = &m.eng;
+/// This process's anonymous memory in 2 MiB pages now, KiB (/proc/self/smaps_rollup; null: unreadable).
+fn hugeKiB(io: std.Io) ?u64 {
+    var f = std.Io.Dir.cwd().openFile(io, "/proc/self/smaps_rollup", .{}) catch return null;
+    defer f.close(io);
+    var buf: [4096]u8 = undefined;
+    const n = f.readPositionalAll(io, &buf, 0) catch return null;
+    return engram_rows.anonHugeKiB(buf[0..n]);
+}
+
+/// TF_DS_ENGRAM_PREFAULT's line: the row cache faulted in at the start, how long it took, and how much of it the kernel
+/// gave 2 MiB pages (the process's AnonHugePages before and after the open: THP set to madvise gives them to madvised
+/// memory alone, the cache's).
+fn logPrefault(r: *const engram_rows.Rows, mib: usize, huge0: ?u64, huge1: ?u64) void {
+    var buf: [256]u8 = undefined;
+    std.log.info("{s}", .{prefaultLine(&buf, mib, r.fault[0..r.layers], r.fault_ns, huge0, huge1)});
+}
+
+pub fn prefaultLine(buf: []u8, mib: usize, faults: []const engram_rows.Fault, ns: u64, huge0: ?u64, huge1: ?u64) []const u8 {
+    if (mib == 0) return "TF_DS_ENGRAM_PREFAULT=1: off: no row cache (TF_DS_ENGRAM_CACHE_MIB=0)";
+    for (faults) |f| if (f.why) |why| return std.fmt.bufPrint(buf, "TF_DS_ENGRAM_PREFAULT=1: off: the kernel did not fault the row cache in ({s}); its pages fault in as it fills", .{why}) catch "TF_DS_ENGRAM_PREFAULT=1: off";
+    const ms = @as(f64, @floatFromInt(ns)) / 1e6;
+    const how: []const u8 = if (faults.len > 0 and faults[0].populated) "the kernel's populate" else "a write to each page";
+    if (huge0 != null and huge1 != null) return std.fmt.bufPrint(buf, "TF_DS_ENGRAM_PREFAULT=1: the Engram row cache's {d} MiB faulted in at the start in {d:.0} ms ({s}; {d} MiB of it in 2 MiB pages)", .{ mib, ms, how, (huge1.? -| huge0.?) / 1024 }) catch "TF_DS_ENGRAM_PREFAULT=1";
+    return std.fmt.bufPrint(buf, "TF_DS_ENGRAM_PREFAULT=1: the Engram row cache's {d} MiB faulted in at the start in {d:.0} ms ({s}; its 2 MiB pages not read)", .{ mib, ms, how }) catch "TF_DS_ENGRAM_PREFAULT=1";
+}
+
 /// TF_DS_DECODE_FUSE `asked` in effect on this rank's kernels, one line when asked: on, or off and why (the checkpoint's
 /// own weights and the decode kernels). Its bits are the separate launches' either way.
 fn useDecodeFuse(k: ?*mx.Kernels, d: *const cuda.Driver, asked: bool) void {
@@ -2254,6 +2272,9 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
                 const sl = if (owned) cols else k;
                 const rec = c.engram_head_dim + c.engram_head_dim / 32;
                 const mib: usize = if (std.c.getenv("TF_DS_ENGRAM_CACHE_MIB")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 2048;
+                // TF_DS_ENGRAM_PREFAULT: the row cache faulted in here, not by its first puts while prompts run
+                const prefault = engram_rows.envOn("TF_DS_ENGRAM_PREFAULT");
+                const huge0 = if (prefault) hugeKiB(io) else null;
                 m.erows = try engram_rows.Rows.open(gpa, d, &m.tables.?, m.epool.?, m.aio, m.paio, .{
                     .dir = std.mem.span(pd),
                     .owned = owned,
@@ -2267,6 +2288,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
                     .round_rows = round.max_rows,
                     .chunk_rows = m.pass_rows,
                     .cache_bytes = mib << 20,
+                    .prefault = prefault,
                     .instream = engram_rows.envOn("TF_DS_ENGRAM_INSTREAM"),
                     .round_dev = try m.arena.take(round.max_rows * sl * rec),
                     .chunk_dev = try m.arena.take(m.pass_rows * sl * rec),
@@ -2274,6 +2296,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
                     .chunk_dev_c = if (prompt2d.roci_stagger_asked and prompt2d.roci_stagger_lanes >= 3) try m.arena.take(m.pass_rows * sl * rec) else 0,
                 });
                 eh.pk = m.erows;
+                if (prefault) logPrefault(m.erows.?, mib, huge0, hugeKiB(io));
             }
         if (c.vision and c.format == .exl3) { // (Format.native: the checkpoint's own gate.bias_vl, loaded with the weights)
             const path = o.vision_bias orelse try std.fs.path.join(a, &.{ o.kit_dir, "vision", "gate_bias_vl.safetensors" });
@@ -3925,6 +3948,20 @@ test "TF_DS_HC_LATE_FORK takes effect with the checkpoint's own weights and the 
     try std.testing.expect(rd.late_fork);
 }
 
+test "TF_DS_ENGRAM_PREFAULT's line: how long, how, and the 2 MiB pages the kernel gave" {
+    var buf: [256]u8 = undefined;
+    const pop = [_]engram_rows.Fault{ .{ .huge = true, .populated = true }, .{ .huge = true, .populated = true } };
+    try std.testing.expectEqualStrings("TF_DS_ENGRAM_PREFAULT=1: the Engram row cache's 2048 MiB faulted in at the start in 412 ms (the kernel's populate; 2044 MiB of it in 2 MiB pages)", prefaultLine(&buf, 2048, &pop, 412_300_000, 2048, 2048 + 2044 * 1024));
+    const wrote = [_]engram_rows.Fault{.{ .written = true }};
+    try std.testing.expectEqualStrings("TF_DS_ENGRAM_PREFAULT=1: the Engram row cache's 64 MiB faulted in at the start in 9 ms (a write to each page; its 2 MiB pages not read)", prefaultLine(&buf, 64, &wrote, 9_000_000, null, 7));
+    const nomem = [_]engram_rows.Fault{ .{ .populated = true }, .{ .why = "OutOfMemory" } };
+    try std.testing.expectEqualStrings("TF_DS_ENGRAM_PREFAULT=1: off: the kernel did not fault the row cache in (OutOfMemory); its pages fault in as it fills", prefaultLine(&buf, 2048, &nomem, 1, 0, 0));
+    try std.testing.expectEqualStrings("TF_DS_ENGRAM_PREFAULT=1: off: no row cache (TF_DS_ENGRAM_CACHE_MIB=0)", prefaultLine(&buf, 0, &.{}, 0, null, null));
+}
+
+test "this process's 2 MiB pages read from /proc/self/smaps_rollup" {
+    try std.testing.expect(hugeKiB(std.testing.io) != null);
+}
 
 test "TF_DS_MMA_SF's line: on every rank with the GEMMs it covers, or off on every rank, which ranks and why" {
     var buf: [320]u8 = undefined;

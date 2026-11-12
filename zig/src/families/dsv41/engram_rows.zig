@@ -9,8 +9,16 @@ const engram_io = @import("engram_io.zig");
 const engram_aio = @import("engram_aio.zig");
 const engram_pack = @import("engram_pack.zig");
 const engram_cache = @import("engram_cache.zig");
+pub const anonHugeKiB = engram_cache.anonHugeKiB;
+pub const Fault = engram_cache.Fault;
 const engram_gpu = @import("engram_gpu.zig");
 const comm = @import("comm.zig");
+
+fn nowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
 
 /// Whether environment switch `name` is set to anything but 0.
 pub fn envOn(name: [:0]const u8) bool {
@@ -70,6 +78,7 @@ pub const Options = struct {
     round_rows: usize, // a round's rows at most
     chunk_rows: usize, // a prompt chunk's
     cache_bytes: usize, // the row cache over the layers (0: none)
+    prefault: bool = false, // its records faulted in at the open (TF_DS_ENGRAM_PREFAULT: engram_cache.Cache.initFaulted)
     instream: bool, // a round's landing as a host step on the stream (needs the round's AIO ring)
     round_dev: u64, // device records of a round (round_rows * slots * record bytes)
     chunk_dev: u64, // of a chunk (chunk_rows * slots * record bytes)
@@ -105,6 +114,8 @@ pub const Rows = struct {
     aio: ?*engram_aio.Aio, // a round's reads (TF_DS_ENGRAM_AIO), else the pool
     paio: ?*engram_aio.Aio, // a chunk's
     instream: bool,
+    fault: [2]engram_cache.Fault = .{ .{}, .{} }, // how each layer's cache was faulted in (Options.prefault)
+    fault_ns: u64 = 0, // and the time it took
 
     /// The shards of node o.node of o.nodes (owned) or the whole ones, checked against `tables`; the kernels; the
     /// staging buffers and the caches. Needs the CUDA context current.
@@ -145,8 +156,12 @@ pub const Rows = struct {
         errdefer for (&caches) |*c| {
             if (c.*) |*x| x.deinit(gpa);
         };
+        var fault: [2]engram_cache.Fault = .{ .{}, .{} };
+        const t0 = nowNs();
         if (o.cache_bytes > 0) {
+            for (0..o.layer_ids.len) |j| caches[j] = if (o.prefault) try engram_cache.Cache.initFaulted(gpa, o.cache_bytes / o.layer_ids.len, rec, 16, &fault[j]) else try engram_cache.Cache.init(gpa, o.cache_bytes / o.layer_ids.len, rec, 16);
         }
+        const fault_ns = nowNs() - t0;
         const r = try gpa.create(Rows);
         r.* = .{
             .gpa = gpa,
@@ -176,6 +191,8 @@ pub const Rows = struct {
             .aio = aio,
             .paio = paio,
             .instream = o.instream,
+            .fault = fault,
+            .fault_ns = fault_ns,
         };
         for (&r.round) |*st| st.rows = r;
         return r;
@@ -405,4 +422,17 @@ test "an owned plan stages hits, zeros another node's rows and lists the misses"
     r.pk[0].hi = 40;
     try r.plan(&st, 0, &hashes, 2, 1);
     try std.testing.expectEqualSlices(i64, &.{ 5, 11, 25, 19 }, st.ids[0..st.misses]);
+}
+
+test "TF_DS_ENGRAM_PREFAULT: the row caches are faulted in at the open, each layer's, and the open keeps how and how long" {
+    const src = @embedFile("engram_rows.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn open(").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "caches[j] = if (o.prefault) try engram_cache.Cache.initFaulted(gpa, o.cache_bytes / o.layer_ids.len, rec, 16, &fault[j]) else try engram_cache.Cache.init(gpa, o.cache_bytes / o.layer_ids.len, rec, 16);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, ".fault = fault,"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, ".fault_ns = fault_ns,"));
+    const model = @embedFile("model.zig");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, model, "const prefault = engram_rows.envOn(\"TF_DS_ENGRAM_PREFAULT\");"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, model, ".prefault = prefault,"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, model, "if (prefault) logPrefault(m.erows.?, mib, huge0, hugeKiB(io));"));
 }
