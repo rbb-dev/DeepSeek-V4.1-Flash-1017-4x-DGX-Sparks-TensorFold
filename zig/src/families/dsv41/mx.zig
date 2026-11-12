@@ -69,6 +69,7 @@ pub const GuArgs = extern struct {
     splits: c_int = 1,
     kblocks: c_int = 0,
     z: u64 = 0,
+    early_exit: c_int = 0, // Track C (TF_DS_EXPERT_EXIT)
 };
 
 /// native.cu's DnArgs.
@@ -98,6 +99,7 @@ pub const DnArgs = extern struct {
     kblocks: c_int = 0,
     z: u64 = 0,
     P: c_int = 0,
+    early_exit: c_int = 0, // Track C (TF_DS_EXPERT_EXIT)
 };
 
 /// native.cu's BfArgs.
@@ -186,6 +188,8 @@ const dec_counters = 16384;
 
 comptime {
     // the layouts native.cu was compiled with (pointers and int64 8 bytes, ints and floats 4, C padding)
+    std.debug.assert(@offsetOf(GuArgs, "sldw") == 136 and @offsetOf(GuArgs, "owner") == 152 and @offsetOf(GuArgs, "z") == 216 and @offsetOf(GuArgs, "early_exit") == 224 and @sizeOf(GuArgs) == 232);
+    std.debug.assert(@offsetOf(DnArgs, "sldw") == 104 and @offsetOf(DnArgs, "out") == 136 and @offsetOf(DnArgs, "z") == 160 and @offsetOf(DnArgs, "early_exit") == 172 and @sizeOf(DnArgs) == 176);
 }
 
 /// The kernels of cuda.kernels.dsv41_native.
@@ -219,6 +223,8 @@ pub const Kernels = struct {
     // TF_DS_DEC_PDL=0: the decode tensor-core kernels (dense, gate / up, down) as ordinary launches, the same kernels (the
     // decode plan's G0.2 control (a)); unset or any other value: programmatic dependent launches as served
     dec_pdl: bool,
+    // TF_DS_EXPERT_EXIT=1 (Track C): the decode expert kernels' grid rows past the active experts return at once
+    expert_exit: bool,
     counters: cuda.DeviceBuffer,
     combine: cuda.Function,
     bf16: cuda.Function,
@@ -253,6 +259,7 @@ pub const Kernels = struct {
             .dec_quant = try m.function("tf_dsn_dec_quant_kernel"),
             .dec_l2pf = try m.function("tf_dsn_dec_l2pf_kernel"),
             .dec_pdl = if (std.c.getenv("TF_DS_DEC_PDL")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true,
+            .expert_exit = if (std.c.getenv("TF_DS_EXPERT_EXIT")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false,
             .counters = counters,
             .module = m,
             .act_quant = try m.function("tf_dsn_act_quant_kernel"),
@@ -1044,6 +1051,7 @@ pub fn gateUp(k: *const Kernels, s: cuda.Stream, d: *const cuda.Driver, ex: weig
             // the decode tensor-core kernel: a tile's gate and up each on decGuSplit warps
             var b = a;
             b.splits = @intCast(dec_gu_ks);
+            b.early_exit = @intFromBool(k.expert_exit);
             ga.add(b);
             const tpc = dec_warps / (2 * dec_gu_ks);
             const rg = decRg(r);
@@ -1120,6 +1128,7 @@ pub fn down(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertSc
     if (split and k.dec_on and i % 128 == 0 and n % 16 == 0) {
         var b = a;
         b.splits = @intCast(dec_dn_ks);
+        b.early_exit = @intFromBool(k.expert_exit);
         var da: cuda.Args = .{};
         da.add(b);
         const tpc = dec_warps / dec_dn_ks;

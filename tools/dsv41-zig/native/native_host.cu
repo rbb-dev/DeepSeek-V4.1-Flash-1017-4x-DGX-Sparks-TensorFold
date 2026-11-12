@@ -119,6 +119,10 @@ int dsn_mx_gemm(const uint8_t* q, const float* s, const int* rows, long ldq, lon
     return int(cudaDeviceSynchronize());
 }
 
+// Track C: the decode expert kernels' early exit (GuArgs / DnArgs early_exit) for dsn_experts' launches
+static int g_expert_exit = 0;
+extern "C" void dsn_set_expert_exit(int v) { g_expert_exit = v; }
+
 // the grouped experts of one layer: x [R, D] bf16 -> y [R, N] fp32 (routed sum), every expert's tensors in tables
 int dsn_experts(const __nv_bfloat16* x, int R, int D, const int* pick, const float* wts, int S, int E,
                 const uint64_t* w1, const uint64_t* w3, const uint64_t* s1, const uint64_t* s3, long ldw_gu,
@@ -146,6 +150,7 @@ int dsn_experts(const __nv_bfloat16* x, int R, int D, const int* pick, const flo
     g.shared = -1; g.owner = nullptr; g.n_tiles = n_tiles; g.rest_tiles = 0; g.wts = wts; g.limit = limit; g.h = h; g.ldh = I;
     (void)cols;
     g.P = RS; g.splits = gu_splits > 1 ? gu_splits : 1; g.kblocks = (D / 32 + g.splits - 1) / g.splits; g.z = z;
+    g.early_exit = g_expert_exit;
     dim3 gg((n_tiles + 3) / 4, E < RS ? E : RS, g.splits);
     if (gu_splits <= -10) {  // the decode tensor-core kernel, -10 - gu_splits warps a tile and matrix
         g.splits = -10 - gu_splits;
@@ -161,6 +166,7 @@ int dsn_experts(const __nv_bfloat16* x, int R, int D, const int* pick, const flo
     d.w2 = w2; d.s2 = s2; d.ldw = ldw_d; d.ldws = ldws_d; d.fmt = fmt; d.shared = -1; d.I = I; d.N = N; d.round_bf16 = 1;
     d.out = out; d.ldo = N;
     d.splits = dn_splits > 1 ? dn_splits : 1; d.kblocks = (I / 32 + d.splits - 1) / d.splits; d.z = z; d.P = RS;
+    d.early_exit = g_expert_exit;
     dim3 gd((N / 32 + 3) / 4, E < RS ? E : RS, d.splits);
     if (dn_splits <= -10) {
         d.splits = -10 - dn_splits;

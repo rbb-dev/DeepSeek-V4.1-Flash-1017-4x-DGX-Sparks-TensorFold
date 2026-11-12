@@ -494,6 +494,20 @@ def check_experts(lib, sh, layer, n_exp=24):
         check(f"experts R={R} swap-AB: vs MoE.forward", r < 2e-2, f"max rel {r:.2e}")
         close = ((ares[1] - y).abs() <= 2 ** -6 * y.abs() + 1e-3 * hmax).float().mean().item()
         check(f"experts R={R} swap-AB: elements within a bf16 rounding", close > 0.999, f"{close:.5f}")
+        # Track C (TF_DS_EXPERT_EXIT): the decode kernels' rows past the active experts leaving at once give the
+        # same bits (R = 5: 24 grid rows for fewer active experts)
+        lib.dsn_set_expert_exit(1)
+        for nm_, dres in (("dec1", d1res), ("dec2", d2res), ("dec4", d4res)):
+            scr["out"].zero_()
+            assert lib.dsn_experts(ptr(x), R, D, ptr(pick), ptr(wts), S, E, ptr(t1), ptr(t3),
+                                   ptr(ts1), ptr(ts3), w1[0].shape[1], s1[0].shape[1], ptr(t2),
+                                   ptr(ts2), w2[0].shape[1], s2[0].shape[1], 1, I_, ptr(cols), I_ // 32, N,
+                                   F(10.0), *[ptr(scr[k]) for k in ("q", "s", "cnt", "off", "fill", "act", "nact", "ent",
+                                                                     "erow", "h", "hq", "hs", "out", "y")], 1,
+                                   code(nm_, gs), code(nm_, ds), ptr(z)) == 0
+            na = int(scr["nact"].item())
+            check(f"experts R={R} {nm_}: the early exit ({min(E, RS) - na} of {min(E, RS)} grid rows idle) gives the same bits", torch.equal(scr["y"], dres[1]))
+        lib.dsn_set_expert_exit(0)
         for nm_, dres in (("dec1", d1res), ("dec2", d2res), ("dec4", d4res)):
             r = rel(dres[1], y.double())
             check(f"experts R={R} {nm_}: vs MoE.forward", r < 2e-2, f"max rel {r:.2e}")
@@ -678,6 +692,7 @@ def main():
     lib.dsn_pf_bf16.argtypes = [P, L, L, P, L, L, I, I, I, I, P, L, L, I, F, I]
     lib.dsn_experts_pf.argtypes = [P, I, I, P, P, I, I, P, P, P, P, L, L, P, P, L, L, I, I, F, I, L, L, L, L] + [P] * 14 + [I, I]
     lib.dsn_dec_dense.argtypes = [I, P, P, P, L, L, P, P, L, L, I, I, I, I, I, P, P, P, L, I, I, F, I, I]
+    lib.dsn_set_expert_exit.argtypes = [I]
     lib.dsn_dec_dense_g.argtypes = [I, P, P, P, L, L, P, P, L, L, I, I, I, I, P, P, P, L, I, I, I, L, L]
     sh = Shards(root, sys.argv[3] if len(sys.argv) > 3 else None)
     check_act_quant(lib)

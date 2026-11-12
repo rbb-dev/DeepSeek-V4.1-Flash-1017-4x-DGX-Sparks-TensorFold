@@ -337,6 +337,7 @@ struct GuArgs {
     // tf_dsn_gu_finish sums them in split order and applies the epilogue; splits 1: the epilogue here
     int splits, kblocks;
     float* z;
+    int early_exit;     // Track C (TF_DS_EXPERT_EXIT): the decode kernel's rows past the active experts leave at once
 };
 
 __device__ __forceinline__ float silu_f(float v) { return v / (1.0f + expf(-v)); }
@@ -458,6 +459,7 @@ struct DnArgs {
     int splits, kblocks;
     float* z;
     int P;              // the entries (z's row count)
+    int early_exit;     // Track C (TF_DS_EXPERT_EXIT): as GuArgs'
 };
 
 template <int MT>
@@ -2050,6 +2052,10 @@ __device__ __forceinline__ void dec_gu(const GuArgs& a) {
     const int ks = a.splits, per_tile = 2 * ks;
     // the experts in reverse id order: the shared expert (the last id, the L2 prefetch's) first
     const int na = a.nact[0];
+    // Track C (docs/UNIFIED-DECODE-IMPROVEMENTS.md, TF_DS_EXPERT_EXIT=1): the grid's rows past the active experts
+    // (it is sized min(experts, rows x slots) on the host, which cannot see the count) leave at once, the whole CTA
+    // together (no barrier is entered, nothing is written, no other CTA waits on them)
+    if (a.early_exit && int(blockIdx.y) >= na) return;
     const bool live = int(blockIdx.y) < na;
     const int e = live ? a.act[na - 1 - blockIdx.y] : 0;
     const int tiles_cta = (blockDim.x >> 5) / per_tile;
@@ -2122,6 +2128,7 @@ __device__ __forceinline__ void dec_dn(const DnArgs& a) {
     extern __shared__ __align__(16) uint8_t dsm[];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int wb = dec::warpBytes<dec::kRbE, dec::kNsE>(1, RG);
+    if (a.early_exit && int(blockIdx.y) >= a.nact[0]) return;  // Track C: as dec_gu
     const bool live = int(blockIdx.y) < a.nact[0];
     const int e = live ? a.act[blockIdx.y] : 0;
     const int tiles_cta = (blockDim.x >> 5) / a.splits;
@@ -2321,5 +2328,7 @@ extern "C" __global__ void __launch_bounds__(1024) tf_dsn_dec_group_kernel(const
 }
 
 // the layouts mx.zig passes (its extern structs assert the same offsets)
+static_assert(offsetof(GuArgs, sldw) == 136 && offsetof(GuArgs, owner) == 152 && offsetof(GuArgs, z) == 216 && offsetof(GuArgs, early_exit) == 224 && sizeof(GuArgs) == 232, "GuArgs layout");
+static_assert(offsetof(DnArgs, sldw) == 104 && offsetof(DnArgs, out) == 136 && offsetof(DnArgs, z) == 160 && offsetof(DnArgs, early_exit) == 172 && sizeof(DnArgs) == 176, "DnArgs layout");
 static_assert(sizeof(DecMulti) == 4 * 168 + 24 && offsetof(DecMulti, cta0) == 676, "DecMulti layout");
 static_assert(sizeof(DecArgs) == 168 && offsetof(DecArgs, gq) == 152 && offsetof(DecArgs, z) == 96 && offsetof(DecArgs, y) == 112, "DecArgs layout");
