@@ -165,18 +165,37 @@ pub const BetweenHook = struct {
     };
 };
 
+/// A prompt pass's rows while it runs, for the threads that report it (the lane host's /health and /metrics): the
+/// backend stores where the pass starts (`from`: the rows it resumed) and, after each chunk, the rows it has passed
+/// (`at`); a reader loads `at` first, so it never counts rows the pass resumed as computed.
 /// A backend that issues work ahead of the device (the host returns while the kernels still run) gates the count: `gate`
 /// holds `generation << 32 | rows` the device has finished, and a reader counts no more than that.
+pub const Progress = struct {
+    from: std.atomic.Value(u32) = .init(0),
+    at: std.atomic.Value(u32) = .init(0),
     gen: std.atomic.Value(u32) = .init(0),
     gate: std.atomic.Value(?*const std.atomic.Value(u64)) = .init(null),
+
     /// The pass starts at `rows` (restored from a kept state); none computed yet. Takes any gate off.
+    pub fn begin(p: *Progress, rows: usize) void {
         p.gate.store(null, .release);
+        p.from.store(@intCast(rows), .monotonic);
+        p.at.store(@intCast(rows), .release);
+    }
+
+    /// The pass has passed `rows` of its prompt.
+    pub fn reach(p: *Progress, rows: usize) void {
+        p.at.store(@intCast(rows), .release);
+    }
+
     /// From here the rows count only once `finished` (generation `gen`) says the device is done with them.
     pub fn gated(p: *Progress, finished: *const std.atomic.Value(u64), gen: u32) void {
         p.gen.store(gen, .release);
         p.gate.store(finished, .release);
     }
 
+    /// The rows the pass resumed and the rows it has passed, as one reading.
+    pub fn read(p: *const Progress) struct { from: u32, at: u32 } {
         const issued = p.at.load(.acquire);
         const from = p.from.load(.monotonic);
         const g = p.gate.load(.acquire) orelse return .{ .from = from, .at = issued };
@@ -184,6 +203,15 @@ pub const BetweenHook = struct {
         // (another generation: a callback of an earlier fill, or the fill not armed yet: nothing finished)
         const done: u32 = if (@as(u32, @truncate(v >> 32)) == p.gen.load(.acquire)) @truncate(v) else 0;
         return .{ .from = from, .at = @min(issued, done) };
+    }
+
+    /// Rows the pass has computed so far (not resumed).
+    pub fn computed(p: *const Progress) u32 {
+        const r = p.read();
+        return r.at -| r.from;
+    }
+};
+
 /// Drafts the backend holds for the stream's next round; a tree keeps its tokens and parents on the host.
 pub const Held = struct {
     count: u32,
@@ -309,6 +337,7 @@ pub const Stream = struct {
     untaught: bool = false,
     images: []const Image = &.{},
     between: ?BetweenHook = null, // the host's round between this stream's prompt chunks (a backend may call it)
+    progress: ?*Progress = null, // the host's view of this stream's prompt pass (a backend stores its rows per chunk)
     key: []const u32 = &.{},
     lane_images: []const LaneImage = &.{},
     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
@@ -684,6 +713,19 @@ test "loop guard fires, closes thinking, and latches once" {
     try std.testing.expect(!s.finished and s.loop_period.? == 1);
 }
 
+test "a prompt pass's progress counts the rows it computes, never the ones it resumed" {
+    var p: Progress = .{};
+    try std.testing.expectEqual(@as(u32, 0), p.computed());
+    p.begin(4096); // a kept state's 4,096 rows restored: none computed yet
+    try std.testing.expectEqual(@as(u32, 0), p.computed());
+    p.reach(6144);
+    p.reach(8192);
+    try std.testing.expectEqual(@as(u32, 4096), p.computed());
+    p.begin(0); // the next pass, from the prompt's start
+    try std.testing.expectEqual(@as(u32, 0), p.computed());
+    p.reach(2048);
+    try std.testing.expectEqual(@as(u32, 2048), p.computed());
+}
 
 test "passRows gives resume rows below pass_from, while a request waits, while another prompt fills and with no hook, else pass rows when nothing decodes or step_rows reaches them" {
     const quiet: Facts = .{ .decoding = false, .filling = false, .waiting = false, .step_rows = std.math.maxInt(u32) };

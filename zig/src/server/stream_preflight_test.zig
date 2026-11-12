@@ -403,6 +403,41 @@ test "prose before a call retains its leading whitespace" {
     try exerciseSpace("\n\nLook up.\n" ++ space_call, "\n\nLook up.\n", true, true, 1);
 }
 
+test "/health counts prompt tokens restored from kept states where the engine keeps them, and only there" {
+    const KeepEngine = struct {
+        keeps: bool,
+        fn engine(e: *@This()) api.Engine {
+            return .{ .ctx = e, .vtable = &.{ .info = info, .submit = HiEngine.submit, .cancel = HiEngine.cancel, .status = HiEngine.status, .memory = HiEngine.memory } };
+        }
+        fn info(ctx: *anyopaque) api.Info {
+            const e: *@This() = @ptrCast(@alignCast(ctx));
+            return .{ .context_window = 4096, .prompt_cache = e.keeps };
+        }
+    };
+    for ([_]bool{ true, false }) |keeps| {
+        var text: TestText = .{};
+        var backend: KeepEngine = .{ .keeps = keeps };
+        var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
+            .served_name = "test-model",
+            .model_ids = &.{"test-model"},
+            .enable_thinking = false,
+            .use_drafts = false,
+        }, null);
+        defer srv.deinit();
+        // two finished requests, 96 of their 220 prompt tokens restored
+        srv.noteRequest(100, 0, 3, 0, 0, &.{}, 2, .{}, 0, null, null, null);
+        srv.noteRequest(120, 96, 3, 0, 0, &.{}, 2, .{}, 0, null, null, null);
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const health = try @import("status_routes.zig").healthValue(srv, arena.allocator(), false);
+        const cached = health.get("cached_tokens_total");
+        if (keeps) {
+            try std.testing.expect(cached != null and cached.? == .int);
+            try std.testing.expectEqualStrings("96", cached.?.int);
+        } else try std.testing.expect(cached == null);
+    }
+}
+
 test "/health shows the prompt cache's counters where the engine reports them, and nothing new where it does not" {
     const CacheEngine = struct {
         cache: ?api.CacheStats,

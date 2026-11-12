@@ -54,6 +54,7 @@ const Totals = struct {
 pub const Metrics = struct {
     gpa: std.mem.Allocator,
     mutex: std.Io.Mutex = .init,
+    started_unix: f64 = 0, // the process's start (unix seconds; 0: not known), set once before the server serves
     prompt: u64 = 0,
     cached: u64 = 0,
     generation: u64 = 0,
@@ -105,6 +106,13 @@ pub const Metrics = struct {
         m.mutex.lockUncancelable(io);
         defer m.mutex.unlock(io);
         m.prepare.observe(took);
+    }
+
+    /// Prompt tokens of finished requests restored from kept prompt states (prompt_tokens_cached_total), for /health.
+    pub fn cachedTotal(m: *Metrics, io: std.Io) u64 {
+        m.mutex.lockUncancelable(io);
+        defer m.mutex.unlock(io);
+        return m.cached;
     }
 
     /// A finished request's head chains by depth (api.Stats.depths).
@@ -197,6 +205,13 @@ pub const Metrics = struct {
         try gauge(w, "prompt_tokens_total", "counter", "Prompt tokens of finished requests.", snap.prompt);
         const keeps = engine.info().prompt_cache;
         if (keeps) try gauge(w, "prompt_tokens_cached_total", "counter", "Prompt tokens of finished requests restored from kept prompt states.", snap.cached);
+        if (status.prompt_tokens_computed) |n| {
+            const p: api.PromptPass = status.prompt_pass orelse .{ .computed = 0, .total = 0, .resumed = 0, .seconds = 0 };
+            try gauge(w, "prompt_tokens_computed_total", "counter", "Prompt tokens computed by prompt passes (not restored from kept states), the running pass's so far included: its rate is the prefill speed.", n);
+            try gauge(w, "prompt_pass_tokens_computed", "gauge", "Tokens the prompt pass running now has computed; 0 between passes.", p.computed);
+            try gauge(w, "prompt_pass_tokens_total", "gauge", "Tokens the prompt pass running now computes in all (its prompt less the tokens it resumed); 0 between passes.", p.total);
+            try gauge(w, "prompt_pass_tokens_resumed", "gauge", "Tokens the prompt pass running now resumed from a kept state; 0 between passes.", p.resumed);
+        }
         try gauge(w, "generation_tokens_total", "counter", "Generated tokens of finished requests.", snap.generation);
         const live = streams[0..@min(status.streams, streams.len)];
         try family(w, "kv_cache_usage_ratio", "gauge", "Tokens in a stream cache divided by that stream's context window.");
@@ -242,6 +257,8 @@ pub const Metrics = struct {
             for ([_][]const u8{ "argmax", "keys", "candidates", "merged", "flagged", "whole" }, hr) |name, n| try w.print("{s}decode_rounds_by_head_path_total{{path=\"{s}\"}} {d}\n", .{ prefix, name, n });
         }
         if (status.draft_vocab) |v| try draftVocabFamilies(w, v);
+        // under its standard name, as Prometheus' client libraries publish it: dashboards date a restart by it
+        if (snap.started_unix > 0) try w.print("# HELP process_start_time_seconds Start time of the process since unix epoch in seconds.\n# TYPE process_start_time_seconds gauge\nprocess_start_time_seconds {d}\n", .{snap.started_unix});
         if (status.cache) |c| try cacheFamilies(w, c);
         if (engine.info().spill) |si| if (si.settings.asked) try spillFamilies(w, si, status.spill);
     }
@@ -635,6 +652,32 @@ test "the stats line covers the requests finished since the last, once its inter
     try std.testing.expectEqualStrings("stats over 10.0s: 1 reply, 7 tokens in 7 rounds (1.00 a round)", second);
 }
 
+test "render shows the prompt pass in flight and the computed prompt tokens, when the engine counts them" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    var stub: RenderStub = .{};
+    var none: std.Io.Writer.Allocating = .init(gpa);
+    defer none.deinit();
+    try m.render(std.testing.io, &none.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, none.written(), "prompt_tokens_computed_total") == null); // not counted
+    try std.testing.expect(std.mem.indexOf(u8, none.written(), "prompt_pass_tokens") == null);
+    stub.status_value.prompt_tokens_computed = 1_234_567;
+    var idle: std.Io.Writer.Allocating = .init(gpa);
+    defer idle.deinit();
+    try m.render(std.testing.io, &idle.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, idle.written(), "tensorfold:prompt_tokens_computed_total 1234567\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, idle.written(), "tensorfold:prompt_pass_tokens_computed 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, idle.written(), "tensorfold:prompt_pass_tokens_total 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, idle.written(), "tensorfold:prompt_pass_tokens_resumed 0\n") != null);
+    stub.status_value.prompt_pass = .{ .computed = 61_440, .total = 120_000, .resumed = 8192, .seconds = 20.97 };
+    var busy: std.Io.Writer.Allocating = .init(gpa);
+    defer busy.deinit();
+    try m.render(std.testing.io, &busy.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, busy.written(), "tensorfold:prompt_pass_tokens_computed 61440\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, busy.written(), "tensorfold:prompt_pass_tokens_total 120000\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, busy.written(), "tensorfold:prompt_pass_tokens_resumed 8192\n") != null);
+}
+
 test "metrics snapshot allocation failure releases the mutex" {
     const io = std.testing.io;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
@@ -871,6 +914,22 @@ test "the tier's call timings render as one histogram labelled by call, with p50
         std.debug.print("missing {s}\n", .{line});
         return e;
     };
+}
+
+test "render names the process's start for a server that knows it, and nothing for one that does not" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    var stub: RenderStub = .{};
+    var none: std.Io.Writer.Allocating = .init(gpa);
+    defer none.deinit();
+    try m.render(std.testing.io, &none.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, none.written(), "process_start_time_seconds") == null);
+    m.started_unix = 1793341234.5;
+    var some: std.Io.Writer.Allocating = .init(gpa);
+    defer some.deinit();
+    try m.render(std.testing.io, &some.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, some.written(), "# TYPE process_start_time_seconds gauge\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, some.written(), "\nprocess_start_time_seconds 1793341234.5\n") != null);
 }
 
 test "render counts finished requests' rounds by plan: copied continuations and the head's drafts, verified and kept" {

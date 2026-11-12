@@ -51,6 +51,11 @@ pub const LaneHost = struct {
     overlap: bool = false, // the backend runs `overlapWork` inside each round's forward wait (Backend.overlap): the round's tokens go out there
     prefill_rate: f64 = 0,
     prefill_at: i96 = 0,
+    /// The prompt passes' done rows (all passes in flight, with the ended ones') each time a turn found them moved, for the speed
+    /// now (engine thread writes, under the lock): the marks of the last `prefill_window_ns` and the newest one before it.
+    filled: std.ArrayList(Mark) = .empty,
+    filled_idle: bool = true, // no pass ran at the last turn: the next pass starts its marks afresh (engine thread only)
+    passes_on: std.atomic.Value(u32) = .init(0), // prompt passes running (passBegin / passEnd): a turn with none takes no lock for the marks
     live_tokens: std.ArrayList(u32) = .empty,
     /// A Metal engine's keepalive target, set by the family that owns the queue; null keeps the ticker off.
     keepalive_target: ?api.keepalive.Target = null,
@@ -95,6 +100,7 @@ pub const LaneHost = struct {
     /// What every rank was last told for each slot of class A (`unset`: nothing yet, the start's): a cfg frame goes out only when a
     /// slot's published value differs.
     live_sent: [live_config.slot_count]u64 = @splat(live_config.unset),
+    computed: u64 = 0, // prompt tokens computed by the prompt passes that ended
     // -- the service fence --------------------------------------------------------------------------------------------
     /// The backend's word that its device is between launches it may interleave with (dsv41: no CUDA graph capture
     /// on its stream); null: always.
@@ -132,6 +138,9 @@ pub const LaneHost = struct {
     const finish_ns: i96 = 5 * std.time.ns_per_s;
     const finish_left: i64 = 256;
     const window_ns: i96 = 2 * std.time.ns_per_s;
+    /// The prompt speed now is the done rows' rise over about this long (the rows move a pass group at a time: a group's
+    /// rows over its time, never the pass's average since it began).
+    const prefill_window_ns: i96 = 4 * std.time.ns_per_s;
     /// Prompt tokens a prompt step indexes for the copy proposer (SuffixLookup.warm): ~1 ms of this thread against a step of 100+ ms on the GPU.
     const warm_tokens: usize = 8192;
     /// The longest a status waits for the engine thread's refresh (ms): a long round, never the request path.
@@ -214,6 +223,10 @@ pub const LaneHost = struct {
         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
         kept0: u64 = 0, // the store's kept count when the job looked it up
         images: pc.Images = .none, // the images key of the prompt's prefixes (0 for a prompt without images)
+        // the job's prompt pass while it runs, for /health and /metrics: the backend stores its rows in `progress`
+        // after each chunk, without the lock; `pass_on` is written and read under the lock
+        progress: lanes.stream.Progress = .{},
+        pass_on: bool = false,
         tried_disk: bool = false, // it asked the disk once: a later lookup takes what memory holds
         deferred_since: ?i96 = null, // its restore was refused for capacity since then, with no restore ending meanwhile
         waited_since: ?i96 = null, // it first waited for a restore then, deferred or parked (load_wait_ns from it)
@@ -401,6 +414,7 @@ pub const LaneHost = struct {
         h.fill_slots.deinit(h.gpa);
         h.cancels.deinit(h.gpa);
         h.decoded.deinit(h.gpa);
+        h.filled.deinit(h.gpa);
         h.live_tokens.deinit(h.gpa);
         h.ready.deinit(h.gpa);
         h.loading.deinit(h.gpa);
@@ -472,15 +486,75 @@ pub const LaneHost = struct {
         }
         const n = @min(stream_tokens.len, h.live_tokens.items.len);
         @memcpy(stream_tokens[0..n], h.live_tokens.items[0..n]);
+        const held = if (now - h.prefill_at <= window_ns) h.prefill_rate else 0;
+        const pass = h.passNow(now);
+        var running: u64 = 0; // rows the passes in flight have computed so far
+        for (h.admitted.items) |job| if (job.pass_on) {
+            running += job.progress.computed();
+        };
+        out.* = .{
             .waiting = @intCast(h.queued.items.len + h.waitingCount()),
             .decode_tokens_per_second = @as(f64, @floatFromInt(tokens)) / 2.0,
+            // a pass in flight: its speed now (the done rows' rise over the last few seconds; before two marks, its speed so far);
+            // else the speed at the last pass's end, for 2 s after it ended
+            .prefill_tokens_per_second = if (pass) |p| speedNow(h.filled.items, now) orelse p.rate() orelse held else held,
+            .preemptions = 0,
             .graph_fallbacks = if (h.graph_fallbacks) |c| c.load(.monotonic) else null,
             .head_rounds = if (h.head_rounds) |c| .{ c[0].load(.monotonic), c[1].load(.monotonic), c[2].load(.monotonic), c[3].load(.monotonic), c[4].load(.monotonic), c[5].load(.monotonic) } else null,
             .draft_vocab = if (h.draft_vocab) |c| c.read() else null,
             .streams = n,
             .generation_tokens = h.live_generated,
+            .prompt_pass = pass,
+            .prompt_tokens_computed = h.computed + running,
             .cache = h.tele,
             .spill = h.spill,
+        };
+    }
+
+    /// The oldest prompt pass in flight, as the HTTP threads report it (the lock held); null when none runs. Passes
+    /// advanced a chunk at a time take turns, so the one admitted first is the one a reader follows.
+    fn passNow(h: *LaneHost, now: i96) ?api.PromptPass {
+        var oldest: ?*Job = null;
+        for (h.admitted.items) |job| if (job.pass_on) {
+            if (oldest == null or job.began < oldest.?.began) oldest = job;
+        };
+        const job = oldest orelse return null;
+        const r = job.progress.read();
+        const len: u32 = @intCast(job.request.prompt.len);
+        const resumed = @min(r.from, len);
+        return .{
+            .computed = r.at -| r.from,
+            .total = len - resumed,
+            .resumed = resumed,
+            .seconds = @as(f64, @floatFromInt(@max(0, now - job.began))) / 1e9,
+        };
+    }
+
+    /// The engine thread starts `job`'s prompt pass: it shows on /health and /metrics until passEnd.
+    fn passBegin(h: *LaneHost, job: *Job) void {
+        h.lock();
+        defer h.unlock();
+        job.progress.begin(0);
+        job.pass_on = true;
+        _ = h.passes_on.fetchAdd(1, .monotonic);
+        job.stream.progress = &job.progress;
+    }
+
+    /// The pass ended: what it computed joins the total, as the backend reported it, or on success at least the
+    /// prompt less the tokens it resumed (a backend that reports nothing), so the counter never goes back from what
+    /// /metrics showed while the pass ran. A job whose pass is not running is left as it is.
+    fn passEnd(h: *LaneHost, job: *Job, ok: bool) void {
+        h.lock();
+        defer h.unlock();
+        if (!job.pass_on) return;
+        const seen: u64 = job.progress.computed();
+        h.computed += if (ok) @max(seen, @as(u64, job.request.prompt.len -| job.stream.cached)) else seen;
+        job.pass_on = false;
+        _ = h.passes_on.fetchSub(1, .monotonic);
+        job.stream.progress = null;
+    }
+
+    fn memoryFn(ctx: *anyopaque, reset_peak: bool) ?Memory {
         const source = self(ctx).memory orelse return null;
         return source.read(source.ctx, reset_peak);
     }
@@ -655,6 +729,7 @@ pub const LaneHost = struct {
 
     fn finish(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) void {
         if (job.started and job.prefilled != null) h.send(job); // (tokens the forward wait did not get to)
+        h.passEnd(job, false); // a job that ends between its prompt's chunks: what they computed stays counted
         job.reported();
         h.gpa.free(job.marks);
         h.gpa.free(job.lineage);
@@ -832,7 +907,9 @@ pub const LaneHost = struct {
         if (h.servicing()) job.stream.between.?.tier = .{ .wanted = betweenWanted, .run = betweenService };
         h.filling_job = job; // (the service fence: inside this pass only Stream.between may service)
         defer h.filling_job = null;
+        h.passBegin(job);
         h.core.addStream(&job.stream) catch |e| {
+            h.passEnd(job, false);
             if (h.between_failed) |msg| {
                 // a round between this prompt's chunks failed: this job and every admitted one end with its error
                 h.between_failed = null;
@@ -844,6 +921,7 @@ pub const LaneHost = struct {
             if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
             return h.drop(job, h.words(e));
         };
+        h.passEnd(job, true);
         h.prefilled(job, began);
         const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
         if (now - began >= long_pass_ns) {
@@ -937,6 +1015,10 @@ pub const LaneHost = struct {
         // a long prompt's step beside decoders is the share's to bill (a short prompt's never is)
         const long = shared and decoders > 0 and h.fillRows(job) > h.share.short;
         const billed = long and h.share.p < 1; // (a count of rounds times nothing)
+        if (first) {
+            if (!h.setup(job)) return;
+            h.passBegin(job);
+        }
         job.stream.settle_step = billed; // timed on the host, so a step owed to decoders ends on the device; none left marked
         const t0: i96 = if (billed) h.shareNow() else 0;
         const step = blk: {
@@ -945,6 +1027,7 @@ pub const LaneHost = struct {
             break :blk h.core.fillStream(&job.stream, first);
         };
         const done = step catch |e| {
+            h.passEnd(job, false);
             if (e == error.Cancelled) {
                 _ = h.cancel(job);
             } else if (e == error.ContextFull and h.admitted.items.len > 1) {
@@ -960,6 +1043,7 @@ pub const LaneHost = struct {
         // the copy index of the prompt, a slice a step (the GPU runs the step just issued): the first round after the prompt finds it built
         if (!done and job.stream.drafts and job.stream.proposer != null) job.proposer.warm(job.stream.context.items, job.stream.prompt_len, warm_tokens) catch {};
         if (done) {
+            h.passEnd(job, true);
             h.prefilled(job, job.began);
         }
     }
@@ -1077,7 +1161,7 @@ pub const LaneHost = struct {
     fn prefilled(h: *LaneHost, job: *Job, began: i96) void {
         const done = std.Io.Clock.awake.now(h.io).toNanoseconds();
         h.lock();
-        if (done > began) h.prefill_rate = @as(f64, @floatFromInt(job.request.prompt.len - job.stream.cached)) / (@as(f64, @floatFromInt(done - began)) / 1e9);
+        if (done > began) h.prefill_rate = speedNow(h.filled.items, done) orelse @as(f64, @floatFromInt(job.request.prompt.len - job.stream.cached)) / (@as(f64, @floatFromInt(done - began)) / 1e9);
         h.prefill_at = done;
         job.prefilled = done;
         h.unlock();
@@ -1217,6 +1301,33 @@ pub const LaneHost = struct {
         };
     }
 
+    /// A mark of the prompt passes' done rows when they moved since the last turn (engine thread, once a turn): the speed now
+    /// in status is their rise across the marks (speedNow). A turn with no pass running costs one atomic load and takes no
+    /// lock (decode rounds pay nothing); a pass that starts after none ran starts the marks afresh.
+    fn notePrefill(h: *LaneHost) void {
+        if (h.passes_on.load(.monotonic) == 0) {
+            h.filled_idle = true;
+            return;
+        }
+        h.lock();
+        defer h.unlock();
+        var running: u64 = 0;
+        for (h.admitted.items) |job| if (job.pass_on) {
+            running += job.progress.computed();
+        };
+        if (h.filled_idle) {
+            h.filled.clearRetainingCapacity();
+            h.filled_idle = false;
+        }
+        const total = h.computed + running;
+        const m = h.filled.items;
+        if (m.len > 0 and m[m.len - 1].tokens == total) return; // (not moved)
+        const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        keepWindow(&h.filled, now);
+        h.filled.append(h.gpa, .{ .at = now, .tokens = total }) catch {};
+    }
+
+    fn noteLive(h: *LaneHost) void {
         if (!h.tele_want.swap(false, .acq_rel)) return; // (nobody asked since the last refresh)
         h.tele_builds += 1;
         const tele = h.telemetry();
@@ -1370,7 +1481,8 @@ pub const LaneHost = struct {
             const busy = h.servicing() and h.pending();
             if (busy) h.service(h.tier.service_ns);
             h.fillOne();
-            status.noteLive(h);
+            h.notePrefill();
+            h.noteLive();
             h.lock();
             if (h.closing) {
                 const left = h.queued.items.len + h.admitted.items.len + h.waitingCount();
@@ -2393,4 +2505,53 @@ test {
     _ = @import("lane_host_tier_test.zig");
 }
 
+/// Drops the marks older than `LaneHost.prefill_window_ns` before `now` but the newest of them (the rise is measured from it).
+fn keepWindow(marks: *std.ArrayList(LaneHost.Mark), now: i96) void {
+    var old: usize = 0;
+    while (old < marks.items.len and marks.items[old].at < now - LaneHost.prefill_window_ns) old += 1;
+    if (old > 1) marks.replaceRangeAssumeCapacity(0, old - 1, &.{});
+}
+
+/// The prompt speed now from the marks (time order): the rows' rise from the oldest mark kept to the newest, over the time
+/// between them. When the newest mark is older than both the window and twice the last gap between marks (rows that
+/// stopped moving), the time runs to `now`, so a stalled pass shows its speed falling. Null with fewer than two marks.
+fn speedNow(marks: []const LaneHost.Mark, now: i96) ?f64 {
+    if (marks.len < 2) return null;
+    const first = marks[0];
+    const last = marks[marks.len - 1];
+    const gap = last.at - marks[marks.len - 2].at;
+    const end = if (now - last.at > @max(LaneHost.prefill_window_ns, 2 * gap)) now else last.at;
+    if (end <= first.at or last.tokens < first.tokens) return null;
+    return @as(f64, @floatFromInt(last.tokens - first.tokens)) / (@as(f64, @floatFromInt(end - first.at)) / 1e9);
+}
+
+test "the prompt speed now is the rise of the last few seconds, not the pass's average since it began" {
+    const s = std.time.ns_per_s;
+    const M = LaneHost.Mark;
+    // a pass that read 8,192 rows a second for 2 s, then slowed to 8,192 rows every 2.5 s
+    var marks: std.ArrayList(M) = .empty;
+    defer marks.deinit(std.testing.allocator);
+    const seen = [_]M{ .{ .at = 0, .tokens = 0 }, .{ .at = 1 * s, .tokens = 8192 }, .{ .at = 2 * s, .tokens = 16384 }, .{ .at = 4 * s + s / 2, .tokens = 24576 }, .{ .at = 7 * s, .tokens = 32768 } };
+    for (seen) |m| {
+        keepWindow(&marks, m.at);
+        try marks.append(std.testing.allocator, m);
+    }
+    // kept: the marks of the last 4 s (4.5 s, 7 s) and the newest before them (2 s)
+    try std.testing.expectEqual(@as(usize, 3), marks.items.len);
+    try std.testing.expectEqual(@as(i96, 2 * s), marks.items[0].at);
+    const now_rate = speedNow(marks.items, 7 * s).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 16384.0 / 5.0), now_rate, 1e-6);
+    // the average since the pass began would say 32,768 / 7 s: the speed now is below it
+    try std.testing.expect(now_rate < 32768.0 / 7.0);
+}
+
+test "the prompt speed now: steady rows give their rate; a stalled pass falls; fewer than two marks give none" {
+    const s = std.time.ns_per_s;
+    const M = LaneHost.Mark;
+    const steady = [_]M{ .{ .at = 0, .tokens = 0 }, .{ .at = 2 * s, .tokens = 8192 }, .{ .at = 4 * s, .tokens = 16384 } };
+    try std.testing.expectApproxEqAbs(@as(f64, 4096), speedNow(&steady, 4 * s).?, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f64, 4096), speedNow(&steady, 7 * s).?, 1e-6); // within twice the gap and the window: held
+    try std.testing.expectApproxEqAbs(@as(f64, 16384.0 / 20.0), speedNow(&steady, 20 * s).?, 1e-6); // stalled 16 s: counted to now
+    try std.testing.expect(speedNow(steady[0..1], 1 * s) == null);
+    try std.testing.expect(speedNow(&.{}, 1 * s) == null);
 }

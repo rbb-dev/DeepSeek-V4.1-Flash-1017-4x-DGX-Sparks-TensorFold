@@ -1350,17 +1350,7 @@ pub const Lanes = struct {
             start = sn.at;
             s.cached = @intCast(sn.at);
         }
-        // where this pass keeps states: the cache's marks and its last resume point before the replay (the served lane's
-        // kept prompt), each at the resume point at or before it
-        const last_end = @min(replay, len - 1) / model.resume_rows * model.resume_rows;
-        self.fills[slot] = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .start = start };
-    }
-
-    fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
-        const self = of(ptr);
-        const l = self.streams.getPtr(s) orelse return error.UnknownStream;
-        if (position != s.prompt_len) return error.PositionMismatch;
-        return l.first;
+        // /health and /metrics follow the pass from here: one atomic store a chunk, no lock, no GPU wait
         if (s.progress) |p| {
             p.begin(start);
             // the rows count once the device has run them, not once the host has issued them (a pair returns ~0.9 s early)

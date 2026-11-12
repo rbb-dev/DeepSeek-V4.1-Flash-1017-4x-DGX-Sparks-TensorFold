@@ -837,6 +837,11 @@ pub const Status = struct {
     fill_unknown: bool = false,
     /// Changes whenever the filling set does: a reader pairs its drain samples with one fill.
     fill_run: u64 = 0,
+    /// The prompt pass running now; null when none runs or the engine does not follow one.
+    prompt_pass: ?PromptPass = null,
+    /// Prompt tokens computed by prompt passes (not restored from kept states), the running pass's so far included;
+    /// null when the engine does not count them. Its rate is the prefill speed, a pass in flight included.
+    prompt_tokens_computed: ?u64 = null,
     /// The prompt cache's counters, when its tier or grouping is on.
     cache: ?CacheStats = null,
     /// The disk tier's state, when it was asked for (outside `cache`: a tier that is off still shows).
@@ -894,6 +899,21 @@ pub const LearnEvent = union(enum) {
 pub const LearnSink = struct {
     ctx: *anyopaque,
     event: *const fn (ctx: *anyopaque, event: *const LearnEvent) void,
+};
+
+/// A prompt pass in flight: the tokens it has computed, those it computes in all (its prompt less the tokens it
+/// resumed), the tokens it resumed from a kept state, and the seconds since its request was admitted.
+pub const PromptPass = struct {
+    computed: u64,
+    total: u64,
+    resumed: u64,
+    seconds: f64,
+
+    /// Its tokens a second so far; null before its first chunk is done.
+    pub fn rate(p: PromptPass) ?f64 {
+        if (p.computed == 0 or p.seconds <= 0) return null;
+        return @as(f64, @floatFromInt(p.computed)) / p.seconds;
+    }
 };
 
 pub const LearnError = error{ Closed, Busy, Unsupported };

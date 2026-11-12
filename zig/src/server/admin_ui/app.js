@@ -885,6 +885,8 @@ function rateBox() {
       const ttfts = (recent || []).map((x) => x.ttft_s).filter((x) => !none(x));
       tiles.set('decode', fmt(dec), '', `${running} stream${running === 1 ? '' : 's'}`, 'Tokens a second the engine generates for all streams together (the engine\'s own live counter).');
       tiles.set('stream', one.format(none(per) ? 0 : per), '', 'mean a user', 'The decode rate divided by the streams generating: what one user gets on average.');
+      const pp = live.prompt_pass, ppAvg = pp && pp.seconds > 0 && pp.computed > 0 ? pp.computed / pp.seconds : null;
+      tiles.set('prefill', fmt(live.prefill_tokens_per_second), '', pp ? (none(ppAvg) ? 'pass running' : `average ${whole.format(ppAvg)}`) : 'no pass now', 'Prompt tokens a second NOW: the rows the prompt passes finished over the last few seconds (the engine\'s own count). Under it while a prompt is read, that prompt\'s average since it began, which stays higher than the speed now as a long prompt slows.');
       tiles.set('itl', whole.format(none(per) || per <= 0 ? 0 : 1000 / per), '', 'per token', 'The mean time between two tokens of one stream: 1000 over the per-stream rate.');
       tiles.set('ttft', ttfts.length ? secFmt(quantile(ttfts, 0.99)) : '0', '', ttfts.length ? `p50 ${secFmt(quantile(ttfts, 0.5))} s` : 'none finished', `Time to first token over the last ${ttfts.length} finished requests the engine remembers (a prompt of any length).`);
     },
@@ -920,6 +922,7 @@ function transportBox() {
 function overview() {
   const lines = linesBox(), health = healthBox(), speed = speedBox(), kv = kvBox(), tier = tierBox(), rate = rateBox(), links = transportBox();
   const cd = chart('DECODE', 'Tokens a second the engine generates, all streams, the last 15 minutes. Fixed 10-second buckets: a bucket keeps its value as the window moves; hover for the bucket\'s mean and peak.', '#e8eaec', 'tok/s', 'decode_tps');
+  const cp = chart('PREFILL', 'Prompt tokens a second of the prompt passes as they ran (the speed now, sampled every second), the last 15 minutes. Fixed 10-second buckets; hover for the mean and peak.', '#9d8bd0', 'tok/s', 'prefill_tps');
   const wrap = (name, c) => h('section', { class: 'box plotbox', 'data-box': name }, c.el);
   refs.main.append(h('div', { class: 'board' },
     h('div', { class: 'col' }, lines.el, health.el, speed.el),

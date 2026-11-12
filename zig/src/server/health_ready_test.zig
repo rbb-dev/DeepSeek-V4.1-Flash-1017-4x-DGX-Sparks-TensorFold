@@ -7,6 +7,24 @@ fn getWith(srv: *server.Server, path: []const u8, headers: []const u8) !Reply {
     const head = try std.fmt.bufPrint(&head_buf, "GET {s} HTTP/1.1\r\nHost: t\r\n{s}\r\n", .{ path, headers });
     if (srv.authenticate(&conn, arena.allocator())) routes.dispatch(srv, &conn, arena.allocator());
 
+test "/health names the engine's start and its uptime once the server knows the start" {
+    var text: NoText = .{};
+    var e: Engine = .{};
+    const srv = try testServer(&e, &text, null);
+    defer srv.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const status_routes = @import("status_routes.zig");
+    try std.testing.expect((try status_routes.healthValue(srv, arena.allocator(), false)).get("started_at") == null);
+    const now: f64 = @as(f64, @floatFromInt(std.Io.Clock.real.now(std.testing.io).toNanoseconds())) / 1e9;
+    srv.metrics.started_unix = now - 120;
+    const h = try status_routes.healthValue(srv, arena.allocator(), false);
+    const at = h.get("started_at") orelse return error.NoStartedAt;
+    const up = h.get("uptime_s") orelse return error.NoUptime;
+    try std.testing.expect(at == .float and @abs(at.float - (now - 120)) < 0.001);
+    try std.testing.expect(up == .float and up.float >= 119 and up.float < 180);
+}
+
 test "keys on: /health gives a key holder its whole answer; without a valid key it says ok and nothing more" {
     var problem: []const u8 = "";
     var keys_arena = std.heap.ArenaAllocator.init(std.testing.allocator);

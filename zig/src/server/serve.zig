@@ -75,6 +75,9 @@ pub const Setup = struct {
     sampling: ?json.Value = null,
     environ: ?*const std.process.Environ.Map = null,
     started: i96 = 0,
+    /// The same moment on the real clock (unix ns; 0: not known): /health's started_at, /metrics'
+    /// process_start_time_seconds.
+    started_real: i96 = 0,
     /// The release, backend and GPU the open /health names.
     identity: server_mod.Identity = .{},
     /// A test build's TF_SLIDE_FORGET_FAIL: the fact whose check a delete fails (0: none, as in every release).
@@ -315,6 +318,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         srv.series = null;
         smp.destroy();
     };
+    if (s.started_real > 0) srv.metrics.started_unix = @as(f64, @floatFromInt(s.started_real)) / 1e9;
     srv.recall = s.recall;
     if (args.loop_guard and !srv.info.loop_guard) {
         std.debug.print("tensorfold: --loop-guard is not supported by this native engine\n", .{});

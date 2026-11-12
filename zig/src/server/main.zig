@@ -98,6 +98,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
     const started = std.Io.Clock.awake.now(io).toNanoseconds();
+    const started_real = std.Io.Clock.real.now(io).toNanoseconds();
     var u: cli.Usage = .{};
     var args = cli.parse(a, argv[2..], &u) catch |e| switch (e) {
         error.Usage => {
@@ -154,6 +155,7 @@ pub fn main(init: std.process.Init) !u8 {
         .sampling = try sampling(a, io, dir, args),
         .environ = init.environ_map,
         .started = started,
+        .started_real = started_real,
         .quiesce = if (up.engine.quiesce) |q| .{ .call = q, .ctx = up.engine.ctx } else null,
         .identity = engines.identity(a, args),
         .forget_fail = if (comptime @import("build_options").slide_test_hooks) forgetFail(init.environ_map) else 0,

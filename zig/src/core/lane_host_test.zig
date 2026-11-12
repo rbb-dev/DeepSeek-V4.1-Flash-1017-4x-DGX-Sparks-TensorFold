@@ -383,27 +383,43 @@ test "a quiesce in a long prompt pass cancels it at its next chunk, and no queue
     try std.testing.expect(took_ms < 1000); // a chunk or two, not the pass's 5 s
 }
 
-test "a lane host fills prompts a chunk a round, serves their tokens, and cancels between chunks" {
+test "a prompt pass in flight shows its progress, and what it computed stays counted when it ends or is cancelled" {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
     defer cfg.deinit(gpa);
-    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 4 };
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
     defer target.deinit();
     var clock: lanes.fake.FixedClock = .{};
-    var core = lanes.Engine.init(gpa, &cfg, target.stepped(), clock.clock());
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
     defer core.deinit();
     var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
     try host.start();
     defer host.stop();
+    const e = host.engine();
+    // what /health and /metrics read while the pass runs: the fake's hook runs at a chunk's start, on the engine
+    // thread, after the chunks before it reported their rows
+    const Look = struct {
+        engine: api.Engine,
+        at: usize,
+        seen: ?api.Status = null,
+        cancel: ?Id = null,
+        fn call(ctx: *anyopaque, _: *lanes.Stream, chunk: usize) void {
+            const l: *@This() = @ptrCast(@alignCast(ctx));
+            if (chunk != l.at) return;
+            var st: api.Status = .{};
+            l.engine.status(&st, &.{});
+            l.seen = st;
+            if (l.cancel) |id| l.engine.cancel(id);
+        }
+    };
     const Box = struct {
         mutex: std.Io.Mutex = .init,
         done: ?Reason = null,
-        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
+        fn event(ctx: *anyopaque, _: Id, ev: *const Event) void {
             const b: *@This() = @ptrCast(@alignCast(ctx));
             b.mutex.lockUncancelable(std.testing.io);
             defer b.mutex.unlock(std.testing.io);
-            switch (e.*) {
-                .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
+            switch (ev.*) {
                 .finished => |f| b.done = f.reason,
                 else => {},
             }
@@ -418,88 +434,135 @@ test "a lane host fills prompts a chunk a round, serves their tokens, and cancel
             }
         }
     };
-    const prompts = [2][]const u32{ &.{ 3, 1, 4, 1, 5, 9, 2, 6 }, &.{ 2, 7, 1, 8, 2, 8 } };
-    var requests: [2]Request = undefined;
-    var boxes: [2]Box = .{ .{}, .{} };
-    defer for (&boxes) |*b| b.tokens.deinit(gpa);
-    const e = host.engine();
-    for (prompts, &requests, &boxes, 1..) |prompt, *r, *b, id| {
-        r.* = .{ .prompt = prompt, .max_tokens = 24 };
-        try e.submit(id, r, .{ .ctx = b, .event = Box.event });
-    }
-    for (prompts, &boxes) |prompt, *b| {
-        try std.testing.expectEqual(Reason.length, b.wait());
-        var history: std.ArrayList(u32) = .empty;
-        defer history.deinit(gpa);
-        try history.appendSlice(gpa, prompt);
-        for (b.tokens.items) |t| {
-            try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
-            try history.append(gpa, t);
-        }
-        try std.testing.expectEqual(@as(usize, 24), b.tokens.items.len);
-    }
-    try std.testing.expectEqual(@as(usize, 8), target.prefill_count);
+    var idle: api.Status = .{};
+    e.status(&idle, &.{});
+    try std.testing.expect(idle.prompt_pass == null);
+    try std.testing.expectEqual(@as(?u64, 0), idle.prompt_tokens_computed);
 
-    const CancelPrefill = struct {
-        engine: Engine,
-        id: Id,
-        at: usize,
+    const prompt = [_]u32{ 8, 6, 7, 5, 3, 0, 9, 2, 1, 4 };
+    const request: Request = .{ .prompt = &prompt, .max_tokens = 1 };
+    var look: Look = .{ .engine = e, .at = 2 };
+    target.prefill_chunks = 5; // two tokens a chunk
+    target.prefill_hook = Look.call;
+    target.prefill_hook_ctx = &look;
+    var first: Box = .{};
+    try e.submit(1, &request, .{ .ctx = &first, .event = Box.event });
+    try std.testing.expectEqual(Reason.length, first.wait());
+    const mid = look.seen.?;
+    const pass = mid.prompt_pass.?;
+    try std.testing.expectEqual(@as(u64, 4), pass.computed); // chunks 0 and 1
+    try std.testing.expectEqual(@as(u64, 10), pass.total);
+    try std.testing.expectEqual(@as(u64, 0), pass.resumed);
+    try std.testing.expectEqual(@as(?u64, 4), mid.prompt_tokens_computed);
+    try std.testing.expect(mid.prefill_tokens_per_second > 0); // the pass's speed so far, not 0 until it ends
+    var after: api.Status = .{};
+    e.status(&after, &.{});
+    try std.testing.expect(after.prompt_pass == null);
+    try std.testing.expectEqual(@as(?u64, 10), after.prompt_tokens_computed);
 
-        fn call(ctx: *anyopaque, _: *lanes.Stream, chunk: usize) void {
-            const c: *@This() = @ptrCast(@alignCast(ctx));
-            if (chunk == c.at) c.engine.cancel(c.id);
-        }
-    };
-    var chunked: Box = .{};
-    defer chunked.tokens.deinit(gpa);
-    var prefill_cancel = CancelPrefill{ .engine = e, .id = 3, .at = 1 };
-    target.prefill_chunks = 10;
-    target.prefill_count = 0;
-    target.prefill_hook = CancelPrefill.call;
-    target.prefill_hook_ctx = &prefill_cancel;
-    try e.submit(3, &requests[0], .{ .ctx = &chunked, .event = Box.event });
-    try std.testing.expectEqual(Reason.cancelled, chunked.wait());
-    try std.testing.expectEqual(@as(usize, 0), chunked.tokens.items.len);
-    try std.testing.expect(target.prefill_count <= 3);
-    try std.testing.expectEqual(@as(usize, 0), target.lanes.count());
+    // cancelled at its fourth chunk: the six tokens it computed stay in the counter, which never goes back
+    look.at = 3;
+    look.cancel = 2;
+    var second: Box = .{};
+    try e.submit(2, &request, .{ .ctx = &second, .event = Box.event });
+    try std.testing.expectEqual(Reason.cancelled, second.wait());
+    try std.testing.expectEqual(@as(?u64, 16), look.seen.?.prompt_tokens_computed);
+    var end: api.Status = .{};
+    e.status(&end, &.{});
+    try std.testing.expect(end.prompt_pass == null);
+    try std.testing.expectEqual(@as(?u64, 16), end.prompt_tokens_computed);
 }
 
-test "a lane host hands the backend the request's history and shared prefix lengths with its stream" {
+test "prompt passes taken a chunk at a time: /health follows the oldest, the counter every one, and a pass cancelled between its chunks stays counted" {
     const gpa = std.testing.allocator;
-    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
-    defer cfg.deinit(gpa);
-    var target: lanes.fake.Fake = .{ .gpa = gpa };
-    defer target.deinit();
-    var clock: lanes.fake.FixedClock = .{};
-    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
-    defer core.deinit();
-    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 1 });
-    try host.start();
-    defer host.stop();
-    const Seen = struct {
-        history: u32 = 0,
-        shared: [2]u32 = .{ 0, 0 },
-        done: std.atomic.Value(bool) = .init(false),
-        fn prefill(ctx: *anyopaque, s: *lanes.Stream, _: usize) void {
-            const seen: *@This() = @ptrCast(@alignCast(ctx));
-            seen.history = s.history_len;
-            @memcpy(seen.shared[0..s.shared_prefixes.len], s.shared_prefixes);
+    for ([_]bool{ false, true }) |cancel_long| {
+        var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+        defer cfg.deinit(gpa);
+        var target: lanes.fake.Fake = .{ .gpa = gpa };
+        defer target.deinit();
+        var clock: lanes.fake.FixedClock = .{};
+        var core = lanes.Engine.init(gpa, &cfg, target.chunkedBackend(), clock.clock()); // four prompt tokens a step
+        defer core.deinit();
+        var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+        const e = host.engine();
+        // what /health and /metrics read at the start of each of the long prompt's steps (on the engine thread, after
+        // the steps before it reported their rows)
+        const Look = struct {
+            engine: api.Engine,
+            seen: [4]?api.Status = @splat(null),
+            cancel_at: ?usize = null,
+            fn call(ctx: *anyopaque, s: *lanes.Stream, chunk: usize) void {
+                const l: *@This() = @ptrCast(@alignCast(ctx));
+                if (s.prompt_len != 16) return;
+                var st: api.Status = .{};
+                l.engine.status(&st, &.{});
+                l.seen[chunk] = st;
+                if (l.cancel_at == chunk) l.engine.cancel(1);
+            }
+        };
+        const Box = struct {
+            mutex: std.Io.Mutex = .init,
+            done: u32 = 0,
+            reasons: [2]?Reason = .{ null, null },
+            fn event(ctx: *anyopaque, id: Id, ev: *const Event) void {
+                const b: *@This() = @ptrCast(@alignCast(ctx));
+                b.mutex.lockUncancelable(std.testing.io);
+                defer b.mutex.unlock(std.testing.io);
+                switch (ev.*) {
+                    .finished => |f| {
+                        b.reasons[@intCast(id - 1)] = f.reason;
+                        b.done += 1;
+                    },
+                    else => {},
+                }
+            }
+            fn wait(b: *@This()) void {
+                while (true) {
+                    b.mutex.lockUncancelable(std.testing.io);
+                    const d = b.done;
+                    b.mutex.unlock(std.testing.io);
+                    if (d == 2) return;
+                    std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+                }
+            }
+        };
+        var look: Look = .{ .engine = e, .cancel_at = if (cancel_long) 2 else null };
+        target.prefill_hook = Look.call;
+        target.prefill_hook_ctx = &look;
+        var box: Box = .{};
+        const long: [16]u32 = @splat(3);
+        const short = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+        const long_request: Request = .{ .prompt = &long, .max_tokens = 2, .drafts = false };
+        const short_request: Request = .{ .prompt = &short, .max_tokens = 2, .drafts = false };
+        try e.submit(1, &long_request, .{ .ctx = &box, .event = Box.event });
+        try e.submit(2, &short_request, .{ .ctx = &box, .event = Box.event });
+        try host.start();
+        defer host.stop();
+        box.wait();
+        // the long prompt's second step: its first step (4 rows) and the short prompt's first (4 rows) are done; the
+        // pass reported is the long one, admitted first
+        const mid = look.seen[1].?;
+        const pass = mid.prompt_pass.?;
+        try std.testing.expectEqual(@as(u64, 4), pass.computed);
+        try std.testing.expectEqual(@as(u64, 16), pass.total);
+        try std.testing.expectEqual(@as(?u64, 8), mid.prompt_tokens_computed);
+        // the third step: the short prompt ended (8 rows counted), the long one stands at 8
+        const third = look.seen[2].?;
+        try std.testing.expectEqual(@as(u64, 8), third.prompt_pass.?.computed);
+        try std.testing.expectEqual(@as(?u64, 16), third.prompt_tokens_computed);
+        var end: api.Status = .{};
+        e.status(&end, &.{});
+        try std.testing.expect(end.prompt_pass == null);
+        if (cancel_long) {
+            // cancelled at its third step's start, between its chunks: the 12 rows it computed stay counted
+            try std.testing.expectEqual(Reason.cancelled, box.reasons[0].?);
+            try std.testing.expectEqual(@as(?u64, 8 + 12), end.prompt_tokens_computed);
+        } else {
+            try std.testing.expectEqual(Reason.length, box.reasons[0].?);
+            try std.testing.expectEqual(@as(?u64, 8 + 16), end.prompt_tokens_computed);
         }
-        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
-            const seen: *@This() = @ptrCast(@alignCast(ctx));
-            if (e.* == .finished) seen.done.store(true, .release);
-        }
-    };
-    var seen: Seen = .{};
-    target.prefill_hook = Seen.prefill;
-    target.prefill_hook_ctx = &seen;
-    const prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
-    const shared = [_]u32{ 2, 4 };
-    const request: Request = .{ .prompt = &prompt, .max_tokens = 2, .history_len = 6, .shared_prefixes = &shared };
-    try host.engine().submit(1, &request, .{ .ctx = &seen, .event = Seen.event });
-    while (!seen.done.load(.acquire)) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
-    try std.testing.expectEqual(@as(u32, 6), seen.history);
-    try std.testing.expectEqualSlices(u32, &shared, &seen.shared);
+        try std.testing.expectEqual(Reason.length, box.reasons[1].?);
+    }
 }
 
 test "the prefill yield: a round that fails between two chunks fails the filling request and every admitted one with its error" {

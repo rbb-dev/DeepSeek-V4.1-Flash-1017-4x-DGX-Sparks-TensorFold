@@ -135,6 +135,7 @@ pub const Fake = struct {
                 try got.value_ptr.history.appendSlice(x.gpa, kept.items);
                 s.cached = s.reuse.at;
             }
+            if (s.progress) |p| p.begin(s.cached); // the rows a backend reports as its chunks finish (Stream.progress)
         }
         const h = &got.value_ptr.history;
         const begin = h.items.len;
@@ -151,6 +152,7 @@ pub const Fake = struct {
             try h.append(x.gpa, t);
             if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(at));
         }
+        if (s.progress) |p| p.reach(end);
         if (x.pass_rule != null) try x.steps.append(x.gpa, .{ .prompt_len = s.prompt_len, .start = begin, .rows = end - begin, .facts = facts, .next = if (end < s.prompt_len) s.hostNext() else null, .decodes = x.decodes });
         return end == s.prompt_len;
     }
@@ -222,44 +224,15 @@ pub const Fake = struct {
             try got.value_ptr.history.appendSlice(x.gpa, kept.items);
             s.cached = s.reuse.at;
         }
+        // the rows a backend reports as its chunks finish (Stream.progress): from the kept state's end, evenly
         const resumed: usize = s.cached;
+        if (s.progress) |p| p.begin(resumed);
         for (0..chunks) |chunk| {
             x.prefill_count += 1;
             s.fill_at.store(@intCast(s.prompt_len * (chunk + 1) / chunks), .monotonic);
             if (x.prefill_hook) |hook| hook(x.prefill_hook_ctx.?, s, chunk);
             if (s.isCancelled()) return error.Cancelled;
-            if (s.yields()) return error.Yielded;
-        }
-        try x.fillPrompt(got.value_ptr, s);
-    }
-
-    fn prefillStep(ptr: *anyopaque, s: *Stream) anyerror!bool {
-        const x = self(ptr);
-        if (x.refuse_sampled and s.sampling != null) return error.SamplingRefused;
-        if (x.memory_lanes) |n| if (!x.lanes.contains(s) and x.lanes.count() >= n) return error.LaneMemory;
-        const got = try x.lanes.getOrPut(x.gpa, s);
-        if (got.found_existing and !got.value_ptr.filling) freeLane(x.gpa, got.value_ptr);
-        if (!got.found_existing or !got.value_ptr.filling) got.value_ptr.* = .{ .filling = true };
-        const l = got.value_ptr;
-        x.prefill_count += 1;
-        if (x.prefill_hook) |hook| hook(x.prefill_hook_ctx.?, s, l.filled);
-        if (s.isCancelled()) return error.Cancelled;
-        l.filled += 1;
-        s.fill_at.store(@intCast(s.prompt_len * l.filled / @max(1, x.prefill_chunks)), .monotonic);
-        if (l.filled < @max(1, x.prefill_chunks)) return false;
-        l.filling = false;
-        try x.fillPrompt(l, s);
-        return true;
-    }
-
-    /// The pass's end: the cache holds the prompt, from a kept state where one was restored.
-    fn fillPrompt(x: *Fake, l: *Lane, s: *Stream) !void {
-        const h = &l.history;
-        s.cached = 0;
-        if (s.reuse.saved) |saved| { // the kept state's tokens stand in for the prompt's first `at`
-            const kept: *std.ArrayList(u32) = @ptrCast(@alignCast(saved));
-            try h.appendSlice(x.gpa, kept.items);
-            s.cached = s.reuse.at;
+            if (s.progress) |p| p.reach(resumed + (s.prompt_len - resumed) * (chunk + 1) / chunks);
             // the host's turn between two chunks, as dsv41's prompt pass offers it: the prefill yield's round (TF_DS_PREFILL_YIELD's
             // stand-in, when a round would run), then the tier's service whether or not the round ran
             if (chunk + 1 < chunks) if (s.between) |b| {

@@ -16,10 +16,11 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
     if (srv.keys) |k| if (k.enabled()) return conn.sendJson(200, "{\"status\": \"ok\"}");
     routes.sendValue(conn, a, 200, try openHealth(srv, a, std.mem.indexOf(u8, conn.path, "reset_peak=1") != null));
     if (srv.keys) |k| if (k.enabled() and conn.key_label == null) return conn.sendJson(200, "{\"status\": \"ok\"}");
+    routes.sendValue(conn, a, 200, try healthValue(srv, a, std.mem.indexOf(u8, conn.path, "reset_peak=1") != null));
 }
 
-/// The open health body: model, lanes, memory and live counts, then whichever of release, backend and GPU it knows.
-pub fn openHealth(srv: *Server, a: Allocator, reset_peak: bool) !Value {
+/// What /health answers when keys are off (`reset_peak`: the request asked the engine to reset its memory peak).
+pub fn healthValue(srv: *Server, a: Allocator, reset_peak: bool) !Value {
     const o = try json.newObject(a);
     try o.put(a, "status", .{ .string = "ok" });
     try o.put(a, "model", .{ .string = srv.config.served_name });
@@ -31,6 +32,11 @@ pub fn openHealth(srv: *Server, a: Allocator, reset_peak: bool) !Value {
     var status: api.Status = .{};
     srv.engine.status(&status, &.{});
     try o.put(a, "warming", .{ .bool = status.warming });
+    if (srv.metrics.started_unix > 0) { // the process's start (unix seconds) and the seconds since
+        const now: f64 = @as(f64, @floatFromInt(std.Io.Clock.real.now(srv.io).toNanoseconds())) / 1e9;
+        try o.put(a, "started_at", .{ .float = srv.metrics.started_unix });
+        try o.put(a, "uptime_s", .{ .float = @max(0, now - srv.metrics.started_unix) });
+    }
     const memory = try json.newObject(a);
     if (srv.engine.memory(reset_peak)) |mem| {
         try memory.put(a, "active", try json.intValue(a, mem.active));
@@ -39,6 +45,9 @@ pub fn openHealth(srv: *Server, a: Allocator, reset_peak: bool) !Value {
         if (mem.limit) |limit| try memory.put(a, "limit", try json.intValue(a, limit));
     }
     try o.put(a, "memory", .{ .object = memory });
+    // an engine that keeps prompt states: the prompt tokens of finished requests restored from them (/metrics'
+    // prompt_tokens_cached_total), under the name TensorFold's Python server and sparkDash use
+    if (srv.info.prompt_cache) try o.put(a, "cached_tokens_total", try json.intValue(a, srv.metrics.cachedTotal(srv.io)));
     if (status.cache) |c| try putCache(a, o, c);
     if (srv.info.spill) |si| try putSpill(a, o, si, status.spill);
     try o.put(a, "live", try live.snapshot(a, srv.engine));
@@ -51,6 +60,9 @@ pub fn openHealth(srv: *Server, a: Allocator, reset_peak: bool) !Value {
         if (field[1].len > 0) try o.put(a, field[0], .{ .string = field[1] });
     return .{ .object = o };
 }
+
+/// The open health body under the name the merged-in tests use.
+pub const openHealth = healthValue;
 
 /// The prompt cache's counters, when its tier or grouping is on: the GLM engine's top-level names (chats_continued,
 /// chats_continued_prefill_tokens), then every

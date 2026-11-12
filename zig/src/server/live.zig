@@ -21,6 +21,19 @@ pub fn snapshot(a: Allocator, engine: api.Engine) Allocator.Error!json.Value {
     try o.put(a, "waiting", try json.intValue(a, status.waiting));
     try o.put(a, "decode_tokens_per_second", .{ .float = round1(status.decode_tokens_per_second) });
     try o.put(a, "prefill_tokens_per_second", .{ .float = round1(status.prefill_tokens_per_second) });
+    // an engine that follows its prompt passes: the one in flight (null between passes; while it runs, the prefill
+    // speed above is its speed so far) and the prompt tokens the passes computed
+    if (status.prompt_tokens_computed) |n| {
+        if (status.prompt_pass) |p| {
+            const q = try json.newObject(a);
+            try q.put(a, "computed", try json.intValue(a, p.computed));
+            try q.put(a, "total", try json.intValue(a, p.total));
+            try q.put(a, "resumed", try json.intValue(a, p.resumed));
+            try q.put(a, "seconds", .{ .float = round1(p.seconds) });
+            try o.put(a, "prompt_pass", .{ .object = q });
+        } else try o.put(a, "prompt_pass", .null);
+        try o.put(a, "prompt_tokens_computed_total", try json.intValue(a, n));
+    }
     return .{ .object = o };
 }
 
@@ -108,6 +121,47 @@ pub fn wanted(io: std.Io, no_live: bool) bool {
 test "status line" {
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("[tensorfold] 3 connections (1 waiting) \u{b7} decode 142 tok/s \u{b7} prefill 1,210 tok/s", line(&buf, .{ .running = 2, .waiting = 1, .decode_tokens_per_second = 142.2, .prefill_tokens_per_second = 1210.4 }));
+}
+
+test "/health's live block shows the prompt pass in flight, or null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const Stub = struct {
+        st: api.Status,
+        fn info(_: *anyopaque) api.Info {
+            return .{};
+        }
+        fn submit(_: *anyopaque, _: api.Id, _: *const api.Request, _: api.Sink) api.SubmitError!void {
+            unreachable;
+        }
+        fn cancel(_: *anyopaque, _: api.Id) void {}
+        fn status(ctx: *anyopaque, out: *api.Status, _: []u32) void {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            out.* = s.st;
+        }
+        fn memory(_: *anyopaque, _: bool) ?api.Memory {
+            return null;
+        }
+        fn engine(s: *@This()) api.Engine {
+            return .{ .ctx = s, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
+        }
+    };
+    var stub: Stub = .{ .st = .{ .running = 1, .prefill_tokens_per_second = 2930.04, .prompt_pass = .{ .computed = 61_440, .total = 120_000, .resumed = 8192, .seconds = 20.97 }, .prompt_tokens_computed = 1_000_000 } };
+    const busy = try snapshot(arena.allocator(), stub.engine());
+    const p = busy.get("prompt_pass").?;
+    try std.testing.expectEqualStrings("61440", p.get("computed").?.int);
+    try std.testing.expectEqualStrings("120000", p.get("total").?.int);
+    try std.testing.expectEqualStrings("8192", p.get("resumed").?.int);
+    try std.testing.expectEqual(@as(f64, 21.0), p.get("seconds").?.float);
+    try std.testing.expectEqual(@as(f64, 2930.0), busy.get("prefill_tokens_per_second").?.float);
+    try std.testing.expectEqualStrings("1000000", busy.get("prompt_tokens_computed_total").?.int);
+    stub.st.prompt_pass = null;
+    const idle = try snapshot(arena.allocator(), stub.engine());
+    try std.testing.expect(idle.get("prompt_pass").? == .null);
+    stub.st.prompt_tokens_computed = null; // an engine that does not follow its passes: /health as before
+    const other = try snapshot(arena.allocator(), stub.engine());
+    try std.testing.expect(other.get("prompt_tokens_computed_total") == null);
+    try std.testing.expect(other.get("prompt_pass") == null);
 }
 
 test "commas" {
