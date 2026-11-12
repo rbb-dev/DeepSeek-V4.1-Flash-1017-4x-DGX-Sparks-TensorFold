@@ -1,3 +1,13 @@
+//! Where this rank's host is, for the failure that names it: a transport's watchdog that fires says only which class and peer it
+//! waited for, not what the host was doing meanwhile. A host that waits for something (the prompt passes' issue gate, the
+//! transport's scheduling ring) writes its place on entering and puts the previous one back on leaving (three atomics, no lock);
+//! whoever reports a failure reads them, from any thread.
+const std = @import("std");
+
+pub const Place = enum(u8) {
+    main_loop, // outside any wait named here
+    issue_gate, // asleep at the issue gate for the GPU to start a layer (a = layers started, b = layers issued)
+    roci_reserve, // waiting for the transport's scheduling ring to drain before a send (a = the class)
     round, // rank 0 inside a decode round's verify call (a = windows)
     frame, // a follower running a frame from its main loop (a = frame kind, b = step)
     after_backend, // rank 0 back from a backend call (a round, a drafter pass) inside the lane core: committing tokens, delivering, choosing the next step
@@ -11,6 +21,39 @@
     idle_ack, // rank 0 waiting for every follower's ready, then committing the world-wide idle boundary
     link_send, // in a blocking send to a rank (a full socket under backpressure holds it)
     link_recv, // in a blocking receive from a rank
+};
+
+pub const Mark = struct { place: Place, a: u32, b: u32, since_ns: u64 };
+
+var place_v: std.atomic.Value(u8) = .init(0);
+var a_v: std.atomic.Value(u32) = .init(0);
+var b_v: std.atomic.Value(u32) = .init(0);
+var since_v: std.atomic.Value(u64) = .init(0);
+
+fn nowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+pub fn set(p: Place, a: u32, b: u32) void {
+    a_v.store(a, .monotonic);
+    b_v.store(b, .monotonic);
+}
+
+pub fn get() Mark {
+}
+
+/// The one thread whose waits are the host's place (0: none claimed, any thread writes). A failure's line names where THE ENGINE
+/// THREAD was; a wait on another thread (one on the transport's scheduling ring) must not leave
+/// its place, or take the engine thread's, in that line.
+var owner: std.atomic.Value(u64) = .init(0);
+
+/// The calling thread's waits are the host's place from now on.
+pub fn claim() void {
+    owner.store(@intCast(std.Thread.getCurrentId()), .release);
+}
+
 /// This thread's id, asked of the kernel once (a gettid call on every mark would be a syscall on the hot path).
 threadlocal var my_id: u64 = 0;
 
@@ -19,7 +62,34 @@ fn thisThread() u64 {
     return my_id;
 }
 
+fn mine() bool {
+    const o = owner.load(.acquire);
     return o == 0 or o == thisThread();
+}
+
+/// What `enter` replaced: `leave` puts it back, and only if `enter` wrote.
+pub const Held = struct { prev: Mark, wrote: bool };
+
+/// The place `set` replaced is put back by `leave`, so a wait inside another place names itself and then hands the place back. Called
+/// from a thread other than the owner it changes nothing.
+pub fn enter(p: Place, a: u32, b: u32) Held {
+    if (!mine()) return .{ .prev = get(), .wrote = false };
+    const prev = get();
+    set(p, a, b);
+    return .{ .prev = prev, .wrote = true };
+}
+
+pub fn leave(h: Held) void {
+    if (h.wrote) set(h.prev.place, h.prev.a, h.prev.b);
+}
+
+/// The mark in words, `now_ns` being the reader's clock.
+pub fn describe(buf: []u8, m: Mark, now_ns: u64) []const u8 {
+    const ms = if (now_ns > m.since_ns and m.since_ns != 0) (now_ns - m.since_ns) / std.time.ns_per_ms else 0;
+    const text = switch (m.place) {
+        .main_loop => std.fmt.bufPrint(buf, "outside any named wait, for {d} ms", .{ms}),
+        .issue_gate => std.fmt.bufPrint(buf, "asleep at the issue gate for the GPU to start a layer (layers started {d}, issued {d}), for {d} ms", .{ m.a, m.b, ms }),
+        .roci_reserve => std.fmt.bufPrint(buf, "waiting for the transport's scheduling ring before a send (class {d}), for {d} ms", .{ m.a, ms }),
         .round => std.fmt.bufPrint(buf, "inside a decode round's verify call ({d} windows), for {d} ms", .{ m.a, ms }),
         .frame => std.fmt.bufPrint(buf, "running a frame from its main loop (kind {d}, step {d}), for {d} ms", .{ m.a, m.b, ms }),
         .after_backend => std.fmt.bufPrint(buf, "in the lane core after a backend call (committing, delivering, choosing the next step), for {d} ms", .{ms}),
@@ -33,6 +103,10 @@ fn thisThread() u64 {
         .idle_ack => std.fmt.bufPrint(buf, "waiting for every follower's idle ack, for {d} ms", .{ms}),
         .link_send => std.fmt.bufPrint(buf, "in a blocking send to a rank, for {d} ms", .{ms}),
         .link_recv => std.fmt.bufPrint(buf, "in a blocking receive from a rank, for {d} ms", .{ms}),
+    } catch buf[0..0];
+    return text;
+}
+
 // -- the frames this rank sent and took last ----------------------------------------------------------------------------
 
 const journal_len = 16;
@@ -78,6 +152,61 @@ pub fn joinThread(th: std.Thread) void {
     th.join();
 }
 
+/// This rank's place in words now.
+pub fn now(buf: []u8) []const u8 {
+    return describe(buf, get(), nowNs());
+}
+
+test "the place is set from one thread and described from another, with how long the host has been there" {
+    set(.issue_gate, 17, 27);
+    const m = get();
+    try std.testing.expectEqual(Place.issue_gate, m.place);
+    var buf: [200]u8 = undefined;
+    const l = describe(&buf, m, m.since_ns + 5_100 * std.time.ns_per_ms);
+    try std.testing.expectEqualStrings("asleep at the issue gate for the GPU to start a layer (layers started 17, issued 27), for 5100 ms", l);
+    // a second set in the same place keeps the time it began; another place restarts it
+    const t0 = get().since_ns;
+    set(.issue_gate, 18, 28);
+    try std.testing.expectEqual(t0, get().since_ns);
+    set(.roci_reserve, 3, 0);
+    try std.testing.expect(get().since_ns >= t0);
+    try std.testing.expectEqualStrings("waiting for the transport's scheduling ring before a send (class 3), for 0 ms", describe(&buf, .{ .place = .roci_reserve, .a = 3, .b = 0, .since_ns = 0 }, 99));
+    set(.main_loop, 0, 0);
+}
+
+test "enter names a wait and leave hands the place back, nested waits included" {
+    set(.main_loop, 0, 0);
+    const outer = enter(.issue_gate, 4, 9);
+    try std.testing.expectEqual(Place.issue_gate, get().place);
+    const inner = enter(.roci_reserve, 2, 0);
+    try std.testing.expectEqual(Place.roci_reserve, get().place);
+    leave(inner);
+    try std.testing.expectEqual(Place.issue_gate, get().place);
+    try std.testing.expectEqual(@as(u32, 9), get().b);
+    leave(outer);
+    try std.testing.expectEqual(Place.main_loop, get().place);
+}
+
+test "only the owner thread's waits are the host's place: another thread enters and leaves without a trace" {
+    set(.main_loop, 0, 0);
+    claim();
+    defer owner.store(0, .release);
+    const outer = enter(.issue_gate, 4, 9);
+    try std.testing.expect(outer.wrote);
+    const T = struct {
+        fn run() void {
+            const h = enter(.roci_reserve, 7, 0); // (the Engram worker's lane in the scheduling ring)
+            std.testing.expect(!h.wrote) catch @panic("a thread that is not the owner wrote the place");
+            leave(h);
+        }
+    };
+    const th = try std.Thread.spawn(.{}, T.run, .{});
+    th.join();
+    try std.testing.expectEqual(Place.issue_gate, get().place);
+    try std.testing.expectEqual(@as(u32, 9), get().b);
+    leave(outer);
+    try std.testing.expectEqual(Place.main_loop, get().place);
+}
 
 test "the frame journal keeps the last 16 frames oldest first, and the report joins the place, the frames and the socket head" {
     for (0..20) |i| frame(if (i % 2 == 0) 'S' else 'T', @intCast(3 + i % 2), 100 + i);

@@ -96,6 +96,11 @@ pub const Event = struct {
         return .{ .d = d, .handle = e };
     }
 
+    /// An ordering-only event whose wait always sleeps (CU_EVENT_BLOCKING_SYNC), whatever TF_DS_CUDA_EVENTS says: for the
+    /// events a host thread waits on for long (the prompt passes' issue lead), where a busy-wait would be the spin the wait is for.
+    pub fn initBlocking(d: *const Driver) Error!Event {
+        var e: abi.Event = null;
+        try d.check(d.api.cuEventCreate(&e, abi.event_disable_timing | abi.event_blocking_sync), "cuEventCreate");
         return .{ .d = d, .handle = e };
     }
 
@@ -154,4 +159,12 @@ test "TF_DS_CUDA_EVENTS: every event is made with the flags Context.init read, t
     try std.testing.expectEqual(abi.event_disable_timing | abi.event_blocking_sync, Fake.flags);
     _ = try Event.init(&driver, true);
     try std.testing.expectEqual(abi.event_blocking_sync, Fake.flags);
+
+    // the issue lead's events sleep whatever the setting says
+    context.event_flags = 0;
+    _ = try Event.initBlocking(&driver);
+    try std.testing.expectEqual(abi.event_disable_timing | abi.event_blocking_sync, Fake.flags);
+    context.event_flags = abi.event_blocking_sync;
+    _ = try Event.initBlocking(&driver);
+    try std.testing.expectEqual(abi.event_disable_timing | abi.event_blocking_sync, Fake.flags);
 }

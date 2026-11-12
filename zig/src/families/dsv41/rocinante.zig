@@ -681,6 +681,10 @@ pub const Settings = struct {
     janitor_ms: u32 = 100,
 };
 
+/// The host's place in words (where.zig), set by the engine: a failure's line says where this rank's host was.
+pub var host_place: ?*const fn (buf: []u8) []const u8 = null;
+const where = @import("where.zig");
+
 pub const FailReason = enum(u8) { none = 0, post, stamp, qp, watchdog, peer, host_wait, refused };
 
 /// A spin lock over the sibling ring's links (one for the process: lanes close and fail rarely, and `check` holds it for two loads).
@@ -929,6 +933,8 @@ pub const Transport = struct {
         // reaches the doorbells), and a transport that does not advance in `dead_ms` has failed
         if (t.ticket -% t.doneMin() >= sched_len / 2) {
             const t0 = nowNs();
+            const prev_place = where.enter(.roci_reserve, @as(u32, @backingInt(class)), 0);
+            defer where.leave(prev_place);
             while (t.ticket -% t.doneMin() >= sched_len / 2) {
                 try t.check();
                 if (nowNs() - t0 > t.set.dead_ms * std.time.ns_per_ms) {
@@ -1103,7 +1109,11 @@ pub const Transport = struct {
         if (t.failed.cmpxchgStrong(0, @backingInt(reason), .acq_rel, .acquire) != null) return;
         _ = t.failing.fetchAdd(1, .acq_rel);
         defer _ = t.failing.fetchSub(1, .acq_rel);
+        // the failure names itself, once the engine has said where its host is: what was waited for, and where this rank's host was
+        if (host_place) |f| {
             var pb: [640]u8 = undefined;
+            std.log.err("ROCI failed on node {d}: {s}, class {s}, peer {d}; this rank's host was {s}", .{ t.g, @tagName(reason), @tagName(class), peer, f(&pb) });
+        }
         t.fail_class.store(@backingInt(class), .monotonic);
         t.fail_peer.store(peer, .monotonic);
         @atomicStore(u64, &t.ctl.abort.v, 1, .release);
@@ -1404,4 +1414,20 @@ comptime {
     // the control block's lines: the doorbell and the abort never share one with a counter the NIC writes
     std.debug.assert(@sizeOf(Word) == line and @alignOf(Word) == line);
     std.debug.assert(@offsetOf(Control, "sched") % line == 0);
+}
+
+test "a transport's failure line names the reason, the class, the peer and where this rank's host was, and the reserve wait names itself" {
+    const src = @embedFile("rocinante.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"a transport's failure line names") orelse return error.TestUnexpectedResult];
+    const at = std.mem.indexOf(u8, code, "pub fn fail(t: *Transport, reason: FailReason, class: Class, peer: u8) void {").?;
+    const body = code[at .. at + 1100];
+    try std.testing.expect(std.mem.indexOf(u8, body, "std.log.err(\"ROCI failed on node {d}: {s}, class {s}, peer {d}; this rank's host was {s}\"") != null);
+    // printed once, by whoever fails first (after the first-failure swap), before the abort is stored
+    try std.testing.expect(std.mem.indexOf(u8, body, "std.log.err").? > std.mem.indexOf(u8, body, "cmpxchgStrong").?);
+    try std.testing.expect(std.mem.indexOf(u8, body, "std.log.err").? < std.mem.indexOf(u8, body, "ctl.abort.v, 1").?);
+    // the half-ring wait is a named place, left when the wait ends
+    const r = code[std.mem.indexOf(u8, code, "fn reserveEntry(").?..];
+    const wait = r[0..std.mem.indexOf(u8, r, "t.ticket += 1;").?];
+    try std.testing.expect(std.mem.indexOf(u8, wait, "const prev_place = where.enter(.roci_reserve,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wait, "defer where.leave(prev_place);") != null);
 }

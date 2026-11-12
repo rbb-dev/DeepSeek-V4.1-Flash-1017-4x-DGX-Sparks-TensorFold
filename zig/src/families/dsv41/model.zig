@@ -61,7 +61,10 @@ const ring2d = @import("ring2d.zig");
 const roci_engine = @import("roci_engine.zig");
 const roci_pair = @import("roci_pair.zig");
 const pair_spans = @import("pair_spans.zig");
+const issue_lead = @import("issue_lead.zig");
 const keep_ahead = @import("keep_ahead.zig");
+const where = @import("where.zig");
+const rocinante_mod = @import("rocinante.zig");
 const pack_epilogue = @import("pack_epilogue.zig");
 const pass_meter = @import("pass_meter.zig");
 const engram_partner = @import("engram_partner.zig");
@@ -1753,12 +1756,62 @@ fn openPair(m: *Model, gpa: std.mem.Allocator, d: *const cuda.Driver, o: Options
     std.log.info("TF_DS_ROCI_STAGGER=1: rank {d}: {d} whole passes of {d} rows in flight (TF_DS_ROCI_STAGGER_LANES), the later's layer L after the earlier's layer L caches, issue gap {d} layers (TF_DS_ROCI_STAGGER_GAP), stream priorities A {d} and B {d} (TF_DS_ROCI_STAGGER_PRIO={d}; a lower number is more urgent), the Engram worker's order {s} (TF_DS_ROCI_WORKER_PAIR_MAJOR); the second pass's chunk and node take {d} bytes of the device arena, its transport's arena {d} bytes and control block {d} bytes; {d} bytes free before, {d} after; the Engram worker's ring holds {d} chunk slots of {d} rows, a pass takes {d}; the KV pool holds {d} positions ({d:.2} GiB on this Spark, POOL) and the floor kept free is {d:.1} GiB", .{ m.comm.rank, m.pair_lanes, m.pass_rows, m.pair_gap, m.stream.priority() catch -99, m.stream_b.?.priority() catch -99, @backingInt(m.pair_prio), if (m.pair_major) "pair-major (both passes' layer 0, then both layer 1)" else "pass-major (each pass's layers in turn)", m.pair_bytes, lay.total, @sizeOf(@import("rocinante.zig").Control), free, after.free, m.workerSlots(), chunk_rows, m.pass_rows / chunk_rows, m.pool_cap, @as(f64, @floatFromInt(poolView(m, c).bytes(m.pool_cap))) / (1 << 30), @as(f64, @floatFromInt(pair_guard_bytes)) / (1 << 30) });
 }
 
+/// How the issue lead's events are made and destroyed (issue_lead.Events).
+const LeadEvents = struct {
+    d: *const cuda.Driver,
+    pub fn create(c: LeadEvents) !cuda.Event {
+        return cuda.Event.initBlocking(c.d);
+    }
+    pub fn destroy(c: LeadEvents, e: *cuda.Event) void {
+        _ = c;
+        e.deinit();
+    }
+};
+
+/// What the polled wait does each slice (issue_lead.pollWait): nap, look at the transports, return the Engram worker's slots (they
+/// go back only when the engine thread polls them, and the worker sits idle waiting for them), say so when the wait is long.
+const LeadWait = struct {
+    m: *Model,
+    g: *issue_lead.Gate,
+    t0: u64,
+    dl: issue_lead.Deadline,
     /// The next nap in microseconds (0: the setting's slice); `backoff` doubles it each empty wake up to issue_lead.backoff_cap_us.
     cur_us: u32 = 0,
+
+    pub fn nap(c: *LeadWait) !void {
         if (c.cur_us == 0) c.cur_us = c.m.ilead_slice_us;
         const ts: std.c.timespec = .{ .sec = 0, .nsec = @as(isize, c.cur_us) * std.time.ns_per_us };
+        _ = std.c.nanosleep(&ts, null);
         if (c.m.ilead_wait == .backoff) c.cur_us = issue_lead.backoffNext(c.cur_us, issue_lead.backoff_cap_us);
+    }
+
+    pub fn check(c: *LeadWait) !void {
+        try c.m.leadCheck();
+        c.late();
+    }
+
+    pub fn service(c: *LeadWait) !void {
+        if (c.m.eh) |*eh| try prompt.engramPoll(eh);
+    }
+
+    pub fn done(c: *LeadWait, slot: usize) !bool {
+        return try c.m.ilead_ev.ev[slot].?.done();
+    }
+
+    /// One line (never fatal) once the wait has lasted TF_DS_ISSUE_LEAD_WARN_MS, then at most every 5 s: where the host is.
+    fn late(c: *LeadWait) void {
+        const now = c.m.now();
+        if (!c.dl.due(now -| c.t0, now)) return;
+        var pb: [256]u8 = undefined;
+        std.log.warn("TF_DS_ISSUE_LEAD: rank {d}: asleep at the issue gate for {d} ms waiting for the GPU to start a layer ({d} started, {d} issued, {d} queued); this rank's host was {s}", .{ c.m.comm.rank, (now -| c.t0) / std.time.ns_per_ms, c.g.startedCount(), c.g.issued, c.g.ahead(), where.now(&pb) });
+    }
+};
+
+/// The host's place for a transport's failure line.
+fn hostPlace(buf: []u8) []const u8 {
     return where.report(buf);
+}
+
 /// One line of TF_DS_ROCI_PAIR_LOG: to the log, and appended to the file the variable names when its value is a path.
 fn pairLog(comptime fmt: []const u8, args: anytype) void {
     std.log.info(fmt, args);
@@ -1950,6 +2003,18 @@ pub const Model = struct {
     pair_log: bool = false, // TF_DS_ROCI_PAIR_LOG: one line a pair (a value starting with / also appends them to that file on rank 0)
     pair_gap: usize = roci_pair.gap,
     pair_prio: roci_pair.Prio = .equal, // TF_DS_ROCI_STAGGER_PRIO
+    // TF_DS_ISSUE_LEAD: the gate over the prompt passes' layers and the events at their starts (made once, in open; null: off)
+    ilead: ?issue_lead.Gate = null,
+    ilead_ev: issue_lead.Events(cuda.Event) = .{},
+    // the prompt so far (reset at its admission): the engine thread's CPU and wall over the passes' calls, and the host time between them
+    ps_cpu: u64 = 0,
+    ps_wall: u64 = 0,
+    ps_gap: u64 = 0,
+    ps_end: u64 = 0, // the wall clock at the end of the last call (0: none yet)
+    ilead_log: bool = false, // TF_DS_ROCI_PAIR_LOG: one line a pass or pair (its engine-thread CPU against wall, and the gate's counters)
+    ilead_wait: issue_lead.Wait = .poll, // TF_DS_ISSUE_LEAD_WAIT
+    ilead_slice_us: u32 = issue_lead.slice_default_us, // TF_DS_ISSUE_LEAD_SLICE_US
+    ilead_warn_ms: u32 = issue_lead.warn_default_ms, // TF_DS_ISSUE_LEAD_WARN_MS
     pair_major: bool = false, // TF_DS_ROCI_WORKER_PAIR_MAJOR
     partner_rc: ?*roci_engine.Roci = null, // TF_DS_ENGRAM_PARTNER: the host lane to the column partner, and the worker's side of the exchange
     partner_link: ?*engram_partner.Link = null,
@@ -2213,6 +2278,16 @@ pub const Model = struct {
         m.span_slot = null;
         m.pair_log = false;
         m.keep_ahead = false;
+        m.ilead = null;
+        m.ilead_ev = .{};
+        m.ps_cpu = 0;
+        m.ps_wall = 0;
+        m.ps_gap = 0;
+        m.ps_end = 0;
+        m.ilead_log = std.c.getenv("TF_DS_ROCI_PAIR_LOG") != null; // (every rank, the gate on or off: the control's CPU against wall)
+        m.ilead_wait = .poll;
+        m.ilead_slice_us = issue_lead.slice_default_us;
+        m.ilead_warn_ms = issue_lead.warn_default_ms;
         m.pair_gap = roci_pair.gap;
         m.pair_prio = .equal;
         m.pair_major = false;
@@ -2268,9 +2343,45 @@ pub const Model = struct {
         // TF_DS_WINDOW_ONCE (on unless 0): a chunk uploads its window indices and low position once, not in every layer. Bytes unchanged.
         prompt.window_once = prompt.windowOnceWanted(if (std.c.getenv("TF_DS_WINDOW_ONCE")) |v| std.mem.span(v) else null);
         std.log.info("TF_DS_WINDOW_ONCE={s}: rank {d}: a prompt chunk's window gather indices, window low position and ring-write indices are uploaded {s}", .{ if (prompt.window_once) "1" else "0", o.rank, if (prompt.window_once) "once per chunk, into buffers of their own" else "in every layer, as before" });
+        // TF_DS_ISSUE_LEAD: a prompt pass queues at most n layers ahead of the GPU. Rank-local (no frame or exchange depends on it:
+        // the gate only delays an issue), so a rank with another lead is slower or faster, never different.
+        const lead_ev_ctx = LeadEvents{ .d = d };
+        errdefer m.ilead_ev.free(lead_ev_ctx);
+        const lead_text: ?[]const u8 = if (std.c.getenv("TF_DS_ISSUE_LEAD")) |v| std.mem.span(v) else null;
+        switch (issue_lead.setting(lead_text)) {
+            .off => if (lead_text != null and std.mem.trim(u8, lead_text.?, " \t\r\n").len > 0)
+                std.log.info("TF_DS_ISSUE_LEAD=0 off: rank {d}: a prompt pass is issued as far ahead of the GPU as the launch queue lets it (the host spins inside the driver when the queue is full)", .{o.rank})
+            else
+                std.log.info("TF_DS_ISSUE_LEAD off (not set): rank {d}: a prompt pass is issued as far ahead of the GPU as the launch queue lets it (the host spins inside the driver when the queue is full)", .{o.rank}),
+            .invalid => std.log.warn("TF_DS_ISSUE_LEAD={s}: not a setting (0, or 1 to 31 layers): off", .{lead_text.?}),
+            .on => |n| {
+                try m.ilead_ev.make(lead_ev_ctx);
+                m.ilead = issue_lead.Gate.init(n);
+                const wait_text: ?[]const u8 = if (std.c.getenv("TF_DS_ISSUE_LEAD_WAIT")) |v| std.mem.span(v) else null;
+                m.ilead_wait = issue_lead.waitSetting(wait_text) orelse blk: {
                     std.log.warn("TF_DS_ISSUE_LEAD_WAIT={s}: not a mode (poll, block or backoff): poll", .{wait_text.?});
+                    break :blk .poll;
+                };
+                const slice_text: ?[]const u8 = if (std.c.getenv("TF_DS_ISSUE_LEAD_SLICE_US")) |v| std.mem.span(v) else null;
+                m.ilead_slice_us = issue_lead.sliceSetting(slice_text) orelse blk: {
+                    std.log.warn("TF_DS_ISSUE_LEAD_SLICE_US={s}: not a setting (1 to 100000 microseconds): {d}", .{ slice_text.?, issue_lead.slice_default_us });
+                    break :blk issue_lead.slice_default_us;
+                };
+                const warn_text: ?[]const u8 = if (std.c.getenv("TF_DS_ISSUE_LEAD_WARN_MS")) |v| std.mem.span(v) else null;
+                m.ilead_warn_ms = issue_lead.warnSetting(warn_text) orelse blk: {
+                    std.log.warn("TF_DS_ISSUE_LEAD_WARN_MS={s}: not a setting (0, or 1 to 3600000 milliseconds): {d}", .{ warn_text.?, issue_lead.warn_default_ms });
+                    break :blk issue_lead.warn_default_ms;
+                };
+                var how_buf: [420]u8 = undefined;
+                const how = (if (m.ilead_wait == .block)
+                    std.fmt.bufPrint(&how_buf, "one blocking-sync wait (TF_DS_ISSUE_LEAD_WAIT=block; the transport is checked and the Engram worker's slots returned before and after it, not during), a wait over {d} ms logged when it ends (TF_DS_ISSUE_LEAD_WARN_MS, 0: never)", .{m.ilead_warn_ms})
                 else if (m.ilead_wait == .backoff)
                     std.fmt.bufPrint(&how_buf, "naps that start at {d} us and double each empty wake up to {d} us (TF_DS_ISSUE_LEAD_WAIT=backoff), the transport checked and the Engram worker's slots returned every wake, a wait over {d} ms logged every 5 s (TF_DS_ISSUE_LEAD_WARN_MS, 0: never)", .{ m.ilead_slice_us, issue_lead.backoff_cap_us, m.ilead_warn_ms })
+                else
+                    std.fmt.bufPrint(&how_buf, "slices of {d} us, the transport checked and the Engram worker's slots returned every slice (TF_DS_ISSUE_LEAD_WAIT=poll, TF_DS_ISSUE_LEAD_SLICE_US), a wait over {d} ms logged every 5 s (TF_DS_ISSUE_LEAD_WARN_MS, 0: never)", .{ m.ilead_slice_us, m.ilead_warn_ms })) catch "slices";
+                std.log.info("TF_DS_ISSUE_LEAD={d}: rank {d}: a prompt pass queues at most {d} layers ahead of the GPU (an event at the start of each layer, the host asleep on the oldest while the lead is at its bound, not inside a full launch queue), waiting in {s}; decode rounds and the drafter are not gated", .{ n, o.rank, n, how });
+            },
+        }
         // rank 0's ports for its followers listen before its weights load: a follower that loads first connects and
         // waits in its port's backlog instead of retrying until rank 0 and the followers before it are in
         m.fan = try prompt2d.Fan.listenAt(o.master, o.listen, o.port, o.rank, o.world);
@@ -3644,6 +3755,10 @@ pub const Model = struct {
     pub fn fillBegin(m: *Model, slot: usize, base: usize) !void {
         try m.pairJoin();
         m.fill_t0 = m.now();
+        m.ps_cpu = 0;
+        m.ps_wall = 0;
+        m.ps_gap = 0;
+        m.ps_end = 0;
         m.pair_in_fill = 0;
         if (m.eh) |*eh| eh.ka.newPrompt();
         if (m.erows) |r| m.dup_fill = .{ r.dup_misses.load(.monotonic), r.dup_unique.load(.monotonic) };
@@ -3776,6 +3891,8 @@ pub const Model = struct {
             }
         }
         var engram_pre: ?usize = null;
+        const clock = m.leadBegin();
+        defer m.leadReport("pass", start, clock);
         for (0..c.layers) |li| {
             try m.issueLead(e.s);
             // TF_DS_ROCI_ENGRAM_AHEAD: the next layer's Engram, when it runs its sums on the transport at owned rows, starts here
@@ -3856,27 +3973,102 @@ pub const Model = struct {
         return true;
     }
 
+    /// TF_DS_ISSUE_LEAD: before a layer of a prompt pass is issued on `s`, the layers the GPU has started are counted, and while
+    /// `lead` layers are queued the host sleeps on the oldest one's start event (made blocking) instead of filling the launch queue.
+    /// The layer's own start event is then recorded on `s`, behind everything issued on it so far, so it fires when the GPU begins
+    /// the layer. Called between a layer's issue and the next, never between a transport's ticket and its launch.
+    fn issueLead(m: *Model, s: cuda.Stream) !void {
+        const g = if (m.ilead) |*x| x else return;
+        const Ctx = struct {
+            m: *Model,
+            g: *issue_lead.Gate,
+            pub fn done(c: @This(), slot: usize) !bool {
+                return try c.m.ilead_ev.ev[slot].?.done();
+            }
+            pub fn sleep(c: @This(), gate: *issue_lead.Gate) !issue_lead.Slept {
+                const prev_place = where.enter(.issue_gate, @intCast(gate.startedCount()), @intCast(gate.issued));
+                defer where.leave(prev_place);
+                const t0 = c.m.now();
+                var w = LeadWait{ .m = c.m, .g = gate, .t0 = t0, .dl = .{ .warn_ns = @as(u64, c.m.ilead_warn_ms) * std.time.ns_per_ms } };
+                var slices: u64 = 0;
+                switch (c.m.ilead_wait) {
+                    .block => {
+                        try w.service();
+                        try c.m.ilead_ev.ev[gate.oldest().?].?.synchronize();
+                        try c.m.leadCheck();
+                        try w.service();
+                        w.late();
+                    },
                     .poll, .backoff => slices = try issue_lead.pollWait(gate, &w),
                 }
-                if (eh.ahead_err) |err| return err;
-                try prompt.engramApply(e, ch, eh, li, seq);
-                const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)).?;
-                const ne = @min(2, c.engram_layers.slice().len);
-                if (j + 1 < ne) {
-                    if (!eh.ahead_ready[j + 1])
-                        ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, j + 1 }) catch null;
-                } else if (m.fill_seq.len > start + n and m.fill_seq.ptr == seq.ptr) {
-                    // the next chunk's rows while this one's layers run
-                    const nn = @min(m.next_rows, m.fill_seq.len - start - n);
-                    eh.ahead_start = start + n;
-                    eh.ahead_n = nn;
-                    eh.ahead_ready = .{ false, false };
-                    eh.ahead_err = null;
-                    m.ahead = std.Thread.spawn(.{}, prompt.engramReadAheadAll, .{ eh, c, m.fill_seq[0 .. start + n + nn], start + n, nn }) catch null;
+                return .{ .ns = c.m.now() - t0, .slices = slices };
+            }
+        };
+        const slot = try g.enter(Ctx{ .m = m, .g = g });
+        try m.ilead_ev.ev[slot].?.record(s);
+    }
+
+    /// Whether this rank's transport lanes or decode rings have failed. A failure stores the abort value into every word a GPU wait
+    /// is queued on, which releases them all: a round after it computes on whatever the buffers hold and would hand rank 0's lane
+    /// core tokens to deliver (test #148 step C: 99 outputs after the failure). Rank 0's rounds ask before they send a frame and
+    /// before they read what the GPU computed; the lead gate asks while it waits.
+    pub fn checkTransport(m: *Model) !void {
+        try m.leadCheck();
+        if (m.partner_rc) |rc| try rc.t.check();
+        if (m.ring) |r| if (r.failure() != null) return error.RingFailed;
+        if (m.rdma_rings) |rs| for ([_]?*rdma.Ring{ rs.all4, rs.col, rs.pair }) |y| if (y) |r| if (r.failure() != null) return error.RingFailed;
+    }
+
+    /// A failed transport seen from the gate's wait: the host asleep for the GPU would otherwise never look (an exchange that does
+    /// not go through the transport has no release when it fails).
+    fn leadCheck(m: *Model) !void {
+        if (m.two) |*t| if (t.rc) |rc| try rc.t.check();
+        if (m.two_b) |*t| if (t.rc) |rc| try rc.t.check();
         if (m.two_c) |*t| if (t.rc) |rc| try rc.t.check();
+    }
+
+    /// The engine thread's wall and CPU time at a pass's start or end (read once each, never in a loop; zero without the log).
+    const PassClock = struct { wall: u64 = 0, cpu: u64 = 0 };
+
+    fn passClock(m: *const Model) PassClock {
+        if (!m.ilead_log) return .{};
+        return .{ .wall = m.now(), .cpu = pair_nap.cpuNow() };
+    }
+
+    /// A pass's or pair's call begins: the host time since the last call ended is added to the prompt's gap, and the gate's next entry
+    /// is marked as the first layer of a pass. Returns the clocks `leadReport` ends with.
+    fn leadBegin(m: *Model) PassClock {
+        if (m.ilead) |*g| {
+            where.claim(); // (the engine thread's waits are the host's place)
+            g.beginPass();
+        }
+        const t = m.passClock();
+        if (m.ilead_log and m.ps_end != 0) m.ps_gap += t.wall -| m.ps_end;
+        return t;
+    }
+
+    /// One line of the pair log (TF_DS_ROCI_PAIR_LOG) a pass or a pair, on every rank, the gate on or off: the engine thread's CPU
+    /// time against wall over the call (the ratio is 1.00 while the thread spins in a full launch queue), and, with the gate, the
+    /// host's sleep in slices and the layers it entered with nothing queued behind the one the GPU was running (the lead was too
+    /// small there, or the host too slow).
+    fn leadReport(m: *Model, what: []const u8, at: usize, t0: PassClock) void {
+        const st: issue_lead.Stats = if (m.ilead) |*g| g.take() else .{};
+        if (!m.ilead_log) return;
+        const t1 = m.passClock();
+        const wall = @as(f64, @floatFromInt(t1.wall -| t0.wall)) / 1e6;
+        const cpu = @as(f64, @floatFromInt(t1.cpu -| t0.cpu)) / 1e6;
+        m.ps_cpu += t1.cpu -| t0.cpu;
+        m.ps_wall += t1.wall -| t0.wall;
+        m.ps_end = t1.wall;
+        const ms = struct {
+            fn of(ns: u64) f64 {
+                return @as(f64, @floatFromInt(ns)) / 1e6;
+            }
+        }.of;
         const ka: keep_ahead.Taken = if (m.eh) |*eh| eh.ka.take() else .{ .wait_ns = 0, .chunks = 0 };
         const starts: u64 = if (m.eh) |*eh| eh.ka.starts else 0;
         pairLog("ROCI {s} at {d} (rank {d}): engine thread CPU {d:.1} ms of {d:.1} ms wall ({d:.2}); issue lead {d}: {d} layers, the host asleep {d:.1} ms in {d} sleeps of {d} slices, {d} layers entered with nothing queued inside the pass and {d} at its first layer; Engram worker starts this prompt {d}, first-layer wait after a round {d:.1} ms in {d} chunks", .{ what, at, m.comm.rank, cpu, wall, if (wall > 0) cpu / wall else 0.0, if (m.ilead) |g| g.n else 0, st.layers, ms(st.sleep_ns), st.sleeps, st.slices, st.bare, st.bare_first, starts, @as(f64, @floatFromInt(ka.wait_ns)) / 1e6, ka.chunks });
+        pairLog("ROCI {s} at {d} (rank {d}) the prompt so far: engine thread CPU {d:.1} ms of {d:.1} ms wall in the passes ({d:.2}), the host {d:.1} ms between them", .{ what, at, m.comm.rank, ms(m.ps_cpu), ms(m.ps_wall), if (m.ps_wall > 0) @as(f64, @floatFromInt(m.ps_cpu)) / @as(f64, @floatFromInt(m.ps_wall)) else 0.0, ms(m.ps_gap) });
         if (m.partner_link) |pl| {
             // TF_DS_ENGRAM_PARTNER, what the worker's steps did since the last line (the counts of a pass in flight may fall in the next line)
             const c = pl.c.since(m.partner_seen);
@@ -3889,6 +4081,8 @@ pub const Model = struct {
             pairLog("ROCI {s} at {d} (rank {d}) partner: {d} steps, {d} split, {d} mismatched, {d} header late, {d} half late, {d} skipped, {d} declined; records read here {d}, sent {d} ({d:.1} MB), received {d} ({d:.1} MB)", .{ what, at, m.comm.rank, c.steps, c.split, c.mismatch, c.header_late, c.half_late, c.skipped, c.declined, c.records_read, c.records_sent, mb(c.records_sent), c.records_got, mb(c.records_got) });
             pairLog("ROCI {s} at {d} (rank {d}) partner time: header wait {d:.1} ms, records wait {d:.1} ms in {d} waits ({d} looks, {d} naps, the longest {d:.2} ms); own half read {d:.1} ms (the whole lists at that rate {d:.1} ms), rest read {d:.1} ms, copies {d:.1} ms", .{ what, at, m.comm.rank, ms(c.hdr_wait_ns), ms(c.rec_wait_ns), c.waits, c.wait_looks, c.wait_naps, ms(c.wait_max_ns), ms(c.read_ns), ms(c.full_ns), ms(c.redo_ns), ms(c.copy_ns) });
         }
+    }
+
     /// The stream, cuBLAS handle and node of the split of one pass of a pair: A is the model's, B the second lane's. Every launch and
     /// exchange a layer makes reads `Engine.s`, `Engine.t.stream`, `Engine.blas` and `Engine.two` (whose transport is the lane), so
     /// swapping them runs the same serial calls on the pass's own stream and lane.
@@ -4102,6 +4296,8 @@ pub const Model = struct {
         }
         prompt.ptimer = null;
         const taps = m.dr != null;
+        const clock = m.leadBegin();
+        defer m.leadReport("pair", start_a, clock);
         if (m.eh) |*eh| {
             const same = eh.wk_thread != null and eh.wk_seq.ptr == m.fill_seq.ptr and eh.wk_seq.len == m.fill_seq.len and
                 start_a >= eh.wk_start and (start_a - eh.wk_start) % chunk_rows == 0 and
@@ -4133,6 +4329,7 @@ pub const Model = struct {
                 const k: usize = @backingInt(l.pass);
                 const s0 = starts[k];
                 const n0 = ns[k];
+                // TF_DS_ISSUE_LEAD: after this pass's stream wait, before its layer; the steps' order is the schedule's
                 try m.issueLead(m.passStreamOf(l.pass));
                 try m.passLayer(chs[k], seq[0 .. s0 + n0], s0, n0, l.li, &sts[k], taps, l.pass, m.pair_ev.?.at(k, l.li));
             },
@@ -5480,12 +5677,122 @@ test "TF_DS_ENGRAM_AIO_SLEEP: the prompt ring sleeps by default (two empty polls
     try std.testing.expect(std.mem.indexOf(u8, code, "catch 32 else 32;") != null); // WAKE
     try std.testing.expect(std.mem.indexOf(u8, code, "catch 1000 else 1000;") != null); // WAKE_US
 }
+
+test "TF_DS_ISSUE_LEAD: a serial pass's layer and a pair's layer step are issued through the gate as the first act, and a pair's waits, boundaries and the chunk's Engram-ahead work are not" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    // the serial pass (also the chunks of any size and the decoder half: one loop): the gate before anything of the layer
+    const loop = std.mem.indexOf(u8, code, "        defer m.leadReport(\"pass\", start, clock);\n        for (0..c.layers) |li| {\n").?;
+    const gate = std.mem.indexOf(u8, code[loop..], "try m.issueLead(e.s);").? + loop;
+    const first = std.mem.indexOf(u8, code[loop..], "if (m.two) |*t| if (t.engramAhead()").? + loop;
+    try std.testing.expect(gate < first);
+    try std.testing.expect(std.mem.indexOf(u8, code[loop..gate], "try m.engramLayer(") == null);
+    // the pair: the gate in the layer step, on the stream of the step's pass, before the layer; none in the wait or boundary steps
     const pair = code[std.mem.indexOf(u8, code, "pub fn fillGroup(").?..];
+    const steps = pair[std.mem.indexOf(u8, pair, "for (steps) |step| switch (step) {").?..];
+    const l_at = std.mem.indexOf(u8, steps, ".layer => |l| {").?;
+    const b_at = std.mem.indexOf(u8, steps, ".boundary => |q| {").?;
     const g_at = std.mem.indexOf(u8, steps, "try m.issueLead(m.passStreamOf(l.pass));").?;
+    const p_at = std.mem.indexOf(u8, steps, "try m.passLayer(").?;
+    try std.testing.expect(l_at < g_at and g_at < p_at and p_at < b_at);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, steps[0..std.mem.indexOf(u8, steps, "// everything the group queued").?], "issueLead("));
+    // each pass's report line
+    try std.testing.expect(std.mem.indexOf(u8, pair, "defer m.leadReport(\"pair\", start_a, clock);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "defer m.leadReport(\"pass\", start, clock);") != null);
+}
+
+test "TF_DS_ISSUE_LEAD: the gate waits on the oldest layer's blocking event and nothing else: no round, no frame, no link, no transport call; the event is recorded after the wait and the ring is made once at the start" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    const at = std.mem.indexOf(u8, code, "    fn issueLead(m: *Model, s: cuda.Stream) !void {").?;
+    const end = std.mem.indexOfPos(u8, code, at, "\n    }\n").?;
+    const body = code[at..end];
+    for ([_][]const u8{ "g.enter(", "ilead_ev.ev[slot].?.record(s)", ".synchronize()", "where.enter(.issue_gate," }) |w|
+        try std.testing.expect(std.mem.indexOf(u8, body, w) != null);
+    for ([_][]const u8{ "fan", "link", "send", "recv", "wire", "flush", "verify", "draft", "reserve", "fillBegin", ".two" }) |w|
+        try std.testing.expect(std.mem.indexOf(u8, body, w) == null);
+    // the sleep is inside the gate's loop (enter), the record after it
+    try std.testing.expect(std.mem.indexOf(u8, body, "g.enter(").? < std.mem.indexOf(u8, body, "record(s)").?);
+    // the events are made once, in open, blocking whatever TF_DS_CUDA_EVENTS says, and freed in close
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "cuda.Event.initBlocking(c.d)"));
+    try std.testing.expect(std.mem.indexOf(u8, code, "try m.ilead_ev.make(lead_ev_ctx);") != null);
+    const close = code[std.mem.indexOf(u8, code, "pub fn close(m: *Model) void {").?..];
+    try std.testing.expect(std.mem.indexOf(u8, close, "m.ilead_ev.free(LeadEvents{ .d = m.ctx.d });") != null);
+    // off unless asked: the gate is only made with the setting on, and the function returns at once without it
+    try std.testing.expect(std.mem.indexOf(u8, body, "const g = if (m.ilead) |*x| x else return;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "m.ilead = issue_lead.Gate.init(n);") != null);
+}
+
+test "TF_DS_ISSUE_LEAD: the start line, on every rank, says the setting is on and its lead" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    const line = "TF_DS_ISSUE_LEAD={d}: rank {d}: a prompt pass queues at most {d} layers ahead of the GPU (an event at the start of each layer, the host asleep on the oldest while the lead is at its bound, not inside a full launch queue), waiting in {s}; decode rounds and the drafter are not gated";
+    try std.testing.expect(std.mem.indexOf(u8, code, "std.log.info(\"" ++ line ++ "\"") != null);
+    // a setting that is none says so and runs off
+    try std.testing.expect(std.mem.indexOf(u8, code, "TF_DS_ISSUE_LEAD={s}: not a setting (0, or 1 to 31 layers): off") != null);
+    // the mode and the slice are named by the line, and a text that is none says so and runs the default
     for ([_][]const u8{ "slices of {d} us, the transport checked and the Engram worker's slots returned every slice (TF_DS_ISSUE_LEAD_WAIT=poll, TF_DS_ISSUE_LEAD_SLICE_US), a wait over {d} ms logged every 5 s (TF_DS_ISSUE_LEAD_WARN_MS, 0: never)", "one blocking-sync wait (TF_DS_ISSUE_LEAD_WAIT=block; the transport is checked and the Engram worker's slots returned before and after it, not during)", "TF_DS_ISSUE_LEAD_WARN_MS={s}: not a setting (0, or 1 to 3600000 milliseconds): {d}", "TF_DS_ISSUE_LEAD_WAIT={s}: not a mode (poll, block or backoff): poll", "TF_DS_ISSUE_LEAD_SLICE_US={s}: not a setting (1 to 100000 microseconds): {d}" }) |w|
+        try std.testing.expect(std.mem.indexOf(u8, code, w) != null);
+}
+
+test "TF_DS_ISSUE_LEAD: the default wait polls in slices through issue_lead.pollWait; each slice checks both lanes' transports and returns the Engram slots; the gate sleeps nowhere between a ticket and its launch" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    const at = std.mem.indexOf(u8, code, "    fn issueLead(m: *Model, s: cuda.Stream) !void {").?;
+    const body = code[at..std.mem.indexOfPos(u8, code, at, "\n    }\n").?];
     try std.testing.expect(std.mem.indexOf(u8, body, ".poll, .backoff => slices = try issue_lead.pollWait(gate, &w),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, ".block => {") != null);
+    // block: the transport and the Engram slots before and after the one wait
+    const blk = body[std.mem.indexOf(u8, body, ".block => {").?..];
+    try std.testing.expect(std.mem.indexOf(u8, blk, "try w.service();").? < std.mem.indexOf(u8, blk, ".synchronize()").?);
+    try std.testing.expect(std.mem.indexOf(u8, blk, ".synchronize()").? < std.mem.indexOf(u8, blk, "try c.m.leadCheck();").?);
+    // the slice: a nap, the transports, the Engram worker's slots (prompt.engramPoll), the late line
+    const lw = code[std.mem.indexOf(u8, code, "const LeadWait = struct {").?..];
+    const lwb = lw[0..std.mem.indexOf(u8, lw, "\n};\n").?];
+    for ([_][]const u8{ "std.c.nanosleep(&ts, null)", "try c.m.leadCheck();", "c.late();", "try prompt.engramPoll(eh);", "c.dl.due(", "std.log.warn(\"TF_DS_ISSUE_LEAD: rank {d}: asleep at the issue gate for {d} ms" }) |w|
+        try std.testing.expect(std.mem.indexOf(u8, lwb, w) != null);
+    const lc = code[std.mem.indexOf(u8, code, "    fn leadCheck(m: *Model) !void {").?..];
+    const lcb = lc[0..std.mem.indexOf(u8, lc, "\n    }\n").?];
+    try std.testing.expect(std.mem.indexOf(u8, lcb, "if (m.two) |*t| if (t.rc) |rc| try rc.t.check();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lcb, "if (m.two_b) |*t| if (t.rc) |rc| try rc.t.check();") != null);
     try std.testing.expect(std.mem.indexOf(u8, lcb, "if (m.two_c) |*t| if (t.rc) |rc| try rc.t.check();") != null);
+    // only the engine thread writes the place: claimed at each call's start
+    try std.testing.expect(std.mem.indexOf(u8, code, "where.claim(); // (the engine thread's waits are the host's place)") != null);
+    // the clocks of the pass line are read once at the start and once at the end, never inside the gate
+    try std.testing.expect(std.mem.indexOf(u8, body, "cpuNow") == null and std.mem.indexOf(u8, body, "passClock") == null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, code, "m.passClock()"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, code, "m.leadBegin()")); // (fillChunk, fillPair: once each, at the call's start) // the start (leadBegin) and the end (leadReport)
+    // every ticket a prompt reserves for a ringing kernel is followed at once by that kernel's launch (no call between them could
+    // reach the gate): the reserve and the launch are two statements of one function
+    const pr = @embedFile("prompt.zig");
+    const pcode = pr[0 .. std.mem.indexOf(u8, pr, "\ntest \"") orelse return error.TestUnexpectedResult];
+    var from: usize = 0;
+    var seen: usize = 0;
+    while (std.mem.indexOfPos(u8, pcode, from, "const rs = try rc.reserve(.own1, ")) |i| : (from = i + 1) {
+        const stmt_end = std.mem.indexOfPos(u8, pcode, i, "\n").?;
+        const next = pcode[stmt_end + 1 .. std.mem.indexOfPos(u8, pcode, stmt_end + 1, "\n").?];
+        try std.testing.expect(std.mem.indexOf(u8, next, "mx.linearSentFirst(") != null or std.mem.indexOf(u8, next, "mx.gemmSentFirst(") != null or std.mem.indexOf(u8, next, "ch.own1_sent = true;") != null);
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), seen);
+}
+
+test "TF_DS_ISSUE_LEAD off: unset and 0 each say so on every rank, and the prompt's sums and the pass's first layer are kept by the call's start and end" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    try std.testing.expect(std.mem.indexOf(u8, code, "std.log.info(\"TF_DS_ISSUE_LEAD=0 off: rank {d}:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "std.log.info(\"TF_DS_ISSUE_LEAD off (not set): rank {d}:") != null);
+    const lb = code[std.mem.indexOf(u8, code, "    fn leadBegin(m: *Model) PassClock {").?..];
+    const lbb = lb[0..std.mem.indexOf(u8, lb, "\n    }\n").?];
+    try std.testing.expect(std.mem.indexOf(u8, lbb, "g.beginPass()") != null and std.mem.indexOf(u8, lbb, "m.ps_gap +=") != null);
+    const lr = code[std.mem.indexOf(u8, code, "    fn leadReport(").?..];
+    const lrb = lr[0..std.mem.indexOf(u8, lr, "\n    }\n").?];
+    for ([_][]const u8{ "m.ps_cpu +=", "m.ps_wall +=", "m.ps_end = t1.wall;", "the prompt so far", "at its first layer" }) |w|
+        try std.testing.expect(std.mem.indexOf(u8, lrb, w) != null);
+    // the sums start again at each prompt's admission
+    const fb = code[std.mem.indexOf(u8, code, "m.fill_t0 = m.now();").?..];
+    try std.testing.expect(std.mem.indexOf(u8, fb[0..200], "m.ps_gap = 0;") != null);
+}
 
 test "Model.open: a refusal or failure after partial setup unwinds what already runs (the transport lanes' proxy threads, the Engram readers, the round's side state, the pair), before the arena and the context go" {
     const src = @embedFile("model.zig");
