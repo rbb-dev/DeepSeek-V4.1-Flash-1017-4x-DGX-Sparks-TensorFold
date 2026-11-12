@@ -380,9 +380,8 @@ pub const LaneHost = struct {
         job.reported();
         h.gpa.free(job.marks);
         const s = &job.stream;
-        const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .depths = depthsOf(s), .min_rows = s.min_rows, .loop_period = s.loop_period, .loop_novelty = s.loop_novelty, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
-        const told = if (job.started) recalls.finished(h, job, reason, stats) else stats;
-        emit(job, .{ .finished = .{ .reason = reason, .stats = told, .message = message } });
+        const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .plans = s.plans, .min_rows = s.min_rows, .loop_period = s.loop_period, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
+        emit(job, .{ .finished = .{ .reason = reason, .stats = stats, .message = message } });
         if (job.started) {
             if (s.grammar) |g| g.deinit(h.gpa);
             s.deinit(h.gpa);
@@ -923,6 +922,52 @@ fn depthsOf(s: *const lanes.Stream) [api.draft_depths]api.DraftDepth {
         o.drafted += d.drafted;
         o.reached += d.reached;
         o.kept += d.kept;
+test "a finished request's stats carry its rounds by plan: its copied continuations, verified and kept" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    const prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
+    // the fake's reply repeats 11, 12, 13 from its 8th token: the proposer copies it (no head here: every draft a copy)
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .cycle_after = 8, .probe_prompt = prompt.len };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+    try host.start();
+    defer host.stop();
+    const Box = struct {
+        mutex: std.Io.Mutex = .init,
+        stats: ?Stats = null,
+        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
+            const b: *@This() = @ptrCast(@alignCast(ctx));
+            b.mutex.lockUncancelable(std.testing.io);
+            defer b.mutex.unlock(std.testing.io);
+            switch (e.*) {
+                .finished => |f| b.stats = f.stats,
+                else => {},
+            }
+        }
+        fn wait(b: *@This()) Stats {
+            while (true) {
+                b.mutex.lockUncancelable(std.testing.io);
+                const d = b.stats;
+                b.mutex.unlock(std.testing.io);
+                if (d) |x| return x;
+                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+            }
+        }
+    };
+    var box: Box = .{};
+    const request: Request = .{ .prompt = &prompt, .max_tokens = 64 };
+    try host.engine().submit(1, &request, .{ .ctx = &box, .event = Box.event });
+    const st = box.wait();
+    try std.testing.expect(st.plans.copy.rounds > 0);
+    try std.testing.expectEqual(st.drafted, st.plans.copy.drafted);
+    try std.testing.expectEqual(st.accepted, st.plans.copy.accepted);
+    try std.testing.expectEqual(lanes.stream.Plans.Count{}, st.plans.head);
+}
+
 test "under the fill order an admitted prompt the order serves first makes the stepping prompt's step wait, as a rotation's arrival does; one it serves later does not" {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);

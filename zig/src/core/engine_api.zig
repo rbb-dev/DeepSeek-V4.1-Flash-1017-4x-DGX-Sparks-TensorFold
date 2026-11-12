@@ -202,6 +202,10 @@ pub const draft_depths = 16;
 pub const DraftDepth = struct { drafted: u32 = 0, reached: u32 = 0, kept: u32 = 0 };
 
 /// What a finished reply's rounds did, for its runtime fields and /metrics.
+/// A reply's decode rounds by the plan its window ran: copied continuations and the head's drafts, each the rounds, the
+/// drafts verified and those kept (lanes.stream.Plans).
+pub const Plans = lanes.stream.Plans;
+
 /// A drafter's pruned vocabulary (DeepSeek's TF_DS_DRAFT_VOCAB), as the family counts it: its passes on the list and
 /// on the whole head, the committed tokens its guard counted and how many of them were outside the list, and whether
 /// the passes take the whole head. The family writes them; the server reads them at any time.
@@ -224,6 +228,7 @@ pub const Stats = struct {
     rounds: u64 = 0,
     drafted: u64 = 0,
     accepted: u64 = 0,
+    plans: Plans = .{},
     /// The draft head's chains by depth (index 0: the first draft); all zero where the engine does not count them.
     depths: [draft_depths]DraftDepth = @splat(.{}),
     /// The narrowest verify window of the reply's rounds (drafted replies: 2 or more).

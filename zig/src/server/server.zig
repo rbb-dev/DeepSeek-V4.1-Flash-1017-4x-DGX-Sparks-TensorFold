@@ -379,10 +379,10 @@ pub const Server = struct {
     }
 
     /// Counts one finished request for /metrics, then writes the stats line when its interval has passed.
-    pub fn noteRequest(srv: *Server, prompt_len: usize, cached: usize, generated: usize, drafted: u64, accepted: u64, depths: []const api.DraftDepth, rounds: u64, received: i96, first: ?i96, last: ?i96, prefill: ?f64) void {
+    pub fn noteRequest(srv: *Server, prompt_len: usize, cached: usize, generated: usize, drafted: u64, accepted: u64, depths: []const api.DraftDepth, rounds: u64, plans: api.Plans, received: i96, first: ?i96, last: ?i96, prefill: ?f64) void {
         const now = clock.nowNs(srv.io);
         const tpot = srv.metrics.tpotValue(first, last, generated);
-        srv.metrics.note(srv.io, prompt_len, cached, generated, drafted, accepted, rounds, @max(0, clock.seconds(now - received)), if (first) |f| clock.seconds(f - received) else null, if (first) |f| @max(0, clock.seconds(now - f)) else null, prefill, tpot);
+        srv.metrics.note(srv.io, prompt_len, cached, generated, drafted, accepted, rounds, plans, @max(0, clock.seconds(now - received)), if (first) |f| clock.seconds(f - received) else null, if (first) |f| @max(0, clock.seconds(now - f)) else null, prefill, tpot);
         srv.metrics.noteDepths(srv.io, depths);
         if (srv.config.stats_every_s == 0) return;
         var buf: [1024]u8 = undefined;

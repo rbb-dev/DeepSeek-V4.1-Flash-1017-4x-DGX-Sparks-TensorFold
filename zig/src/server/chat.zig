@@ -230,6 +230,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     preparing = false;
     var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = input.token_ids, .sent_ns = nowNs(io), .lp = if (request.logprobs != null) .{} else null };
     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, &box.stats.depths, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
+    defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, &box.stats.depths, box.stats.rounds, box.stats.plans, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {
         if (sink != null and gen.tools.len > 0) {
@@ -627,7 +628,8 @@ const Generation = struct {
             log.line("warning: a reply reached max_tokens while still thinking, so its content is empty and its text is all in reasoning_content; raise max_tokens, or send chat_template_kwargs {{\"enable_thinking\": false}} (server: --no-thinking)", .{});
         var cycle_text: [32]u8 = undefined;
         const cycle = if (s.loop_period) |period| std.fmt.bufPrint(&cycle_text, " loop=period:{d}", .{period}) catch "" else if (s.loop_novelty) |share| std.fmt.bufPrint(&cycle_text, " loop=novelty:{d:.4}", .{share}) catch "" else "";
-        log.line("done {s} prompt={d} cached={d} thinking={s} effort={s} tokens={d} sha={s} finish={s}{s} rounds={d} accepted={d}/{d}", .{ g.reply_id, prompt_len, reply.cached_tokens, if (thinking) "True" else "False", if (thinking) effort orelse "none" else "none", g.collected.items.len, sha, reason, cycle, s.rounds, s.accepted, s.drafted });
+        var plans_text: [plans_text_len]u8 = undefined;
+        log.line("done {s} prompt={d} cached={d} thinking={s} effort={s} tokens={d} sha={s} finish={s}{s} rounds={d} accepted={d}/{d}{s}", .{ g.reply_id, prompt_len, reply.cached_tokens, if (thinking) "True" else "False", if (thinking) effort orelse "none" else "none", g.collected.items.len, sha, reason, cycle, s.rounds, s.accepted, s.drafted, plansText(&plans_text, s.plans) });
         return reply;
     }
 };
@@ -657,4 +659,45 @@ pub fn deltaOf(a: Allocator, key: []const u8, text: []const u8) Allocator.Error!
     const o = try json.newObject(a);
     try o.put(a, key, .{ .string = text });
     return .{ .object = o };
+}
+
+/// The reply's token ids hashed: drafted and ``"draft": false`` replies must match.
+/// The done line's rounds by plan: " copy=kept/drafted head=kept/drafted copy_rounds=N head_rounds=N" (api.Plans), in
+/// at most plans_text_len bytes.
+pub fn plansText(buf: []u8, p: api.Plans) []const u8 {
+    return std.fmt.bufPrint(buf, " copy={d}/{d} head={d}/{d} copy_rounds={d} head_rounds={d}", .{ p.copy.accepted, p.copy.drafted, p.head.accepted, p.head.drafted, p.copy.rounds, p.head.rounds }) catch "";
+}
+
+pub const plans_text_len = 160;
+
+pub fn tokenSha(tokens: []const u32) [12]u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var buf: [16]u8 = undefined;
+    for (tokens, 0..) |t, i| {
+        if (i > 0) h.update(",");
+        h.update(std.fmt.bufPrint(&buf, "{d}", .{t}) catch unreachable);
+    }
+    var d: [32]u8 = undefined;
+    h.final(&d);
+    var out: [12]u8 = undefined;
+    const hex = std.fmt.bytesToHex(d[0..6].*, .lower);
+    @memcpy(&out, &hex);
+    return out;
+}
+
+test "a finished request's rounds by plan reach /metrics and its done line" {
+    const file = @embedFile("chat.zig");
+    const src = file[0..std.mem.indexOf(u8, file, "\ntest \"").?]; // the code before the tests
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "box.stats.drafted, box.stats.accepted, &box.stats.depths, box.stats.rounds, box.stats.plans, received,"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "s.rounds, s.accepted, s.drafted, plansText(&plans_text, s.plans) });"));
+}
+
+test "the done line's rounds by plan: kept over drafted for copies and the head's drafts, then their rounds" {
+    var buf: [plans_text_len]u8 = undefined;
+    try std.testing.expectEqualStrings(" copy=93/108 head=21/42 copy_rounds=32 head_rounds=13", plansText(&buf, .{ .copy = .{ .rounds = 32, .drafted = 108, .accepted = 93 }, .head = .{ .rounds = 13, .drafted = 42, .accepted = 21 } }));
+    try std.testing.expectEqualStrings(" copy=0/0 head=0/0 copy_rounds=0 head_rounds=0", plansText(&buf, .{}));
+    // the widest counts fit the line's buffer
+    const big = std.math.maxInt(u64);
+    const all: api.Plans = .{ .copy = .{ .rounds = big, .drafted = big, .accepted = big }, .head = .{ .rounds = big, .drafted = big, .accepted = big } };
+    try std.testing.expect(std.mem.endsWith(u8, plansText(&buf, all), " head_rounds=18446744073709551615"));
 }

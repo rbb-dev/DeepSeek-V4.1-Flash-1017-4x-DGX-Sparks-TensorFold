@@ -392,6 +392,8 @@ pub const Engine = struct {
                 e.accepted += kept;
                 s.drafted += rows - 1;
                 s.accepted += kept;
+                const mine = win.ownDrafts(p, rows, path);
+                if (p.kind == .copy) s.plans.copy.add(mine[0], mine[1]) else if (p.kind == .head) s.plans.head.add(mine[0], mine[1]);
                 // the proposal's own rows: the grammar's drafts after them are neither the proposer's nor the head's
                 const own_end = if (p.grammar_from > 0) p.grammar_from else rows;
                 var own_kept: usize = 0;

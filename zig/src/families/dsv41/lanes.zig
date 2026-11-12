@@ -2976,7 +2976,22 @@ test "a peer that stops stops this rank: the watch starts before the follow loop
 }
 
 test "draft chances are the prefix survivals chooseK sums" {
+    // a draft's chance is draft.landing: the sigmoid of the calibrated confidence (conf_cal, default {1.0, 0.19}), so a
+    // confidence of 0 lands 0.547, not 0.5; the expectation is built from the calibration the engine runs with
+    const cal = draft.conf_cal;
+    const at = struct {
+        fn f(c: f64) f64 {
+            return 1.0 / (1.0 + @exp(-(draft.conf_cal[0] * c + draft.conf_cal[1])));
+        }
+    }.f;
     var out: [3]f64 = undefined;
+    survivals(&.{ 0.0, 0.0, 2.0 }, &out);
+    try std.testing.expectApproxEqAbs(at(0.0), out[0], 1e-12);
+    try std.testing.expectApproxEqAbs(at(0.0) * at(0.0), out[1], 1e-12);
+    try std.testing.expectApproxEqAbs(at(0.0) * at(0.0) * at(2.0), out[2], 1e-12);
+    // with the identity calibration the chances are the plain sigmoids (0.5, 0.25, 0.25 / (1 + e^-2))
+    draft.conf_cal = .{ 1.0, 0.0 };
+    defer draft.conf_cal = cal;
     survivals(&.{ 0.0, 0.0, 2.0 }, &out);
     try std.testing.expectApproxEqAbs(@as(f64, 0.5), out[0], 1e-12);
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), out[1], 1e-12);

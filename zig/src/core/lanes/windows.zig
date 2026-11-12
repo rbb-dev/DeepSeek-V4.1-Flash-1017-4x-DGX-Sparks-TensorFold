@@ -318,6 +318,17 @@ pub fn constrain(e: *Engine, p: *Plan) !void {
     if (p.kind != .forced and w.rows.len == 1) p.kind = if (w.extra.len > 0) .grammar else .none;
 }
 
+/// A concluded window's own drafts of its plan (the rows before the grammar's drafts and before suffix-match branches)
+/// and those on the kept path: what Stream.plans counts.
+pub fn ownDrafts(p: Plan, rows: usize, path: []const u32) [2]u64 {
+    var end = rows;
+    if (p.grammar_from > 0) end = @min(end, p.grammar_from);
+    if (p.branch_from > 0) end = @min(end, p.branch_from);
+    var kept: u64 = 0;
+    for (path[1..]) |r| kept += @intFromBool(r < end);
+    return .{ end - 1, kept };
+}
+
 /// The window's rows, parents and keyed positions, ready for the backend.
 pub fn build(e: *Engine, p: Plan, early: bool) !be.Window {
     const a = e.arena.allocator();

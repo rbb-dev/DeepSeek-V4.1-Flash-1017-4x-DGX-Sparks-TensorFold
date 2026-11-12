@@ -61,6 +61,7 @@ pub const Metrics = struct {
     accepted: u64 = 0,
     depths: [api.draft_depths]Depth = @splat(.{}),
     rounds: u64 = 0,
+    plans: api.Plans = .{}, // those rounds, drafted and kept drafts by the window's plan
     disconnects: u64 = 0,
     latency: Histogram = .{},
     ttft: Histogram = .{},
@@ -77,7 +78,7 @@ pub const Metrics = struct {
         m.requests.deinit(m.gpa);
     }
 
-    pub fn note(m: *Metrics, io: std.Io, prompt: usize, cached: usize, generation: usize, drafted: u64, accepted: u64, rounds: u64, latency: f64, ttft: ?f64, decode: ?f64, prefill: ?f64, tpot: ?f64) void {
+    pub fn note(m: *Metrics, io: std.Io, prompt: usize, cached: usize, generation: usize, drafted: u64, accepted: u64, rounds: u64, plans: api.Plans, latency: f64, ttft: ?f64, decode: ?f64, prefill: ?f64, tpot: ?f64) void {
         m.mutex.lockUncancelable(io);
         defer m.mutex.unlock(io);
         m.prompt += prompt;
@@ -86,6 +87,11 @@ pub const Metrics = struct {
         m.drafted += drafted;
         m.accepted += accepted;
         m.rounds += rounds;
+        inline for (.{ "copy", "head" }) |k| {
+            @field(m.plans, k).rounds += @field(plans, k).rounds;
+            @field(m.plans, k).drafted += @field(plans, k).drafted;
+            @field(m.plans, k).accepted += @field(plans, k).accepted;
+        }
         m.latency.observe(latency);
         if (ttft) |t| m.ttft.observe(t);
         if (decode) |d| m.decode.observe(d);
@@ -195,6 +201,9 @@ pub const Metrics = struct {
         try histogram(w, "request_decode_seconds", "Seconds a finished request spent decoding. Its sum over generation_tokens_total is the decode rate.", snap.decode);
         try histogram(w, "request_time_per_output_token_seconds", "Seconds from the first generated token to the last, divided by the tokens less one.", snap.tpot);
         try gauge(w, "decode_rounds_total", "counter", "Decode rounds used by finished requests.", snap.rounds);
+        try byPlan(w, "decode_rounds_by_plan_total", "Decode rounds of finished requests by the plan their window ran: a copied continuation of the stream's context (copy) or the drafter's drafts (head); forced and plain rounds count in neither.", snap.plans, "rounds");
+        try byPlan(w, "mtp_drafted_by_plan_total", "Draft tokens verified on finished requests, by the plan of their round's window (copy, head).", snap.plans, "drafted");
+        try byPlan(w, "mtp_accepted_by_plan_total", "Draft tokens kept on finished requests, by the plan of their round's window (copy, head).", snap.plans, "accepted");
         try histogram(w, "request_prefill_seconds", "Seconds a finished request's prompt pass took.", snap.prefill);
         try processGauges(w, process.read());
         if (engine.memory(false)) |mem| {
@@ -244,6 +253,12 @@ fn draftVocabFamilies(w: *std.Io.Writer, v: api.DraftVocab) !void {
     try gauge(w, "draft_vocab_tokens_total", "counter", "Committed tokens the pruned list's guard counted.", v.tokens);
     try gauge(w, "draft_vocab_misses_total", "counter", "Of the counted committed tokens, those outside the pruned list.", v.misses);
     try gauge(w, "draft_vocab_full", "gauge", "1 while the guard has the drafter's passes take the whole head (over 2% of the last 4,096 committed tokens outside the list).", @intFromBool(v.full));
+}
+
+/// A counter family of the rounds by plan (api.Plans): one line a plan, its `count` (rounds, drafted or accepted).
+fn byPlan(w: *std.Io.Writer, name: []const u8, help: []const u8, plans: api.Plans, comptime count: []const u8) !void {
+    try family(w, name, "counter", help);
+    inline for (.{ "copy", "head" }) |k| try w.print("{s}{s}{{plan=\"{s}\"}} {d}\n", .{ prefix, name, k, @field(@field(plans, k), count) });
 }
 
 /// Depths 1 to the deepest any counted chain drafted (none: no chain counted).
@@ -366,7 +381,7 @@ test "edges and numbers" {
 test "metrics record rounds prefill and per-token timing" {
     const gpa = std.testing.allocator;
     var m: Metrics = .{ .gpa = gpa };
-    m.note(std.testing.io, 10, 0, 3, 0, 0, 2, 1.0, null, null, 0.25, m.tpotValue(1_000_000_000, 1_024_000_000, 3));
+    m.note(std.testing.io, 10, 0, 3, 0, 0, 2, .{}, 1.0, null, null, 0.25, m.tpotValue(1_000_000_000, 1_024_000_000, 3));
     try std.testing.expectEqual(@as(u64, 2), m.rounds);
     try std.testing.expectEqual(@as(u64, 1), m.prefill.n);
     try std.testing.expectEqual(@as(u64, 1), m.tpot.n);
@@ -407,7 +422,7 @@ const RenderStub = struct {
 test "render exposes live counters, rounds, prefill and TPOT without cache family" {
     const gpa = std.testing.allocator;
     var m: Metrics = .{ .gpa = gpa };
-    m.note(std.testing.io, 10, 0, 3, 0, 0, 2, 1.0, null, null, 0.25, m.tpotValue(1_000_000_000, 3_000_000_000, 3));
+    m.note(std.testing.io, 10, 0, 3, 0, 0, 2, .{}, 1.0, null, null, 0.25, m.tpotValue(1_000_000_000, 3_000_000_000, 3));
     var stub: RenderStub = .{};
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -433,8 +448,8 @@ test "render exposes live counters, rounds, prefill and TPOT without cache famil
 test "render counts restored prompt tokens where the engine keeps prompt states" {
     const gpa = std.testing.allocator;
     var m: Metrics = .{ .gpa = gpa };
-    m.note(std.testing.io, 100, 0, 3, 0, 0, 2, 1.0, null, null, null, null);
-    m.note(std.testing.io, 120, 96, 3, 0, 0, 2, 1.0, null, null, null, null);
+    m.note(std.testing.io, 100, 0, 3, 0, 0, 2, .{}, 1.0, null, null, null, null);
+    m.note(std.testing.io, 120, 96, 3, 0, 0, 2, .{}, 1.0, null, null, null, null);
     var stub: RenderStub = .{ .info_value = .{ .prompt_cache = true } };
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -489,9 +504,9 @@ test "the stats line covers the requests finished since the last, once its inter
     var buf: [1024]u8 = undefined;
     const s_ns: i96 = std.time.ns_per_s;
     try std.testing.expectEqual(@as(?[]const u8, null), m.statsLine(io, 99 * s_ns, 10 * s_ns, &buf)); // lines off
-    m.note(io, 10, 0, 30, 20, 9, 11, 1.0, null, null, null, null); // before the lines start: in no window
+    m.note(io, 10, 0, 30, 20, 9, 11, .{}, 1.0, null, null, null, null); // before the lines start: in no window
     m.startLines(io, 0);
-    m.note(io, 10, 0, 40, 30, 15, 16, 1.0, null, null, null, null);
+    m.note(io, 10, 0, 40, 30, 15, 16, .{}, 1.0, null, null, null, null);
     var depths: [api.draft_depths]api.DraftDepth = @splat(.{});
     depths[0] = .{ .drafted = 16, .reached = 16, .kept = 12 };
     depths[1] = .{ .drafted = 14, .reached = 12, .kept = 3 };
@@ -500,7 +515,7 @@ test "the stats line covers the requests finished since the last, once its inter
     const first = m.statsLine(io, 12 * s_ns, 10 * s_ns, &buf) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("stats over 12.0s: 1 reply, 40 tokens in 16 rounds (2.50 a round) | drafts kept 50.00% (15 of 30) | head chains by depth: kept [75.00%, 21.43%] of drafted [16, 14], kept when reached [75.00%, 25.00%]", first);
     try std.testing.expectEqual(@as(?[]const u8, null), m.statsLine(io, 13 * s_ns, 10 * s_ns, &buf));
-    m.note(io, 10, 0, 7, 0, 0, 7, 1.0, null, null, null, null); // no drafts: the line says none
+    m.note(io, 10, 0, 7, 0, 0, 7, .{}, 1.0, null, null, null, null); // no drafts: the line says none
     const second = m.statsLine(io, 22 * s_ns, 10 * s_ns, &buf) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("stats over 10.0s: 1 reply, 7 tokens in 7 rounds (1.00 a round)", second);
 }
@@ -526,7 +541,7 @@ test "metrics snapshot allocation failure releases the mutex" {
     try std.testing.expect(failing.has_induced_failure);
     failing.fail_index = std.math.maxInt(usize);
     m.httpRequest(io, "client", 200);
-    m.note(io, 10, 0, 3, 0, 0, 2, 1.0, null, null, 0.25, null);
+    m.note(io, 10, 0, 3, 0, 0, 2, .{}, 1.0, null, null, 0.25, null);
     try m.render(io, &out.writer, stub.engine(), 4096);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "requests_total{key=\"client\",status=\"200\"} 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "prompt_tokens_total 10") != null);
@@ -624,3 +639,37 @@ test "render counts the drafter's pruned-list passes, its guard's tokens and mis
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, out, "# HELP tensorfold:draft_vocab_"));
 }
 
+
+test "render counts finished requests' rounds by plan: copied continuations and the head's drafts, verified and kept" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    m.note(std.testing.io, 10, 0, 30, 21, 17, 9, .{ .copy = .{ .rounds = 3, .drafted = 15, .accepted = 13 }, .head = .{ .rounds = 2, .drafted = 6, .accepted = 4 } }, 1.0, null, null, null, null);
+    m.note(std.testing.io, 10, 0, 10, 5, 2, 6, .{ .head = .{ .rounds = 1, .drafted = 5, .accepted = 2 } }, 1.0, null, null, null, null);
+    var stub: RenderStub = .{};
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
+    const body = out.written();
+    for ([_][]const u8{
+        "# TYPE tensorfold:decode_rounds_by_plan_total counter\n",
+        "tensorfold:decode_rounds_by_plan_total{plan=\"copy\"} 3\n",
+        "tensorfold:decode_rounds_by_plan_total{plan=\"head\"} 3\n",
+        "# TYPE tensorfold:mtp_drafted_by_plan_total counter\n",
+        "tensorfold:mtp_drafted_by_plan_total{plan=\"copy\"} 15\n",
+        "tensorfold:mtp_drafted_by_plan_total{plan=\"head\"} 11\n",
+        "# TYPE tensorfold:mtp_accepted_by_plan_total counter\n",
+        "tensorfold:mtp_accepted_by_plan_total{plan=\"copy\"} 13\n",
+        "tensorfold:mtp_accepted_by_plan_total{plan=\"head\"} 6\n",
+        "tensorfold:mtp_drafted_total 26\n", // the plans split it (other plans none here)
+        "tensorfold:decode_rounds_total 15\n",
+    }) |line| {
+        if (std.mem.indexOf(u8, body, line) == null) std.debug.print("missing: {s}", .{line});
+        try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
+    }
+    // nothing noted: each plan's line at 0
+    var empty: Metrics = .{ .gpa = gpa };
+    var none: std.Io.Writer.Allocating = .init(gpa);
+    defer none.deinit();
+    try empty.render(std.testing.io, &none.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, none.written(), "tensorfold:mtp_accepted_by_plan_total{plan=\"head\"} 0\n") != null);
+}

@@ -62,6 +62,7 @@ test {
     _ = @import("decisions_test.zig");
     _ = @import("prepare_gate.zig");
     _ = @import("text_memo_test.zig");
+    _ = @import("chat.zig");
     _ = @import("systemone.zig");
     _ = @import("systemone_test.zig");
     _ = @import("slide.zig");

@@ -190,6 +190,28 @@ pub const LaneVision = struct {
     pub const PrepareError = error{ BadImage, OutOfMemory };
 };
 
+/// A stream's decode rounds by the plan its window ran (windows.Kind, as the round concluded): copied continuations
+/// (`copy`) and the head's drafts (`head`), each the rounds, the plan's own drafts verified and those the target kept
+/// (a grammar's drafts after them and suffix-match branches count in neither, as do forced, plain, grammar and fill
+/// rounds).
+pub const Plans = struct {
+    copy: Count = .{},
+    head: Count = .{},
+
+    pub const Count = struct {
+        rounds: u64 = 0,
+        drafted: u64 = 0,
+        accepted: u64 = 0,
+
+        /// One round of this plan: its window's drafts and those kept.
+        pub fn add(c: *Count, drafted: u64, accepted: u64) void {
+            c.rounds += 1;
+            c.drafted += drafted;
+            c.accepted += accepted;
+        }
+    };
+};
+
 /// One image of a prompt: tower input (patches [gh * gw, width]) for the `tokens` placeholder rows from `at`.
 pub const Image = struct { pixels: []const f32, gh: u32, gw: u32, at: u32, tokens: u32 };
 
@@ -278,6 +300,7 @@ pub const Stream = struct {
     rounds: u64 = 0,
     drafted: u64 = 0,
     accepted: u64 = 0,
+    plans: Plans = .{}, // those rounds, drafts and kept drafts of copies and of the head's drafts (Plans)
     depths: [shape.max_depth]Depth = @splat(.{}), // the head's chains by depth (noteDepths)
     branch_rows: u64 = 0, // suffix-match branch rows verified (lanes/fill.zig)
     branch_accepted: u64 = 0, // of those, rows on the accepted path
