@@ -33,8 +33,18 @@ const exact = @import("exact.zig");
 const tri_index = @import("tri_index.zig");
 const idx_split = @import("idx_split.zig");
 const exl3_linear = @import("exl3_linear.zig");
+const mx = @import("mx.zig");
 const prompt2d = @import("prompt2d.zig");
 const rdma = @import("rdma.zig");
+const round = @import("round.zig");
+
+/// A profile's (--profile 2) chunk timer (model.zig sets it while it times a chunk): the attention's and the MoE's
+/// steps marked inside their phases (a_in, a_q, a_idx, a_core, a_woa; m_rt, m_gu, m_x), the rest of each in its own.
+pub var ptimer: ?*round.PhaseTimer = null;
+
+fn pmark(e: *const Engine, p: round.PhaseTimer.Phase) void {
+    if (ptimer) |t| t.mark(e.s, p) catch {};
+}
 
 /// The indexer's [rows, n_comp] keys a row block holds at most (model.py: rb * n_comp <= 2^26 / 4 past 16 rows).
 const key_elems: usize = 1 << 24;
@@ -132,6 +142,7 @@ pub const Engine = struct {
     two: ?*const prompt2d.Two = null, // a node of the four-node 2D split (prompt2d.zig); `world` stays TP2's
     ring: ?*rdma.Ring = null, // TP2: the decode-size all-gathers over the RDMA ring (the served lane's), else NCCL
     par: ?*const exl3_experts2d.ParKernels = null, // the parity split's gate / up in one launch (null: the served two)
+    mx: ?*const mx.Kernels = null, // Format.native: DeepSeek's own FP8 / MXFP4 checkpoint's kernels (mx.zig)
 
     /// A decode-size all-gather of `count` fp32 a rank into `dst`, rank after rank: the RDMA ring when the engine has
     /// one and the slice fits a slot (whole float4s), else NCCL. The same bytes either way.
@@ -275,6 +286,11 @@ pub const Chunk = struct {
     head_l: u64 = 0, // fp32 [1, this rank's vocabulary columns]: its logits
     head_g: u64 = 0, // fp32 [world, 1, columns]: their gather (the prompt's logits, rank after rank)
     pending: bool = false, // gm holds a MoE gather whose post is not in h yet
+    // Format.native (mx.zig): the linears' quantized rows and split partials, and the experts' scratch (the
+    // intermediate's rows: xs.xd for a prompt chunk's, xsd.xd for a decode window's)
+    mxs: mx.Scratch = undefined,
+    mxe: mx.ExpertScratch = undefined,
+
 
     /// Every buffer for `cap` rows from `a`, the compressed layers' for chunks ending by position `tokens`; the scratch
     /// the served build zeros (or fills with -1) is set the same.
@@ -405,8 +421,27 @@ pub const Chunk = struct {
         var xs: exl3_experts.Scratch = undefined;
         xs.rows = cap;
         xs.slots = sl;
-        inline for (.{ "xg", "xu", "xd", "z", "no_y", "ids", "count", "counts", "members", "work_gu", "work_d" }, 0..) |f, j| {
-            @field(xs, f) = try a.take(sz[j]);
+        if (e.mx != null) {
+            // Format.native: only the intermediate's rows (bf16 [cap * slots, pack]), xs.xd for chunks and xsd.xd for
+            // decode windows; the grouping and the quantized rows live in ch.mxe
+            const pack = ex.width + if (ex.rest) |r| r.width else 0;
+            xs = std.mem.zeroes(exl3_experts.Scratch);
+            xs.rows = cap;
+            xs.slots = sl;
+            xs.xd = try a.take(cap * sl * pack * 2);
+            ch.xs = xs;
+            ch.xsd = std.mem.zeroes(exl3_experts.DecodeScratch);
+            ch.xsd.rows = exl3_experts.exact_rows;
+            ch.xsd.slots = sl;
+            ch.xsd.xd = xs.xd;
+            try mxScratch(e, &ch, a, cap);
+        } else {
+            inline for (.{ "xg", "xu", "xd", "z", "no_y", "ids", "count", "counts", "members", "work_gu", "work_d" }, 0..) |f, j| {
+                @field(xs, f) = try a.take(sz[j]);
+            }
+            ch.xs = xs;
+            ch.xsd = try decodeScratch(e, a, ex, sl);
+            if (e.two) |t| try t.clearRest(e); // parity: the rest launches' grouping starts empty
         }
         ch.xs = xs;
         ch.xsd = try decodeScratch(e, a, ex, sl);
@@ -469,8 +504,10 @@ pub const Chunk = struct {
         ch.gxh = try a.take(128 * max_gk * 2);
         ch.gz = try a.take(@max(max_gz, 1) * 4);
         // the scratch as experts.py makes it: zeros, the member lists -1
-        for ([_]u64{ xs.xg, xs.xu, xs.xd, xs.z, xs.no_y, xs.ids, xs.count, xs.counts }, [_]usize{ sz[0], sz[1], sz[2], sz[3], sz[4], sz[5], sz[6], sz[7] }) |p, n| try fill(e, p, 0, n);
-        try fill32(e, xs.members, 0xffffffff, sz[8] / 4);
+        if (e.mx == null) {
+            for ([_]u64{ xs.xg, xs.xu, xs.xd, xs.z, xs.no_y, xs.ids, xs.count, xs.counts }, [_]usize{ sz[0], sz[1], sz[2], sz[3], sz[4], sz[5], sz[6], sz[7] }) |p, n| try fill(e, p, 0, n);
+            try fill32(e, xs.members, 0xffffffff, sz[8] / 4);
+        }
         try fill(e, ch.neg, 0xff, cap * 8);
         var had: [128 * 128]u16 = undefined;
         exl3_prefill.hadamard(&had);
@@ -478,6 +515,68 @@ pub const Chunk = struct {
         return ch;
     }
 };
+
+/// Format.native's scratch for chunks of `cap` rows (and rounds and drafter passes, fewer): the widest K any native
+/// linear reads (wo_a's groups together), the largest split partials, and the experts' grouping for the routed rows.
+fn mxScratch(e: *const Engine, ch: *Chunk, a: *Arena, cap: usize) !void {
+    var max_k: usize = 0;
+    var zf: usize = 0;
+    var e_max: usize = 0;
+    var dn_k: usize = 0;
+    var dn_n: usize = 0;
+    const blocks: []const weights.Layer = if (e.w.dspark) |ds| ds.blocks else &.{};
+    for ([_][]const weights.Layer{ e.w.layers, blocks }) |ls| for (ls) |lay| {
+        var lin: [16]?weights.Linear = @splat(null);
+        lin[0] = lay.wq_a;
+        lin[1] = lay.wkv;
+        lin[2] = lay.wq_b;
+        lin[3] = lay.wo_b;
+        lin[4] = lay.comp_wkv;
+        lin[5] = lay.comp_wgate;
+        lin[6] = lay.idx_wq_b;
+        lin[7] = lay.idx_wk;
+        lin[8] = lay.engram_wkv;
+        for (lin) |ol| {
+            const l = ol orelse continue;
+            max_k = @max(max_k, l.k);
+            zf = @max(zf, mx.zFloats(l, cap));
+        }
+        var wk: usize = 0;
+        for (lay.wo_a[0..lay.groups]) |wo| wk += wo.k;
+        max_k = @max(max_k, wk);
+        // the 2D split's wo_b reads the rank's whole wo_a output
+        if (e.two) |t| max_k = @max(max_k, t.uw[0] + t.uw[1]);
+        e_max = @max(e_max, lay.experts.count);
+        dn_k = @max(dn_k, lay.experts.down_k);
+        dn_n = @max(dn_n, lay.experts.down_n);
+        max_k = @max(max_k, lay.experts.down_k);
+    };
+    if (e.w.dspark) |ds| {
+        max_k = @max(max_k, ds.main_proj.k);
+        zf = @max(zf, mx.zFloats(ds.main_proj, cap));
+    }
+    const ls = mx.Scratch.sizes(cap, max_k, zf);
+    ch.mxs = .{ .q = try a.take(ls[0]), .s = try a.take(ls[1]), .z = try a.take(ls[2]), .fake = try a.take(ls[3]), .rows = cap, .max_k = max_k };
+    const sl = e.slots();
+    const es = mx.ExpertScratch.sizes(cap, sl, e_max, e.c.hidden, dn_k, dn_n);
+    var x: mx.ExpertScratch = undefined;
+    x.rows = cap;
+    x.slots = sl;
+    inline for (.{ "q", "s", "cnt", "off", "fill", "act", "nact", "ent", "erow", "hq", "hs", "out" }, 0..) |f, j| {
+    }
+    // the prefill tiles' list (mx.gateUp / down of a prompt chunk)
+    x.tiles = try a.take(mx.ExpertScratch.tileBytes(cap, sl, e_max));
+    x.ntiles = try a.take(4);
+    x.z = .{ .ptr = 0, .floats = 0 };
+    // decode launches' split partials (round.zig and the drafter's own: mx.decode_rows rows at most)
+    var zf_dec: usize = 0;
+    for ([_][]const weights.Layer{ e.w.layers, blocks }) |dls| for (dls) |lay| {
+        zf_dec = @max(zf_dec, mx.decodeZFloats(lay, e.c.hidden, e.c.experts, e.c.index_heads, mx.decode_rows, sl));
+    };
+    if (e.w.head.fmt == .bf16) zf_dec = @max(zf_dec, mx.bfSplits(e.w.head.k, e.w.head.n) * mx.decode_rows * e.w.head.n);
+    if (zf_dec > 0) x.z = .{ .ptr = try a.take(zf_dec * 4), .floats = zf_dec };
+    ch.mxe = x;
+}
 
 /// A layer's linears in the chunk's grouped-linear sizes (its attention input group, its wo_a group, each alone at 128
 /// rows) and each one's split-K counters (Chunk.init).
@@ -565,6 +664,11 @@ pub fn counterOf(ch: *const Chunk, l: weights.Linear) !u64 {
 /// TF_EXL3_PDL and TF_EXL3_L2_DISCARD).
 pub fn grouped(e: *const Engine, ch: *const Chunk, m: usize, ls: []const weights.Linear, xs: []const u64, ldxs: []const usize, outs: []const u64, ldos: []const usize, types: []const exl3_linear.DType) !void {
     if (m == 0 or m > 128 or ls.len > 8) return error.NotADecodeWindow;
+    if (e.mx) |k| {
+        // Format.native: each linear on its own (its rows quantized, the MX or bf16 GEMM): the bits of any row count
+        for (ls, 0..) |l, i| try mx.linear(k, e.s, ch.mxs, l, xs[i], .bf16, ldxs[i], m, outs[i], ldos[i], types[i], false, null);
+        return;
+    }
     var calls: [8]exl3_linear.Call = undefined;
     var off: usize = 0;
     for (ls, 0..) |l, i| {
@@ -577,8 +681,16 @@ pub fn grouped(e: *const Engine, ch: *const Chunk, m: usize, ls: []const weights
 
 /// Exl3Group.rotated on m rows already rotated into each call's xh (a kernel that folds the rotation in wrote them):
 /// the glinear launches alone, each call's counters and folds as given.
+/// grouped for a decode launch (a round's rows, the drafter's): Format.native's FP8 / FP4 linears through the GEMV
+/// (mx.linear decode), each row its own bits at any row count; EXL3 as grouped.
+pub fn groupedDecode(e: *const Engine, ch: *const Chunk, m: usize, ls: []const weights.Linear, xs: []const u64, ldxs: []const usize, outs: []const u64, ldos: []const usize, types: []const exl3_linear.DType) !void {
+    const k = e.mx orelse return grouped(e, ch, m, ls, xs, ldxs, outs, ldos, types);
+    try mx.linearsDecode(k, e.s, ch.mxs, ls, xs, ldxs, m, outs, ldos, types, ch.mxe.z);
+}
+
 pub fn groupedRotated(e: *const Engine, ch: *const Chunk, m: usize, calls: []exl3_linear.Call) !void {
     if (m == 0 or m > 128 or calls.len > exl3_linear.gmax) return error.NotADecodeWindow;
+    if (e.mx != null) return error.RotatedRowsOnNative; // Format.native: the callers pass plain rows (grouped)
     for (calls) |*c| c.counters = try counterOf(ch, c.layer);
     try exl3_linear.glinear(e.lin, e.s, calls, m, ch.gz, true, true);
 }
@@ -717,16 +829,32 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
         ch.pending = false;
     } else {
         try tri_basic.hcPre(e.t, ch.h, lay.hc_attn[0], lay.hc_attn[1], lay.hc_attn[2], ch.pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, ch.x, ch.pre_a, ch.post, ch.comb, ch.part, ch.n, c.hidden);
+pub var dump_dir: ?[:0]const u8 = null;
+pub var dump_done: bool = false;
+pub var dump_node: u32 = 0;
+
     }
+pub fn dump(e: *const Engine, li: usize, name: []const u8, ptr: u64, bytes: usize) void {
+    const dir = dump_dir orelse return;
+    e.s.synchronize() catch return;
+    const host = std.heap.page_allocator.alloc(u8, bytes) catch return;
+    defer std.heap.page_allocator.free(host);
+    e.d.check(e.d.api.cuMemcpyDtoH_v2(host.ptr, ptr, bytes), "cuMemcpyDtoH") catch return;
+    var buf: [512]u8 = undefined;
+    const path = std.mem.printSentinel(&buf, "{s}/n{d}-{s}.bin", .{ dir, dump_node, name }, 0) catch return;
+    const f = std.c.fopen(path.ptr, "wb") orelse return;
+    defer _ = std.c.fclose(f);
+    _ = std.c.fwrite(host.ptr, 1, bytes, f);
 }
 
 /// mm(layer, x, out_dtype) of m rows: the prompt GEMM beyond 128 rows, the layer's own group (GROUPED) up to 128.
-fn mmRows(e: *const Engine, ch: *const Chunk, m: usize, l: weights.Linear, x: u64, ldx: usize, out: u64, out_type: tri_markov.OutType, os: usize) !void {
-    if (m > 128) return exl3_prefill.matmul(e.pf, e.t, ch.ws, l, x, .bf16, ldx, out, out_type, os, m);
+pub fn mmRows(e: *const Engine, ch: *const Chunk, m: usize, l: weights.Linear, x: u64, ldx: usize, out: u64, out_type: tri_markov.OutType, os: usize) !void {
     const dt: exl3_linear.DType = switch (out_type) {
         .bf16 => .bf16,
         .fp32 => .f32,
     };
+    // Format.native: one kernel for every row count (a row's bits at any m)
+    if (e.mx) |k| return mx.linear(k, e.s, ch.mxs, l, x, .bf16, ldx, m, out, os, dt, false, null);
     try grouped(e, ch, m, &.{l}, &.{x}, &.{ldx}, &.{out}, &.{os}, &.{dt});
 }
 
@@ -783,9 +911,15 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     } else {
         try grouped(e, ch, n, &.{ lay.wq_a, lay.wkv }, &.{ ch.x, ch.x }, &.{ c.hidden, c.hidden }, &.{ ch.qa, ch.y }, &.{ lay.wq_a.n, hd }, &.{ .bf16, .bf16 });
     }
-    try tri_basic.rmsnorm(e.t, ch.qa, lay.wq_a.n, lay.q_norm, ch.qr, lay.wq_a.n, c.eps, n, lay.wq_a.n);
+    pmark(e, .a_in);
+    dump(e, li, "x", ch.x, n * c.hidden * 2);
+    dump(e, li, "qa", ch.qa, n * lay.wq_a.n * 2);
+    dump(e, li, "y", ch.y, n * hd * 2);
+    dump(e, li, "qr", ch.qr, n * lay.wq_a.n * 2);
     try mm(e, ch, lay.wq_b, ch.qr, lay.wq_a.n, ch.q, .bf16, hl * hd);
+    dump(e, li, "q_norope", ch.q, n * hl * hd * 2);
     try tri_norm.ropeHeads(e.t, ch.q, rope.cos, rope.sin, ch.pos, rd, false, n, hl, hd);
+    pmark(e, .a_q);
     // the window keys: the ring's last window - 1 positions before start, then this chunk's rows
     const lo = @max(floor, start -| (c.window - 1));
     const wsrc_rows = if (ring_mode) ring_rows else start - lo + n;
@@ -834,6 +968,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
             padded = true;
         }
     }
+    pmark(e, .a_idx);
     try tri_attn.sparseAttn(e.t, .{
         .q = ch.q,
         .out = ch.o,
@@ -863,12 +998,16 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         try upload(e, ch.ring_idx, &idx, keep * 8);
         try e.ops.scatterRows(e.s, kv + (n - keep) * hd * 2, hd * 2, ch.ring_idx, ring, hd * 2, hd * 2, keep);
     }
+    pmark(e, .a_core);
+    dump(e, li, "o", ch.o, n * hl * hd * 2);
     // wo_a: each group's column block of o read in place, written into its column block of u; then wo_b to fp32
     const groups = lay.groups;
     const gk = hl * hd / groups;
     const uw = groups * lay.wo_a[0].n;
     var col: usize = 0;
-    if (n > 128) {
+    if (e.mx) |k| {
+            dump(e, li, "o_fake", ch.mxs.fake, n * hl * hd * 2);
+            dump(e, li, "wo_a0", lay.wo_a[0].w, @as(usize, lay.wo_a[0].n) * lay.wo_a[0].k * 2);
         for (lay.wo_a[0..groups], 0..) |wo, g| {
             try mm(e, ch, wo, ch.o + g * gk * 2, hl * hd, ch.u + col * 2, .bf16, uw);
             col += wo.n;
@@ -887,7 +1026,13 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         const dts = [_]exl3_linear.DType{ .bf16, .bf16, .bf16, .bf16 };
         try grouped(e, ch, n, lay.wo_a[0..groups], xs[0..groups], lds[0..groups], outs[0..groups], oss[0..groups], dts[0..groups]);
     }
-    if (e.two) |t| return t.woB(e, ch, lay); // 2D: the column partner's groups first, then this pair's columns
+    pmark(e, .a_woa);
+    dump(e, li, "u", ch.u, n * uw * 2);
+    if (e.two) |t| {
+        dump(e, li, "u_full", t.u_full, n * (t.uw[0] + t.uw[1]) * 2);
+        dump(e, li, "pa", ch.pa, n * lay.wo_b.n * 4);
+        return;
+    }
     try mm(e, ch, lay.wo_b, ch.u, uw, ch.pa, .fp32, c.hidden);
 }
 
@@ -985,6 +1130,16 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     } else {
         try e.ops.toF32(e.s, ch.x, ch.xf, n * c.hidden);
         try e.blas.xwTRows(ch.xf, lay.idx_proj, ch.wl, n, c.hidden, ih, gemm_rows);
+        // Format.native: weights_proj, a bf16 Linear, times the scale (Indexer.forward), at any row count
+    } else {
+        if (n <= tri.decode_rows) {
+            // a decode-sized chunk: the row-invariant matmul of the fp16 projection (rowmm2)
+            try tri_norm.rowmm2(e.t, ch.x, c.hidden, lay.idx_proj_h, ch.wl, n, c.hidden, ih);
+        } else {
+            try e.ops.toF32(e.s, ch.x, ch.xf, n * c.hidden);
+            try e.blas.xwT(ch.xf, lay.idx_proj, ch.wl, n, c.hidden, ih);
+        }
+        try e.exact.bf16Scale(e.s, ch.wl, ch.iw, n * ih, exact.indexScale(id, ih));
     }
     try e.exact.bf16Scale(e.s, ch.wl, ch.iw, n * ih, exact.indexScale(id, ih));
     const kk = @min(c.index_topk, n_comp_end);
@@ -1105,6 +1260,25 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
     const sl = e.slots();
     const shared_id = lay.experts.count - 1;
     var kc: usize = 0;
+    if (e.mx) |k| {
+            try mx.bf16Gemm(k, e.s, ch.x, d, lay.gate_w, d, n, c.experts, d, ch.logits, c.experts, .f32, 1, false, 1, 0, 0, 0, null);
+            try tri_norm.route(e.t, ch.logits, 0, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick, ch.wts, n, c.experts, sl);
+            try routeSpans(e, ch, lay, shared_id, sl, 0);
+        pmark(e, .m_rt);
+        dump(e, li, "mx", ch.x, n * d * 2);
+        dump(e, li, "logits", ch.logits, n * c.experts * 4);
+        dump(e, li, "pick", ch.pick, n * sl * 4);
+        dump(e, li, "wts", ch.wts, n * sl * 4);
+        if (e.two) |t| {
+            const pack = lay.experts.width + t.ir;
+            dump(e, li, "xd", ch.xs.xd, n * sl * pack * 2);
+            dump(e, li, "xd_full", t.xd_full, n * sl * lay.experts.down_k * 2);
+            dump(e, li, "pm", ch.pm, n * lay.experts.down_n * 4);
+            return;
+        }
+        try mx.gateUp(k, e.s, e.d, lay.experts, ch.mxe, ch.x, d, ch.pick, ch.wts, n, c.swiglu_limit, ch.xs.xd, lay.experts.width, false);
+        return mx.down(k, e.s, lay.experts, ch.mxe, ch.xs.xd, lay.experts.width, ch.pick, n, ch.pm, d, false, false);
+    }
     if (n <= tri.decode_rows) {
         // a decode-sized chunk: the row-invariant gate (rowmm_gate's chunk sums) and its routing
         kc = try tri_norm.rowmmGate(e.t, ch.x, d, lay.gate_w, ch.gl, n, d, c.experts);
@@ -1131,7 +1305,7 @@ fn routeSpans(e: *const Engine, ch: *Chunk, lay: weights.Layer, shared_id: usize
     if (lay.gate_b_vl == 0) return error.NoImageRoutingBias;
     const c = e.c;
     const n = ch.n;
-    const src = if (n <= tri.decode_rows) ch.gl else ch.logits;
+    const src = if (n <= tri.decode_rows and kc != 0) ch.gl else ch.logits;
     const row = @max(kc, 1) * c.experts * 4;
     for (ch.spans) |sp| {
         const o = overlap(sp, ch.start, n) orelse continue;
@@ -1183,6 +1357,20 @@ pub const EngramHost = struct {
     p_x: u64 = 0,
     p_gate: u64 = 0,
     p_calls: u64 = 0,
+    // the prompt's read-ahead worker (engramWorker; model.zig runs it through a fill): chunk i's rows of Engram layer j
+    // in wk_rows[i % 2][j], chunk i ready once wk_done[j] > i, its slot free again once wk_used[j] > i (the rows
+    // uploaded), so the worker runs up to a chunk ahead of the layers: a chunk's table reads overlap the chunk before
+    wk_flat: []i64 = &.{},
+    wk_w: []u8 = &.{},
+    wk_s: []u8 = &.{},
+    wk_done: [2]std.atomic.Value(usize) = .{ .init(0), .init(0) },
+    wk_used: [2]std.atomic.Value(usize) = .{ .init(0), .init(0) },
+    wk_stop: std.atomic.Value(bool) = .init(false),
+    wk_failed: std.atomic.Value(bool) = .init(false),
+    wk_err: ?anyerror = null,
+    wk_thread: ?std.Thread = null,
+    wk_seq: []const i32 = &.{}, // the prompt it reads (its whole ids)
+    wk_start: usize = 0, // its first chunk's start
 
     pub fn init(gpa: std.mem.Allocator, c: *const Config, hasher: engram.Hasher, tables: *const engram_io.Tables, pool: *engram_io.Pool, rank: usize, world: usize, cap: usize) !EngramHost {
         const cols = hasher.cols();
@@ -1190,6 +1378,13 @@ pub const EngramHost = struct {
         const hi = (rank + 1) * cols / world;
         const k = hi - lo;
         const t = tables.layers.get(@intCast(c.engram_layers.slice()[0])) orelse return error.MissingEngramTable;
+        var max_w: usize = 0;
+        var max_s: usize = 0;
+        for (0..@min(2, c.engram_layers.slice().len)) |j| {
+            const tj = tables.layers.get(@intCast(c.engram_layers.slice()[j])) orelse return error.MissingEngramTable;
+            max_w = @max(max_w, tj.row_w);
+            max_s = @max(max_s, tj.row_s);
+        }
         var aw: [2][]u8 = .{ &.{}, &.{} };
         var as: [2][]u8 = .{ &.{}, &.{} };
         var ar: [2][]u16 = .{ &.{}, &.{} };
@@ -1202,6 +1397,7 @@ pub const EngramHost = struct {
             af[j] = try gpa.alloc(i64, cap * k);
         }
         return .{
+            .wk_rows = wr,
             .ahead_w = aw,
             .ahead_s = as,
             .ahead_rows = ar,
@@ -1340,20 +1536,9 @@ fn lap(e: *const Engine, eh: *const EngramHost, t: *u64) u64 {
     return now - t.*;
 }
 
-/// A chunk's rows `ids` of table `t` by AIO (the pool's bytes, at ~0.07 s for 24,576 rows where the pool's preads take
-/// ~0.5 s on one GB10 node): batches of a quarter of the ring's slots (two reads a row), all submitted (a submit reaps while the
-/// ring is full), then waited for in order.
-fn aioGather(aio: *engram_aio.Aio, t: engram_io.Table, ids: []const i64, out_w: []u8, out_s: []u8) !void {
-    const per = @max(aio.slots / 4, 1);
-    var batch: [64]u64 = undefined;
-    var nb: usize = 0;
-    var at: usize = 0;
-    errdefer for (batch[0..nb]) |id| aio.wait(id) catch {};
-    while (at < ids.len) : (at += per) {
-        const n = @min(per, ids.len - at);
-        if (nb == batch.len) return error.TooManyRows;
-        batch[nb] = try aio.start(t, ids[at..][0..n], out_w[at * t.row_w ..][0 .. n * t.row_w], out_s[at * t.row_s ..][0 .. n * t.row_s]);
-        nb += 1;
+/// The fill's read-ahead worker (a thread of model.zig's fill): from the chunk at `start`, chunk after chunk of
+/// `chunk` rows to the end of `seq` (the prompt's whole ids), both Engram layers' rows hashed, read and decoded as
+/// engramApply would, into the chunk's slot once the layers freed it. Errors land in wk_err (wk_failed set).
     }
     for (batch[0..nb], 0..) |id, i| {
         aio.wait(id) catch |err| {
@@ -1409,12 +1594,58 @@ pub fn tap(e: *const Engine, ch: *Chunk, j: usize) !void {
 /// Tap j's rows (bf16 [n, D]).
 pub fn tapRows(e: *const Engine, ch: *const Chunk, j: usize) u64 {
     return ch.taps + j * ch.cap * e.c.hidden * 2;
+pub fn engramWorker(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize, chunk: usize) void {
+    const nl = @min(2, c.engram_layers.slice().len);
+    const cols = eh.hasher.cols();
+    const k = eh.hi - eh.lo;
+        const n = @min(chunk, seq.len - at);
+            eh.wk_err = err;
+            eh.wk_failed.store(true, .release);
+            return;
+        };
+    }
+}
+
+    const li = c.engram_layers.slice()[j];
+    const t = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
+    for (0..n) |r| {
+    }
+    const m = n * k;
+    if (eh.paio) |aio| try aioGather(aio, t, eh.wk_flat[0..m], eh.wk_w[0 .. m * t.row_w], eh.wk_s[0 .. m * t.row_s]) else try eh.pool.gather(t, eh.wk_flat[0..m], eh.wk_w[0 .. m * t.row_w], eh.wk_s[0 .. m * t.row_s]);
+    engram.decodeRows(eh.wk_w[0 .. m * t.row_w], eh.wk_s[0 .. m * t.row_s], out[0 .. m * t.row_w], m, t.row_w, t.row_s, 8);
+}
+
+    engramWorkerStop(eh);
+    for (&eh.wk_done) |*v| v.store(0, .release);
+    for (&eh.wk_used) |*v| v.store(0, .release);
+    eh.wk_stop.store(false, .release);
+    eh.wk_failed.store(false, .release);
+    eh.wk_err = null;
+    eh.wk_seq = seq;
+    eh.wk_start = start;
+    eh.wk_thread = try std.Thread.spawn(.{}, engramWorker, .{ eh, c, seq, start, chunk });
+}
+
+/// Stop and join the worker (a fill's end, or its prompt about to change).
+pub fn engramWorkerStop(eh: *EngramHost) void {
+    const th = eh.wk_thread orelse return;
+    eh.wk_stop.store(true, .release);
+    eh.wk_thread = null;
+    eh.wk_seq = &.{};
+}
+
+/// The worker's rows of Engram layer j for the chunk at `start` (waiting for them), for engramApply.
+pub fn engramWorkerRows(eh: *EngramHost, j: usize, start: usize, chunk: usize) ![]u16 {
+    const ci = (start - eh.wk_start) / chunk;
+}
+
 }
 
 /// The head on the chunk's last row (_forward_k without all_logits): the pending MoE post, collapse_norm of the row with
 /// its pre, the head's columns (one row through the head's own group, fp32) and their gather: head_g holds the
 /// prompt's logits, the ranks' columns in rank order.
 pub fn head(e: *const Engine, ch: *Chunk) !void {
+    dump(e, 0, "head_l", ch.head_l, hl.n * 4);
     const c = e.c;
     const n = ch.n;
     if (ch.pending) {

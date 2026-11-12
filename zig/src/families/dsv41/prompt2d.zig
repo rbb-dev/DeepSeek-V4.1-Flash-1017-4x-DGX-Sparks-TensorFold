@@ -18,6 +18,7 @@ const Config = @import("config.zig").Config;
 const plan = @import("plan.zig");
 const prompt = @import("prompt.zig");
 const weights = @import("weights.zig");
+const mx = @import("mx.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const exl3_experts2d = @import("exl3_experts2d.zig");
 const ring2d = @import("ring2d.zig");
@@ -49,7 +50,13 @@ pub const Fan = struct {
     links: [3]?Link = .{ null, null, null },
 
     pub fn open(io: std.Io, ip: [4]u8, port: u16, rank: u32, world: u32) !Fan {
-        var f: Fan = .{};
+        return openAt(io, ip, null, port, rank, world);
+    }
+
+    /// open, rank 0 listening for follower g on `listen[g - 1]` when given (each follower's own link address of this
+    /// node: on a ring without a switch a follower reaches the head at the address of the cable it comes in on), else
+    /// on `ip` for all of them.
+    pub fn openAt(io: std.Io, ip: [4]u8, listen: ?[3][4]u8, port: u16, rank: u32, world: u32) !Fan {
         errdefer f.close();
         if (world > 4) return error.UnsupportedWorld;
         if (world < 2) return f;
@@ -184,6 +191,40 @@ pub const Settings = extern struct {
     }
 };
 
+/// API); unset, rank g serves node g. On four GB10s cabled as a ring 0-1-2-3-0 without a switch, "0,1,3,2" makes every
+/// the cables in rank order.
+pub fn order() ![4]u32 {
+    const v = std.c.getenv("TF_DS_2D_ORDER") orelse return .{ 0, 1, 2, 3 };
+    return parseOrder(std.mem.span(v));
+}
+
+pub fn parseOrder(text: []const u8) ![4]u32 {
+    var out: [4]u32 = undefined;
+    var seen: [4]bool = @splat(false);
+    var it = std.mem.splitScalar(u8, text, ',');
+    for (&out) |*o| {
+        const x = std.mem.trim(u8, it.next() orelse return error.BadOrder, " ");
+        o.* = std.fmt.parseInt(u32, x, 10) catch return error.BadOrder;
+        if (o.* > 3 or seen[o.*]) return error.BadOrder;
+        seen[o.*] = true;
+    }
+    if (it.next() != null or out[0] != 0) return error.BadOrder;
+    return out;
+}
+
+    var inv: [4]u32 = undefined;
+    for (ord, 0..) |g, i| inv[g] = @intCast(i);
+    return inv;
+}
+
+test "TF_DS_2D_ORDER: a ring's order and its inverse" {
+    const o = try parseOrder("0,1,3,2");
+    try std.testing.expectEqual([4]u32{ 0, 1, 3, 2 }, o);
+    try std.testing.expectError(error.BadOrder, parseOrder("1,0,2,3"));
+    try std.testing.expectError(error.BadOrder, parseOrder("0,1,1,2"));
+    try std.testing.expectError(error.BadOrder, parseOrder("0,1,2"));
+}
+
 fn len(r: ?[2]usize) usize {
     const x = r orelse return 0;
     return x[1] - x[0];
@@ -259,8 +300,11 @@ pub const Two = struct {
         t.xd_full = try a.take(@max(cap, round_rows) * slots * (t.gu[0] + t.gu[1] + t.ir) * 2);
         if (t.ir != 0) {
             if (t.gu[0] != t.gu[1]) return error.UnequalParityParts;
-            t.rest_dec = try restScratch(a, ex0, exl3_experts.exact_rows, slots, false);
-            t.rest_chunk = try restScratch(a, ex0, cap, slots, true);
+            // (Format.native computes the rest in the main launch: no rest scratch)
+            if (ex0.native == null) {
+                t.rest_dec = try restScratch(a, ex0, exl3_experts.exact_rows, slots, false);
+                t.rest_chunk = try restScratch(a, ex0, cap, slots, true);
+            }
             t.peer = try a.take(@max(cap, round_rows) * slots * (t.gu[t.p] + t.ir) * 2);
         }
         t.own = try a.take(round_rows * t.uw[pp] * 2);
@@ -460,29 +504,18 @@ pub const Two = struct {
         try exl3_experts2d.down(e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
     }
 
-    /// Engram's projection summed over the TP2 ranks and cast, kv [n, ew0 + ew1] bf16 = bf16(g0 + g1) (model.py esum
-    /// then .to(bf16)), from this node's fp32 columns `src` [n, ew[p]] with less traffic than the quarters: the row
-    /// partner's columns over NCCL send / recv, one fp32 add (two operands: the same bits in either order) cast to
-    /// bf16, then the column partner's bf16 sums the same way. `tmp` holds n * (ew[p] * 6 + ew[1 - p] * 2) bytes.
-    pub fn engramSum(t: *const Two, e: *const prompt.Engine, src: u64, tmp: u64, kv: u64, n: usize) !void {
-        const w = t.ew;
-        const mine = n * w[t.p];
-        const other = tmp;
-        const half = tmp + mine * 4;
-        const their = half + mine * 2;
-        const g: u32 = @intCast(t.r + 2 * t.p);
-        try e.comm.exchange(src, mine, other, mine, .f32, g ^ 1, e.s);
-        try e.ops.add2Bf16(e.s, src, other, half, mine);
-        if (t.neighbor_gather != null) {
-            try neighbor.forward(e.comm, half, their, .{ n * w[0], n * w[0], n * w[1], n * w[1] }, .bf16, t.pad, t.part_bytes, e.s);
-        } else {
-            try e.comm.exchange(half, mine, their, n * w[1 - t.p], .bf16, g ^ 2, e.s);
+    /// Format.native's experts on a 2D node, chunk or round alike: this node's pack of every expert's gate / up (its main
+    /// blocks, its rest block for the experts whose rest is this pair's) into xd [rows * slots, pack] bf16, the rank's
+    /// whole intermediate assembled from the two pairs' packs (the same bytes moved as the EXL3 path's fp16 rows), down
+        const k = e.mx.?;
+        if (!split_k) if (prompt.ptimer) |pt| pt.mark(e.s, .m_gu) catch {};
         }
-        const row = (w[0] + w[1]) * 2;
-        for (0..2) |pg| {
-            const from = if (pg == t.p) half else their;
-            try e.ops.copyRows(e.s, from, w[pg] * 2, kv + pg * w[0] * 2, row, w[pg] * 2, n);
+        if (t.ir != 0) try t.assembleParity(e, ex, xd, pick, rows * ch.mxe.slots) else try t.catRank(e, xd, t.xd_full, rows * ch.mxe.slots, t.gu, 2);
+        if (!split_k) if (prompt.ptimer) |pt| pt.mark(e.s, .m_x) catch {};
         }
+        try mx.down(k, e.s, ex, ch.mxe, t.xd_full, ex.down_k, pick, rows, out, t.dw[t.p], false, split_k);
+    }
+
     }
 
     /// Engram's projection summed over the ranks from its column quarters (model.py esum): the gathered width.

@@ -36,11 +36,12 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     }
     const g = try std.fmt.parseInt(u32, args[1], 10);
+    const ord = try dsv41.prompt2d.order();
     const ip = try dsv41.link.parseIp(args[2]);
     const port = try std.fmt.parseInt(u16, args[3], 10);
     var rows_text: []const u8 = "1,6,16,32,48";
     var reps: usize = 200;
-    var gid: u8 = 5;
+    var gid: ?u8 = null;
     var i: usize = 6;
     while (i + 1 < args.len) : (i += 2) {
         if (std.mem.eql(u8, args[i], "--rows")) rows_text = args[i + 1] else if (std.mem.eql(u8, args[i], "--reps")) reps = try std.fmt.parseInt(usize, args[i + 1], 10) else if (std.mem.eql(u8, args[i], "--gid")) gid = try std.fmt.parseInt(u8, args[i + 1], 10) else return error.BadArgument;

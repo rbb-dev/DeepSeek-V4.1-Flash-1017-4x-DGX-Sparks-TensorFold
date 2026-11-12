@@ -21,6 +21,7 @@ const tri_norm = @import("tri_norm.zig");
 const tri_attn = @import("tri_attn.zig");
 const tri_index = @import("tri_index.zig");
 const exl3_linear = @import("exl3_linear.zig");
+const mx = @import("mx.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const round2d = @import("round2d.zig");
 const exl3_experts2d = @import("exl3_experts2d.zig");
@@ -312,6 +313,10 @@ pub const Round = struct {
         // wo_a_rot's suh: the slices' suh one after another (torch.cat's bytes)
         rd.wo_suh = try gpa.alloc(u64, w.layers.len);
         for (w.layers, 0..) |lay, li| {
+            if (e.mx != null) { // Format.native: no rotations
+                rd.wo_suh[li] = 0;
+                continue;
+            }
             var k: usize = 0;
             for (lay.wo_a[0..lay.groups]) |wo| k += wo.k;
             const dst = try a.take(k * 2);
@@ -425,6 +430,17 @@ pub const Round = struct {
         rd.pf_out = true;
     }
 
+    /// The active experts' down weights into L2 beside the main stream (mx.prefetchDown), as prefetch forks.
+    fn prefetchDown(rd: *Round, e: *const Engine, k: *const mx.Kernels, ex: weights.Experts, sc: mx.ExpertScratch, budget: u64) !void {
+        const s = rd.pf orelse return;
+        if (budget == 0) return;
+        try rd.pf_fork.?.record(e.s);
+        try s.wait(rd.pf_fork.?);
+        try mx.prefetchDown(k, s, ex, sc, budget);
+        try rd.pf_join.?.record(s);
+        rd.pf_out = true;
+    }
+
     /// The main stream waits for the prefetches forked so far (a stretch ends joined: its graph's every stream).
     fn joinPrefetch(rd: *Round, e: *const Engine) !void {
         if (!rd.pf_out) return;
@@ -446,9 +462,9 @@ pub const Round = struct {
     fn mark(rd: *Round, e: *const Engine, p: PhaseTimer.Phase) !void {
         if (rd.clk != 0 and rd.clk_marks and (rd.clk_ratio == null or rd.clk_ratio.? == rd.cur_ratio)) {
             const now = cuda.launch.count;
-            rd.launches[@intFromEnum(p)] += now -% rd.launch_mark;
+            rd.launches[@backingInt(p)] += now -% rd.launch_mark;
             rd.launch_mark = now;
-            try rd.clock(e, @intFromEnum(p));
+            try rd.clock(e, @backingInt(p));
         }
         if (rd.timer) |t| try t.mark(e.s, p);
     }
@@ -572,7 +588,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         }
         const xs = [_]u64{ rd.x, rd.x, rd.x, rd.x };
         const ldxs = [_]usize{ c.hidden, c.hidden, c.hidden, c.hidden };
-        try prompt.grouped(e, ch, R, ls[0..n], xs[0..n], ldxs[0..n], outs[0..n], lds[0..n], dts[0..n]);
+        try prompt.groupedDecode(e, ch, R, ls[0..n], xs[0..n], ldxs[0..n], outs[0..n], lds[0..n], dts[0..n]);
     }
     try rd.mark(e, .a_in);
     // the indexer's top-k takes every entry it scans (short contexts): its selection needs no scores
@@ -582,7 +598,16 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
     const need_iq = has_idx and !idx_all;
     // q_proj with kv (rot_q): q's RMSNorm writes wq_b's (and the indexer wq_b's) rotated rows and the window KV into
     // the ring in one launch; wq_b's epilogue applies q's RoPE
-    {
+    if (e.mx != null) {
+        // Format.native: q's RMSNorm and the window KV (RMSNorm, RoPE, FP8 quant-dequant into the ring) as plain rows,
+        // then wq_b (and the indexer's wq_b) on them and q's RoPE (Attention.forward)
+            try tri_basic.rmsnorm(t, rd.qa, lay.wq_a.n, lay.q_norm, rd.qr, lay.wq_a.n, c.eps, R, lay.wq_a.n);
+            try tri_norm.kvNormRope(t, rd.ykv, lay.kv_norm, rope.cos, rope.sin, pos, ring, ring_rows, rd.g(.wslot), c.eps, true, rd_dim, rd.kout, R, hd);
+        if (need_iq) {
+            try prompt.groupedDecode(e, ch, R, &.{ lay.wq_b, lay.idx_wq_b.? }, &.{ rd.qr, rd.qr }, &.{ lay.wq_a.n, lay.wq_a.n }, &.{ rd.q, rd.iq }, &.{ lay.wq_b.n, lay.idx_wq_b.?.n }, &.{ .bf16, .bf16 });
+        } else try prompt.groupedDecode(e, ch, R, &.{lay.wq_b}, &.{rd.qr}, &.{lay.wq_a.n}, &.{rd.q}, &.{lay.wq_b.n}, &.{.bf16});
+        try tri_norm.ropeHeads(t, rd.q, rope.cos, rope.sin, pos, rd_dim, false, R, hl, hd);
+    } else {
         var rot: [2]tri_norm.Rot = undefined;
         var calls: [2]exl3_linear.Call = undefined;
         var n: usize = 0;
@@ -602,8 +627,8 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
     // the prefetch: this layer's wo_a and wo_b behind q's linears
     {
         var r: [5][2]u64 = @splat(.{ 0, 0 });
-        for (lay.wo_a[0..lay.groups], 0..) |wo, j| r[j] = linearBytes(wo);
-        r[4] = linearBytes(lay.wo_b);
+        const w8: ?weights.Linear = if (e.mx) |mk| (if (mk.dec_on) lay.wo_a8 else null) else null;
+        if (w8) |x| r[0] = linearBytes(x) else for (lay.wo_a[0..lay.groups], 0..) |wo, j| r[j] = linearBytes(wo);
         if (l2_skip & 1 == 0) try rd.prefetch(e, &r, l2_mb[0] << 20);
     }
     try rd.mark(e, .a_q);
@@ -632,7 +657,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
             const gpos = rd.g(if (ratio == 1) .gpos1 else .gpos2);
             if (lay.idx_wk) |iwk| {
                 const id = c.index_head_dim;
-                try prompt.grouped(e, ch, R, &.{iwk}, &.{rd.lat}, &.{hd}, &.{rd.ikp}, &.{id}, &.{.bf16});
+                try prompt.groupedDecode(e, ch, R, &.{iwk}, &.{rd.lat}, &.{hd}, &.{rd.ikp}, &.{id}, &.{.bf16});
                 try tri_basic.rmsnorm(t, rd.ikp, id, lay.idx_k_norm, rd.ik, id, c.eps, R, id);
                 try tri_norm.ropeHeads(t, rd.ik, rope.cos, rope.sin, gpos, rd_dim, false, R, 1, id);
                 try tri_attn.fp4Store(t, rd.ik, id, cs.idx_codes[li], cs.idx_scales[li], ctarget, R, id, 32, false);
@@ -655,7 +680,9 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
             const k: tri_index.IndexK = .{ .fp4 = .{ .codes = cs.idx_codes[src], .scales = cs.idx_scales[src] } };
             try tri_norm.ropeHeads(t, rd.iq, rope.cos, rope.sin, pos, rd_dim, false, R, ih, id);
             try tri_attn.fp4QdP2(t, rd.iq, rd.iq4, R * ih * id);
-            try tri_norm.rowmmWts(t, rd.x, c.hidden, lay.idx_proj_h, exact.indexScale(c.index_head_dim, c.index_heads), rd.iw, R, c.hidden, ih);
+            if (e.mx) |mk| {
+                try mx.bf16Gemm(mk, e.s, rd.x, c.hidden, lay.idx_proj, c.hidden, R, ih, c.hidden, rd.iw, ih, .bf16, exact.indexScale(c.index_head_dim, c.index_heads), true, 1, 0, 0, 0, ch.mxe.z);
+            } else try tri_norm.rowmmWts(t, rd.x, c.hidden, lay.idx_proj_h, exact.indexScale(c.index_head_dim, c.index_heads), rd.iw, R, c.hidden, ih);
             const kk = @min(c.index_topk, nb);
             const pow2 = kk & (kk - 1) == 0;
             const after_src = c.candidate_source < li;
@@ -731,12 +758,36 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         .wbase = rd.g(.wbase),
         .cbase = cbase,
         .ring_rows = ring_rows,
-        .rot = .{ .cos = rope.cos, .sin = rope.sin, .rd = rd_dim, .suh = rd.wo_suh[li], .xh = rd.xhwo, .gh = gk / hd },
+        .rot = if (e.mx != null) null else .{ .cos = rope.cos, .sin = rope.sin, .rd = rd_dim, .suh = rd.wo_suh[li], .xh = rd.xhwo, .gh = gk / hd },
         .parts = .{ .pm = rd.pm_, .pl = rd.pl_, .po = rd.po_ },
     });
     try rd.mark(e, .a_core);
-    var calls: [exl3_linear.gmax]exl3_linear.Call = undefined;
     const uw = lay.groups * lay.wo_a[0].n;
+    if (e.mx) |k| {
+        // Format.native: the inverse RoPE on o, wo_a's groups (o quant-dequantized, bf16 einsum), then wo_b on the
+        // rank's whole wo_a output (2D: the column partner's groups first, as on the prompt path)
+        try tri_norm.ropeHeads(t, rd.o, rope.cos, rope.sin, pos, rd_dim, true, R, hl, hd);
+        if (if (k.dec_on) lay.wo_a8 else null) |w8| {
+            try mx.woA8(k, e.s, ch.mxs, w8, lay.groups, rd.o, hl * hd, R, rd.u, uw, ch.mxe.z);
+        } else try mx.woA(k, e.s, ch.mxs, lay.wo_a[0..lay.groups], rd.o, hl * hd, R, rd.u, uw, ch.mxe.z);
+        try rd.mark(e, .a_woa);
+            var u = rd.u;
+            var uk: usize = uw;
+            if (e.two) |tw| {
+                try tw.catRank(e, rd.u, tw.u_full, R, tw.uw, 2);
+                u = tw.u_full;
+                uk = tw.uw[0] + tw.uw[1];
+            }
+            try rd.mark(e, .a_x);
+            try prompt.groupedDecode(e, ch, R, &.{lay.wo_b}, &.{u}, &.{uk}, &.{rd.pa}, &.{lay.wo_b.n}, &.{.f32});
+        // (the decode tensor-core kernels: the shared expert's gate / up too, read first by gate / up, during the
+        // attention's gather)
+        if (k.dec_on) {
+            if (l2_skip & 2 == 0) try rd.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 }, lay.experts.shared_gate, lay.experts.shared_up }, (l2_mb[1] + l2_dec_mb) << 20);
+        } else if (l2_skip & 2 == 0) try rd.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 } }, l2_mb[1] << 20);
+        return;
+    }
+    var calls: [exl3_linear.gmax]exl3_linear.Call = undefined;
     var col: usize = 0;
     var off: usize = 0;
     for (lay.wo_a[0..lay.groups], 0..) |wo, gi| {
@@ -762,6 +813,25 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     const c = e.c;
     const R = rd.r;
     const sl = e.slots();
+    if (e.mx) |k| {
+        // Format.native: Gate.forward's fp32 logits (bf16 rows and weight), the routing, the experts
+        try mx.bf16Gemm(k, e.s, rd.x, c.hidden, lay.gate_w, c.hidden, R, c.experts, c.hidden, rd.gl, c.experts, .f32, 1, false, 1, 0, 0, 0, ch.mxe.z);
+        try tri_norm.route(e.t, rd.gl, 0, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - 1, rd.pick, rd.mw, R, c.experts, sl);
+        try rd.mark(e, .m_rt);
+        if (e.two) |tw| {
+            // prompt2d.expertsNative's steps, the profile's marks between: gate / up, the packs' exchange, down
+            const ex = lay.experts;
+            try mx.gateUp(k, e.s, e.d, ex, ch.mxe, rd.x, c.hidden, rd.pick, rd.mw, R, c.swiglu_limit, ch.xsd.xd, ex.width, true);
+            try rd.mark(e, .m_gu);
+            if (k.dec_on and l2_skip & 8 == 0) try rd.prefetchDown(e, k, ex, ch.mxe, l2_dn_mb << 20);
+            try rd.mark(e, .m_x);
+        } else {
+            try mx.gateUp(k, e.s, e.d, lay.experts, ch.mxe, rd.x, c.hidden, rd.pick, rd.mw, R, c.swiglu_limit, ch.xsd.xd, lay.experts.width, true);
+            try mx.down(k, e.s, lay.experts, ch.mxe, ch.xsd.xd, lay.experts.width, rd.pick, R, rd.pm, c.hidden, false, true);
+        }
+        try rd.mark(e, .m_gu);
+        return prefetchNext(e, rd, li);
+    }
     const kc = try tri_norm.rowmmGate(e.t, rd.x, c.hidden, lay.gate_w, rd.gl, R, c.hidden, c.experts);
     try tri_norm.route(e.t, rd.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - 1, rd.pick, rd.mw, R, c.experts, sl);
     try rd.mark(e, .m_rt);
@@ -784,8 +854,13 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
         try rd.mark(e, .m_x);
         try exl3_experts2d.decodeDown(e.ex, e.s, lay.experts, ch.xsd, tw.xd_full, rd.pick, rd.mw, rd.pm, R);
     } else try exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
-    // the prefetch behind the experts: the next layer's attention mix and input linears (an Engram layer: the first
-    // 4 MiB of its wkv), after the last layer the head
+    try prefetchNext(e, rd, li);
+}
+
+/// The prefetch behind the experts: the next layer's attention mix and input linears (an Engram layer: the first
+/// 4 MiB of its wkv), after the last layer the head.
+fn prefetchNext(e: *const Engine, rd: *Round, li: usize) !void {
+    const c = e.c;
     if (li + 1 < e.w.layers.len) {
         const nx = e.w.layers[li + 1];
         if (nx.engram_wkv) |ew| {
@@ -796,11 +871,17 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     } else try rd.prefetch(e, &.{linearBytes(e.w.head)}, l2_mb[2] << 20);
 }
 
-/// An EXL3 linear's words: their first byte and length (k * n values of k2 / 2 bits).
+/// A linear's weight bytes: their first byte and length (EXL3: k * n values of k2 / 2 bits; native: FP8 a byte, MXFP4
+/// half one, bf16 two, a value).
 fn linearBytes(l: weights.Linear) [2]u64 {
-    return .{ l.words, @as(u64, l.k) * l.n * l.k2 / 16 };
+    const kn = @as(u64, l.k) * l.n;
+    return switch (l.fmt) {
+        .exl3 => .{ l.words, kn * l.k2 / 16 },
+        .fp8 => .{ l.w, kn },
+        .fp4 => .{ l.w, kn / 2 },
+        .bf16 => .{ l.w, kn * 2 },
+    };
 }
-
 
 /// A measurement's L2 prefetches left out (TF_DS_L2_SKIP, read at Model.open: bit 1 the "attn" fork after q, 2 the "moe"
 /// fork after wo_b, 4 the "next" fork after the experts); 0 in service.
@@ -809,6 +890,10 @@ pub var l2_skip: u8 = 0;
 /// The forks' MiB (the served L2_ATTN_MB, L2_MOE_MB, L2_NEXT_MB and L2_STRETCH_END_MB: 16, 8, 16, 4; TF_DS_L2_ATTN_MB,
 /// TF_DS_L2_MOE_MB, TF_DS_L2_NEXT_MB, TF_DS_L2_STRETCH_END_MB at Model.open).
 pub var l2_mb: [4]u64 = .{ 16, 8, 16, 4 };
+/// The MiB the native decode path adds to the second prefetch (the shared expert's gate / up; TF_DS_L2_DEC_MB).
+pub var l2_dec_mb: u64 = 8;
+/// The MiB of the active experts' down weights prefetched beside the 2D exchange (TF_DS_L2_DN_MB; 0: none).
+pub var l2_dn_mb: u64 = 8;
 
 /// An mHC mix's weights hc_*_fn: fp32 [24, hc * d].
 fn hcFnBytes(c: anytype) u64 {
@@ -1016,6 +1101,7 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
                 pending = null;
             }
             try prompt.grouped(e, ch, R, &.{ew}, &.{rd.e_in}, &.{ew.k}, &.{rd.ek}, &.{ew.n}, &.{.f32});
+            try prompt.groupedDecode(e, ch, R, &.{ew}, &.{rd.e_in}, &.{ew.k}, &.{rd.ek}, &.{ew.n}, &.{.f32});
             try Probe.check(probe, .engram_proj, l, rd.ek);
             const en = if (e.two) |tw| tw.engramWidth() else ew.n;
             if (e.two) |tw| try tw.quarters(e, rd.ek, rd.ekg, R, tw.ew, 4) else try e.gatherF32(rd.ek, rd.ekg, R * ew.n);
@@ -1102,6 +1188,14 @@ fn aheadRow(j: usize) usize {
     return j * max_rows;
 }
 
+/// The rows an Engram host a round reads through holds: two Engram layers' rows of a round at the most rows.
+pub const engram_cap = 2 * max_rows;
+
+/// Whether an Engram host whose flat row-id buffer holds `flat_len` ids (rows x k) serves a round (engramAhead).
+pub fn engramFits(flat_len: usize, k: usize) bool {
+    return flat_len >= engram_cap * k;
+}
+
 fn engramAhead(e: *const Engine, eh: *prompt.EngramHost, seq: []const i32, rows: Rows, ah: *Ahead) !void {
     const c = e.c;
     const R = rows.ids.len;
@@ -1109,7 +1203,7 @@ fn engramAhead(e: *const Engine, eh: *prompt.EngramHost, seq: []const i32, rows:
     const k = eh.hi - eh.lo;
     const one = [_]Window{.{ .row = 0, .n = R, .seq = seq }};
     const windows = rows.windows orelse &one;
-    if (c.engram_layers.slice().len > 2 or eh.flat.len < 2 * max_rows * k) return error.EngramShape;
+    if (c.engram_layers.slice().len > 2 or !engramFits(eh.flat.len, k)) return error.EngramShape;
     const t0 = stamp(eh);
     for (windows) |w| {
         const start: usize = @intCast(rows.pos[w.row]);

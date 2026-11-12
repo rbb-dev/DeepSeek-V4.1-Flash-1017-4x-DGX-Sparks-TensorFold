@@ -1183,6 +1183,17 @@ pub const Lanes = struct {
             self.m.joinAhead();
             self.m.fill_seq = &.{};
             self.dropFill(f.slot);
+        surv *= draft.landing(cf);
+        o.* = surv;
+    }
+}
+
+/// A primitive this rank refused: rank 0 runs the same one on the same inputs and refuses it at the same step (its
+/// request ends with the error), so the follower reports it and takes the next frame instead of ending.
+fn refused(err: anyerror) void {
+    std.debug.print("{{\"follow_refused\": \"{s}\"}}\n", .{@errorName(err)});
+}
+
         }
         if (self.first_of == s) self.first_of = null;
         const kv = self.streams.fetchRemove(s) orelse return;

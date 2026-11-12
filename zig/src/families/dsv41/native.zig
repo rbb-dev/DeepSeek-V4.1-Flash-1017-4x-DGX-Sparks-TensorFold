@@ -3,6 +3,8 @@
 //! node (the same model directory, rank cache, kit, pool and port). The ranks link over TCP and NCCL; the inputs
 //! beyond the checkpoint come from the environment:
 //!   TF_TP_WORLD (2), TF_TP_MASTER, TF_TP_PORT   the ranks: rank 0's fabric address and port (rank 1 connects)
+//!   TF_TP_LISTEN                                world 4: rank 0's address for each follower, "a,b,c" (ranks 1-3: the
+//!                                               address each was given; unset: TF_TP_MASTER for all)
 //!   TF_DS_RANK_CACHE                            the lane's per-rank weight files (the Python lane's TF_DS_RANK_CACHE)
 //!   TF_DS_KIT                                   cubins/ (the served extension cubins), the served RoPE tables
 //!                                               (rope-*.f32, as many rows as the context) and engram.json
@@ -140,6 +142,13 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (world != 2 and world != 4) return error.NotPortedYet; // TP2, or the four-node 2D split
     const master = link.parseIp(getenv("TF_TP_MASTER") orelse return error.NoMaster) catch return error.BadMaster;
     const port = std.fmt.parseInt(u16, getenv("TF_TP_PORT") orelse "29620", 10) catch return error.BadPort;
+    const listen: ?[3][4]u8 = if (getenv("TF_TP_LISTEN")) |t| blk: {
+        var out: [3][4]u8 = undefined;
+        var it = std.mem.splitScalar(u8, t, ',');
+        for (&out) |*a| a.* = link.parseIp(it.next() orelse return error.BadMaster) catch return error.BadMaster;
+        if (it.next() != null) return error.BadMaster;
+        break :blk out;
+    } else null;
     const arena_gib = if (getenv("TF_DS_ARENA_GIB")) |t| std.fmt.parseInt(usize, t, 10) catch return error.BadArena else 0;
     const window = if (getenv("TF_DS_WINDOW")) |t| std.fmt.parseInt(usize, t, 10) catch return error.BadWindow else o.context;
     if (window < o.context) return error.BadWindow;
@@ -154,6 +163,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .rank = 0,
         .world = world,
         .master = master,
+        .listen = listen,
         .port = port,
         .engram_dir = getenv("TF_DS_ENGRAM"),
         .token_map = getenv("TF_DS_TOKEN_MAP"),

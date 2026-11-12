@@ -21,6 +21,7 @@ const exl3_prefill = @import("exl3_prefill.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const exl3_experts2d = @import("exl3_experts2d.zig");
+const mx = @import("mx.zig");
 const ops_mod = @import("ops.zig");
 const exact = @import("exact.zig");
 const cublas = @import("cublas.zig");
@@ -44,6 +45,13 @@ pub fn wavesOn() bool {
 /// Rows between resume points: the served build's 2048-row grid. Kept states land on it; a pass is cut short to end at
 /// the next one it keeps, so a longer pass resumes where a 2048-row pass would.
 pub const resume_rows = 2048;
+
+/// TF_DS_ENGRAM_WORKER=0: a fill's Engram rows read by a thread a chunk (the chunk before's end to this one's first
+/// Engram layer) instead of the fill's worker.
+var wk_on: bool = true;
+pub fn readWorkerEnv() void {
+    if (std.c.getenv("TF_DS_ENGRAM_WORKER")) |v| wk_on = !std.mem.eql(u8, std.mem.span(v), "0");
+}
 /// The pool's streams (--parallel 4).
 pub const max_streams = draft.max_streams;
 /// The pool's streams when unset (--parallel 4).
@@ -59,6 +67,7 @@ pub const Options = struct {
     rank: u32,
     world: u32,
     master: [4]u8,
+    listen: ?[3][4]u8 = null, // rank 0 at world 4: the address to listen on for each follower (TF_TP_LISTEN), else master
     port: u16,
     engram_dir: ?[]const u8 = null, // the Engram tables (none: a checkpoint without Engram layers)
     token_map: ?[]const u8 = null, // the compressed token map (the lane's JSON cache)
@@ -714,6 +723,108 @@ pub const Model = struct {
         if (n == 0 or n > chunk_rows or seq.len != start + n) return error.BadChunk;
         if (m.waves and n > wave_rows) return m.fillPair(seq, start, n, replay);
         const e = &m.eng;
+    mxk: ?mx.Kernels = null, // Format.native: DeepSeek's own FP8 / MXFP4 checkpoint's kernels (mx.zig)
+    rope_buf: cuda.DeviceBuffer,
+    arena: prompt.Arena,
+        readWorkerEnv();
+        if (std.c.getenv("TF_DS_L2_DN_MB")) |v| round.l2_dn_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dn_mb;
+        if (std.c.getenv("TF_DS_L2_DEC_MB")) |v| round.l2_dec_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dec_mb;
+        const ord = if (o.world == 4) try prompt2d.order() else [4]u32{ 0, 1, 2, 3 };
+        const role: u32 = if (o.world == 4) ord[o.rank] else o.rank;
+        const cache_name = try rank_cache.find(a, io, m.cache_dir, role, o.world);
+        m.ix = try rank_cache.open(gpa, io, m.cache_dir, cache_name);
+        errdefer m.ix.deinit();
+        m.cache_file = try m.cache_dir.openFile(io, cache_name, .{});
+        errdefer m.cache_file.close(io);
+        var sp = try prompt2d.split(role, o.world);
+        if (std.c.getenv("TF_DS_DUMP")) |dd| {
+            prompt.dump_dir = std.mem.span(dd);
+            prompt.dump_node = role;
+        }
+        if (std.c.getenv("TF_DS_DRAFT_PROF")) |v| draft.dprof = v[0] == '1';
+        if (std.c.getenv("TF_DS_CONF_CAL")) |v| {
+            var it = std.mem.splitScalar(u8, std.mem.span(v), ',');
+            draft.conf_cal[0] = std.fmt.parseFloat(f64, it.next() orelse "1") catch return error.BadConfCal;
+            draft.conf_cal[1] = std.fmt.parseFloat(f64, it.next() orelse "0") catch return error.BadConfCal;
+        }
+        if (std.c.getenv("TF_DS_DRAFT_MS")) |v| draft.cost_ms = std.fmt.parseFloat(f64, std.mem.span(v)) catch return error.BadDraftMs;
+        if (std.c.getenv("TF_DS_DRAFT_LOG")) |v| {
+            draft.dlog = std.mem.span(v);
+            draft.ddump_node = role;
+        }
+        if (std.c.getenv("TF_DS_DRAFT_DUMP")) |dd| {
+            draft.ddump = std.mem.span(dd);
+            draft.ddump_node = role;
+            if (std.c.getenv("TF_DS_DRAFT_DUMP_PASS")) |dp| draft.ddump_pass = std.fmt.parseInt(usize, std.mem.span(dp), 10) catch 2;
+        }
+        sp.parity = sp.pair != null and parityGU(); // TF_DS_2D_GU=parity: the balanced experts split
+        m.par = if (sp.parity and parOne() and c.format == .exl3) try exl3_experts2d.ParKernels.load(d, cuda.kernels.dsv41_experts_par) else null;
+        errdefer if (m.par) |*x| x.unload();
+        m.mxk = if (c.format == .native) try mx.Kernels.load(d, cuda.kernels.dsv41_native) else null;
+        errdefer if (m.mxk) |*x| x.unload();
+        if (m.mxk) |*x| m.eng.mx = x;
+        if (c.vision and c.format == .exl3) { // (Format.native: the checkpoint's own gate.bias_vl, loaded with the weights)
+            const path = o.vision_bias orelse try std.fs.path.join(a, &.{ o.kit_dir, "vision", "gate_bias_vl.safetensors" });
+            m.loadVisionBias(path) catch |err| if (o.vision_bias != null or err != error.FileNotFound) return err;
+        }
+
+        if (m.dr) |*dr| dr.deinit();
+        if (m.timer) |t| {
+            t.deinit();
+            m.gpa.destroy(t);
+        }
+        if (m.ptimer) |t| {
+            t.deinit();
+            m.gpa.destroy(t);
+        }
+        m.rd.dropSide(&m.eng);
+        m.rd.dropPrefetch();
+        m.rd.dropPar();
+        if (m.mxk) |*x| x.unload();
+        m.ex.unload();
+        m.ops.unload();
+        m.exk.unload();
+        m.lg.unload();
+        m.pf.unload();
+        m.set.deinit();
+    /// TF_DS_RDMA_GID: the RDMA rings' GID index on every device; unset, each device's first RoCE v2 IPv4 GID.
+    pub fn rdmaGid() ?u8 {
+        const v = std.c.getenv("TF_DS_RDMA_GID") orelse return null;
+        return std.fmt.parseInt(u8, std.mem.span(v), 10) catch null;
+    }
+
+    fn readKit(a: std.mem.Allocator, io: std.Io, kit: []const u8, name: []const u8) ![]const u8 {
+        return std.Io.Dir.cwd().readFileAllocOptions(io, try std.fs.path.join(a, &.{ kit, "cubins", name }), a, .limited(1 << 28), .@"16", null);
+    }
+
+    /// The link to the other rank (rank 0's to rank 1, rank 1's to rank 0).
+    pub fn peer(m: *const Model) link.Link {
+        return m.fan.links[0].?;
+    }
+
+    /// Rank 0's links to its followers: rank 1's, or ranks 1-3's on the four-node split.
+    pub fn followers(m: *const Model) []const ?link.Link {
+        return m.fan.links[0 .. m.world - 1];
+    }
+
+        if (m.eh) |*eh| prompt.engramWorkerStop(eh);
+    }
+
+    /// A kept prompt state's own bytes (the prompt cache's snapshots; the compressed plane stays in the stream's
+    /// extent): one slot's window ring of every layer and positional stores of every ratio-2 layer.
+    pub fn snapBytes(m: *const Model) usize {
+        const pb = prompt.raw_rows * m.eng.c.head_dim * 4;
+        var n: usize = m.rings.len * m.eng.ringBytes();
+        for (m.caches.raw_kv[0..m.eng.c.layers], m.caches.raw_score[0..m.eng.c.layers]) |k, sc| {
+            if (k != 0) n += pb;
+            if (sc != 0) n += pb;
+        }
+        return n;
+    }
+
+    /// Slot `slot`'s own state into `buf` (save: true) or back from it, in the stream's order (no wait): with the
+    /// extent's compressed rows, the state a prompt pass stands in at a chunk end.
+    pub fn snapCopy(m: *Model, slot: usize, buf: u64, save: bool) !void {
         const c = e.c;
         const ch = &m.ch;
         // an image position's id is negative in the sequence (its n-grams dead for Engram): its embedding's id is the
@@ -722,32 +833,31 @@ pub const Model = struct {
         for (0..n) |j| m.ids64[j] = if (seq[start + j] < 0) image_id else seq[start + j];
         var shared: prompt.Shared = .{};
         const pt = m.ptimer;
-        if (pt) |t| try t.mark(m.stream, .start);
+        prompt.ptimer = pt;
+        defer prompt.ptimer = null;
+        if (pt) |t| try t.mark(e.s, .start);
         try prompt.begin(e, ch, m.ids64[0..n], start, m.host_pos);
         if (ch.spans.len > 0) try prompt.embedSpans(e, ch);
         if (pt) |t| try t.mark(m.stream, .embed);
         const taps = m.dr != null;
         var floor: usize = 0;
         var kv_done: ?usize = null;
-        // Engram rows read ahead on a thread while the GPU runs the layers before them (the served reader pool's
-        // overlap): this chunk's both layers' during the chunk before it (m.ahead), else the first layer's from the
-        // chunk's start and the next's once the first is applied
+        // Engram rows read ahead while the GPU runs the layers before them. A fill of the prompt (seq a prefix of
+        // fill_seq): the fill's worker thread (prompt.engramWorker), up to a chunk ahead of the layers, so a chunk's
+        // table reads overlap the chunk before it. Else (a chunk alone): a thread from the chunk's start, the first
+        // layer's rows then the next's once the first is applied.
+        const use_wk = m.eh != null and wk_on and m.fill_seq.len >= start + n and m.fill_seq.ptr == seq.ptr;
         var ahead: ?std.Thread = m.ahead;
         m.ahead = null;
         defer if (ahead) |th| th.join();
         if (m.eh) |*eh| {
-            if (ahead != null and (eh.ahead_start != start or eh.ahead_n < n)) {
-                ahead.?.join();
+            if (use_wk) {
                 ahead = null;
-            }
-            // rows read ahead that ended before a round or a piece's end are this chunk's when they cover it, both layers
-            const whole = eh.ahead_start == start and eh.ahead_n >= n and eh.ahead_err == null and eh.ahead_ready[0] and (c.engram_layers.slice().len < 2 or eh.ahead_ready[1]);
-            if (ahead == null and !whole) {
-                eh.ahead_start = start;
-                eh.ahead_n = n;
-                eh.ahead_ready = .{ false, false };
-                eh.ahead_err = null;
-                ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, @as(usize, 0) }) catch null;
+                const same = eh.wk_thread != null and eh.wk_seq.ptr == m.fill_seq.ptr and eh.wk_seq.len == m.fill_seq.len and
+                    start >= eh.wk_start and (start - eh.wk_start) % chunk_rows == 0 and
+            } else {
+                prompt.engramWorkerStop(eh);
+                if (ahead != null and (eh.ahead_start != start or eh.ahead_n != n)) {
             }
         }
         for (0..c.layers) |li| {
@@ -769,6 +879,11 @@ pub const Model = struct {
                 if (ahead) |th| {
                     th.join();
                     ahead = null;
+                prompt.dump(e, li, "gm", ch.gm, 2 * ch.n * c.hidden * 4);
+            }
+            prompt.endLayer(ch);
+        }
+        try prompt.head(e, ch);
                 }
                 if (eh.ahead_err) |err| return err;
                 try prompt.engramApply(e, ch, eh, li, seq);

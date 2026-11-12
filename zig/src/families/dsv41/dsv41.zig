@@ -22,6 +22,7 @@ pub const tri_basic = @import("tri_basic.zig");
 pub const cublas = @import("cublas.zig");
 pub const elf = @import("elf.zig");
 pub const exl3_linear = @import("exl3_linear.zig");
+pub const mx = @import("mx.zig");
 pub const tri_norm = @import("tri_norm.zig");
 pub const tri_index = @import("tri_index.zig");
 pub const idx_split = @import("idx_split.zig");
@@ -70,6 +71,7 @@ test {
     refAll(cublas);
     refAll(elf);
     refAll(exl3_linear);
+    refAll(mx);
     refAll(tri_norm);
     refAll(tri_index);
     refAll(idx_split);
