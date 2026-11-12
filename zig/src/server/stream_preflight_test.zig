@@ -304,6 +304,104 @@ test "a reply labels a greedy request greedy and a sampled one exact" {
     try std.testing.expectEqual(@as(i64, 0), sampled.preparing);
 }
 
+// Streamed tool calls on the real server route, with a CPU fake engine (no model or GPU).
+const SpaceEngine = struct {
+    answer: []const u8,
+    chunk_size: usize,
+    fn engine(e: *@This()) api.Engine {
+        return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = HiEngine.cancel, .status = HiEngine.status, .memory = HiEngine.memory } };
+    }
+    fn info(_: *anyopaque) api.Info {
+        return .{ .context_window = 4096 };
+    }
+    fn submit(ctx: *anyopaque, id: api.Id, _: *const api.Request, sink: api.Sink) api.SubmitError!void {
+        const e: *SpaceEngine = @ptrCast(@alignCast(ctx));
+        var tokens: [2048]u32 = undefined;
+        for (e.answer, tokens[0..e.answer.len]) |byte, *token| token.* = byte;
+        sink.event(sink.ctx, id, &.{ .prefilled = 0 });
+        var pos: usize = 0;
+        while (pos < e.answer.len) {
+            var end = @min(e.answer.len, pos + e.chunk_size);
+            // The byte-token fake returns raw bytes, so keep UTF-8 characters whole.
+            while (end < e.answer.len and e.answer[end] & 0xc0 == 0x80) end += 1;
+            sink.event(sink.ctx, id, &.{ .tokens = tokens[pos..end] });
+            pos = end;
+        }
+        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop } });
+    }
+};
+
+const SpaceSeen = struct {
+    a: std.mem.Allocator,
+    content: std.ArrayList(u8) = .empty,
+    calls: usize = 0,
+    call_finish: bool = false,
+    failed: bool = false,
+    fn open(_: *anyopaque, _: usize) error{Closed}!void {}
+    fn event(ctx: *anyopaque, payload: ?json.Value) error{Closed}!void {
+        const s: *SpaceSeen = @ptrCast(@alignCast(ctx));
+        const value = payload orelse return;
+        if (value.get("error") != null) s.failed = true;
+        const choices = value.get("choices") orelse return;
+        for (choices.array) |choice| {
+            if (choice.get("finish_reason")) |f| {
+                if (f == .string and std.mem.eql(u8, f.string, "tool_calls")) s.call_finish = true;
+            }
+            const delta = choice.get("delta") orelse continue;
+            if (delta.get("content")) |c| if (c == .string) {
+                s.content.appendSlice(s.a, c.string) catch return error.Closed;
+            };
+            if (delta.get("tool_calls")) |c| s.calls += c.array.len;
+        }
+    }
+    fn reply(ctx: *anyopaque, _: u16, _: json.Value) void {
+        const s: *SpaceSeen = @ptrCast(@alignCast(ctx));
+        s.failed = true; // every case below requests a stream
+    }
+};
+
+fn exerciseSpace(answer: []const u8, expected: []const u8, called: bool, tools: bool, chunk_size: usize) !void {
+    var text: TestText = .{};
+    var backend: SpaceEngine = .{ .answer = answer, .chunk_size = chunk_size };
+    var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
+        .served_name = "test-model",
+        .model_ids = &.{"test-model"},
+        .enable_thinking = false,
+        .use_drafts = false,
+    }, null);
+    defer srv.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tool_list = if (tools) ",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"}}}}}]" else "";
+    const body = try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":true,\"max_tokens\":2048", tool_list, "}" });
+    const raw = (try json.parse(a, body)).ok;
+    var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
+    var seen: SpaceSeen = .{ .a = a };
+    openai.run(srv, a, .{ .ctx = &seen, .vt = &.{ .open = SpaceSeen.open, .event = SpaceSeen.event, .reply = SpaceSeen.reply } }, .{ .conn = &conn }, true, raw);
+    try std.testing.expect(!seen.failed);
+    try std.testing.expectEqual(called, seen.call_finish);
+    try std.testing.expectEqual(called, seen.calls > 0);
+    try std.testing.expectEqualStrings(expected, seen.content.items);
+}
+
+const space_call = "<\u{ff5c}DSML\u{ff5c} calls><\u{ff5c}DSML\u{ff5c} invoke name=\"f\"><\u{ff5c}DSML\u{ff5c} parameter name=\"x\" string=\"false\">7</\u{ff5c}DSML\u{ff5c} parameter></\u{ff5c}DSML\u{ff5c} invoke></\u{ff5c}DSML\u{ff5c} calls>";
+
+test "pure DSML call never streams framing whitespace" {
+    for ([_]usize{ 1, 2, 7, 2048 }) |n| try exerciseSpace("\n\n" ++ space_call, "", true, true, n);
+}
+test "leading indentation in ordinary prose is retained with tools" {
+    for ([_]usize{ 1, 2, 7, 2048 }) |n| try exerciseSpace("\n\n    indented\n", "\n\n    indented\n", false, true, n);
+}
+test "whitespace only answer is retained when no call is parsed" {
+    try exerciseSpace("\n \t", "\n \t", false, true, 1);
+}
+test "whitespace with tools disabled is unchanged" {
+    try exerciseSpace("\n\n    indented\n", "\n\n    indented\n", false, false, 1);
+}
+test "prose before a call retains its leading whitespace" {
+    try exerciseSpace("\n\nLook up.\n" ++ space_call, "\n\nLook up.\n", true, true, 1);
+}
 /// A two-call reply on `route`, whole and streamed: the stream sends no text that the whole reply does not show.
 fn expectToolStreamLikeWhole(route: Route, comptime fields: []const u8) !void {
     var backend: CallEngine = .{};

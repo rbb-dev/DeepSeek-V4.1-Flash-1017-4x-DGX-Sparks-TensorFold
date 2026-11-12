@@ -386,6 +386,9 @@ const Generation = struct {
         }
         const shown = if (g.calls != null) try reply_text.hideIntoMarked(g.a, &g.hidden, answer, false, mp) else answer;
         const visible_content = if (g.response_channel == .structured_json) shown else reply_text.streamingVisible(shown);
+        // Hold leading whitespace while a tool-only reply is still possible; later prose sends it intact.
+        const vis = if (g.calls != null and g.streamed.text.items.len == 0 and
+            reply_text.pyStrip(visible_content).len == 0) "" else visible_content;
         const copied = @intFromPtr(vis.ptr) >= @intFromPtr(g.hidden.items.ptr) and @intFromPtr(vis.ptr) <= @intFromPtr(g.hidden.items.ptr) + g.hidden.items.len;
         const delta = g.streamed.after(vis, !copied);
         if (delta.len > 0) {
@@ -530,7 +533,12 @@ const Generation = struct {
             const thought = g.streamed_reasoning.text.items;
             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
                 try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
-            const shown = if (g.calls != null) try reply_text.finishedProseMarked(a, content, mp) else content;
+            var shown = if (g.calls != null) try reply_text.finishedProseMarked(a, content, mp) else content;
+            // Drop held whitespace only after a real call parsed; whitespace-only answers are still sent.
+            if (g.calls != null and g.streamed.text.items.len == 0 and reply_text.pyStrip(shown).len == 0) {
+                const parsed = try tool_parse.parse(a, content, g.tools, null);
+                if (parsed.calls != null) shown = "";
+            }
             const sent = g.streamed.text.items;
             const rest = if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) shown[sent.len..] else "";
             if (g.lp) |*l| (if (try l.delta(g.srv, a, g.thinking, g.ignore_eos, g.collected.items, rest, shown.len, true)) |d| try g.emit(sink, d)) else if (rest.len > 0) try g.emit(sink, .{ .string = rest });

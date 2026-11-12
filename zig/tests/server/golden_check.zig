@@ -1,4 +1,4 @@
-//! Frozen server goldens for `zig build test-golden`, with the ten differences that are still known.
+//! Frozen server goldens for `zig build test-golden`, with the ten differences that are still known (nine of ours and TensorFold's).
 const std = @import("std");
 const posix = std.posix;
 const Io = std.Io;
@@ -16,6 +16,8 @@ const known_diffs = [_]Known{
     .{ .group = "metrics-open", .name = "metrics" },
     .{ .group = "metrics-open", .name = "v1-metrics" },
     .{ .group = "keys", .name = "metrics-counted" },
+    // TensorFold #32: a streamed tool-only reply does not send its framing whitespace as content ("\n" before the
+    // calls), which the frozen Python answers still send
     .{ .group = "tools", .name = "two_tools-stream" },
     .{ .group = "tools", .name = "two_tools-single-stream" },
     .{ .group = "anthropic", .name = "tool-use-stream" },
