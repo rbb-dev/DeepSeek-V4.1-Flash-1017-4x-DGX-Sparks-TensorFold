@@ -33,7 +33,8 @@ pub const HfText = struct {
             return error.Load;
         };
         errdefer t.tok.deinit();
-        // each request renders its chat up to three times, and a chat's earlier messages come back every turn
+        // each request renders its chat twice (prompt.zig's prepare: the prompt and the history), and a chat's earlier
+        // messages come back every turn: their long segments' ids are kept (64 MiB at most, the oldest dropped first)
         t.tok.memo = try tokenizer.Memo.create(gpa, 64 << 20);
         const added = try a.alloc([]const u8, t.tok.added.len);
         for (t.tok.added, added) |x, *s| s.* = x.content;

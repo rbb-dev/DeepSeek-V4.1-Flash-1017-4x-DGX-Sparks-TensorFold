@@ -249,6 +249,7 @@ test "a forced DSML call's marker is its token: spelled in plain characters, the
     // characters, the closing tags with two spaces; the grammar takes all of it as the parameter's value, never the end
     const reply = "<" ++ marker ++ " calls>\n<" ++ marker ++ " invoke name=\"get_weather\">\n<" ++ marker ++ " parameter name=\"city\" string=\"true\">London</" ++ marker ++ "  parameter>\n</" ++ marker ++ "  invoke>\n</" ++ marker ++ "  calls> \n\nHello! How can I help you today?";
     const plain = try text.encodePlain(a, reply);
+    plain_tokenizer.memo = null; // its segments are not split as the matching tokenizer's are
     try std.testing.expect(std.mem.indexOfScalar(u32, plain, dsml) == null and std.mem.indexOfScalar(u32, plain, bar[0]) != null);
     const w = try walk(&c, io, g, plain, stop);
     try std.testing.expect(w.taken == plain.len and !w.ended);

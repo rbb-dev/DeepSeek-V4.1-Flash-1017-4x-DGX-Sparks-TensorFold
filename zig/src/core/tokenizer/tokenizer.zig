@@ -3,8 +3,9 @@ const std = @import("std");
 const unicode = @import("unicode.zig");
 const steps = @import("steps.zig");
 const models = @import("model.zig");
+const memo_mod = @import("memo.zig");
 const Allocator = std.mem.Allocator;
-pub const Memo = @import("memo.zig").Memo;
+pub const Memo = memo_mod.Memo;
 /// A digest of what ids mean as loaded (identity.zig): what Recall keys its record by.
 pub const identity = @import("identity.zig").identity;
 
@@ -99,7 +100,8 @@ pub const Tokenizer = struct {
     raw: Trie = .{},
     normalized: Trie = .{},
     specials: std.StringHashMapUnmanaged(void) = .empty,
-    memo: ?*Memo = null, // long segments' ids kept between encodes (null: each encode tokenizes everything)
+    /// Long segments' ids kept between encodes (encodeText; null: each encode tokenizes everything).
+    memo: ?*Memo = null,
 
     pub fn deinit(t: *Tokenizer) void {
         t.vocab.deinit();
@@ -164,9 +166,7 @@ pub const Tokenizer = struct {
     fn encodeTextWith(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, first: bool, ids: *std.ArrayList(u32), added: bool) Error!void {
         var zero: usize = if (first) unicode.decodeAt(text, 0).len else 0;
         const normalized = if (t.normalizer) |*n| try n.apply(ctx, text, &zero) else text;
-        const whole = [_]Segment{.{ .start = 0, .end = normalized.len, .id = null }};
-        const segs: []const Segment = if (added) try t.splitAdded(ctx, &t.normalized, normalized) else &whole;
-        for (segs) |seg| {
+        for (try t.splitAdded(ctx, &t.normalized, normalized)) |seg| {
             if (seg.id) |id| {
                 try ids.append(ctx.a, id);
                 continue;
@@ -176,16 +176,18 @@ pub const Tokenizer = struct {
             const lead = seg.start < zero;
             // a long segment goes through the memo here, between every added token: a chat's markers can be ones
             // matched after normalization (DeepSeek-V4's are), and only here does a message's text stand alone, the
-            // same in the prompt's render, the history's and the next turn's. Its ids come from its text and `lead`
+            // same in the prompt's render, the history's and the next turn's. Its ids come from its text and `first`
             // alone, the memo's key.
-            const kept = if (added and part.len >= @import("memo.zig").min_bytes) t.memo else null;
-            if (kept) |k| if (try k.append(part, lead, ctx.a, ids)) continue;
+            const kept = if (plain.len >= memo_mod.min_bytes) t.memo else null;
+            if (kept) |k| if (try k.append(piece.text, piece.first, ctx.a, ids)) continue;
             const from = ids.items.len;
             var pieces: std.ArrayList(steps.Piece) = .empty;
             try pieces.append(ctx.a, .{ .text = part, .first = lead });
             if (t.pre_tokenizer) |*p| try p.apply(ctx, &pieces);
             for (pieces.items) |piece| try t.model.tokenize(ctx, &t.vocab, piece.text, ids);
             if (kept) |k| k.put(part, lead, ids.items[from..]);
+            } else try walk.run(t, 0, piece, ids, ctx.a);
+            if (kept) |k| k.put(piece.text, piece.first, ids.items[from..]);
         }
     }
 
@@ -237,6 +239,8 @@ pub const Tokenizer = struct {
         return std.mem.join(a, " ", tokens.items);
     }
 
+        const masked = try t.maskAdded(a, text);
+        defer if (masked) |m| a.free(m);
     /// Exact, possibly incomplete UTF-8 bytes; null for context-dependent decoders. Caller frees with `a`.
     pub fn tokenBytes(t: *const Tokenizer, a: Allocator, id: u32) Error!?[]u8 {
         const d = if (t.decoder) |*decoder| decoder else return null;
@@ -390,6 +394,15 @@ test "byte-level BPE with merges, added tokens and decode" {
     const unknown = (try t.tokenBytes(a, 99)).?;
     defer a.free(unknown);
     try std.testing.expectEqualStrings("", unknown);
+    return deepseekWith(a,
+        \\{"added_tokens":[{"id":0,"content":"<｜User｜>","special":true,"lstrip":false,"rstrip":false,"normalized":false,"single_word":false}],
+        \\ "normalizer":null,
+    , words);
+}
+
+/// deepseekLike with `head`'s added tokens and normalizer (the JSON before the pre-tokenizer); the vocabulary's ids from 1.
+fn deepseekWith(a: Allocator, head: []const u8, words: []const []const u8) !Tokenizer {
+    try w.writeAll(head);
 }
 
 test "with the memo, long segments encode as without it, and the second encode takes their kept ids" {
@@ -417,43 +430,6 @@ test "with the memo, long segments encode as without it, and the second encode t
         try std.testing.expectEqualSlices(u32, plain, kept);
     }
     try std.testing.expectEqual(@as(u64, 2), t.memo.?.hits); // both segments, the second time
-}
-
-test "the memo keeps a message's text between markers matched after normalization, as a chat's are" {
-    // DeepSeek-V4's chat markers are added tokens with "normalized": true: the prompt's render and the history's
-    // differ past the message, and the message's text is the same segment in both only after the split on them
-    const json =
-        \\{"added_tokens":[{"id":7,"content":"<|end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
-        \\ {"id":8,"content":"<|user|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":true,"special":false},
-        \\ {"id":9,"content":"<|bot|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":true,"special":false}],
-        \\ "pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":" ?\\S+|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
-        \\ "decoder":{"type":"ByteLevel"},
-        \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
-        \\  "vocab":{"a":0,"b":1,"Ġ":2,"ab":3,"Ġa":4,"Ġab":5,"c":6},"merges":[["Ġ","a"],"a b","Ġa b"]}}
-    ;
-    const a = std.testing.allocator;
-    var t = try parse(a, json);
-    defer t.deinit();
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(a);
-    for (0..300) |_| try body.appendSlice(a, "ab abc ");
-    const history = try std.mem.concat(a, u8, &.{ "<|end|><|user|>", body.items });
-    defer a.free(history);
-    const prompt = try std.mem.concat(a, u8, &.{ history, "<|bot|>" });
-    defer a.free(prompt);
-    const fresh_prompt = try t.encode(a, prompt);
-    defer a.free(fresh_prompt);
-    const fresh_history = try t.encode(a, history);
-    defer a.free(fresh_history);
-    try std.testing.expectEqual(@as(u32, 9), fresh_prompt[fresh_prompt.len - 1]);
-    t.memo = try Memo.create(a, 1 << 20);
-    const kept_prompt = try t.encode(a, prompt);
-    defer a.free(kept_prompt);
-    const kept_history = try t.encode(a, history);
-    defer a.free(kept_history);
-    try std.testing.expectEqualSlices(u32, fresh_prompt, kept_prompt);
-    try std.testing.expectEqualSlices(u32, fresh_history, kept_history);
-    try std.testing.expectEqual(@as(u64, 1), t.memo.?.hits); // the message's text, in the history's encode
 }
 
 test "a kept segment's ids equal a fresh encode's wherever the segment sits" {
@@ -509,123 +485,253 @@ test "a kept segment's ids equal a fresh encode's wherever the segment sits" {
     }
 }
 
-test "sentencepiece-style BPE with byte fallback" {
+test "the memo keeps a message's text between markers matched after normalization, as a chat's are" {
+    // DeepSeek-V4's chat markers are added tokens with "normalized": true: the prompt's render and the history's
+    // differ past the message, and the message's text is the same segment in both only after the split on them
     const json =
-        \\{"added_tokens":[],"normalizer":{"type":"Replace","pattern":{"String":" "},"content":"▁"},
-        \\ "pre_tokenizer":{"type":"Split","pattern":{"String":" "},"behavior":"MergedWithPrevious","invert":false},
-        \\ "decoder":{"type":"Sequence","decoders":[{"type":"Replace","pattern":{"String":"▁"},"content":" "},{"type":"ByteFallback"},{"type":"Fuse"}]},
-        \\ "model":{"type":"BPE","unk_token":"<unk>","fuse_unk":true,"byte_fallback":true,
-        \\  "vocab":{"<unk>":0,"<0xC3>":1,"<0xA9>":2,"h":3,"i":4,"▁":5,"hi":6,"▁h":7},"merges":["h i","▁ h"]}}
+        \\{"added_tokens":[{"id":7,"content":"<|end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
+        \\ {"id":8,"content":"<|user|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":true,"special":false},
+        \\ {"id":9,"content":"<|bot|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":true,"special":false}],
+        \\ "pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":" ?\\S+|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
+        \\ "decoder":{"type":"ByteLevel"},
+        \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+        \\  "vocab":{"a":0,"b":1,"Ġ":2,"ab":3,"Ġa":4,"Ġab":5,"c":6},"merges":[["Ġ","a"],"a b","Ġa b"]}}
     ;
     const a = std.testing.allocator;
     var t = try parse(a, json);
     defer t.deinit();
-    const ids = try t.encode(a, "hi h\u{E9}");
-    defer a.free(ids);
-    try std.testing.expectEqualSlices(u32, &.{ 6, 7, 1, 2 }, ids);
-    const text = try t.decode(a, ids, false);
-    defer a.free(text);
-    try std.testing.expectEqualStrings("hi h\u{E9}", text);
-    try std.testing.expectEqual(@as(?u32, 0), t.unk_id);
-    const first = (try t.tokenBytes(a, 1)).?;
-    defer a.free(first);
-    const second = (try t.tokenBytes(a, 2)).?;
-    defer a.free(second);
-    try std.testing.expectEqualSlices(u8, &.{0xc3}, first);
-    try std.testing.expectEqualSlices(u8, &.{0xa9}, second);
-    const space = (try t.tokenBytes(a, 7)).?;
-    defer a.free(space);
-    try std.testing.expectEqualStrings(" h", space);
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    for (0..300) |_| try body.appendSlice(a, "ab abc ");
+    const history = try std.mem.concat(a, u8, &.{ "<|end|><|user|>", body.items });
+    defer a.free(history);
+    const prompt = try std.mem.concat(a, u8, &.{ history, "<|bot|>" });
+    defer a.free(prompt);
+    const fresh_prompt = try t.encode(a, prompt);
+    defer a.free(fresh_prompt);
+    const fresh_history = try t.encode(a, history);
+    defer a.free(fresh_history);
+    try std.testing.expectEqual(@as(u32, 9), fresh_prompt[fresh_prompt.len - 1]);
+    t.memo = try Memo.create(a, 1 << 20);
+    const kept_prompt = try t.encode(a, prompt);
+    defer a.free(kept_prompt);
+    const kept_history = try t.encode(a, history);
+    defer a.free(kept_history);
+    try std.testing.expectEqualSlices(u32, fresh_prompt, kept_prompt);
+    try std.testing.expectEqualSlices(u32, fresh_history, kept_history);
+    try std.testing.expectEqual(@as(u64, 1), t.memo.?.hits); // the message's text, in the history's encode
 }
 
-test "without a decoder, decode joins known ids' tokens with spaces" {
-    const a = std.testing.allocator;
-    var t = Tokenizer{ .allocator = a, .vocab = .init(a), .id_to_token = .{ .allocator = a }, .model = .empty(.wordpiece) };
-    defer t.deinit();
-    try t.vocab.put("t1", 1);
-    try t.id_to_token.put(1, "t1");
-    try t.id_to_token.put(4, "t4");
-    const text = try t.decode(a, &.{ 1, 4, 9 }, false);
-    defer a.free(text);
-    try std.testing.expectEqualStrings("t1 t4", text);
-    try std.testing.expectEqual(@as(?u32, null), t.unk_id);
-    try std.testing.expect((try t.tokenBytes(a, 1)) == null);
-}
+/// DeepSeek-V4's added tokens as its tokenizer.json flags them (the sentence ends and the image token matched before
+/// the normalizer, the chat markers after it) and its empty normalizer; their ids come from addTokens (past the model).
+const v4_head =
+    \\{"added_tokens":[
+    \\ {"id":5000,"content":"<｜begin▁of▁sentence｜>","special":true,"lstrip":false,"rstrip":false,"normalized":false,"single_word":false},
+    \\ {"id":5001,"content":"<｜end▁of▁sentence｜>","special":true,"lstrip":false,"rstrip":false,"normalized":false,"single_word":false},
+    \\ {"id":5002,"content":"<｜deepseek_image｜>","special":false,"lstrip":false,"rstrip":false,"normalized":false,"single_word":false},
+    \\ {"id":5003,"content":"<｜System｜>","special":false,"lstrip":false,"rstrip":false,"normalized":true,"single_word":false},
+    \\ {"id":5004,"content":"<｜User｜>","special":false,"lstrip":false,"rstrip":false,"normalized":true,"single_word":false},
+    \\ {"id":5005,"content":"<｜Assistant｜>","special":false,"lstrip":false,"rstrip":false,"normalized":true,"single_word":false},
+    \\ {"id":5006,"content":"<think>","special":false,"lstrip":false,"rstrip":false,"normalized":true,"single_word":false},
+    \\ {"id":5007,"content":"</think>","special":false,"lstrip":false,"rstrip":false,"normalized":true,"single_word":false},
+    \\ {"id":5008,"content":"｜DSML｜","special":false,"lstrip":false,"rstrip":false,"normalized":true,"single_word":false}],
+    \\ "normalizer":{"type":"Sequence","normalizers":[]},
+;
 
-test "raw ByteLevel pieces preserve an incomplete UTF-8 character" {
-    const a = std.testing.allocator;
-    var t = Tokenizer{
-        .allocator = a,
-        .vocab = .init(a),
-        .id_to_token = .{ .allocator = a },
-        .model = .empty(.bpe),
-        .decoder = .byte_level,
-    };
-    defer t.deinit();
-    try t.id_to_token.put(0, "\u{c3}");
-    try t.id_to_token.put(1, "\u{a9}");
-    const first = (try t.tokenBytes(a, 0)).?;
-    defer a.free(first);
-    const second = (try t.tokenBytes(a, 1)).?;
-    defer a.free(second);
-    try std.testing.expectEqualSlices(u8, &.{0xc3}, first);
-    try std.testing.expectEqualSlices(u8, &.{0xa9}, second);
-    const decoded = try t.decode(a, &.{ 0, 1 }, false);
-    defer a.free(decoded);
-    try std.testing.expectEqualStrings("\u{e9}", decoded);
-    const partial = try t.decode(a, &.{0}, false);
-    defer a.free(partial);
-    try std.testing.expectEqualStrings("\u{fffd}", partial);
-}
+const ChatMsg = struct { role: enum { system, user, tool, assistant }, text: []const u8, reasoning: []const u8 = "", call: []const u8 = "" };
 
-test "raw token bytes refuse replacements after the decoder joins token boundaries" {
-    const a = std.testing.allocator;
-    const decoders = [_]steps.Decoder{
-        .byte_level, .{ .replace = .{ .pattern = .{ .literal = "ab" }, .content = "x" } },
-    };
-    var t = Tokenizer{
-        .allocator = a,
-        .vocab = .init(a),
-        .id_to_token = .{ .allocator = a },
-        .model = .empty(.bpe),
-        .decoder = .{ .sequence = &decoders },
-    };
-    defer t.deinit();
-    try t.id_to_token.put(0, "a");
-    try t.id_to_token.put(1, "b");
-    const decoded = try t.decode(a, &.{ 0, 1 }, false);
-    defer a.free(decoded);
-    try std.testing.expectEqualStrings("x", decoded);
-    try std.testing.expect((try t.tokenBytes(a, 0)) == null);
-}
-
-test "raw token bytes conservatively refuse context-sensitive decoder kinds" {
-    const a = std.testing.allocator;
-    var scratch = std.heap.ArenaAllocator.init(a);
-    defer scratch.deinit();
-    const pattern = try @import("regex.zig").Regex.compile(scratch.allocator(), "a+");
-    const after_fuse = [_]steps.Decoder{
-        .fuse, .{ .replace = .{ .pattern = .{ .literal = "ab" }, .content = "x" } },
-    };
-    const decoders = [_]steps.Decoder{
-        .{ .strip = .{ .content = ' ', .start = 1, .stop = 0 } },
-        .{ .metaspace = .{ .replacement = 0x2581, .scheme = .always } },
-        .{ .wordpiece = .{ .prefix = "##", .cleanup = false } },
-        .{ .replace = .{ .pattern = .{ .regex = pattern }, .content = "x" } },
-        .{ .sequence = &after_fuse },
-    };
-    var t = Tokenizer{
-        .allocator = a,
-        .vocab = .init(a),
-        .id_to_token = .{ .allocator = a },
-        .model = .empty(.bpe),
-    };
-    defer t.deinit();
-    try t.id_to_token.put(0, "a");
-    for (decoders) |decoder| {
-        t.decoder = decoder;
-        try std.testing.expect((try t.tokenBytes(a, 0)) == null);
+/// `msgs` as DeepSeek-V4.1's chat template lays them out (the recipe's model/chat_template.jinja): the sentence start,
+/// the effort line, the system text and its tools, each user turn with the tool results merged into it, each assistant
+/// turn (its reasoning, text and DSML call, the sentence end), and the assistant header after a user turn the assistant
+/// answers, or after the last one when `generation`.
+fn chatV4(a: Allocator, msgs: []const ChatMsg, thinking: bool, generation: bool) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, "<｜begin▁of▁sentence｜>");
+    if (thinking or msgs[0].role == .system) try out.appendSlice(a, "<｜System｜>");
+    if (thinking) try out.appendSlice(a, "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n");
+    for (msgs, 0..) |m, i| {
+        switch (m.role) {
+            .system => {
+                try out.appendSlice(a, m.text);
+                try out.appendSlice(a, "\n\n## Tools\n\nYou can invoke tools by writing a \"<｜DSML｜ calls>\" block:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n");
+            },
+            .user => {
+                try out.appendSlice(a, "<｜User｜>");
+                try out.appendSlice(a, m.text);
+            },
+            .tool => {
+                const merged = i > 0 and (msgs[i - 1].role == .user or msgs[i - 1].role == .tool);
+                try out.appendSlice(a, if (merged) "\n\n" else "<｜User｜>");
+                try out.print(a, "<tool_result>{s}</tool_result>", .{m.text});
+            },
+            .assistant => {
+                if (thinking) {
+                    try out.appendSlice(a, m.reasoning);
+                    try out.appendSlice(a, "</think>");
+                }
+                try out.appendSlice(a, m.text);
+                if (m.call.len > 0) try out.print(a, "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"read\">\n<｜DSML｜ parameter name=\"path\" string=\"true\">{s}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>", .{m.call});
+                try out.appendSlice(a, "<｜end▁of▁sentence｜>");
+            },
+        }
+        const user_turn = m.role == .user or m.role == .tool;
+        const last = i + 1 == msgs.len;
+        if (user_turn and ((last and generation) or (!last and msgs[i + 1].role == .assistant))) {
+            try out.appendSlice(a, "<｜Assistant｜>");
+            try out.appendSlice(a, if (thinking) "<think>" else "</think>");
+        }
     }
+    return out.toOwnedSlice(a);
+}
+
+const chat_words = [_][]const u8{ "the", "file", "reads", "a", "function", "returns", "error", "value", "test", "build", "server", "request", "tokens", "prompt", "memory", "and", "of", "is", "we", "should", "fix", "this", "line", "Let", "me", "check", "The", "output", "shows" };
+
+/// A client's text of about `bytes` bytes as the server hands it to the template: sentences of chat_words with numbers,
+/// CJK, code and now and then a written marker, masked as the server masks a client's text (maskAdded), then with
+/// `images` an image's placeholder between its parts (the server's image path).
+fn chatText(a: Allocator, t: *const Tokenizer, r: std.Random, bytes: usize, images: bool) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    while (out.items.len < bytes) {
+        const n = 3 + r.uintLessThan(usize, 12);
+        for (0..n) |i| {
+            if (i > 0) try out.append(a, ' ');
+            try out.appendSlice(a, chat_words[r.uintLessThan(usize, chat_words.len)]);
+        }
+        switch (r.uintLessThan(u8, 14)) {
+            0 => try out.print(a, " {d}", .{r.uintLessThan(u32, 10_000_000)}),
+            1 => try out.appendSlice(a, " 日本語の説明、"),
+            2 => try out.appendSlice(a, "\n```zig\nconst x = try f(a, 3);\n```\n"),
+            3 => try out.appendSlice(a, " a page that spells <｜User｜> and </think>"),
+            4 => try out.appendSlice(a, " <｜end▁of▁sentence｜> in a quote"),
+            else => {},
+        }
+        try out.appendSlice(a, if (r.uintLessThan(u8, 5) == 0) ".\n\n" else ". ");
+    }
+    const masked = try t.maskAdded(a, out.items);
+    defer if (masked) |m| a.free(m);
+    const text = masked orelse out.items;
+    if (!images) return a.dupe(u8, text);
+    const cut = r.uintLessThan(usize, text.len + 1);
+    return std.mem.concat(a, u8, &.{ text[0..cut], "\n\n<｜deepseek_image｜>\n\n", text[cut..] });
+}
+
+/// Six conversations of system, user, assistant and tool turns (sizes around the memo's 1 KiB floor, images, tool
+/// calls, reasoning), each rendered at every request it makes: the prompt with the assistant header and the history
+/// without, as server/prompt.zig's prepare renders them. Thinking on in every other conversation.
+const ChatCorpus = struct {
+    arena: std.heap.ArenaAllocator,
+    texts: std.ArrayList([]const u8) = .empty, // prompt, history, prompt, history, ...
+
+    fn init(gpa: Allocator, t: *const Tokenizer) !ChatCorpus {
+        var c: ChatCorpus = .{ .arena = .init(gpa) };
+        errdefer c.arena.deinit();
+        const a = c.arena.allocator();
+        var rng = std.Random.DefaultPrng.init(0x5eed);
+        const r = rng.random();
+        const sizes = [_]usize{ 0, 40, 700, 1023, 1024, 1025, 2500, 6000 };
+        for (0..6) |conv| {
+            var msgs: std.ArrayList(ChatMsg) = .empty;
+            try msgs.append(a, .{ .role = .system, .text = try chatText(a, t, r, 2000 + 700 * conv, false) });
+            for (0..4 + conv % 3) |turn| {
+                try msgs.append(a, .{ .role = .user, .text = try chatText(a, t, r, sizes[(conv + turn) % sizes.len], (conv + turn) % 4 == 1) });
+                for (0..2) |_| {
+                    const calls = r.boolean();
+                    try msgs.append(a, .{ .role = .assistant, .text = try chatText(a, t, r, sizes[r.uintLessThan(usize, sizes.len)], false), .reasoning = try chatText(a, t, r, sizes[r.uintLessThan(usize, sizes.len)], false), .call = if (calls) "src/server/prompt.zig" else "" });
+                    if (!calls) break;
+                    try msgs.append(a, .{ .role = .tool, .text = try chatText(a, t, r, 500 + r.uintLessThan(usize, 7000), turn == 1) });
+                }
+            }
+            const thinking = conv % 2 == 0;
+            for (1..msgs.items.len + 1) |k| {
+                const end = msgs.items[k - 1].role;
+                if (end != .user and end != .tool) continue;
+                try c.texts.append(a, try chatV4(a, msgs.items[0..k], thinking, true));
+                try c.texts.append(a, try chatV4(a, msgs.items[0..k], thinking, false));
+            }
+        }
+        return c;
+    }
+
+    fn deinit(c: *ChatCorpus) void {
+        c.arena.deinit();
+    }
+};
+
+test "DeepSeek-V4 chats through the memo: every request's prompt and history ids are a fresh encode's" {
+    const gpa = std.testing.allocator;
+    var fresh = try deepseekWith(gpa, v4_head, &chat_words);
+    defer fresh.deinit();
+    const user = fresh.specialTokenId("<｜User｜>").?;
+    var kept = try deepseekWith(gpa, v4_head, &chat_words);
+    defer kept.deinit();
+    kept.memo = try Memo.create(gpa, 64 << 20);
+    var corpus = try ChatCorpus.init(gpa, &fresh);
+    defer corpus.deinit();
+    try std.testing.expect(corpus.texts.items.len >= 40);
+    var requests: usize = 0;
+    var i: usize = 0;
+    while (i < corpus.texts.items.len) : (i += 2) {
+        const before = kept.memo.?.hits;
+        for (corpus.texts.items[i .. i + 2], 0..) |text, which| {
+            const want = try fresh.encode(gpa, text);
+            defer gpa.free(want);
+            const got = try kept.encode(gpa, text);
+            defer gpa.free(got);
+            try std.testing.expectEqualSlices(u32, want, got);
+            // the markers the template wrote are their tokens
+            try std.testing.expect(std.mem.indexOfScalar(u32, want, user) != null);
+            if (which == 1) try std.testing.expect(kept.memo.?.hits > before); // the history takes the prompt's segments
+        }
+        requests += 1;
+    }
+    try std.testing.expect(kept.memo.?.hits >= 2 * requests);
+    try std.testing.expect(kept.memo.?.held <= 64 << 20);
+}
+
+const Encoder = struct {
+    t: *const Tokenizer,
+    texts: []const []const u8,
+    want: []const []const u32,
+    start: usize,
+    bad: *std.atomic.Value(u32),
+
+    fn run(e: Encoder) void {
+        for (0..e.texts.len) |k| {
+            const i = (e.start + 7 * k) % e.texts.len;
+            const got = e.t.encode(std.heap.page_allocator, e.texts[i]) catch {
+                _ = e.bad.fetchAdd(1, .monotonic);
+                continue;
+            };
+            defer std.heap.page_allocator.free(got);
+            if (!std.mem.eql(u32, e.want[i], got)) _ = e.bad.fetchAdd(1, .monotonic);
+        }
+    }
+};
+
+test "a memo too small for a chat (every segment dropped in turn), four threads at once: still a fresh encode's ids" {
+    const gpa = std.testing.allocator;
+    var fresh = try deepseekWith(gpa, v4_head, &chat_words);
+    defer fresh.deinit();
+    var kept = try deepseekWith(gpa, v4_head, &chat_words);
+    defer kept.deinit();
+    const cap = 24 << 10;
+    kept.memo = try Memo.create(std.heap.page_allocator, cap);
+    var corpus = try ChatCorpus.init(gpa, &fresh);
+    defer corpus.deinit();
+    const texts = corpus.texts.items;
+    const want = try gpa.alloc([]const u32, texts.len);
+    defer gpa.free(want);
+    for (texts, want) |text, *w| w.* = try fresh.encode(gpa, text);
+    defer for (want) |w| gpa.free(w);
+    var bad: std.atomic.Value(u32) = .init(0);
+    var threads: [4]std.Thread = undefined;
+    for (&threads, 0..) |*th, k| th.* = try std.Thread.spawn(.{}, Encoder.run, .{Encoder{ .t = &kept, .texts = texts, .want = want, .start = k * 11, .bad = &bad }});
+    for (threads) |th| th.join();
+    try std.testing.expectEqual(@as(u32, 0), bad.load(.monotonic));
+    try std.testing.expect(kept.memo.?.hits > 0);
+    try std.testing.expect(kept.memo.?.held <= cap);
 }
 
 test {
