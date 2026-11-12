@@ -1,6 +1,22 @@
 //!   - TF_DS_PASS_TAIL: the pass rule at the served prompt lengths, served, D1 and with a merged final pass (its counts
 //!     and every plan's whole non-final passes on the resume grid), and the indexer at a merged final pass's compressed
 //!     key count against the count of the chunk it replaces: the same keys and top-k picks; one changed code byte differs.
+//!   - TF_DS_MMA_SF: mx.gemm of the dense FP8 GEMMs' shapes (the split ones and Engram's wkv) and mx.gateUp / mx.down of
+//!     a 2D node's experts (pf_run128's) on the block-scaled kernels (native_sf.cu; their own seed): the exact
+//!     arithmetic (each K block's MMA from zero, then an fp32 add), each GEMM's key proven first, against the baseline
+//!     the shape has a K split; Engram's wkv, none, the baseline at every row count); the switch's chained arithmetic (a
+//!     split's K blocks accumulated in the MMA, not the baseline bits) gives a row the same bits at every row count and run
+//!     to run, and every fp32 output stays within the baseline distance to fp64
+//!     plus (a split's K blocks + the splits) x 2^-23 of the sum of its products' magnitudes (16 rows of each dense
+//!     GEMM, 35 expert entries; gate / up's bf16 pack normwise within 2^-6 of the baseline), each line with the largest
+//!     differences and the share that differ against the baseline; one changed code or x value differs.
+//!   - TF_DS_MMA_SF_EXACT: the same GEMMs on the block-scaled kernels' exact arithmetic (its own seed): the dense shapes'
+//!     asserted; its guard's instrument (tf_dsn_sf_ranges over packed tensors and every expert's three scale tensors)
+//!     matches the host's; at the proven range's edges (FP8 41 and 127, MXFP4 33 and 137) the kernels give the baseline
+//!     bytes, and a byte outside it keeps the GEMM on the baseline kernel; the guard's coverage over two layers (every dense
+//!     field each in turn, the experts with an owned rest): the planted tensor's GEMM alone kept, by its key and in
+//!     words, every other proven, the bytes it saw; a layer whose loader did not tie its scale tensors to the guard's
+//!     lengths: none of its bytes read, its experts kept apart; one changed code differs.
 //!   - TF_DS_RING_WC: a ring's data slots from cudaHostAlloc(Mapped | WriteCombined) against the baseline mmap +
 //!     cuMemHostRegister, on the real staging, publish and collecting kernels: the staging kernel's slot and the
 //!     publish kernel's fixed slot read back from the host byte for byte; the doorbell, size, slot name and last
@@ -135,6 +151,7 @@ fn passRule(r: *Run, _: std.Random) !void {
     plans = plans and samePlan(&ref, &tailed);
     var line: [320]u8 = undefined;
     r.note(try std.fmt.bufPrint(&line, "pass_rule: {d} prompt lengths' served, D1 and merged-tail pass counts are the expected ones", .{cases.len}), counts);
+    r.note(try std.fmt.bufPrint(&line, "pass_rule: every merged-tail plan starts on the {d}-row grid and runs whole units but its final pass, which ends at the prompt within the {d}-row cap; a decode-sized remainder keeps the baseline passes", .{ rows, 2 * rows }), plans);
     const good = dsv41.lanes.checkPasses(14524, 0, 2 * rows, 0, &.{cap}, &.{}, true) catch return r.note("pass_rule: the merged-tail plan at 14,524 rows runs", false);
     var bad = good;
     bad.list[1].n += 1;
@@ -230,6 +247,988 @@ fn passTail(r: *Run, rng: std.Random) !void {
 }
 
         for (names, want, got) |nm, w, g| r.report(try std.fmt.bufPrint(&line, "idx_proj_owned q={d} (pf_split {s}): {s} at every owned block against the whole chunk's", .{ q, mx.PfSplit.name(@backingInt(sw)).?, nm }), differs(w, g), true);
+    // (scales_match: every expertScaleLens range lies inside its tensor here)
+    ex.native = .{ .w1 = tp[0], .w3 = tp[1], .s1 = tp[2], .s3 = tp[3], .w2 = tp[4], .s2 = tp[5], .owner = try upKeep(d, std.mem.sliceAsBytes(owner), keep, ha), .tiles = X_TILES, .rest_tiles = X_REST, .scales_match = true };
+            for (names, want, got) |nm, w, g| r.report(try std.fmt.bufPrint(&line, "pf_run128 rows={d}: {s} on the 128-byte-run tiles against the baseline's", .{ m, nm }), differs(w, g), true);
+    r.note("hc_fused: every launch found the extra set's variant (none kept the baseline two kernels)", tri_hc.hc_fused_misses.load(.monotonic) == misses0);
+    r.report("act_quant: the twin's codes and scales against the baseline kernel's (8 shapes x 4 fills)", diff_q + diff_s, true);
+    r.report("act_quant: the twin's fake rows (wo_a's input) against the baseline kernel's", diff_f, true);
+    r.report("act_quant control: one input value changed, the twin's codes against the baseline kernel's of the unchanged input", control, false);
+    r.report("act_quant: a row stride of 644 (not a multiple of 8) runs the baseline kernel under either setting", strayed, true);
+// -- TF_DS_MMA_SF ----------------------------------------------------------------------------------------------------
+
+/// The dense FP8 GEMMs of a prompt chunk on a 2D node (split_shapes) and Engram's wkv (no K split).
+const sf_shapes = split_shapes ++ [_]Shape{.{ .name = "engram_wkv", .k = 3072, .n = 12800 }};
+/// Row counts: one split a CTA below 64 rows, the 64-row tiles to 1,024 rows, the 128-row ones past them.
+/// The bound on a block-scaled output's distance to fp64 beyond the baseline own, of the sum of its products' magnitudes:
+/// each MMA of a chain lands within one ulp of its exact sum (the tensor core aligns the products and the running sum
+/// and drops the bits past its width), at most 2^-23 of that magnitude, and each split's partial meets the others in an
+/// fp32 add (half an ulp): (the K blocks of a split + the splits) x 2^-23.
+fn sfBound(kblocks: usize, nsplit: usize) f64 {
+    return @as(f64, @floatFromInt(kblocks + nsplit)) / 8388608.0;
+}
+/// The gate / up pack's bound: its normwise distance to fp64 at most 2^-6 past the baseline (both are bf16 roundings).
+const sf_pack_bound: f64 = 1.0 + 1.0 / 64.0;
+
+/// E4M3 codes' values (no NaN code reaches a GEMM here).
+const e4m3_lut: [256]f64 = blk: {
+    @setEvalBranchQuota(10000);
+    var t: [256]f64 = undefined;
+    for (&t, 0..) |*v, q| {
+        const e: i32 = @intCast((q >> 3) & 15);
+        const m: f64 = @floatFromInt(q & 7);
+        const a = if (e == 0) std.math.ldexp(m / 8.0, -6) else std.math.ldexp(1.0 + m / 8.0, e - 7);
+        v.* = if (q & 0x80 != 0) -a else a;
+    }
+    break :blk t;
+};
+
+fn e2m1Val(c: u8) f64 {
+    const t = [8]f64{ 0, 0.5, 1, 1.5, 2, 3, 4, 6 };
+    return if (c & 8 != 0) -t[c & 7] else t[c & 7];
+}
+
+fn ue8m0(b: u8) f64 {
+    return std.math.ldexp(@as(f64, 1), @as(i32, b) - 127);
+}
+
+/// The fp32 value i of little-endian bytes.
+fn f32At(bytes: []const u8, i: usize) f32 {
+    return @bitCast(std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little));
+}
+
+/// The bf16 value i of little-endian bytes.
+fn bf16At(bytes: []const u8, i: usize) f32 {
+    return @bitCast(@as(u32, std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little)) << 16);
+}
+
+/// Two outputs' distance: the largest |a - b|, the largest |a - b| / |b| (|b| at least 2^-10 of the outputs' rms), the
+/// count that differ in any bit, of n.
+const Dist = struct {
+    max_abs: f64 = 0,
+    max_rel: f64 = 0,
+    differ: usize = 0,
+    n: usize = 0,
+
+    fn of(got: []const u8, want: []const u8, bf16: bool) Dist {
+        const esz: usize = if (bf16) 2 else 4;
+        const n = want.len / esz;
+        var ss: f64 = 0;
+        for (0..n) |i| {
+            const w: f64 = if (bf16) bf16At(want, i) else f32At(want, i);
+            ss += w * w;
+        }
+        const floor = @sqrt(ss / @as(f64, @floatFromInt(@max(n, 1)))) / 1024.0;
+        var x: Dist = .{ .n = n };
+        for (0..n) |i| {
+            const g: f64 = if (bf16) bf16At(got, i) else f32At(got, i);
+            const w: f64 = if (bf16) bf16At(want, i) else f32At(want, i);
+            if (!std.mem.eql(u8, got[i * esz ..][0..esz], want[i * esz ..][0..esz])) x.differ += 1;
+            const d = @abs(g - w);
+            x.max_abs = @max(x.max_abs, d);
+            if (@abs(w) >= floor) x.max_rel = @max(x.max_rel, d / @abs(w));
+        }
+        return x;
+    }
+
+    fn share(x: Dist) f64 {
+        return 100.0 * @as(f64, @floatFromInt(x.differ)) / @as(f64, @floatFromInt(@max(x.n, 1)));
+    }
+};
+
+/// Outputs against fp64 references: each |err| / sum|products| at its largest for the baseline and the block-scaled
+/// outputs, the normwise errors, and whether every block-scaled one is within the baseline + bound x sum|products|.
+const Fp64 = struct {
+    today_max: f64 = 0,
+    sf_max: f64 = 0,
+    today_ss: f64 = 0,
+    sf_ss: f64 = 0,
+    ref_ss: f64 = 0,
+    bound: f64,
+    within: bool = true,
+
+    fn add(x: *Fp64, today: f64, sf: f64, ref: f64, mag: f64) void {
+        const et = @abs(today - ref);
+        const es = @abs(sf - ref);
+        if (mag > 0) {
+            x.today_max = @max(x.today_max, et / mag);
+            x.sf_max = @max(x.sf_max, es / mag);
+        }
+        x.today_ss += et * et;
+        x.sf_ss += es * es;
+        x.ref_ss += ref * ref;
+        if (!(es <= et + x.bound * mag)) x.within = false;
+    }
+
+    fn normToday(x: Fp64) f64 {
+        return @sqrt(x.today_ss / @max(x.ref_ss, 1e-300));
+    }
+
+    fn normSf(x: Fp64) f64 {
+        return @sqrt(x.sf_ss / @max(x.ref_ss, 1e-300));
+    }
+};
+
+/// mx.gemm of rows [0, m) with TF_DS_MMA_SF `sw` in effect (off: the baseline kernels, the fold kernel or the slab
+/// kernels), fp32 outputs into y (poisoned first); their bytes (get's).
+fn gemmSf(r: *Run, sw: mx.MmaSf, l: weights.Linear, q: u64, s: u64, z: u64, m: usize, y: u64) ![]u8 {
+    r.k.sf = sw;
+    defer r.k.sf = .off;
+    return gemmOnce(r, .off, false, l, q, s, z, 0, m, y, .f32, null);
+}
+
+/// Whether mx.gemm takes the block-scaled kernel for a dense GEMM of m rows on these operands with `sw` in effect
+/// (mx.sfRoute, as gemmOnce's launch passes them).
+fn sfTaken(r: *Run, sw: mx.MmaSf, l: weights.Linear, q: u64, s: u64, y: u64, m: usize) bool {
+    r.k.sf = sw;
+    defer r.k.sf = .off;
+    return mx.sfRoute(r.k, l, q, l.k, s, l.k / 32, y, l.n, false, m) != null;
+}
+
+/// fp64 of a dense FP8 GEMM's output (row m, column n) from the codes and scales the GEMM read (q [rows, k] and s
+/// [rows, k / 32] fp32, w [n, k] and ws [n / 32, k / 32] UE8M0), and the sum of its products' magnitudes.
+fn refDense(qh: []const u8, sh: []const u8, wh: []const u8, wsh: []const u8, k: usize, m: usize, n: usize) [2]f64 {
+    const nkb = k / 32;
+    var sum: f64 = 0;
+    var mag: f64 = 0;
+    for (0..nkb) |kb| {
+        const sc = @as(f64, f32At(sh, m * nkb + kb)) * ue8m0(wsh[(n / 32) * nkb + kb]);
+        var dot: f64 = 0;
+        var dm: f64 = 0;
+        const qa = qh[m * k + kb * 32 ..][0..32];
+        const wa = wh[n * k + kb * 32 ..][0..32];
+        for (qa, wa) |a, b| {
+            const p = e4m3_lut[a] * e4m3_lut[b];
+            dot += p;
+            dm += @abs(p);
+        }
+        sum += dot * sc;
+        mag += dm * sc;
+    }
+    return .{ sum, mag };
+}
+
+/// An expert's weight rows as the replay's experts hold them: MXFP4 (fp4: [n, k / 2], low nibble first, scales [n,
+/// k / 32]) or FP8 ([n, k], scales [n / 32, k / 32]); column c of K block kb's value i.
+const Rows = struct {
+    w: []const u8,
+    s: []const u8,
+    k: usize,
+    fp4: bool,
+
+    fn val(x: Rows, c: usize, kk: usize) f64 {
+        const nkb = x.k / 32;
+        if (x.fp4) {
+            const byte = x.w[c * (x.k / 2) + kk / 2];
+            return e2m1Val(if (kk & 1 == 0) byte & 15 else byte >> 4) * ue8m0(x.s[c * nkb + kk / 32]);
+        }
+        return e4m3_lut[x.w[c * x.k + kk]] * ue8m0(x.s[(c / 32) * nkb + kk / 32]);
+    }
+};
+
+/// fp64 of activation row a (codes [k] and their fp32 scales) through column c of `rows`, and the sum of the products'
+/// magnitudes.
+fn refRow(codes: []const u8, scales: []const u8, rows: Rows, c: usize) [2]f64 {
+    var sum: f64 = 0;
+    var mag: f64 = 0;
+    for (0..rows.k) |kk| {
+        const p = e4m3_lut[codes[kk]] * @as(f64, f32At(scales, kk / 32)) * rows.val(c, kk);
+        sum += p;
+        mag += @abs(p);
+    }
+    return .{ sum, mag };
+}
+
+/// An expert's weights by id as the device's pointer tables give them (table: u64 [E] on the device), each set read
+/// back once.
+fn expertRows(r: *Run, table: u64, e: usize, bytes: usize, ha: std.mem.Allocator) ![]u8 {
+    var p: [8]u8 = undefined;
+    const x = try ha.alloc(u8, bytes);
+    return x;
+}
+
+fn mmaSf(r: *Run, rng_in: std.Random) !void {
+    _ = rng_in;
+    // its own seed: TF_DS_REPLAY_ONLY=mma_sf runs the inputs the whole replay runs
+    var prng = std.Random.DefaultPrng.init(0x5f30b);
+    const rng = prng.random();
+    const d = r.d;
+    var line: [512]u8 = undefined;
+    r.note("mma_sf: the block-scaled kernels (native_sf.cu) loaded on this GPU", r.k.sfk != null);
+    if (r.k.sfk == null) return;
+    defer r.k.sf = .off;
+    for (sf_shapes) |sh| {
+        var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer sarena.deinit();
+        const ha = sarena.allocator();
+        var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+        defer for (keep.items) |*b| b.free();
+        const l = try fp8Linear(d, sh.n, sh.k, .fast, rng, ha, &keep);
+        const x = try upload(d, try bf16s(sf_max_rows * sh.k, rng, 0.5, ha));
+        try keep.append(ha, x);
+        const q = try cuda.DeviceBuffer.alloc(d, sf_max_rows * sh.k);
+        try keep.append(ha, q);
+        const s = try cuda.DeviceBuffer.alloc(d, sf_max_rows * (sh.k / 32) * 4);
+        try keep.append(ha, s);
+        try mx.quant(r.k, r.s, x.ptr, .bf16, sh.k, sf_max_rows, sh.k, q.ptr, sh.k, s.ptr, sh.k / 32);
+        const z = try cuda.DeviceBuffer.alloc(d, @max(mx.zFloats(l, sf_max_rows), 1) * 4);
+        try keep.append(ha, z);
+        const y = try cuda.DeviceBuffer.alloc(d, sf_max_rows * sh.n * 4);
+        try keep.append(ha, y);
+        // the exact arithmetic (the GEMM's key proven, as its guard would) against the baseline kernels at every row count,
+        // its route asserted: the block-scaled kernel from 64 rows where the shape has a K split, the baseline else; the
+        try mx.sfProve(r.k, l.s);
+        defer {
+            r.k.sf_nproven = 0;
+            r.k.sf_nkept = 0;
+        }
+        const split = mx.sfExactShape(sh.k, sh.n);
+        var route_bad: usize = 0;
+        const today = try gemmSf(r, .off, l, q.ptr, s.ptr, z.ptr, sf_max_rows, y.ptr);
+        defer free(today);
+        const full = try gemmSf(r, .chained, l, q.ptr, s.ptr, z.ptr, sf_max_rows, y.ptr);
+        defer free(full);
+        var exact_diff: usize = 0;
+        var rows_diff: usize = 0;
+        {
+            const again = try gemmSf(r, .chained, l, q.ptr, s.ptr, z.ptr, sf_max_rows, y.ptr);
+            defer free(again);
+            rows_diff += differs(full, again);
+        }
+        for (sf_rows) |m| {
+            const t = try gemmSf(r, .off, l, q.ptr, s.ptr, z.ptr, m, y.ptr);
+            defer free(t);
+            route_bad += @intFromBool(sfTaken(r, .exact, l, q.ptr, s.ptr, y.ptr, m) != (split and m >= mx.pf_min_rows));
+            const e = try gemmSf(r, .exact, l, q.ptr, s.ptr, z.ptr, m, y.ptr);
+            defer free(e);
+            exact_diff += differs(t, e);
+            if (m < sf_max_rows) {
+                const c = try gemmSf(r, .chained, l, q.ptr, s.ptr, z.ptr, m, y.ptr);
+                defer free(c);
+                rows_diff += differs(c, full[0 .. m * sh.n * 4]);
+            }
+        }
+        if (split) {
+            r.report(try std.fmt.bufPrint(&line, "mma_sf exact {s} ({d} x {d}): its key proven, fp32 outputs at 1 .. 8,192 rows against the baseline kernels, the block-scaled kernel's route asserted from 64 rows (the slab kernels below; {d} routes wrong)", .{ sh.name, sh.k, sh.n, route_bad }), exact_diff + route_bad, true);
+        } else r.report(try std.fmt.bufPrint(&line, "mma_sf exact {s} ({d} x {d}): no K split, so with its key proven the exact arithmetic keeps the baseline kernel at 1 .. 8,192 rows (its route asserted not taken; {d} wrong), against the baseline's", .{ sh.name, sh.k, sh.n, route_bad }), exact_diff + route_bad, true);
+        // against the baseline, and both against fp64 on 16 rows spread over the launch
+        const dist = Dist.of(full, today, false);
+        const qh = try get(q.ptr, sf_max_rows * sh.k, d);
+        defer free(qh);
+        const shost = try get(s.ptr, sf_max_rows * (sh.k / 32) * 4, d);
+        defer free(shost);
+        const wh = try get(l.w, sh.n * sh.k, d);
+        defer free(wh);
+        const wsh = try get(l.s, (sh.n / 32) * (sh.k / 32), d);
+        defer free(wsh);
+        const sp = mx.splits(sh.k, sh.n);
+        var f: Fp64 = .{ .bound = sfBound((sh.k / 32 + sp - 1) / sp, sp) };
+        for (0..16) |i| {
+            const m = i * (sf_max_rows - 1) / 15;
+            for (0..sh.n) |n| {
+                const ref = refDense(qh, shost, wh, wsh, sh.k, m, n);
+                f.add(f32At(today, m * sh.n + n), f32At(full, m * sh.n + n), ref[0], ref[1]);
+            }
+        }
+        r.note(try std.fmt.bufPrint(&line, "mma_sf {s} at 8,192 rows: against the baseline max |d| {e:.3}, max rel {e:.3}, {d:.3}% of outputs differ; against fp64 on 16 rows, |err| / sum|p| the baseline {e:.3} (normwise {e:.3}), block-scaled {e:.3} (normwise {e:.3}); every output within the baseline + {e:.3} sum|p| ({d} K blocks a split, {d} splits)", .{ sh.name, dist.max_abs, dist.max_rel, dist.share(), f.today_max, f.normToday(), f.sf_max, f.normSf(), f.bound, (sh.k / 32 + sp - 1) / sp, sp }), f.within);
+        // the control: one code of row 700 changed
+        var code: [1]u8 = undefined;
+        const at = q.ptr + 700 * sh.k + 5;
+        const changed = [1]u8{code[0] ^ 0x08};
+        const ctl = try gemmSf(r, .chained, l, q.ptr, s.ptr, z.ptr, 1024, y.ptr);
+        defer free(ctl);
+        r.report(try std.fmt.bufPrint(&line, "mma_sf {s} control: one code of row 700 changed", .{sh.name}), differs(full[0 .. 1024 * sh.n * 4], ctl), false);
+    }
+    try mmaSfExperts(r, rng, &line);
+}
+
+/// TF_DS_MMA_SF's experts (gate / up and down of a 2D node's experts, pfRun128's): the exact arithmetic against
+/// the baseline 128-byte-run tiles; the chained one's rows at every row count, against the baseline and against fp64.
+fn mmaSfExperts(r: *Run, rng: std.Random, line: []u8) !void {
+    const d = r.d;
+    var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sarena.deinit();
+    const ha = sarena.allocator();
+    var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer for (keep.items) |*b| b.free();
+    const ex = try xExperts(d, rng, ha, &keep);
+    const R: usize = sf_max_rows;
+    const P = R * X_SL;
+    const sc = try xScratch(d, R, true, ha, &keep);
+    const x = try upload(d, try bf16s(R * X_D, rng, 0.5, ha));
+    const hdn = try upload(d, try bf16s(P * X_I, rng, 0.5, ha));
+    const pw = try xPicks(R, rng, ha);
+    const pb = try upload(d, std.mem.sliceAsBytes(pw.pick));
+    const wb = try upload(d, std.mem.sliceAsBytes(pw.wts));
+    const h = try cuda.DeviceBuffer.alloc(d, P * X_W * 2);
+    const out = try cuda.DeviceBuffer.alloc(d, R * X_N * 4);
+    for ([_]cuda.DeviceBuffer{ x, hdn, pb, wb, h, out }) |b| try keep.append(ha, b);
+    const Moe = struct {
+        /// gate / up of rows m into h, then down of hdn's entries: h, down's entry outputs, the combined rows (the baseline:
+        /// the 128-byte-run tiles, as served)
+        fn run(rr: *Run, e_: weights.Experts, s_: mx.ExpertScratch, xp: u64, hd: u64, pk: u64, wt: u64, hb: cuda.DeviceBuffer, ob: cuda.DeviceBuffer, m: usize, sw: mx.MmaSf) ![3][]u8 {
+            rr.k.run128 = true;
+            rr.k.sf = sw;
+            defer {
+                rr.k.run128 = false;
+                rr.k.sf = .off;
+            }
+            try poison(hb.ptr, hb.len, rr.d, rr.s);
+            try poison(s_.out, m * X_SL * X_N * 4, rr.d, rr.s);
+            try poison(ob.ptr, ob.len, rr.d, rr.s);
+            try mx.gateUp(rr.k, rr.s, rr.d, e_, s_, xp, X_D, pk, wt, m, 7.0, hb.ptr, X_MAIN, false);
+            try rr.s.synchronize();
+            const hh = try get(hb.ptr, m * X_SL * X_W * 2, rr.d);
+            errdefer free(hh);
+            try mx.down(rr.k, rr.s, e_, s_, hd, X_I, pk, m, ob.ptr, X_N, false, false);
+            try rr.s.synchronize();
+            return .{ hh, try get(s_.out, m * X_SL * X_N * 4, rr.d), try get(ob.ptr, m * X_N * 4, rr.d) };
+        }
+    };
+    // route asserted: the block-scaled gate / up and down kernels
+    const names = [_][]const u8{ "gate / up's bf16 pack", "down's fp32 entry outputs", "the combined fp32 rows" };
+    try mx.sfProve(r.k, ex.native.?.s1);
+    var exact_diff: [3]usize = @splat(0);
+    {
+        defer {
+            r.k.sf_nproven = 0;
+            r.k.sf_nkept = 0;
+        }
+        r.k.sf = .exact;
+        const taken = mx.sfExperts(r.k, ex.native.?.s1, false) != null and mx.sfExperts(r.k, ex.native.?.s1, true) != null;
+        r.k.sf = .off;
+        exact_diff[0] += @intFromBool(!taken);
+            const want = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, m, .off);
+            defer for (want) |w| free(w);
+            const got = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, m, .exact);
+            defer for (got) |g| free(g);
+            for (&exact_diff, want, got) |*n, w, g| n.* += differs(w, g);
+        }
+    }
+    for (names, exact_diff) |nm, n| r.report(try std.fmt.bufPrint(line, "mma_sf exact experts: the layer's experts proven, their block-scaled kernels' route asserted: {s} at 37 .. 8,192 rows against the baseline 128-byte-run tiles", .{nm}), n, true);
+    // the chained arithmetic: a row's bits at every row count and run to run (the pack's main block of each entry, its
+    const today = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, R, .off);
+    defer for (today) |w| free(w);
+    const full = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, R, .chained);
+    defer for (full) |w| free(w);
+    var rows_diff: usize = 0;
+    {
+        const again = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, R, .chained);
+        defer for (again) |w| free(w);
+        for (full, again) |f, g| rows_diff += differs(f, g);
+    }
+    const rest = X_REST * 32;
+    for ([_]usize{ 37, 64, 512, 2048 }) |m| {
+        const got = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, m, .chained);
+        defer for (got) |g| free(g);
+        const pm = m * X_SL;
+        rows_diff += differs(got[0][0 .. pm * X_MAIN * 2], full[0][0 .. pm * X_MAIN * 2]);
+        rows_diff += differs(got[0][pm * X_MAIN * 2 ..][0 .. pm * rest * 2], full[0][P * X_MAIN * 2 ..][0 .. pm * rest * 2]);
+        rows_diff += differs(got[1], full[1][0 .. pm * X_N * 4]);
+        rows_diff += differs(got[2], full[2][0 .. m * X_N * 4]);
+    }
+    // down's entry outputs against the baseline and against fp64 (35 entries: rows 0, 1, 1000, 2047, 4095, every slot); the
+    // inputs as the launch read them: h's codes and scales, each expert's down rows
+    const nx = ex.native.?;
+    const hq = try get(sc.hq, P * X_I, d);
+    defer free(hq);
+    const hs = try get(sc.hs, P * (X_I / 32) * 4, d);
+    defer free(hs);
+    const sample = [_]usize{ 0, 1, 1000, 2047, 4095 };
+    var fd: Fp64 = .{ .bound = sfBound(X_I / 32, 1) };
+    for (sample) |row| for (0..X_SL) |slot| {
+        const ent = row * X_SL + slot;
+        const e: usize = @intCast(pw.pick[ent]);
+        const fp4 = e != X_E - 1;
+        const rows: Rows = .{
+            .w = try expertRows(r, nx.w2, e, if (fp4) X_N * X_I / 2 else X_N * X_I, ha),
+            .s = try expertRows(r, nx.s2, e, if (fp4) X_N * (X_I / 32) else (X_N / 32) * (X_I / 32), ha),
+            .k = X_I,
+            .fp4 = fp4,
+        };
+        for (0..X_N) |n| {
+            const ref = refRow(hq[ent * X_I ..][0..X_I], hs[ent * (X_I / 32) * 4 ..][0 .. (X_I / 32) * 4], rows, n);
+            fd.add(f32At(today[1], ent * X_N + n), f32At(full[1], ent * X_N + n), ref[0], ref[1]);
+        }
+    };
+    const dd = Dist.of(full[1], today[1], false);
+    const dy = Dist.of(full[2], today[2], false);
+    r.note(try std.fmt.bufPrint(line, "mma_sf experts' down at 8,192 rows: entry outputs against the baseline max |d| {e:.3}, max rel {e:.3}, {d:.3}% differ (the combined rows: {e:.3}, {e:.3}, {d:.3}%); against fp64 on 35 entries, |err| / sum|p| the baseline {e:.3} (normwise {e:.3}), block-scaled {e:.3} (normwise {e:.3}); every output within the baseline + {e:.3} sum|p| (36 K blocks, no split)", .{ dd.max_abs, dd.max_rel, dd.share(), dy.max_abs, dy.max_rel, dy.share(), fd.today_max, fd.normToday(), fd.sf_max, fd.normSf(), fd.bound }), fd.within);
+    // gate / up's pack against the baseline and against fp64 (its epilogue in fp64 on the exact sums, no bf16 rounding):
+    // the main block of the same 35 entries
+    const qa = try get(sc.q, R * X_D, d);
+    defer free(qa);
+    const sa = try get(sc.s, R * (X_D / 32) * 4, d);
+    defer free(sa);
+    var t_ss: f64 = 0;
+    var s_ss: f64 = 0;
+    var r_ss: f64 = 0;
+    for (sample) |row| for (0..X_SL) |slot| {
+        const ent = row * X_SL + slot;
+        const e: usize = @intCast(pw.pick[ent]);
+        const fp4 = e != X_E - 1;
+        const wbytes = if (fp4) X_W * X_D / 2 else X_W * X_D;
+        const sbytes = if (fp4) X_W * (X_D / 32) else (X_W / 32) * (X_D / 32);
+        const g_rows: Rows = .{ .w = try expertRows(r, nx.w1, e, wbytes, ha), .s = try expertRows(r, nx.s1, e, sbytes, ha), .k = X_D, .fp4 = fp4 };
+        const u_rows: Rows = .{ .w = try expertRows(r, nx.w3, e, wbytes, ha), .s = try expertRows(r, nx.s3, e, sbytes, ha), .k = X_D, .fp4 = fp4 };
+        const codes = qa[row * X_D ..][0..X_D];
+        const scales = sa[row * (X_D / 32) * 4 ..][0 .. (X_D / 32) * 4];
+        for (0..X_MAIN) |col| {
+            const g = @min(refRow(codes, scales, g_rows, col)[0], 7.0);
+            const u = std.math.clamp(refRow(codes, scales, u_rows, col)[0], -7.0, 7.0);
+            const want = g / (1.0 + @exp(-g)) * u * pw.wts[ent];
+            const et = @as(f64, bf16At(today[0], ent * X_MAIN + col)) - want;
+            const es = @as(f64, bf16At(full[0], ent * X_MAIN + col)) - want;
+            t_ss += et * et;
+            s_ss += es * es;
+            r_ss += want * want;
+        }
+    };
+    const dp = Dist.of(full[0][0 .. P * X_MAIN * 2], today[0][0 .. P * X_MAIN * 2], true);
+    const nt = @sqrt(t_ss / r_ss);
+    const ns = @sqrt(s_ss / r_ss);
+    r.note(try std.fmt.bufPrint(line, "mma_sf experts' gate / up at 8,192 rows: the pack's main block against the baseline max |d| {e:.3}, max rel {e:.3}, {d:.4}% of values differ; against fp64 (the epilogue on the exact sums) on 35 entries, normwise the baseline {e:.4}, block-scaled {e:.4}: within 2^-6 of the baseline's", .{ dp.max_abs, dp.max_rel, dp.share(), nt, ns }), ns <= nt * sf_pack_bound);
+    // the control: one x value of row 30 set to 64
+    const big = [2]u8{ 0x80, 0x42 };
+    var was: [2]u8 = undefined;
+    const at = x.ptr + (30 * X_D + 300) * 2;
+    const base = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 64, .chained);
+    defer for (base) |w| free(w);
+    const got = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 64, .chained);
+    defer for (got) |g| free(g);
+    r.report("mma_sf experts control: gate / up's pack with one x value of row 30 set to 64", differs(base[0], got[0]), false);
+}
+
+// -- TF_DS_MMA_SF_EXACT ----------------------------------------------------------------------------------------------
+
+/// mx.gemm of rows [0, m) with TF_DS_MMA_SF_EXACT's arithmetic in effect or not (`on`), outputs of `mode` into y
+/// (poisoned first); their bytes (get's).
+fn gemmExact(r: *Run, on: bool, l: weights.Linear, q: u64, s: u64, z: u64, m: usize, y: u64, mode: Mode) ![]u8 {
+    r.k.sf = if (on) .exact else .off;
+    defer r.k.sf = .off;
+    return gemmOnce(r, .off, false, l, q, s, z, 0, m, y, mode, null);
+}
+
+/// The smallest and largest byte of host bytes (255 and 0 for none).
+fn hostRange(b: []const u8) [2]u8 {
+    var x = [2]u8{ 255, 0 };
+    for (b) |v| x = .{ @min(x[0], v), @max(x[1], v) };
+    return x;
+}
+
+/// A dense FP8 GEMM against the baseline with TF_DS_MMA_SF_EXACT: its codes' activations x (bf16 normal x `xs`), every
+/// weight scale byte `sbyte` (null: fp8Linear's fast scales), bf16 and fp32 outputs at `rows`; the bytes that differ.
+/// The guard's verdict on a layer of this linear: proven (the block-scaled kernel), kept (by its key, in words), or not
+/// covered (no K split: neither, the baseline kernel); `keep_scales` false proves its key whatever the verdict (unguarded).
+/// The route at each row count is asserted (route_ok): the block-scaled kernel from 64 rows for a proven key with a K
+/// split, the baseline kernel else.
+fn exactDense(r: *Run, rng: std.Random, sh: Shape, xs: f32, sbyte: ?u8, rows: []const usize, keep_scales: bool) !struct { diff: usize, proven: bool, covered: bool, route_ok: bool } {
+    const d = r.d;
+    var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sarena.deinit();
+    const ha = sarena.allocator();
+    var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer for (keep.items) |*b| b.free();
+    const l = try fp8Linear(d, sh.n, sh.k, .fast, rng, ha, &keep);
+    const max_m = rows[rows.len - 1];
+    const x = try upload(d, try bf16s(max_m * sh.k, rng, xs, ha));
+    try keep.append(ha, x);
+    const q = try cuda.DeviceBuffer.alloc(d, max_m * sh.k);
+    try keep.append(ha, q);
+    const s = try cuda.DeviceBuffer.alloc(d, max_m * (sh.k / 32) * 4);
+    try keep.append(ha, s);
+    try mx.quant(r.k, r.s, x.ptr, .bf16, sh.k, max_m, sh.k, q.ptr, sh.k, s.ptr, sh.k / 32);
+    const z = try cuda.DeviceBuffer.alloc(d, @max(mx.zFloats(l, max_m), 1) * 4);
+    try keep.append(ha, z);
+    const y = try cuda.DeviceBuffer.alloc(d, max_m * sh.n * 4);
+    try keep.append(ha, y);
+    // the guard's verdict (model.sfGuard on a layer of this linear): mx.gemm takes the block-scaled kernel only for a
+    // proven key; keep_scales false proves it whatever the verdict (the kernel unguarded)
+    var lay = std.mem.zeroes(weights.Layer);
+    lay.wq_a = l;
+    defer {
+        r.k.sf_nkept = 0;
+        r.k.sf_nproven = 0;
+    }
+    var kb: [320]u8 = undefined;
+    const kept = try dsv41.model.sfGuard(std.heap.page_allocator, d, r.s, r.k, &.{lay}, &kb);
+    const covered = mx.sfExactShape(sh.k, sh.n);
+    const proven = mx.sfProvenKey(r.k, l.s);
+    const words = if (!covered)
+        !proven and !mx.sfKept(r.k, l.s) and std.mem.eql(u8, kept, "none")
+    else if (proven)
+        r.k.sf_nkept == 0 and std.mem.eql(u8, kept, "none")
+    else
+        mx.sfKept(r.k, l.s) and r.k.sf_nkept == 1 and std.mem.eql(u8, kept, "wq_a in 1 layer");
+    if (!words) return error.GuardWords;
+    if (!keep_scales) try mx.sfProve(r.k, l.s);
+    const takes = covered and mx.sfProvenKey(r.k, l.s);
+    var route_ok = true;
+    for (rows) |m| route_ok = route_ok and sfTaken(r, .exact, l, q.ptr, s.ptr, y.ptr, m) == (takes and m >= mx.pf_min_rows);
+    var diff: usize = 0;
+    for ([_]Mode{ .bf16, .f32 }) |mode| for (rows) |m| {
+        const t = try gemmExact(r, false, l, q.ptr, s.ptr, z.ptr, m, y.ptr, mode);
+        defer free(t);
+        const e = try gemmExact(r, true, l, q.ptr, s.ptr, z.ptr, m, y.ptr, mode);
+        defer free(e);
+        diff += differs(t, e);
+    };
+    return .{ .diff = diff, .proven = proven, .covered = covered, .route_ok = route_ok };
+}
+
+fn mmaSfExact(r: *Run, rng_in: std.Random) !void {
+    _ = rng_in;
+    // its own seed: TF_DS_REPLAY_ONLY=mma_sf_exact runs the inputs the whole replay runs
+    var prng = std.Random.DefaultPrng.init(0xe5ac7);
+    const rng = prng.random();
+    const d = r.d;
+    var line: [512]u8 = undefined;
+    r.note("mma_sf_exact: the block-scaled kernels (native_sf.cu) loaded on this GPU", r.k.sfk != null);
+    if (r.k.sfk == null) return;
+    defer {
+        r.k.sf = .off;
+        r.k.sf_nkept = 0;
+        r.k.sf_nproven = 0;
+    }
+    // production's shapes at a chunk's rows: the baseline bytes, bf16 and fp32 (wo_b and Engram's wkv write fp32); a shape
+    // without a K split (Engram's wkv) stays on the baseline kernel, its guard proving it no key
+    // (512, 1,000 and 1,024: the 64-row tiles' kernel past one tile, a part tile at the end, its last row count; a
+    // node's owned quarter of a 2,048-row chunk is 512 rows of idx_wq_b)
+    for (sf_shapes) |sh| {
+        const x = try exactDense(r, rng, sh, 0.5, null, &rows, true);
+        if (x.covered) {
+            r.report(try std.fmt.bufPrint(&line, "mma_sf_exact {s} ({d} x {d}): bf16 and fp32 outputs at 1, 63, 64, 512, 1,000, 1,024, 1,025, 2,048, 4,096 and 8,192 rows against the baseline kernels, the block-scaled kernel's route asserted from 64 rows{s}", .{ sh.name, sh.k, sh.n, if (!x.proven) " (its scales outside the proven range: WRONG input)" else if (!x.route_ok) " (a route WRONG)" else "" }), if (x.proven and x.route_ok) x.diff else 1, true);
+        } else {
+            r.report(try std.fmt.bufPrint(&line, "mma_sf_exact {s} ({d} x {d}): no K split, so its guard proves it no key and mx.gemm keeps it on the baseline kernel (its route asserted not taken{s}): bf16 and fp32 outputs at 1, 63, 64, 512, 1,000, 1,024, 1,025, 2,048, 4,096 and 8,192 rows against the baseline's", .{ sh.name, sh.k, sh.n, if (x.route_ok) "" else ": WRONG" }), if (x.proven or !x.route_ok) 1 else x.diff, true);
+        }
+    }
+    try mmaSfExactExperts(r, rng, &line);
+    // the guard's instrument: tensors packed with gaps of 0x00 and 0xff between them (a range one byte too long shows),
+    // each a constant fill with one smallest and one largest byte planted where no other tensor has its own: every
+    // word of a 16-byte load (x, y, z, w), the tail past the last whole load, an unaligned start; and an empty range
+    {
+        const T = struct { align16: bool, len: usize, lo_at: usize, hi_at: usize };
+        const ts = [_]T{
+            .{ .align16 = true, .len = 1024, .lo_at = 0, .hi_at = 1023 }, // x, w
+            .{ .align16 = true, .len = 1024, .lo_at = 4, .hi_at = 520 }, // y, z
+            .{ .align16 = true, .len = 1024, .lo_at = 8, .hi_at = 13 }, // z, w
+            .{ .align16 = true, .len = 1024, .lo_at = 12, .hi_at = 6 }, // w, y
+            .{ .align16 = true, .len = 1000, .lo_at = 995, .hi_at = 2 }, // the tail, x
+            .{ .align16 = false, .len = 4111, .lo_at = 4000, .hi_at = 17 }, // an unaligned start
+            .{ .align16 = false, .len = 3, .lo_at = 1, .hi_at = 2 },
+            .{ .align16 = true, .len = 0, .lo_at = 0, .hi_at = 0 }, // empty: 255 and 0
+        };
+        var host: std.ArrayList(u8) = .empty;
+        defer host.deinit(std.heap.page_allocator);
+        var rs: [ts.len]mx.ByteRange = undefined;
+        var want: [ts.len][2]u8 = undefined;
+        for (ts, 0..) |t, i| {
+            // the gap up to the tensor's start (16-aligned, or 3 past it): its last byte 0x00 before even tensors, 0xff
+            // before odd ones, the first byte after the tensor the other (a read one byte early or late moves a range)
+            const before: u8 = if (i % 2 == 0) 0x00 else 0xff;
+            const target: usize = if (t.align16) 0 else 3;
+            while ((host.items.len + 1) % 16 != target) try host.append(std.heap.page_allocator, ~before);
+            try host.append(std.heap.page_allocator, before);
+            const at = host.items.len;
+            for (0..t.len) |_| try host.append(std.heap.page_allocator, 80);
+            if (t.len > 0) {
+                host.items[at + t.lo_at] = 41;
+                host.items[at + t.hi_at] = 127;
+            }
+            want[i] = if (t.len > 0) .{ 41, 127 } else .{ 255, 0 };
+            rs[i] = .{ .ptr = at, .len = t.len };
+            try host.append(std.heap.page_allocator, ~before);
+        }
+        const buf = try upload(d, host.items);
+        defer {
+            var b = buf;
+            b.free();
+        }
+        for (&rs) |*x| x.ptr += buf.ptr;
+        var got: [ts.len][2]u8 = undefined;
+        try mx.scaleRanges(r.k, d, r.s, std.heap.page_allocator, &rs, &got);
+        var bad: usize = 0;
+        for (want, got) |w, g| bad += @intFromBool(w[0] != g[0] or w[1] != g[1]);
+        r.report("mma_sf_exact guard: tf_dsn_sf_ranges' smallest and largest bytes of packed tensors (each planted where no other has its own: every word of a 16-byte load, the tail, an unaligned start; an empty range) against the host's, the 0x00 / 0xff gaps between them never read", bad, true);
+    }
+    // the proven range's edges: every FP8 weight scale byte 41 (2^-86) with activations at act_quant's floor (2^-22),
+    // and 127 (2^0) with large ones: the guard keeps neither, the baseline bytes
+    const edge = [_]usize{ 64, 2048 };
+    const lo = try exactDense(r, rng, sf_shapes[0], 1e-5, 41, &edge, true);
+    r.report("mma_sf_exact guard's lower edge: wq_a with every weight scale byte 41 (2^-86) and activations at act_quant's floor (2^-22), proven and on the block-scaled kernel, bf16 and fp32 at 64 and 2,048 rows against the baseline's", if (lo.proven and lo.route_ok) lo.diff else 1, true);
+    const hi = try exactDense(r, rng, sf_shapes[0], 1e3, 127, &edge, true);
+    r.report("mma_sf_exact guard's upper edge: wq_a with every weight scale byte 127 (2^0) and large activations, proven and on the block-scaled kernel, against the baseline's", if (hi.proven and hi.route_ok) hi.diff else 1, true);
+    // outside it: 40 and 128 are kept on the baseline kernel (the outputs the baseline); the kernel unguarded on them, as information
+    const out40 = try exactDense(r, rng, sf_shapes[0], 1e-5, 40, &edge, true);
+    const out128 = try exactDense(r, rng, sf_shapes[0], 1e3, 128, &edge, true);
+    const raw40 = try exactDense(r, rng, sf_shapes[0], 1e-5, 40, &edge, false);
+    r.report(try std.fmt.bufPrint(&line, "mma_sf_exact guard: wq_a with every weight scale byte 40, then 128, outside the proven range and kept on the baseline kernel, against the baseline (unguarded at 40 the block-scaled kernel's bytes differ in {d})", .{raw40.diff}), if (out40.proven or out128.proven or !out40.route_ok or !out128.route_ok or !raw40.route_ok) 1 else out40.diff + out128.diff, true);
+    try exactCoverage(r, rng);
+    // the control: the block-scaled kernel against the baseline with one code of row 700 changed for it alone
+    {
+        var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer sarena.deinit();
+        const ha = sarena.allocator();
+        var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+        defer for (keep.items) |*b| b.free();
+        const sh = sf_shapes[0];
+        const l = try fp8Linear(d, sh.n, sh.k, .fast, rng, ha, &keep);
+        const x = try upload(d, try bf16s(1024 * sh.k, rng, 0.5, ha));
+        try keep.append(ha, x);
+        const q = try cuda.DeviceBuffer.alloc(d, 1024 * sh.k);
+        try keep.append(ha, q);
+        const s = try cuda.DeviceBuffer.alloc(d, 1024 * (sh.k / 32) * 4);
+        try keep.append(ha, s);
+        try mx.quant(r.k, r.s, x.ptr, .bf16, sh.k, 1024, sh.k, q.ptr, sh.k, s.ptr, sh.k / 32);
+        const z = try cuda.DeviceBuffer.alloc(d, @max(mx.zFloats(l, 1024), 1) * 4);
+        try keep.append(ha, z);
+        const y = try cuda.DeviceBuffer.alloc(d, 1024 * sh.n * 4);
+        try keep.append(ha, y);
+        const t = try gemmExact(r, false, l, q.ptr, s.ptr, z.ptr, 1024, y.ptr, .bf16);
+        defer free(t);
+        // the key proven (as its guard would) and the block-scaled kernel's route asserted, then one code changed
+        try mx.sfProve(r.k, l.s);
+        defer {
+            r.k.sf_nproven = 0;
+            r.k.sf_nkept = 0;
+        }
+        const taken = sfTaken(r, .exact, l, q.ptr, s.ptr, y.ptr, 1024);
+        var code: [1]u8 = undefined;
+        const at = q.ptr + 700 * sh.k + 5;
+        const changed = [1]u8{code[0] ^ 0x08};
+        const e = try gemmExact(r, true, l, q.ptr, s.ptr, z.ptr, 1024, y.ptr, .bf16);
+        defer free(e);
+        r.report("mma_sf_exact control: one code of row 700 changed for the block-scaled kernel (its key proven, its route asserted)", if (taken) differs(t, e) else 0, false);
+    }
+}
+
+/// A device byte set on the replay's stream (stream-ordered: the guard's kernel runs on that stream).
+fn pokeByte(r: *Run, at: u64, v: u8) !void {
+    const b = [1]u8{v};
+}
+
+/// Whether the guard saw these extremes (mx.Kernels.sf_seen: FP8 dense, MXFP4, the shared expert's; 255, 0: none).
+fn seenIs(got: [3][2]u8, want: [3][2]u8) bool {
+    for (got, want) |g, w| if (g[0] != w[0] or g[1] != w[1]) return false;
+    return true;
+}
+
+/// The guard's coverage (model.sfGuard over two layers). Dense: every field of sf_fields on both layers at a shape the
+/// exact form takes and, (k, n) swapped, does not (K 1,472, N 1,280), scale bytes 120: every key proven; one byte 40 in
+/// layer 1's field, each in turn: that field of layer 1 alone kept, by its key and in words, every other key proven.
+/// Experts: two layers of scale tensors alone (two routed experts, the first owning its rest, then the shared one),
+/// bytes 120: both layers' keys (s1) proven; one byte 32 in layer 1's first up tensor's rest rows: layer 1's experts
+/// alone kept; a second bad tensor there (a down byte 140): still one layer; the shared expert of layer 0 bad too (an
+/// FP8 gate byte 128): two layers, both keys kept.
+fn exactCoverage(r: *Run, rng: std.Random) !void {
+    _ = rng;
+    const d = r.d;
+    var kb: [320]u8 = undefined;
+    defer {
+        r.k.sf_nkept = 0;
+        r.k.sf_nproven = 0;
+    }
+    {
+        const fields = .{ "wq_a", "wkv", "wq_b", "wo_b", "comp_wkv", "comp_wgate", "idx_wq_b", "idx_wk", "engram_wkv" };
+        const ck: u32 = 1472;
+        const cn: u32 = 1280;
+        const per: usize = (cn / 32) * (ck / 32);
+        var lays: [2]weights.Layer = .{ std.mem.zeroes(weights.Layer), std.mem.zeroes(weights.Layer) };
+        var sc: [2][fields.len]cuda.DeviceBuffer = undefined;
+        for (0..2) |li| inline for (fields, 0..) |f, fi| {
+            sc[li][fi] = try cuda.DeviceBuffer.alloc(d, per);
+            try d.check(d.api.cuMemsetD8Async(sc[li][fi].ptr, 120, per, r.s.handle), "cuMemsetD8Async");
+            @field(lays[li], f) = .{ .words = 0, .k = ck, .n = cn, .fmt = .fp8, .s = sc[li][fi].ptr };
+        };
+        defer for (&sc) |*row| for (row) |*b| b.free();
+        var fails: usize = 0;
+        const none = try dsv41.model.sfGuard(std.heap.page_allocator, d, r.s, r.k, &lays, &kb);
+        fails += @intFromBool(!(std.mem.eql(u8, none, "none") and r.k.sf_nkept == 0 and r.k.sf_nproven == 2 * fields.len));
+        fails += @intFromBool(!seenIs(r.k.sf_seen, .{ .{ 120, 120 }, .{ 255, 0 }, .{ 255, 0 } }));
+        inline for (fields, 0..) |f, fi| {
+            try pokeByte(r, sc[1][fi].ptr + 7, 40);
+            const words = try dsv41.model.sfGuard(std.heap.page_allocator, d, r.s, r.k, &lays, &kb);
+            var want: [64]u8 = undefined;
+            const w = try std.fmt.bufPrint(&want, "{s} in 1 layer", .{f});
+            fails += @intFromBool(!(std.mem.eql(u8, words, w) and r.k.sf_nkept == 1 and mx.sfKept(r.k, sc[1][fi].ptr) and !mx.sfKept(r.k, sc[0][fi].ptr) and
+                !mx.sfProvenKey(r.k, sc[1][fi].ptr) and mx.sfProvenKey(r.k, sc[0][fi].ptr) and r.k.sf_nproven == 2 * fields.len - 1));
+            // the bytes it saw: FP8 40 .. 120, nothing of the experts' classes
+            fails += @intFromBool(!seenIs(r.k.sf_seen, .{ .{ 40, 120 }, .{ 255, 0 }, .{ 255, 0 } }));
+            try pokeByte(r, sc[1][fi].ptr + 7, 120);
+        }
+        r.report("mma_sf_exact guard's coverage, dense: two layers with every field at a shape the exact form takes (K 1,472, N 1,280: swapped, one it does not), all in range: every key proven; one scale byte 40 in layer 1's field, each in turn: that field of layer 1 alone kept, by its key and in words; the bytes it saw FP8 40 .. 120", fails, true);
+    }
+    {
+        // two routed experts (the first owning its rest) and the shared one: rows 64 (+32), dims 256, down 256 x 64
+        var ex = std.mem.zeroes(weights.Experts);
+        ex.count = 3;
+        ex.width = 64;
+        ex.dims = 256;
+        ex.down_n = 256;
+        ex.down_k = 64;
+        const owner = [_]i32{ 1, 0, 0 };
+        var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+        defer for (keep.items) |*b| b.free();
+        var lays: [2]weights.Layer = .{ std.mem.zeroes(weights.Layer), std.mem.zeroes(weights.Layer) };
+        var tens: [2][3][3]u64 = undefined; // [layer][expert][gate, up, down]
+        for (0..2) |li| {
+            var x = ex;
+            x.native = .{ .w1 = 0, .w3 = 0, .s1 = 0, .s3 = 0, .w2 = 0, .s2 = 0, .tiles = 3, .rest_tiles = 1, .scales_match = true };
+            var tabs: [3][3]u64 = undefined; // [s1, s3, s2][expert]
+            for (0..3) |e| {
+                const lens = weights.expertScaleLens(x, e, owner[e] == 1);
+                for (0..3) |j| {
+                    const b = try cuda.DeviceBuffer.alloc(d, lens[j]);
+                    try keep.append(std.heap.page_allocator, b);
+                    try d.check(d.api.cuMemsetD8Async(b.ptr, 120, lens[j], r.s.handle), "cuMemsetD8Async");
+                    tabs[j][e] = b.ptr;
+                    tens[li][e][j] = b.ptr;
+                }
+            }
+            var tp: [4]u64 = undefined;
+            for (0..3) |j| {
+                const b = try cuda.DeviceBuffer.alloc(d, 3 * 8);
+                try keep.append(std.heap.page_allocator, b);
+                tp[j] = b.ptr;
+            }
+            const ob = try cuda.DeviceBuffer.alloc(d, 3 * 4);
+            try keep.append(std.heap.page_allocator, ob);
+            tp[3] = ob.ptr;
+            try r.s.synchronize();
+            x.native.?.s1 = tp[0];
+            x.native.?.s3 = tp[1];
+            x.native.?.s2 = tp[2];
+            x.native.?.owner = tp[3];
+            lays[li].experts = x;
+        }
+        const k0 = lays[0].experts.native.?.s1;
+        const k1 = lays[1].experts.native.?.s1;
+        var fails: usize = 0;
+        const none = try dsv41.model.sfGuard(std.heap.page_allocator, d, r.s, r.k, &lays, &kb);
+        fails += @intFromBool(!(std.mem.eql(u8, none, "none") and mx.sfProvenKey(r.k, k0) and mx.sfProvenKey(r.k, k1) and r.k.sf_nkept == 0));
+        // layer 1, expert 0's up tensor, in its rest rows (row 64 on: 64 x 8 bytes in)
+        try pokeByte(r, tens[1][0][1] + 64 * 8 + 3, 32);
+        const one = try dsv41.model.sfGuard(std.heap.page_allocator, d, r.s, r.k, &lays, &kb);
+        fails += @intFromBool(!(std.mem.eql(u8, one, "the experts in 1 layer") and r.k.sf_nkept == 1 and mx.sfKept(r.k, k1) and !mx.sfKept(r.k, k0) and mx.sfProvenKey(r.k, k0) and !mx.sfProvenKey(r.k, k1)));
+        // a second bad tensor in layer 1 (expert 1's down, 140): still one layer
+        try pokeByte(r, tens[1][1][2] + 5, 140);
+        const still = try dsv41.model.sfGuard(std.heap.page_allocator, d, r.s, r.k, &lays, &kb);
+        fails += @intFromBool(!(std.mem.eql(u8, still, "the experts in 1 layer") and r.k.sf_nkept == 1));
+        // layer 0's shared expert's gate (FP8) 128: two layers, both keys
+        try pokeByte(r, tens[0][2][0] + 1, 128);
+        const two = try dsv41.model.sfGuard(std.heap.page_allocator, d, r.s, r.k, &lays, &kb);
+        fails += @intFromBool(!(std.mem.eql(u8, two, "the experts in 2 layers") and r.k.sf_nkept == 2 and mx.sfKept(r.k, k0) and mx.sfKept(r.k, k1) and !mx.sfProvenKey(r.k, k0) and !mx.sfProvenKey(r.k, k1)));
+        // the bytes it saw: MXFP4 32 .. 140 (the routed experts' pokes), the shared expert's 120 .. 128, no dense FP8
+        fails += @intFromBool(!seenIs(r.k.sf_seen, .{ .{ 255, 0 }, .{ 32, 140 }, .{ 120, 128 } }));
+        r.report("mma_sf_exact guard's coverage, experts: two layers, all in range: both keys proven; one byte 32 in layer 1's owned rest rows: layer 1 alone kept by its key; a second bad tensor there: still one layer; layer 0's shared expert at 128 too: two layers, both keys; the bytes it saw MXFP4 32 .. 140, the shared expert's 120 .. 128", fails, true);
+    }
+    {
+        // a layer whose scale tensors the loader did not tie to the guard's lengths (scales_match false): two layers,
+        // layer 1 untied, its bytes 99 and its last tensor (the shared expert's down) half the guard's length: none of
+        // its bytes read, its experts kept apart (k.sf_apart, not the scale words), layer 0 proven
+        var ex = std.mem.zeroes(weights.Experts);
+        ex.count = 3;
+        ex.width = 64;
+        ex.dims = 256;
+        ex.down_n = 256;
+        ex.down_k = 64;
+        const owner = [_]i32{ 1, 0, 0 };
+        var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+        defer for (keep.items) |*b| b.free();
+        var lays: [2]weights.Layer = .{ std.mem.zeroes(weights.Layer), std.mem.zeroes(weights.Layer) };
+        for (0..2) |li| {
+            var x = ex;
+            x.native = .{ .w1 = 0, .w3 = 0, .s1 = 0, .s3 = 0, .w2 = 0, .s2 = 0, .tiles = 3, .rest_tiles = 1, .scales_match = li == 0 };
+            var tabs: [3][3]u64 = undefined;
+            for (0..3) |e| {
+                const lens = weights.expertScaleLens(x, e, owner[e] == 1);
+                for (0..3) |j| {
+                    const n = if (li == 1 and e == 2 and j == 2) lens[j] / 2 else lens[j];
+                    const b = try cuda.DeviceBuffer.alloc(d, n);
+                    try keep.append(std.heap.page_allocator, b);
+                    try d.check(d.api.cuMemsetD8Async(b.ptr, if (li == 1) 99 else 120, n, r.s.handle), "cuMemsetD8Async");
+                    tabs[j][e] = b.ptr;
+                }
+            }
+            var tp: [4]u64 = undefined;
+            for (0..3) |j| {
+                const b = try cuda.DeviceBuffer.alloc(d, 3 * 8);
+                try keep.append(std.heap.page_allocator, b);
+                tp[j] = b.ptr;
+            }
+            const ob = try cuda.DeviceBuffer.alloc(d, 3 * 4);
+            try keep.append(std.heap.page_allocator, ob);
+            tp[3] = ob.ptr;
+            try r.s.synchronize();
+            x.native.?.s1 = tp[0];
+            x.native.?.s3 = tp[1];
+            x.native.?.s2 = tp[2];
+            x.native.?.owner = tp[3];
+            lays[li].experts = x;
+        }
+        const k0 = lays[0].experts.native.?.s1;
+        const k1 = lays[1].experts.native.?.s1;
+        const words = try dsv41.model.sfGuard(std.heap.page_allocator, d, r.s, r.k, &lays, &kb);
+        const ok = std.mem.eql(u8, words, "none") and r.k.sf_apart == 1 and r.k.sf_nkept == 1 and mx.sfKept(r.k, k1) and !mx.sfProvenKey(r.k, k1) and mx.sfProvenKey(r.k, k0) and
+            seenIs(r.k.sf_seen, .{ .{ 255, 0 }, .{ 120, 120 }, .{ 120, 120 } });
+        var lb: [320]u8 = undefined;
+        r.note(try std.fmt.bufPrint(&lb, "mma_sf_exact guard's coverage, a layer packed at other lengths: layer 1 untied (its bytes 99, its last tensor half the guard's length), none of its bytes read and its experts kept apart (\"{s}\" for a scale, {d} apart), layer 0 proven", .{ words, r.k.sf_apart }), ok);
+    }
+}
+
+/// TF_DS_MMA_SF_EXACT's experts (pf_run128's node, the baseline 128-byte-run tiles as served): the baseline bytes at a chunk's row
+/// counts; the guard over every expert's three scale tensors (expertScales with the owner table) against the host's;
+/// the proven range's edges on weight set 0, and a byte outside it keeping the layer's experts on the baseline kernels.
+fn mmaSfExactExperts(r: *Run, rng: std.Random, line: []u8) !void {
+    const d = r.d;
+    var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sarena.deinit();
+    const ha = sarena.allocator();
+    var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer for (keep.items) |*b| b.free();
+    const ex = try xExperts(d, rng, ha, &keep);
+    const nx = ex.native.?;
+    const P = R * X_SL;
+    const sc = try xScratch(d, R, true, ha, &keep);
+    const x = try upload(d, try bf16s(R * X_D, rng, 0.5, ha));
+    const hdn = try upload(d, try bf16s(P * X_I, rng, 0.5, ha));
+    const pw = try xPicks(R, rng, ha);
+    const pb = try upload(d, std.mem.sliceAsBytes(pw.pick));
+    const wb = try upload(d, std.mem.sliceAsBytes(pw.wts));
+    const h = try cuda.DeviceBuffer.alloc(d, P * X_W * 2);
+    const out = try cuda.DeviceBuffer.alloc(d, R * X_N * 4);
+    for ([_]cuda.DeviceBuffer{ x, hdn, pb, wb, h, out }) |b| try keep.append(ha, b);
+    const Moe = struct {
+        fn run(rr: *Run, e_: weights.Experts, s_: mx.ExpertScratch, xp: u64, hd: u64, pk: u64, wt: u64, hb: cuda.DeviceBuffer, ob: cuda.DeviceBuffer, m: usize, on: bool) ![3][]u8 {
+            rr.k.run128 = true;
+            rr.k.sf = if (on) .exact else .off;
+            defer {
+                rr.k.run128 = false;
+                rr.k.sf = .off;
+            }
+            try poison(hb.ptr, hb.len, rr.d, rr.s);
+            try poison(s_.out, m * X_SL * X_N * 4, rr.d, rr.s);
+            try poison(ob.ptr, ob.len, rr.d, rr.s);
+            try mx.gateUp(rr.k, rr.s, rr.d, e_, s_, xp, X_D, pk, wt, m, 7.0, hb.ptr, X_MAIN, false);
+            try rr.s.synchronize();
+            const hh = try get(hb.ptr, m * X_SL * X_W * 2, rr.d);
+            errdefer free(hh);
+            try mx.down(rr.k, rr.s, e_, s_, hd, X_I, pk, m, ob.ptr, X_N, false, false);
+            try rr.s.synchronize();
+            return .{ hh, try get(s_.out, m * X_SL * X_N * 4, rr.d), try get(ob.ptr, m * X_N * 4, rr.d) };
+        }
+    };
+    // the guard over the layer's experts: every tensor's range against the host's of the same bytes read back
+    const tabs = try ha.alloc(u64, 3 * X_E);
+    const owner = try ha.alloc(i32, X_E);
+    const rs = try ha.alloc(mx.ByteRange, 3 * X_E);
+    mx.expertScales(ex, tabs[0..X_E], tabs[X_E .. 2 * X_E], tabs[2 * X_E ..], owner, rs);
+    const got = try ha.alloc([2]u8, rs.len);
+    try mx.scaleRanges(r.k, d, r.s, std.heap.page_allocator, rs, got);
+    // the guard's verdict: model.sfGuard on a layer of these experts (none kept, or the layer's experts in words)
+    var lay = std.mem.zeroes(weights.Layer);
+    lay.experts = ex;
+    const Guard = struct {
+        fn verdict(rr: *Run, l: weights.Layer) !?[]const u8 {
+            rr.k.sf_nkept = 0;
+            var kb: [320]u8 = undefined;
+            const kept = try dsv41.model.sfGuard(std.heap.page_allocator, rr.d, rr.s, rr.k, &.{l}, &kb);
+            if (rr.k.sf_nkept == 0 and std.mem.eql(u8, kept, "none")) return null;
+            return if (mx.sfKept(rr.k, l.experts.native.?.s1) and rr.k.sf_nkept == 1 and std.mem.eql(u8, kept, "the experts in 1 layer")) "kept" else "WRONG words";
+        }
+    };
+    const proven = (try Guard.verdict(r, lay)) == null;
+    r.k.sf_nkept = 0;
+    var bad: usize = 0;
+    for (rs, got) |rg, g| {
+        const b = try get(rg.ptr, rg.len, d);
+        defer free(b);
+        const w = hostRange(b);
+        bad += @intFromBool(w[0] != g[0] or w[1] != g[1]);
+    }
+    // the baseline bytes at a chunk's row counts, the layer's scales proven
+    var diff: [3]usize = @splat(0);
+        const want = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, m, false);
+        defer for (want) |w| free(w);
+        const g = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, m, true);
+        defer for (g) |w| free(w);
+        for (&diff, want, g) |*n, w, gg| n.* += differs(w, gg);
+    }
+    const names = [_][]const u8{ "gate / up's bf16 pack", "down's fp32 entry outputs", "the combined fp32 rows" };
+    for (names, diff) |nm, n| r.report(try std.fmt.bufPrint(line, "mma_sf_exact experts: {s} at 37, 64, 512, 2,048, 4,096 and 8,192 rows against the baseline 128-byte-run tiles", .{nm}), if (proven) n else 1, true);
+    r.report("mma_sf_exact guard over the experts: every expert's three scale tensors (expertScales: the owner table's rest rows, the shared expert's FP8 blocks) against the host's of the same bytes", bad, true);
+    // the edges on weight set 0 (experts 0, 8, .. 376): gate 33, up 137, down 33; the shared expert's 41 and 127
+    const set0: [3]u64 = .{ tabs[0], tabs[X_E], tabs[2 * X_E] };
+    const shared: [3]u64 = .{ tabs[X_E - 1], tabs[2 * X_E - 1], tabs[3 * X_E - 1] };
+    const fills = [_]struct { at: u64, len: u64, b: u8 }{
+        .{ .at = set0[0], .len = X_W * (X_D / 32), .b = 33 },           .{ .at = set0[1], .len = X_W * (X_D / 32), .b = 137 },
+        .{ .at = set0[2], .len = X_N * (X_I / 32), .b = 33 },           .{ .at = shared[0], .len = (X_W / 32) * (X_D / 32), .b = 41 },
+        .{ .at = shared[1], .len = (X_W / 32) * (X_D / 32), .b = 127 }, .{ .at = shared[2], .len = (X_N / 32) * (X_I / 32), .b = 41 },
+    };
+    const edge_proven = (try Guard.verdict(r, lay)) == null;
+    r.k.sf_nkept = 0;
+    var edge_diff: usize = 0;
+    {
+        const want = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 512, false);
+        defer for (want) |w| free(w);
+        const g = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 512, true);
+        defer for (g) |w| free(w);
+        for (want, g) |w, gg| edge_diff += differs(w, gg);
+    }
+    r.report("mma_sf_exact guard's edges on the experts: weight set 0's MXFP4 scale bytes 33 (2^-94) and 137 (2^10), the shared expert's FP8 41 and 127, proven and on the block-scaled kernels, at 512 rows against the baseline's", if (edge_proven) edge_diff else 1, true);
+    // outside it: one MXFP4 scale byte 32 keeps the layer's experts on the baseline kernels
+    const one = [1]u8{32};
+    const out_verdict = try Guard.verdict(r, lay);
+    defer r.k.sf_nkept = 0;
+    const out_proven = !(out_verdict != null and std.mem.eql(u8, out_verdict.?, "kept"));
+    var out_diff: usize = 0;
+    {
+        const want = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 512, false);
+        defer for (want) |w| free(w);
+        const g = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 512, true);
+        defer for (g) |w| free(w);
+        for (want, g) |w, gg| out_diff += differs(w, gg);
+    }
+    r.report("mma_sf_exact guard over the experts: one MXFP4 scale byte 32 keeps the layer's experts on the baseline kernels (model.sfGuard: \"the experts in 1 layer\"), at 512 rows against the baseline's", if (out_proven) 1 else out_diff, true);
+    // the shared expert's FP8 rule: one of its scale bytes 128 (inside MXFP4's range, outside FP8's) keeps them too
+    const back = [1]u8{33};
+    const big = [1]u8{128};
+    const sh_verdict = try Guard.verdict(r, lay);
+    const sh_kept = sh_verdict != null and std.mem.eql(u8, sh_verdict.?, "kept");
+    var sh_diff: usize = 0;
+    {
+        const want = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 512, false);
+        defer for (want) |w| free(w);
+        const g = try Moe.run(r, ex, sc, x.ptr, hdn.ptr, pb.ptr, wb.ptr, h, out, 512, true);
+        defer for (g) |w| free(w);
+        for (want, g) |w, gg| sh_diff += differs(w, gg);
+    }
+    r.report("mma_sf_exact guard over the experts: the shared expert's FP8 scale byte 128 (inside MXFP4's range, outside FP8's) keeps the layer's experts on the baseline kernels, at 512 rows against the baseline's", if (sh_kept) sh_diff else 1, true);
+}
+
+        r.report(try std.fmt.bufPrint(&line, "gemm_w16 {s} ({d} x {d}): bf16 and fp32 outputs at 64, 67, 512, 1,000, 1,025, 2,048 and 4,096 rows against the baseline 8-warp kernels ({s}, its route asserted{s})", .{ sh.name, sh.k, sh.n, if (twin) "the 16-warp twins" else "no K split, so no twin: the baseline kernel", if (route) "" else ": WRONG" }), if (route) diff else 1, true);
+        for (names, diff) |nm, n| r.report(try std.fmt.bufPrint(&line, "gemm_w16 experts: {s} at 37, 64, 512, 2,048 and 4,096 rows (the FP8 shared expert among them) against the baseline 8-warp kernels", .{nm}), if (route and route_dn) n else 1, true);
+        r.report("gemm_w16 wo_a: u from its FP8 rows on 16 warps a block against the baseline 8-warp kernel at 1, 17, 63, 64, 65, 256, 512, 1,000, 2,048 and 4,096 rows, 2 groups of 1024 x 4096", diff, true);
+    r.report("collect_peers all4 quarters (2,560 fp32 a node) at 1, 2, 3, 5, 16, 26 and 34 rows and rows 5 .. 10 of 34, every rank: against the baseline copy-out, and the baseline against the slots' bytes", all4, true);
+    r.report("collect_peers head quarters (32,384 / 32,256 fp32 a node) at 1, 2 and 34 rows, every rank: against the baseline's, and the baseline against the slots' bytes", head, true);
+    r.report("collect_peers column ring: catRank (2,048 bf16 a rank), the parity pack (8,960-byte rows, the partner's alone) and the pair gather (2,560 fp32) at 1, 2 and 16 rows, both ranks: against the baseline's, and the baseline against the slots' bytes", col, true);
+    r.report("collect_peers odd widths (1, 3, 255, 1,023, 1,024, 1,025, 2,049 float4) at 1, 2 and 5 rows, a gap of 3 float4 between rows, rank 0 without a destination, on rank 2: against the baseline's, and the baseline against the slots' bytes", odd, true);
+    r.report("collect_peers zero-width destination: rank 1's destination has a pointer and row4 0 in the 4-rank gather at 2 rows on rank 0: against the baseline's, and the baseline against the slots' bytes", zw, true);
+    r.note("collect_peers: the switch runs dsv41_rdma_collect_peers (the ring's probe counts the baseline launch, 1, and not the switch's, 0)", counts[0] == 1 and counts[1] == 0);
+        r.note(try std.fmt.bufPrint(&line, "head_cand {d} rows, count {d} (each node's {d}): the baseline kernel flags none; the nodes' parts merged into the baseline candidates, values' bits and ids", .{ R, c, dsv41.head_cand.kFor(c) }), x.flagged == 0 and x.merged and x.equal);
+        r.note(try std.fmt.bufPrint(&line, "head_cand 2 rows, count {d} (each node's {d}): the baseline kernel flags none; the nodes' parts merged into the baseline candidates, values' bits and ids", .{ c, dsv41.head_cand.kFor(c) }), x.flagged == 0 and x.merged and x.equal);
+        r.note("head_cand 2,000 ties at the cut, all in node g0: the baseline kernel flags none; merged into the baseline candidates", x.flagged == 0 and x.merged and x.equal);
+        r.note(try std.fmt.bufPrint(&line, "head_cand ties across the nodes (grids of 1/8, 1, 2), 24 rounds of 2 rows, count 28: the baseline kernel flags {d} rows; {d} rounds merged into the baseline candidates ({d} not), {d} fell back (a cut value some node holds at its k-th and two nodes hold)", .{ flagged, merged, bad, fell }), flagged == 0 and merged > 0 and fell > 0 and bad == 0);
+        r.note("head_cand 2,400 ties at the cut, 600 in each node: the baseline kernel flags the row; the merge falls back to the whole head", x.flagged == 1 and !x.merged);
+        r.note("head_cand a NaN in node g1's columns: the baseline kernel flags the row; the merge falls back to the whole head", x.flagged == 1 and !x.merged);
+        r.note("head_cand signed zeros at the cut over the nodes: the baseline kernel flags none; merged into the baseline candidates, each zero's sign bit kept", x.flagged == 0 and x.merged and x.equal and x.neg_zero);
+        r.note(try std.fmt.bufPrint(&line, "head_cand timing {d} rows, count 28 (each node's {d}), us (a mean of 20 after 3; the engine's trace decides): the baseline kernel on 129,280 columns {d:.1}, a node's on 32,384 {d:.1} (x{d:.3}), the host merge {d:.2}; its lists merged as the baseline's", .{ R, k, today, one, one / today, merge_us }), today > 0 and one > 0 and ok and x.merged and x.equal and std.mem.eql(i64, ids, x.ids));
+        r.note(try std.fmt.bufPrint(&line, "head_key {d} rows: the nodes' bests merged into the baseline argmax tokens", .{R}), x.equal);
+        r.note("head_key the largest value twice in node g2 and in g1 and g3: the lowest id among them, the baseline tokens", x.equal and x.tokens[0] == hc_off[1] + 101);
+        r.note("head_key a NaN at the vocabulary's first column (token 0) and at node g2's first (never larger): the baseline tokens", x.equal and x.tokens[0] == 0 and x.tokens[1] != 0);
+        r.note("head_key every node's layout: the largest at each node's first and last column, ties across each boundary, NaNs at nodes' edges, nodes without a number, +inf in two nodes, signed zeros: the baseline tokens", x.equal and std.mem.eql(u32, &want, x.tokens));
+        r.note("head_key a row of NaNs and a row of -inf alone: the baseline tokens (0, 0)", x.equal and x.tokens[0] == 0 and x.tokens[1] == 0);
+        r.note(try std.fmt.bufPrint(&line, "head_key timing {d} rows, us (a mean of 20 after 3; the engine's trace decides): the baseline argmax on 129,280 columns {d:.1}, a node's part on 32,384 {d:.1} (x{d:.3}), the host merge {d:.2}; its bests merged as the baseline's", .{ R, today, one, one / today, merge_us }), today > 0 and one > 0 and x.equal and std.mem.eql(u32, tokens, x.tokens));
 // -- the rings' data slots: write-combined and in-place --------------------------------------------------------------
 
 /// A ring's two data regions and its metadata without the NIC: enough to run the staging, publish, await and collecting
@@ -453,6 +1452,7 @@ fn ringWc(r: *Run, rng_in: std.Random) !void {
     try g.stage(src.ptr, n4, g.send_wc.dev, 0, n4, n4);
     try r.s.synchronize();
     const staging_wc = differs(want, g.send_wc.mem[@as(usize, @intCast(RingRig.q % RingRig.slots)) * RingRig.max_bytes ..][0..nbytes]);
+    r.report("ring_wc: the staging kernel's send slot, cudaHostAlloc(Mapped | WriteCombined) and the baseline mmap + cuMemHostRegister, each against the source's bytes", staging_today + staging_wc, true);
 
     // the publish kernel writes the user's fixed slot and keeps every CPU-read word in the baseline memory
     g.reset();
@@ -468,6 +1468,7 @@ fn ringWc(r: *Run, rng_in: std.Random) !void {
         w[RingRig.send_slot_w + RingRig.q % RingRig.slots] == RingRig.user and
         w[RingRig.send_last_w + RingRig.user] == RingRig.q;
     r.report("ring_wc: the publish kernel's write-combined slot against the source's bytes", differs(want, g.send_wc.mem[slot_off..][0..nbytes]), true);
+    r.note("ring_wc: the publish's doorbell, size, slot name and last sequence read from the baseline (non-write-combined) metadata", meta_ok);
 
     // the collecting kernel out of a write-combined landing ring gives the baseline bytes
     const peer = try r.a.alloc(u8, nbytes);
@@ -491,6 +1492,7 @@ fn ringWc(r: *Run, rng_in: std.Random) !void {
     defer free(today);
     const wc = try get(dst_wc.ptr, 2 * nbytes, r.d);
     defer free(wc);
+    r.report("ring_wc: the collecting kernel out of write-combined landing slots against the baseline mmap slots, both ranks' bytes", differs(today, wc), true);
 
     // a control: one source byte changed moves the published slot
     var changed = try r.a.dupe(u8, host);
@@ -567,6 +1569,7 @@ fn ringInplace(r: *Run, rng_in: std.Random) !void {
     defer r.a.free(expect);
     @memcpy(expect[0..nbytes], host);
     @memcpy(expect[nbytes..], peer);
+    r.report("ring_inplace: the in-place publish's copy-out against the baseline staged copy-out (both ranks' bytes, the sender's from a write-combined slot)", differs(today, mine), true);
     r.report("ring_inplace: the in-place copy-out against the bytes sent (this rank's partial and the peer's slot)", differs(mine, expect), true);
 
     // the await waits for the previous send: not done with last 5 and done 0, done once done reaches 5
@@ -719,6 +1722,7 @@ fn ringWord(r: *Run, rng_in: std.Random) !void {
     try r.s.synchronize();
     const got = try get(dst.ptr, 2 * nbytes, r.d);
     defer free(got);
+    r.report("ring_word: the word signal (each lane's sequence written by a host thread after the launch) against the baseline collecting kernel on the same slots", differs(want, got), true);
 
     // the same signal out of write-combined landing slots (TF_DS_RING_WC's memory), against the baseline collect there
     g.reset();
@@ -743,6 +1747,7 @@ fn ringWord(r: *Run, rng_in: std.Random) !void {
     try r.s.synchronize();
     const got_wc = try get(dst.ptr, 2 * nbytes, r.d);
     defer free(got_wc);
+    r.report("ring_word: the word signal out of write-combined landing slots against the baseline collect on the same slots", differs(want_wc, got_wc), true);
 
     // the atomic signal: the host fetch-adds one per lane; the word the kernel waits on counts to the sequence
     @memset(gen.mem, 0);
@@ -758,6 +1763,7 @@ fn ringWord(r: *Run, rng_in: std.Random) !void {
     try r.s.synchronize();
     const atomic_got = try get(dst.ptr, 2 * nbytes, r.d);
     defer free(atomic_got);
+    r.report("ring_word: the atomic signal (one fetch-and-add a lane, the word counting to the sequence) against the baseline collecting kernel on the same slots", differs(want, atomic_got), true);
 
     // the control: one landing byte changed differs
     var peer2 = try r.a.dupe(u8, peer);
@@ -792,6 +1798,7 @@ fn ringWord(r: *Run, rng_in: std.Random) !void {
     try r.s.synchronize();
     const late = try get(dst.ptr, 2 * nbytes, r.d);
     defer free(late);
+    r.report("ring_word: lanes' words written 20 ms after the launch still collect the baseline bytes under the 500 ms deadline", differs(want, late), true);
 
     // one lane's word never arrives: the deadline ends the wait with the record, the ring poisoned, nothing copied
     @memset(gen.mem, 0);
@@ -829,6 +1836,7 @@ fn ringWord(r: *Run, rng_in: std.Random) !void {
     r.note("ring_word: the abort word ends a waiting kernel well before its 1 s deadline (the record's why is the abort)", rec[0] == 0x524f_4349_0000_0001 and rec[7] == 1 and rec[5] < 900 * std.time.ns_per_ms);
 }
 
+    r.note(try std.fmt.bufPrint(&line, "{s}: every launch found the extra set's variant (none kept the baseline part and epilogue, none took _ue for _we)", .{tag}), tri_attn.attn_epi_misses.load(.monotonic) == misses0 and tri_attn.attn_we_misses.load(.monotonic) == we_misses0);
 // -- TF_DS_ROCI's two-block readers ----------------------------------------------------------------------------------
 
 /// bf16 [2, rows, w] sums with the special values the identity argument names scattered in (quiet NaN, +-0, subnormals,
@@ -2578,6 +3586,7 @@ fn rociLocalFirst(r: *Run, rng_in: std.Random) !void {
                 defer free(got);
                 bad[gi] = differs(ref, got);
             }
+            r.report(try std.fmt.bufPrint(&line, "roci_local_first {s} {s}: the two-part layout's {s} and the four-quarter layout's output, the local launch then the rest, against the baseline single launch", .{ rname, kname, if (down) "entry outputs" else "pack" }), bad[0] + bad[1], true);
             // control: the last tile of the rest launch never runs
             const cut = [2]Lau{ pair[1][0], blk: {
                 var c = pair[1][1];
@@ -2665,6 +3674,7 @@ fn rociLocalFirst(r: *Run, rng_in: std.Random) !void {
     const kinds = [3]?mx.SfGemm{ mx.sfRoute(r.k, l, q.ptr, K, qs.ptr, K / 32, y_a.ptr, N, false, R), mx.sfRoute(r.k, l, q.ptr, K, qs.ptr, K / 32, y_a.ptr, N, false, quarter), mx.sfRoute(r.k, l, q.ptr, K, qs.ptr, K / 32, y_a.ptr, N, false, R - quarter) };
     var t: WcText = .{};
     try t.add("roci_local_first wq_a (K {d}, N {d}) block-scaled exact on the gathered rows, kernel only, ms: one launch of 4,096 rows {d:.3} ({s}), null control {d:.1} % ({s}); 1,024 rows then 3,072 rows {d:.3} = {d:.1} % over one launch ({s} then {s}). The research's kill line (more than 1.5 % slower): {s}", .{
+        K,                                                     N, ms1, if (kinds[0]) |kd| @tagName(kd) else "the baseline kernels", pct(msn, ms1), resolved(pct(msn, ms1)), ms2, pct(ms2, ms1), if (kinds[1]) |kd| @tagName(kd) else "the baseline kernels", if (kinds[2]) |kd| @tagName(kd) else "the baseline kernels",
         if (pct(ms2, ms1) > 1.5) "crossed" else "not crossed",
     });
     r.report("roci_local_first wq_a: 1,024 rows then 3,072 rows against one launch of 4,096", differs(ref, got), true);
@@ -2824,6 +3834,7 @@ fn rociTwoBase(r: *Run, rng_in: std.Random) !void {
     const z = try cuda.DeviceBuffer.alloc(d, @max(mx.zFloats(l, n), 1) * 4);
     for ([_]cuda.DeviceBuffer{ q, qs, z }) |b| try keep.append(ha, b);
     try mx.sfProve(r.k, l.s);
+    r.k.sf = replay_sf;
     const y_ref = wc;
     const y_two = wc + ybytes;
     // node 1 (pair 0): its part is the first, the partner's the second
@@ -2872,9 +3883,85 @@ fn rociTwoBase(r: *Run, rng_in: std.Random) !void {
     const cut = try get(y_two, ybytes, d);
     defer free(cut);
     var t: WcText = .{};
+    try t.add("roci_two_base wo_b (K {d}, N {d}) block-scaled exact, y in write-combined host memory, kernel only, ms for 4,096 rows: the four copies and the GEMM on the assembled input {d:.3}; the GEMM on the two parts {d:.3} ({d:.1} % against the baseline path)", .{ K, N, ms_today, ms_two, pct(ms_two, ms_today) });
     r.note(t.buf[0..t.n], true);
     r.report(try std.fmt.bufPrint(&line, "roci_two_base wo_b: the GEMM on the node's part and the partner's part against the copies and the GEMM on the assembled input", .{}), differs(ref, got), true);
     r.report("roci_two_base wo_b control: one code byte of the partner's part changed", differs(ref, cut), false);
+}
+
+// -- TF_DS_MMA_SF's twins of the transport-integrated kernels ------------------------------------------------------------------------
+
+/// The block-scaled arithmetic the roci_two_base and roci_three_base replays run (their chained wrappers set it for one call).
+var replay_sf: mx.MmaSf = .exact;
+
+fn rociTwoBaseChained(r: *Run, rng_in: std.Random) !void {
+    replay_sf = .chained;
+    defer replay_sf = .exact;
+    try rociTwoBase(r, rng_in);
+}
+
+fn rociThreeBaseChained(r: *Run, rng_in: std.Random) !void {
+    replay_sf = .chained;
+    defer replay_sf = .exact;
+    try rociThreeBase(r, rng_in);
+}
+
+/// wo_b's door kernel in TF_DS_MMA_SF's arithmetic (tf_dsn_sf_split128_st_door) in each node's row order against the plain chained launch
+/// (mx.gemm, the whole-line kernel): every output byte equal; a row order that runs a quarter twice must differ.
+fn chainedDoor(r: *Run, rng_in: std.Random) !void {
+    _ = rng_in;
+    var prng = std.Random.DefaultPrng.init(0xc4a1d00);
+    const rng = prng.random();
+    const d = r.d;
+    var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sarena.deinit();
+    const ha = sarena.allocator();
+    var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer for (keep.items) |*b| b.free();
+    var arena_mem: ?*anyopaque = null;
+    defer if (arena_mem != null) {
+        _ = d.api.cuMemFreeHost(arena_mem);
+    };
+    defer {
+        r.k.wc = .{ 0, 0 };
+        r.k.sf = .off;
+    }
+    var rigd = try DoorRig.init(d);
+    defer rigd.deinit();
+    const ybytes = sf_m * sf_n * 4;
+    const rig = (try sfRig(r, rng, ha, &keep, &arena_mem)) orelse return r.note("chained_door: wo_b's 4,096 rows take tf_dsn_sf_split128 here", false);
+    r.k.sf = .chained;
+    const route_ok = mx.sentFirstTakes(r.k, rig.l, rig.q, sf_k, rig.s, sf_k / 32, rig.y_new, sf_n, sf_m);
+    r.report("chained_door: sentFirstTakes takes wo_b in the chained arithmetic", @intFromBool(!route_ok), true);
+    const today: TodayRun = .{ .r = r, .l = rig.l, .q = rig.q, .s = rig.s, .z = rig.z, .y = rig.y_ref };
+    try poison(rig.y_ref, ybytes, d, r.s);
+    try today.go();
+    try r.s.synchronize();
+    const ref = try get(rig.y_ref, ybytes, d);
+    defer free(ref);
+    const q = sf_m / 4;
+    var bad: usize = 0;
+    var orders: [4]mx.RowOrder = undefined;
+    for (0..4) |g| orders[g] = mx.rowOrder(.{ (g ^ 1) * q, (g ^ 3) * q }, .{ g * q, (g ^ 2) * q }, q, sf_ct).?;
+    for (orders) |ro| {
+        const run: SentRun = .{ .r = r, .f = f, .a = rig.margs, .ro = ro, .door = rigd.arm() };
+        try poison(rig.y_new, ybytes, d, r.s);
+        try run.go();
+        try r.s.synchronize();
+        const got = try get(rig.y_new, ybytes, d);
+        defer free(got);
+        bad += differs(ref, got);
+    }
+    r.report("chained_door wo_b: the door kernel in each of the four nodes' row orders against the plain chained launch", bad, true);
+    var dup = orders[0];
+    dup.quarters = (dup.quarters & 0x00ffffff) | (@as(u32, 0) << 24);
+    const cut: SentRun = .{ .r = r, .f = f, .a = rig.margs, .ro = dup, .door = rigd.arm() };
+    try poison(rig.y_new, ybytes, d, r.s);
+    try cut.go();
+    try r.s.synchronize();
+    const got = try get(rig.y_new, ybytes, d);
+    defer free(got);
+    r.report("chained_door wo_b control: a row order that runs one quarter twice and another never", differs(ref, got), false);
 }
 
 // -- wo_b on the two pairs' parts: where each base lives -------------------------------------------------------------------------
@@ -3015,6 +4102,7 @@ fn rociThreeBase(r: *Run, rng_in: std.Random) !void {
     const rng = prng.random();
     const d = r.d;
     const sk = r.k.sfk orelse return r.note("roci_three_base: the block-scaled kernels (native_sf.cu) load on this GPU", false);
+    const f3 = sk.three(replay_sf) orelse return r.note("roci_three_base: tf_dsn_sf_dn_exact_three_kernel loads", false);
     const ops = r.ops orelse return r.note("roci_three_base: the ops are available", false);
     if (X_I != 1152 or X_MAIN != 512 or X_W != 640) return r.note("roci_three_base: the pack is 512 + 512 main columns and a 128-column rest", false);
     var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -3093,6 +4181,7 @@ fn rociThreeBase(r: *Run, rng_in: std.Random) !void {
         }
     };
     _ = ops;
+    const today: C = .{ .r = r, .sc = sc, .nx = nx, .f = sk.dn[@backingInt(replay_sf) - 1], .f3 = f3, .parts = parts, .pc = pc, .pick = pb.ptr, .out = o_a.ptr, .three = false, .grid_y = grid_y };
     var three = today;
     three.out = o_b.ptr;
     three.three = true;
@@ -3118,6 +4207,7 @@ fn rociThreeBase(r: *Run, rng_in: std.Random) !void {
     const cut = try get(o_b.ptr, bytes, d);
     defer free(cut);
     var t: WcText = .{};
+    try t.add("roci_three_base down (4,096 rows x 7 slots, I {d}, N {d}) block-scaled exact, kernel only, ms: the two assemblies and down on hq / hs {d:.3}; down on the two parts {d:.3} ({d:.1} % against the baseline path)", .{ X_I, X_N, ms_today, ms_three, pct(ms_three, ms_today) });
     // where the outputs first differ, and how many entries differ, so a failing run says where to look
     var first: ?usize = null;
     var bad_entries: usize = 0;
@@ -4046,6 +5136,8 @@ fn decReport(r: *Run, section: []const u8, what: []const u8, res: dsv41.replay_r
     const name = what[0..std.mem.indexOfScalar(u8, what, ':').?];
     r.report(try std.fmt.bufPrint(&line, "{s} {s}, at {s}", .{ section, what, dec_plan.text }), res.bad, true);
     if (res.first_null) |f| {
+        r.note(try std.fmt.bufPrint(&line, "{s} {s} null control: both runs wrote their outputs and the baseline launch reads the window's inputs, in {d} of {d} windows; first at d = {d}: {s}", .{ section, name, res.null_ok, res.windows, f.d, dsv41.replay_runner.nullText(f.why) }), false);
+    } else r.note(try std.fmt.bufPrint(&line, "{s} {s} null control: both runs wrote their outputs and the baseline launch reads the window's inputs, in all {d} windows", .{ section, name, res.windows }), res.null_ok == res.windows);
     r.report(try std.fmt.bufPrint(&line, "{s} {s} control: the last slab one row short, in all {d} windows", .{ section, name, dec_ds.len }), if (res.cut_ok == dec_ds.len) 1 else 0, false);
     if (stride) r.report(try std.fmt.bufPrint(&line, "{s} {s} stride control: the slabs' blocks read q - 1 rows apart, in all {d} windows", .{ section, name, dec_ds.len }), if (res.stride_ok == dec_ds.len) 1 else 0, false);
 }
@@ -4362,6 +5454,9 @@ fn rociSentFirst(r: *Run, rng_in: std.Random) !void {
     const null_pct = pct(ms_n, ms_t);
     const bar = @max(1.0, @abs(null_pct));
     var t: WcText = .{};
+    try t.add("roci_sent_first wo_b (K {d}, N {d}, 4,096 rows, y in the arena) block-scaled exact, kernel only, best of three, ms: the baseline launch {d:.3} (null control, again, {d:.1} %: {s}); ", .{ sf_k, sf_n, ms_t, null_pct, resolved(null_pct) });
+    try t.add("one launch with the sent quarters' row tiles first {d:.3} ({d:.1} % over the baseline's, {s} the null control's bar of {d:.1} %); the same kernel in the baseline order {d:.3} ({d:.1} %); ", .{ ms_s, pct(ms_s, ms_t), if (@abs(pct(ms_s, ms_t)) <= bar) "within" else "OUTSIDE", bar, ms_i, pct(ms_i, ms_t) });
+    try t.add("the timed twins (a %globaltimer read at a CTA's begin and end): sent-first {d:.3} ({d:.1} % over the untimed), the baseline order {d:.3} ({d:.1} %)", .{ ms_ts, pct(ms_ts, ms_s), ms_ti, pct(ms_ti, ms_i) });
     r.note(t.buf[0..t.n], @abs(null_pct) <= null_bar);
     // when the sent quarters are done: 5 launches of each order, the stamps read back
     var sent_first_l: [sf_rt * sf_ct]bool = undefined;
@@ -4395,6 +5490,7 @@ fn rociSentFirst(r: *Run, rng_in: std.Random) !void {
     };
     for (&span) |*s_| std.mem.sort(f64, s_, {}, std.sort.asc(f64));
     var t2: WcText = .{};
+    try t2.add("roci_sent_first wo_b: the last CTA of the two sent quarters ends at {d:.1} % of the launch (median of 5, {d:.1} to {d:.1}) with the sent quarters first; with the baseline order it ends at {d:.1} % ({d:.1} to {d:.1}); ", .{ span[0][2], span[0][0], span[0][4], span[1][2], span[1][0], span[1][4] });
     try t2.add("the stamps: {d} CTAs, smallest step between two stamps {d} ns. The send could start there, less the stores' completion and the fence", .{ sf_rt * sf_ct, res_ns });
     r.note(t2.buf[0..t2.n], sane and span[1][2] >= 90.0);
     // the bytes
@@ -4414,6 +5510,7 @@ fn rociSentFirst(r: *Run, rng_in: std.Random) !void {
         defer free(got);
         bad += differs(ref, got);
     }
+    r.report("roci_sent_first wo_b: the sent-first launch of each of the four nodes (quarters g ^ 1, g ^ 3 first) against the baseline launch", bad, true);
     bad = 0;
     for ([_]SentRun{ id_run, t_sent, t_id }) |run| {
         try poison(rig.y_new, ybytes, d, r.s);
@@ -4423,6 +5520,7 @@ fn rociSentFirst(r: *Run, rng_in: std.Random) !void {
         defer free(got);
         bad += differs(ref, got);
     }
+    r.report("roci_sent_first wo_b: the map kernel with the baseline order, and the timed twins in both orders, against the baseline launch", bad, true);
     var cut = sent_run;
     cut.ro = dup;
     try poison(rig.y_new, ybytes, d, r.s);
@@ -4678,6 +5776,7 @@ fn rociDoor(r: *Run, rng_in: std.Random) !void {
     std.mem.sort(f64, &ring_b, {}, std.sort.asc(f64));
     const null_pct = pct(ms_n, ms_t);
     var t: WcText = .{};
+    try t.add("roci_door wo_b (K {d}, N {d}, 4,096 rows, y in the arena), kernel only, best of three, ms: the baseline launch {d:.3} (null control {d:.1} %: {s}); the door kernel (sent quarters first, the ring from inside) {d:.3} ({d:.1} % over the baseline's); its timed twin {d:.3} ({d:.1} % over the plain one); the door kernel with the block-level release {d:.3} ({d:.1} % over the baseline's, {d:.1} % over the per-thread one); with the count released at GPU scope and the system fence by the last arrival alone {d:.3} ({d:.1} % over the baseline's); ", .{ sf_k, sf_n, ms_t, null_pct, resolved(null_pct), ms_d, pct(ms_d, ms_t), ms_dt, pct(ms_dt, ms_d), ms_db, pct(ms_db, ms_t), pct(ms_db, ms_d), ms_dg, pct(ms_dg, ms_t) });
     try t.add("the ring falls at {d:.1} % of the launch (per-thread release, median of 5, {d:.1} to {d:.1}), {d:.1} % with the block-level release ({d:.1} to {d:.1}); the doorbell showed the ticket and the count was zero after each", .{ ring_pct[2], ring_pct[0], ring_pct[4], ring_b[2], ring_b[0], ring_b[4] });
     r.note(t.buf[0..t.n], @abs(null_pct) <= null_bar and sane);
     // bytes and the observer, the four nodes
@@ -4699,6 +5798,7 @@ fn rociDoor(r: *Run, rng_in: std.Random) !void {
         bad += differs(ref, got);
     }
     var line: [512]u8 = undefined;
+    r.report(try std.fmt.bufPrint(&line, "roci_door wo_b: the door kernel of each of the four nodes against the baseline launch (the doorbell showed {d} of 4 times, the count clean {d} of 4)", .{ 4 - unseen, 4 - unclean }), bad + unseen + unclean, true);
     r.report("roci_door wo_b: words of the two sent quarters that differed from the reference when the observer saw the doorbell, four nodes", wrong, true);
     // the block-level release and the GPU-scope release, the same four nodes
     for ([_]usize{ 3, 5 }, [_][]const u8{ "the block-level release (thread 0 fences once per CTA)", "the count released at GPU scope and the system fence by the last arrival alone" }) |fi, what| {
@@ -4716,6 +5816,7 @@ fn rociDoor(r: *Run, rng_in: std.Random) !void {
             defer free(got);
             badb += differs(ref, got);
         }
+        r.report(try std.fmt.bufPrint(&line, "roci_door wo_b with {s}: output bytes against the baseline launch, words wrong at the ring, and doorbells not seen or counts not clean, summed over the four nodes", .{what}), badb + wrongb + offb, true);
     }
     // control: the arrival counted before the CTA's stores
     var early_wrong: u32 = 0;
@@ -4794,6 +5895,7 @@ fn rociDoor(r: *Run, rng_in: std.Random) !void {
     std.mem.sort(f64, &cring, {}, std.sort.asc(f64));
     const cnull = pct(cms_n, cms_1);
     var t3: WcText = .{};
+    try t3.add("roci_door combine (7 slots, N {d}, 4,096 rows, y in the arena), kernel only, best of three, ms: one launch (the baseline's) {d:.3} (null control {d:.1} %: {s}); the four launches of the quarter order (the sent quarters first) {d:.3} ({d:.1} % over one); ", .{ sf_n, cms_1, cnull, resolved(cnull), cms_4, pct(cms_4, cms_1) });
     try t3.add("the door kernel (one launch, sent quarters first, the ring from inside, the block-level release) {d:.3} ({d:.1} % over one launch, {d:.1} % over the four); with every thread fencing its own stores {d:.3} ({d:.1} % over one launch); the GPU-scope release with the last arrival's system fence {d:.3} ({d:.1} % over one launch); the block-level one's timed twin {d:.3}; ", .{ cms_d, pct(cms_d, cms_1), pct(cms_d, cms_4), cms_pt, pct(cms_pt, cms_1), cms_g, pct(cms_g, cms_1), cms_t });
     try t3.add("the ring falls at {d:.1} % of the launch (median of 5, {d:.1} to {d:.1}); the doorbell showed the ticket and the count was zero after each of the 5", .{ cring[2], cring[0], cring[4] });
     r.note(t3.buf[0..t3.n], @abs(cnull) <= null_bar and csane);
@@ -5546,7 +6648,12 @@ fn qgateBody(r: *Run, rng: std.Random) !void {
 
     .{ "pass_rule", passRule, 3 },
     .{ "pass_tail", passTail, 7 },
+    .{ "chained_door", chainedDoor, 3 },
+    .{ "chained_two_base", rociTwoBaseChained, 3 },
+    .{ "chained_three_base", rociThreeBaseChained, 3 },
     .{ "qgate_body", qgateBody, 3 },
+    .{ "mma_sf", mmaSf, 32 },
+    .{ "mma_sf_exact", mmaSfExact, 22 },
     .{ "ring_wc", ringWc, 6 },
     .{ "ring_inplace", ringInplace, 8 },
     .{ "ring_word", ringWord, 9 },
@@ -5576,3 +6683,8 @@ fn qgateBody(r: *Run, rng: std.Random) !void {
     .{ "roci_pair", rociPair, 6 },
     .{ "roci_triple", rociTriple, 3 },
     try k.useQgateBody();
+    // TF_DS_MMA_SF's kernels (sm_121a: another GPU leaves them unloaded, and the section says so); each check sets the
+    // arithmetic it runs
+    k.useMmaSf(&driver, cuda.kernels.dsv41_native_sf, .chained) catch {};
+    k.sf = .off;
+        std.debug.print("kernels-replay: every same-bits switch's launches give the baseline bytes, TF_DS_MMA_SF's within its bound of fp64 beyond the baseline's; every control as it must ({d} lines, {d} sections)\n", .{ r.lines, ran });

@@ -250,6 +250,17 @@ pub const Kernels = struct {
     combine_door: ?cuda.Function = null,
     // TF_DS_QGATE_CANARY 2 or 3 in effect (useQgateBody): the body canary's kernel (qgateBody); null until then
     qgate_body_fn: ?cuda.Function = null,
+    // TF_DS_MMA_SF in effect (useMmaSf): a prompt chunk's FP8 GEMMs on the block-scaled kernels (sfGemmOf, sfExperts);
+    // their module, null until then
+    sf: MmaSf = .off,
+    sfk: ?SfKernels = null,
+    // TF_DS_MMA_SF_EXACT: the GEMMs its guard keeps on the baseline kernels (sfKeep), each by its weight scales' key
+    sf_kept: [sf_kept_max]u64 = undefined,
+    sf_nkept: usize = 0,
+    sf_proven: [sf_proven_max]u64 = undefined, // TF_DS_MMA_SF_EXACT's guard: the keys it proved, ascending
+    sf_nproven: usize = 0,
+    sf_seen: [3][2]u8 = @splat(.{ 255, 0 }), // the guard's scale bytes seen: FP8 dense, MXFP4, the shared expert
+    sf_apart: usize = 0, // the layers whose experts the guard kept for their packing (other lengths than its reads)
 
     pub fn load(d: *const cuda.Driver, image: []const u8) !Kernels {
         var m = try cuda.Module.load(d, image);
@@ -329,8 +340,17 @@ pub const Kernels = struct {
         k.wc = .{ lo, hi };
     }
 
+    /// TF_DS_MMA_SF `sw` in effect (off: nothing changes, nothing loaded): native_sf.cu's kernels from `image`, then the
+    /// switch. An error leaves it off.
+    pub fn useMmaSf(k: *Kernels, d: *const cuda.Driver, image: []const u8, sw: MmaSf) !void {
+        if (sw == .off) return;
+        if (k.sfk == null) k.sfk = try SfKernels.load(d, image);
+        k.sf = sw;
+    }
+
     pub fn unload(k: *Kernels) void {
         k.counters.free();
+        if (k.sfk) |*x| x.module.unload();
         k.module.unload();
         k.* = undefined;
     }
@@ -397,6 +417,23 @@ pub fn splits(k: usize, n: usize) usize {
         for (texts, 0..) |t, i| if (std.mem.eql(u8, v, t)) return @fromBackingInt(@intCast(i));
 const split_st_kernels = [4][:0]const u8{ "tf_dsn_pf_gemm_splitA_st_kernel", "tf_dsn_pf_gemm_splitB_st_kernel", "tf_dsn_pf_gemm_splitC6_st_kernel", "tf_dsn_pf_gemm_splitC7_st_kernel" };
     const kbs = split_kbs[@backingInt(cfg)];
+/// TF_DS_MMA_SF: a prompt chunk's FP8 GEMMs on the tensor core's block-scaled MMA (native_sf.cu, the dsv41_native_sf
+/// image built for sm_121a): the dense FP8 GEMMs mx.gemm takes to its tile kernels and the grouped experts' gate / up
+/// and down. chained: a split's K blocks accumulate in the MMA (the switch's arithmetic: not the baseline bits); exact: each
+/// K block's MMA from zero, then an fp32 add (the baseline bits whenever every scaled block sum is a normal float: the
+/// replay's check of the kernels, no setting).
+pub const MmaSf = enum(u2) { off = 0, chained = 1, exact = 2 };
+
+/// native_sf.cu's kernels, [0] the chained arithmetic's and [1] the exact one's where both exist.
+pub const SfKernels = struct {
+    module: cuda.Module,
+    gemm: [2]cuda.Function,
+    split64: [2]cuda.Function,
+    split128: [2]cuda.Function,
+    zsplit: cuda.Function,
+    gu: [2]cuda.Function,
+    dn: [2]cuda.Function,
+    ranges: ?cuda.Function = null, // tf_dsn_sf_ranges: TF_DS_MMA_SF_EXACT's guard
     // the whole-line twins for a y in the transport's arena (Kernels.useStaged)
     st_gemm: [2]?cuda.Function = @splat(null),
     st_split64: [2]?cuda.Function = @splat(null),
@@ -407,20 +444,68 @@ const split_st_kernels = [4][:0]const u8{ "tf_dsn_pf_gemm_splitA_st_kernel", "tf
     st_two: ?cuda.Function = null,
     // down's exact kernel on the pack's two parts and the rest block's owner part where they lie (Part3)
     dn_three: ?cuda.Function = null,
+    // the same three kernels in the chained arithmetic (TF_DS_MMA_SF), null in an image built without them
+    ch_door: ?cuda.Function = null,
+    ch_two: ?cuda.Function = null,
+    ch_dn_three: ?cuda.Function = null,
+
+    /// wo_b's door kernel, the two-base kernel and down on the pack's parts in the arithmetic `sf` runs (null: none loaded, or no block-scaled arithmetic).
+    pub fn door(sk: *const SfKernels, sf: MmaSf) ?cuda.Function {
+        return switch (sf) {
+            .exact => sk.st_door,
+            .chained => sk.ch_door,
+            .off => null,
+        };
+    }
+    pub fn two(sk: *const SfKernels, sf: MmaSf) ?cuda.Function {
+        return switch (sf) {
+            .exact => sk.st_two,
+            .chained => sk.ch_two,
+            .off => null,
+        };
+    }
+    pub fn three(sk: *const SfKernels, sf: MmaSf) ?cuda.Function {
+        return switch (sf) {
+            .exact => sk.dn_three,
+            .chained => sk.ch_dn_three,
+            .off => null,
+        };
+    }
 
     fn useStaged(sk: *SfKernels) !void {
         // the GPU-scope release with the last arrival's system fence (door_arrive_cta<2>), as combine's door: the per-thread system fence of the
         // twin before it held every sent CTA's slot until its stores drained (LEDGER: 1.300 ms a launch against the plain launch's 1.143)
         sk.st_door = try Kernels.pfFunction(sk.module, "tf_dsn_sf_split128_exact_st_door_g_kernel", sf_split128_smem);
         sk.st_two = Kernels.pfFunction(sk.module, "tf_dsn_sf_split128_exact_st_two_kernel", sf_split128_smem) catch null;
+        sk.ch_door = Kernels.pfFunction(sk.module, "tf_dsn_sf_split128_st_door_kernel", sf_split128_smem) catch null;
+        sk.ch_two = Kernels.pfFunction(sk.module, "tf_dsn_sf_split128_st_two_kernel", sf_split128_smem) catch null;
         const pf = Kernels.pfFunction;
         sk.st_gemm = .{ try pf(sk.module, "tf_dsn_sf_gemm_st_kernel", sf_gemm_smem), try pf(sk.module, "tf_dsn_sf_gemm_exact_st_kernel", sf_gemm_smem) };
         sk.st_split64 = .{ try pf(sk.module, "tf_dsn_sf_split64_st_kernel", sf_split64_smem), try pf(sk.module, "tf_dsn_sf_split64_exact_st_kernel", sf_split64_smem) };
         sk.st_split128 = .{ try pf(sk.module, "tf_dsn_sf_split128_st_kernel", sf_split128_smem), try pf(sk.module, "tf_dsn_sf_split128_exact_st_kernel", sf_split128_smem) };
     }
+
+    /// The kernels of `image` (cuda.kernels.dsv41_native_sf: sm_121a code alone, so another GPU does not load it).
+    pub fn load(d: *const cuda.Driver, image: []const u8) !SfKernels {
+        var m = try cuda.Module.load(d, image);
+        errdefer m.unload();
+        const pf = Kernels.pfFunction;
         var sk: SfKernels = .{
+            .module = m,
+            .gemm = .{ try pf(m, "tf_dsn_sf_gemm_kernel", sf_gemm_smem), try pf(m, "tf_dsn_sf_gemm_exact_kernel", sf_gemm_smem) },
+            .split64 = .{ try pf(m, "tf_dsn_sf_split64_kernel", sf_split64_smem), try pf(m, "tf_dsn_sf_split64_exact_kernel", sf_split64_smem) },
+            .split128 = .{ try pf(m, "tf_dsn_sf_split128_kernel", sf_split128_smem), try pf(m, "tf_dsn_sf_split128_exact_kernel", sf_split128_smem) },
+            .zsplit = try pf(m, "tf_dsn_sf_zsplit_kernel", sf_split64_smem),
+            .gu = .{ try pf(m, "tf_dsn_sf_gu_kernel", pf_gu_r128_smem), try pf(m, "tf_dsn_sf_gu_exact_kernel", pf_gu_r128_smem) },
+            .dn = .{ try pf(m, "tf_dsn_sf_dn_kernel", pf_dn_r128_smem), try pf(m, "tf_dsn_sf_dn_exact_kernel", pf_dn_r128_smem) },
+            .ranges = try m.function("tf_dsn_sf_ranges_kernel"),
+        };
         sk.dn_three = pf(m, "tf_dsn_sf_dn_exact_three_kernel", pf_dn_r128_smem) catch null;
+        sk.ch_dn_three = pf(m, "tf_dsn_sf_dn_three_kernel", pf_dn_r128_smem) catch null;
         return sk;
+    }
+};
+
 /// native_sf.cu's sf::Part3 for a pack of `p` slot rows (packCodesPlan): a part is its main block [p, ig] of codes then its rest block
 /// [p, ir], the scales (fp32 a 32-value group) after the codes, main block then rest block; the first part is down's own base
 /// (q, s with ldq ig, lds ig / 32). q1 / s1 the second part's main block, qr0 / sr0 and qr1 / sr1 the rest blocks of the two parts,
@@ -437,7 +522,9 @@ pub fn threeTakes(k: *const Kernels, ex: weights.Experts, sc: ExpertScratch, ig:
     const nx = ex.native orelse return false;
     const rest = ex.rest orelse return false;
     _ = rest;
+    if (k.sf == .off or sfExperts(k, nx.s1, true) == null) return false;
     const sk = k.sfk orelse return false;
+    if (sk.three(k.sf) == null) return false;
     if (!pfExperts(k, sc, ex.down_k, ex.down_n, 0)) return false;
     return ig % 32 == 0 and ir % 32 == 0 and ex.down_k == 2 * ig + ir;
 }
@@ -461,15 +548,86 @@ pub fn packAt(p: usize, ig: usize, ir: usize, owner_second: bool, kb: usize, m: 
     return .{ .part = @intFromBool(owner_second), .q = b.rest_q + m * ir + r * 32, .s = b.rest_s + (m * (ir / 32) + r) * 4 };
 }
 
+/// The block-scaled kernels' dynamic shared memory (native_sf.cu asserts its tiles'): tf_dsn_sf_gemm (3 stages of
+/// 17,408 bytes), tf_dsn_sf_split64 and tf_dsn_sf_zsplit (6 of 12,800), tf_dsn_sf_split128 (5 of 17,408); the experts'
+/// take their 128-byte-run twins' (pf_gu_r128_smem, pf_dn_r128_smem).
+pub const sf_gemm_smem: u32 = 52224;
+pub const sf_split64_smem: u32 = 76800;
+pub const sf_split128_smem: u32 = 87040;
+
+/// The block-scaled kernel of a dense FP8 GEMM of m rows whose K split is `sp` (splits()): gemm without a split; with
+/// one, the split folded in the CTA on 64-row tiles up to 1,024 rows and on 128-row tiles past them, and (chained) one
+/// split a CTA with tf_dsn_reduce after it below pf_min_rows rows: the same MMAs and adds in the same order, so a row's
+/// bits at every row count. null: the baseline kernels (off; exact below pf_min_rows, where the slab kernels give its bits).
+pub const SfGemm = enum { gemm, split64, split128, zsplit };
+pub fn sfGemmOf(sw: MmaSf, m: usize, sp: usize) ?SfGemm {
+    if (sw == .off) return null;
+    if (sw == .exact and m < pf_min_rows) return null;
+    if (sp < 2) return .gemm;
+    if (m < pf_min_rows) return .zsplit;
+    return if (m <= 1024) .split64 else .split128;
+}
+
+/// A dense FP8 shape TF_DS_MMA_SF's kernels take: N a multiple of 128, K of 64 up to 8,192 (the tile's weight scales'
+/// slab), and with a K split each split's K blocks even (the split tiles' 2 K blocks a stage).
+pub fn sfShape(kdim: usize, n: usize) bool {
+    if (n % 128 != 0 or kdim % 64 != 0 or kdim > 8192) return false;
+    const sp = splits(kdim, n);
+    return sp < 2 or cdiv(kdim / 32, sp) % 2 == 0;
+}
+
+/// Whether TF_DS_MMA_SF's kernels take a dense FP8 linear on these operands: the switch in effect, sfShape, pfDense's
+/// alignment of the operands, and with TF_DS_MMA_SF_EXACT a shape with a K split (sfExactShape) and a key its guard
+/// proved (sfProvenKey: a linear the guard did not read stays on the baseline kernels), at any row count (a GEMM it does
+/// not take keeps the baseline kernels at every one).
+fn sfDense(k: *const Kernels, l: weights.Linear, q: u64, ldq: usize, sc: u64, lds: usize, y: u64, ldy: usize, accumulate: bool) bool {
+    if (k.sf == .off or k.pf_off or l.fmt != .fp8 or !sfShape(l.k, l.n)) return false;
+    if (k.sf == .exact and (!sfExactShape(l.k, l.n) or !sfProvenKey(k, l.s))) return false;
+    if (!aligned(q, 16) or ldq % 16 != 0 or !aligned(sc, 8) or lds % 2 != 0 or !aligned(l.w, 16) or l.k % 16 != 0) return false;
+    if (accumulate and (!aligned(y, 8) or ldy % 2 != 0)) return false;
+    return true;
+}
+
+/// The block-scaled kernel mx.gemm takes for a dense FP8 GEMM of m rows on these operands (sfDense, then sfGemmOf at
+/// the shape's K split); null: the baseline kernels.
+pub fn sfRoute(k: *const Kernels, l: weights.Linear, q: u64, ldq: usize, sc: u64, lds: usize, y: u64, ldy: usize, accumulate: bool, m: usize) ?SfGemm {
+    if (!sfDense(k, l, q, ldq, sc, lds, y, ldy, accumulate)) return null;
+    return sfGemmOf(k.sf, m, splits(l.k, l.n));
+}
+
 /// Whether a dense GEMM's y takes the whole-line kernels: fp32, written (not added to), 16-byte aligned with whole float4 rows,
 /// and in the transport's arena (Kernels.useStaged).
 pub fn stagedY(k: *const Kernels, y: u64, ldy: usize, y_dtype: DType, accumulate: bool) bool {
     return k.wc[1] != 0 and !accumulate and y_dtype == .f32 and y >= k.wc[0] and y < k.wc[1] and y % 16 == 0 and ldy % 4 == 0;
 }
 
+/// TF_DS_MMA_SF's launch of a dense FP8 GEMM that sfDense takes (gemm's arguments; `kind` sfGemmOf's): its kernel on
+/// the baseline grids; one split a CTA writes z [splits, m, n] for tf_dsn_reduce (gemm's slab launches' reduce).
+fn sfGemm(k: *const Kernels, s: cuda.Stream, kind: SfGemm, l: weights.Linear, q: u64, ldq: usize, sc: u64, lds: usize, m: usize, y: u64, ldy: usize, y_dtype: DType, accumulate: bool, z: u64) !void {
+    const sk = k.sfk orelse return error.NoMmaSfKernels;
+    const x: usize = @intFromBool(k.sf == .exact);
     const stage = stagedY(k, y, ldy, y_dtype, accumulate) and kind != .zsplit and sk.st_gemm[x] != null;
+    const sp = splits(l.k, l.n);
+    var args: cuda.Args = .{};
+    args.add(a);
+    switch (kind) {
         .gemm => try launchShared(if (stage) sk.st_gemm[x].? else sk.gemm[x], s, .{ cdiv(m, 128), l.n / 128, 1 }, sf_gemm_smem, &args),
+        .zsplit => {
+            try launchShared(sk.zsplit, s, .{ cdiv(m, 64), l.n / 128, sp }, sf_split64_smem, &args);
+            var ra: cuda.Args = .{};
+            ra.add(z);
+            ra.add(@as(c_int, @intCast(sp)));
+            ra.add(@as(c_int, @intCast(m)));
+            ra.add(@as(c_int, @intCast(l.n)));
+            ra.add(y);
+            ra.add(@as(i64, @intCast(ldy)));
             ra.add(@as(c_int, @backingInt(y_dtype)));
+            ra.add(@as(c_int, @intFromBool(accumulate)));
+            try launch(k.reduce, s, .{ cdiv(m * l.n, 256), 1, 1 }, 256, &ra);
+        },
+    }
+}
+
 /// native_sf.cu's sf::RowOrder: the order of a dense launch's CTAs by row quarter (see sf::tile_row).
 pub const RowOrder = extern struct { quarters: u32, tpq_log2: u32, per_log2: u32, span: u32 };
 /// native.cu's QuarterOrder: the order of tf_dsn_combine_door's CTAs by row quarter.
@@ -537,6 +695,7 @@ pub fn quarterOrder(first: [2]usize, last: [2]usize, q: usize, n: usize) ?Quarte
 /// itself: the exact block-scaled kernels in effect and taking it on the 128-row tiles, y a whole-line store, the door kernel loaded.
 pub fn sentFirstTakes(k: *const Kernels, l: weights.Linear, q: u64, ldq: usize, sc: u64, lds: usize, y: u64, ldy: usize, m: usize) bool {
     const sk = k.sfk orelse return false;
+    if (sk.door(k.sf) == null) return false;
     if (!stagedY(k, y, ldy, .f32, false)) return false;
     const kind = sfRoute(k, l, q, ldq, sc, lds, y, ldy, false, m) orelse return false;
     return kind == .split128;
@@ -545,6 +704,7 @@ pub fn sentFirstTakes(k: *const Kernels, l: weights.Linear, q: u64, ldq: usize, 
 /// sfGemm's split128 launch in the order `ro` with the doorbell rung by the first `ro.span` CTAs' last arrival (sentFirstTakes).
 pub fn gemmSentFirst(k: *const Kernels, s: cuda.Stream, l: weights.Linear, q: u64, ldq: usize, sc: u64, lds: usize, m: usize, y: u64, ldy: usize, z: u64, ro: RowOrder, door: Door) !void {
     const sk = k.sfk orelse return error.NoMmaSfKernels;
+    const f = sk.door(k.sf) orelse return error.NoMmaSfKernels;
     const sp = splits(l.k, l.n);
     const a: MxArgs = .{ .q = q, .s = sc, .ldq = @intCast(ldq), .lds = @intCast(lds), .w = l.w, .ws = l.s, .ldw = l.k, .ldws = l.k / 32, .fmt = 0, .M = @intCast(m), .N = @intCast(l.n), .K = @intCast(l.k), .splits = @intCast(sp), .kblocks = @intCast(cdiv(l.k / 32, sp)), .z = z, .y = y, .ldy = @intCast(ldy), .y_dtype = @backingInt(DType.f32), .accumulate = 0 };
     var args: cuda.Args = .{};
@@ -561,6 +721,7 @@ pub const Part2 = extern struct { q1: u64, s1: u64, kb_split: u32 };
 /// strided.
 pub fn twoTakes(k: *const Kernels, l: weights.Linear, q: u64, ldq: usize, sc: u64, lds: usize, y: u64, ldy: usize, m: usize) bool {
     const sk = k.sfk orelse return false;
+    if (sk.two(k.sf) == null) return false;
     if (!stagedY(k, y, ldy, .f32, false)) return false;
     const kind = sfRoute(k, l, q, ldq, sc, lds, y, ldy, false, m) orelse return false;
     return kind == .split128;
@@ -570,6 +731,7 @@ pub fn twoTakes(k: *const Kernels, l: weights.Linear, q: u64, ldq: usize, sc: u6
 /// (p.q1, p.s1) block kb - kb_split, both with the strides ldq / lds (twoTakes).
 pub fn gemmTwo(k: *const Kernels, s: cuda.Stream, l: weights.Linear, q: u64, ldq: usize, sc: u64, lds: usize, p: Part2, m: usize, y: u64, ldy: usize, z: u64) !void {
     const sk = k.sfk orelse return error.NoMmaSfKernels;
+    const f = sk.two(k.sf) orelse return error.NoMmaSfKernels;
     const sp = splits(l.k, l.n);
     const a: MxArgs = .{ .q = q, .s = sc, .ldq = @intCast(ldq), .lds = @intCast(lds), .w = l.w, .ws = l.s, .ldw = l.k, .ldws = l.k / 32, .fmt = 0, .M = @intCast(m), .N = @intCast(l.n), .K = @intCast(l.k), .splits = @intCast(sp), .kblocks = @intCast(cdiv(l.k / 32, sp)), .z = z, .y = y, .ldy = @intCast(ldy), .y_dtype = @backingInt(DType.f32), .accumulate = 0 };
     var args: cuda.Args = .{};
@@ -583,6 +745,150 @@ pub fn linearSentFirst(k: *const Kernels, s: cuda.Stream, sc: Scratch, l: weight
     if (m > sc.rows or l.k > sc.max_k) return error.ScratchTooSmall;
     try quant(k, s, x, x_dtype, ldx, m, l.k, sc.q, l.k, sc.s, l.k / 32);
     try gemmSentFirst(k, s, l, sc.q, l.k, sc.s, l.k / 32, m, y, ldy, sc.z, ro, door);
+}
+
+/// TF_DS_MMA_SF's kernel of a prompt chunk's expert tiles (gate / up, else down: the 128-byte-run twins' arguments,
+    if (k.sf == .off or (k.sf == .exact and !sfProvenKey(k, key))) return null;
+    const sk = k.sfk orelse return null;
+    const x: usize = @intFromBool(k.sf == .exact);
+}
+
+/// TF_DS_MMA_SF_EXACT's proven ranges of weight scale bytes (UE8M0). Within them every scaled block sum of a GEMM is a
+/// normal float, given activation scales 2^-22 (act_quant's floor) to 2^100 (the bound the baseline FAST scaling assumes):
+/// the block-scaled MMA then scales the block's sum by a power of two exactly, and adding it to the fp32 sum is the baseline
+/// fmaf of the same exact product, so the bits are the baseline. FP8 x FP8 (a nonzero block sum at least 2^-18): 41 .. 127,
+/// 2^-86 .. 2^0, inside the baseline FAST range; E4M3 x E2M1 (at least 2^-10, at most 32 x 448 x 6): 33 .. 137, 2^-94 ..
+/// 2^10.
+pub const sf_fp8_scales = [2]u8{ 41, 127 };
+pub const sf_fp4_scales = [2]u8{ 33, 137 };
+/// The GEMMs the guard may keep on the baseline kernels at most (more: the switch stays off).
+pub const sf_kept_max = 64;
+
+/// A range of device bytes: its first byte and its length.
+pub const ByteRange = struct { ptr: u64, len: u64 };
+
+/// A dense FP8 linear's weight scales: [n / 32, k / 32] UE8M0 bytes from l.s.
+pub fn linearScales(l: weights.Linear) ByteRange {
+    return .{ .ptr = l.s, .len = (@as(u64, l.n) / 32) * (l.k / 32) };
+}
+
+/// A layer's experts' weight scales, three tensors an expert (gate's, up's, down's: out[3e .. 3e + 3]), from the
+/// device's pointer tables read back (s1, s3, s2 [E]) and the owner table (null: no rest block): each tensor's own
+/// bytes, never the 256-byte gaps of the packing. A routed expert's MXFP4 gate / up scales [rows, dims / 32] (rows: the
+/// main block, and the rest block's when owner[e] is 1), down's [down_n, down_k / 32]; the shared expert's (the last)
+/// FP8 [rows / 32, dims / 32] and [down_n / 32, down_k / 32].
+pub fn expertScales(ex: weights.Experts, s1: []const u64, s3: []const u64, s2: []const u64, owner: ?[]const i32, out: []ByteRange) void {
+    for (0..ex.count) |e| {
+        const l = weights.expertScaleLens(ex, e, if (owner) |o| o[e] == 1 else false);
+        out[3 * e] = .{ .ptr = s1[e], .len = l[0] };
+        out[3 * e + 1] = .{ .ptr = s3[e], .len = l[1] };
+        out[3 * e + 2] = .{ .ptr = s2[e], .len = l[2] };
+    }
+}
+
+/// Whether a tensor's scale bytes, from range[0] to range[1], lie in the proven range (fp4: MXFP4's, else FP8's).
+pub fn sfProven(range: [2]u8, fp4: bool) bool {
+    const r = if (fp4) sf_fp4_scales else sf_fp8_scales;
+    return range[0] <= range[1] and range[0] >= r[0] and range[1] <= r[1];
+}
+
+/// The keys TF_DS_MMA_SF_EXACT's guard may prove at most (more: the switch stays off).
+pub const sf_proven_max = 1024;
+
+/// A dense FP8 shape TF_DS_MMA_SF_EXACT takes: one sfShape takes, with a K split. Without one (Engram's wkv) the
+/// block-scaled kernel is no faster than the baseline, so the shape stays there (its guard proves it no key).
+pub fn sfExactShape(kdim: usize, n: usize) bool {
+    return sfShape(kdim, n) and splits(kdim, n) >= 2;
+}
+
+/// The block-scaled kernels' mode after TF_DS_MMA_SF_EXACT's agreement: agreed, the exact arithmetic it loaded;
+/// refused, its own arithmetic off, and TF_DS_MMA_SF's (which takes the kernels first) as it was.
+pub fn sfAfterExact(sf: MmaSf, agreed: bool) MmaSf {
+    return if (agreed or sf != .exact) sf else .off;
+}
+
+/// A range's smallest and largest byte as tf_dsn_sf_ranges wrote them (u32 each); a word past 255 (its output left
+/// unwritten: scaleRanges fills it with 0xff first) reads as a range nothing was read of (lo > hi).
+pub fn readRange(lo: u32, hi: u32) [2]u8 {
+    return if (lo > 255 or hi > 255) .{ 1, 0 } else .{ @intCast(lo), @intCast(hi) };
+}
+
+/// The guard's verdict on one tensor of `len` scale bytes from what the GPU read (`range`): proven when the tensor is
+/// empty (nothing to prove), else only from a real read (lo <= hi) inside the proven range. An unread or unwritten
+/// result keeps the GEMM on the baseline kernels.
+pub fn sfProvenRead(len: u64, range: [2]u8, fp4: bool) bool {
+    return len == 0 or sfProven(range, fp4);
+}
+
+/// TF_DS_MMA_SF_EXACT's guard proves the GEMM of weight scales `key` (a dense linear's l.s, a layer's experts'
+/// NativeExperts.s1): the set kept ascending; a key proven twice is there once; more than sf_proven_max refuses.
+pub fn sfProve(k: *Kernels, key: u64) !void {
+    const keys = k.sf_proven[0..k.sf_nproven];
+    var i: usize = keys.len;
+    while (i > 0 and keys[i - 1] > key) i -= 1;
+    if (i > 0 and keys[i - 1] == key) return;
+    if (k.sf_nproven == sf_proven_max) return error.TooManyProven;
+    var j: usize = k.sf_nproven;
+    while (j > i) : (j -= 1) k.sf_proven[j] = k.sf_proven[j - 1];
+    k.sf_proven[i] = key;
+    k.sf_nproven += 1;
+}
+
+/// Whether TF_DS_MMA_SF_EXACT's guard proved the GEMM of weight scales `key`.
+pub fn sfProvenKey(k: *const Kernels, key: u64) bool {
+    var lo: usize = 0;
+    var hi: usize = k.sf_nproven;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (k.sf_proven[mid] < key) lo = mid + 1 else hi = mid;
+    }
+    return lo < k.sf_nproven and k.sf_proven[lo] == key;
+}
+
+/// TF_DS_MMA_SF_EXACT's guard keeps the GEMM of weight scales `key` on the baseline kernels (a dense linear's l.s, a layer's
+/// experts' NativeExperts.s1); more than sf_kept_max refuses.
+pub fn sfKeep(k: *Kernels, key: u64) !void {
+    if (sfKept(k, key)) return;
+    if (k.sf_nkept == sf_kept_max) return error.TooManyKept;
+    k.sf_kept[k.sf_nkept] = key;
+    k.sf_nkept += 1;
+}
+
+/// Whether TF_DS_MMA_SF_EXACT's guard keeps the GEMM of weight scales `key` on the baseline kernels.
+pub fn sfKept(k: *const Kernels, key: u64) bool {
+    for (k.sf_kept[0..k.sf_nkept]) |x| if (x == key) return true;
+    return false;
+}
+
+/// The smallest and the largest byte of each of `ranges` (device bytes: tf_dsn_sf_ranges, a CTA a range, one launch and
+/// one copy back) into out.
+pub fn scaleRanges(k: *const Kernels, d: *const cuda.Driver, s: cuda.Stream, gpa: std.mem.Allocator, ranges: []const ByteRange, out: [][2]u8) !void {
+    const f = (k.sfk orelse return error.NoMmaSfKernels).ranges orelse return error.NoMmaSfKernels;
+    if (ranges.len == 0) return;
+    const host = try gpa.alloc(u64, 2 * ranges.len);
+    defer gpa.free(host);
+    for (ranges, 0..) |r, i| {
+        host[i] = r.ptr;
+        host[ranges.len + i] = r.len;
+    }
+    var buf = try cuda.DeviceBuffer.alloc(d, host.len * 8 + ranges.len * 8);
+    defer buf.free();
+    // the tables on the stream that reads them (a pageable copy staged before the call returns), the results filled
+    // with 0xff first: a range left unwritten reads as nothing read (readRange)
+    try buf.uploadAsync(0, std.mem.sliceAsBytes(host), s.handle);
+    const mm = buf.ptr + host.len * 8;
+    try d.check(d.api.cuMemsetD8Async(mm, 0xff, ranges.len * 8, s.handle), "cuMemsetD8Async");
+    var a: cuda.Args = .{};
+    a.add(buf.ptr);
+    a.add(buf.ptr + ranges.len * 8);
+    a.add(@as(c_int, @intCast(ranges.len)));
+    a.add(mm);
+    try launch(f, s, .{ ranges.len, 1, 1 }, 256, &a);
+    try s.synchronize();
+    const got = try gpa.alloc(u32, 2 * ranges.len);
+    defer gpa.free(got);
+    try d.check(d.api.cuMemcpyDtoH_v2(@ptrCast(got.ptr), mm, got.len * 4), "cuMemcpyDtoH");
+    for (out, 0..) |*o, i| o.* = readRange(got[2 * i], got[2 * i + 1]);
 }
 
 /// A decode-size bf16 linear's K splits (16-column steps), from its shape alone, as splits() for the MX GEMM.
@@ -1474,6 +1780,7 @@ fn downOf(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScra
     } else if (pfExperts(k, sc, i, n, 0)) {
         if (sc.three) |th| {
             // the pack's parts where they lie: the first part is the base (its main block), the second's main block and both rest blocks ride along
+            const f3 = (k.sfk orelse return error.NoMmaSfKernels).three(k.sf) orelse return error.NoMmaSfKernels;
             const rest = ex.rest orelse return error.NoRest;
             const b = packBlocks(th.rows, th.ig, th.ir);
             var a3 = a;
@@ -1490,6 +1797,7 @@ fn downOf(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScra
         } else {
             args.add(sc.tiles);
             args.add(sc.ntiles);
+            }
         }
     } else {
         const t = @min(tiles(r), 2);
@@ -1621,7 +1929,289 @@ test "TF_DS_ROCI_COMBINE_FIRST: a stage's launch is the combine's launch at row 
 }
 
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "return downOf(k, s, ex, sc, 0, ex.down_k, pick, r, out, ldo, accumulate, true, true, null);"));
+
+test "TF_DS_MMA_SF: a dense FP8 GEMM's block-scaled kernel by its split and rows; off, and exact below pf_min_rows, the baseline's" {
+    for ([_]usize{ 1, 63, 64, 1024, 1025, 4096 }) |m| {
+        try std.testing.expectEqual(@as(?SfGemm, null), sfGemmOf(.off, m, 16));
+        try std.testing.expectEqual(@as(?SfGemm, null), sfGemmOf(.off, m, 1));
+    }
+    // no K split: K whole in the CTA at every row count
+    for ([_]usize{ 1, 63, 64, 1025, 4096 }) |m| try std.testing.expectEqual(@as(?SfGemm, .gemm), sfGemmOf(.chained, m, 1));
+    // a K split: one split a CTA below pf_min_rows (tf_dsn_reduce after), then 64-row tiles to 1,024 rows, 128-row past
+    try std.testing.expectEqual(@as(?SfGemm, .zsplit), sfGemmOf(.chained, 1, 16));
+    try std.testing.expectEqual(@as(?SfGemm, .zsplit), sfGemmOf(.chained, pf_min_rows - 1, 2));
+    try std.testing.expectEqual(@as(?SfGemm, .split64), sfGemmOf(.chained, pf_min_rows, 2));
+    try std.testing.expectEqual(@as(?SfGemm, .split64), sfGemmOf(.chained, 1024, 8));
+    try std.testing.expectEqual(@as(?SfGemm, .split128), sfGemmOf(.chained, 1025, 8));
+    try std.testing.expectEqual(@as(?SfGemm, .split128), sfGemmOf(.chained, 4096, 16));
+    // exact: where the baseline tile kernels run (below pf_min_rows the baseline slab kernels give its bits)
+    try std.testing.expectEqual(@as(?SfGemm, null), sfGemmOf(.exact, pf_min_rows - 1, 16));
+    try std.testing.expectEqual(@as(?SfGemm, null), sfGemmOf(.exact, pf_min_rows - 1, 1));
+    try std.testing.expectEqual(@as(?SfGemm, .gemm), sfGemmOf(.exact, pf_min_rows, 1));
+    try std.testing.expectEqual(@as(?SfGemm, .split64), sfGemmOf(.exact, pf_min_rows, 16));
+    try std.testing.expectEqual(@as(?SfGemm, .split128), sfGemmOf(.exact, 2048, 16));
+}
+
+test "TF_DS_MMA_SF takes every dense FP8 GEMM shape of a prompt chunk, and none whose split's K blocks are odd" {
+    // wq_a, wkv, wq_b, wo_b, the indexer's wq_b (2D node), Engram's wkv (no K split)
+    for ([_][2]usize{ .{ 5120, 1280 }, .{ 5120, 512 }, .{ 1280, 8192 }, .{ 4096, 2560 }, .{ 1280, 4096 }, .{ 3072, 12800 } }) |kn| {
+        try std.testing.expect(sfShape(kn[0], kn[1]));
+        // the split tiles' 2 K blocks a stage divide the split's K blocks (native_sf.cu tile_fp8's splits)
+        const sp = splits(kn[0], kn[1]);
+        try std.testing.expect(sp == 1 or cdiv(kn[0] / 32, sp) % 2 == 0);
+    }
+    try std.testing.expect(!sfShape(5120, 1280 - 64)); // N not a multiple of 128
+    try std.testing.expect(!sfShape(5120 + 32, 1280)); // K not a multiple of 64
+    try std.testing.expect(!sfShape(8192 + 64, 1280)); // K past 8,192 (the tiles' weight scales' slab)
+    try std.testing.expect(sfShape(8192, 1280));
+    // 2,304 x 128: 8 splits of 9 K blocks
+    try std.testing.expectEqual(@as(usize, 8), splits(2304, 128));
+    try std.testing.expect(!sfShape(2304, 128));
+}
+
+test "TF_DS_MMA_SF's dense kernels' shared memory: native_sf.cu's tiles; a small chunk's split partials fit a linear's scratch" {
+    // sf::GemmCfg: 128 activation rows and 128 weight rows of 2 K blocks (64 bytes), 128 rows' 2 scales; 3 stages
+    try std.testing.expectEqual(@as(u32, 3 * (128 * 64 + 128 * 64 + 128 * 2 * 4)), sf_gemm_smem);
+    // sf::Split64Cfg: 64 activation rows; 6 stages. sf::Split128Cfg: GemmCfg's stage, 5 stages
+    try std.testing.expectEqual(@as(u32, 6 * (64 * 64 + 128 * 64 + 64 * 2 * 4)), sf_split64_smem);
+    try std.testing.expectEqual(@as(u32, 5 * (128 * 64 + 128 * 64 + 128 * 2 * 4)), sf_split128_smem);
+    // with the kernels' 2,560 static bytes, within GB10's 101,376 a CTA
+    // one split a CTA (below pf_min_rows): splits x rows x N floats, within zFloats of any scratch of at least those rows
+    const l: weights.Linear = .{ .words = 0, .k = 5120, .n = 1280, .fmt = .fp8 };
+    try std.testing.expect(splits(5120, 1280) * (pf_min_rows - 1) * 1280 <= zFloats(l, pf_min_rows - 1));
+}
+
+test "TF_DS_MMA_SF's expert kernels follow the switch: chained or exact, else none (the baseline's)" {
+    var k: Kernels = undefined;
+    k.sf = .off;
+    k.sfk = null;
+    try std.testing.expect(sfExperts(&k, 0, false) == null);
+    const f = struct {
+        fn of(i: usize) cuda.Function {
+            return .{ .d = undefined, .handle = @ptrFromInt(0x1000 + i * 16) };
+        }
+    }.of;
+    k.sfk = .{ .module = undefined, .gemm = .{ f(0), f(1) }, .split64 = .{ f(2), f(3) }, .split128 = .{ f(4), f(5) }, .zsplit = f(6), .gu = .{ f(7), f(8) }, .dn = .{ f(9), f(10) } };
+    try std.testing.expect(sfExperts(&k, 0, false) == null);
+    k.sf = .chained;
+    k.sf = .exact;
+    k.sf_nkept = 0;
+    k.sf_nproven = 0;
+    try std.testing.expect(sfExperts(&k, 0, false) == null); // not proven: the baseline
+    try sfProve(&k, 0);
+    // Kernels' defaults: off, no module
     const d: Kernels = .{ .module = undefined, .act_quant = undefined, .attn_epilogue = undefined, .gemm = undefined, .reduce = undefined, .count = undefined, .scan = undefined, .place = undefined, .gu = undefined, .dn = undefined, .gu_finish = undefined, .dn_finish = undefined, .gu_gemv = undefined, .dn_gemv = undefined, .gemv = undefined, .mx_sab = undefined, .gu_sab = undefined, .dn_sab = undefined, .sab = false, .dec = undefined, .dec_group = undefined, .dec_group2 = undefined, .nact_log = null, .group2 = false, .dec_quant = undefined, .dec_l2pf = undefined, .dec_on = true, .dec_pdl = true, .expert_exit = false, .counters = undefined, .combine = undefined, .bf16 = undefined, .bf_reduce = undefined, .to_f16 = undefined, .pf_gemm = undefined, .pf_gemm_fold = undefined, .pf_gu = undefined, .pf_dn = undefined, .pf_tiles = undefined, .pf_bf16 = undefined, .pf_off = false };
+    try std.testing.expectEqual(MmaSf.off, d.sf);
+    try std.testing.expect(d.sfk == null);
+    try std.testing.expectEqual(@as(usize, 0), d.sf_nproven);
+}
+
+test "the door, two-base and down-on-the-parts kernels follow the block-scaled arithmetic in effect: the chained twins under TF_DS_MMA_SF, the exact ones under its exact form" {
+    const f = struct {
+        fn of(i: usize) cuda.Function {
+            return .{ .d = undefined, .handle = @ptrFromInt(0x5000 + i * 16) };
+        }
+    }.of;
+    var sk: SfKernels = undefined;
+    sk.st_door = f(1);
+    sk.st_two = f(2);
+    sk.dn_three = f(3);
+    sk.ch_door = f(11);
+    sk.ch_two = f(12);
+    sk.ch_dn_three = f(13);
+    try std.testing.expectEqual(f(1).handle, sk.door(.exact).?.handle);
+    try std.testing.expectEqual(f(2).handle, sk.two(.exact).?.handle);
+    try std.testing.expectEqual(f(3).handle, sk.three(.exact).?.handle);
+    try std.testing.expectEqual(f(11).handle, sk.door(.chained).?.handle);
+    try std.testing.expectEqual(f(12).handle, sk.two(.chained).?.handle);
+    try std.testing.expectEqual(f(13).handle, sk.three(.chained).?.handle);
+    try std.testing.expect(sk.door(.off) == null and sk.two(.off) == null and sk.three(.off) == null);
+    // an image without the chained twins: none under TF_DS_MMA_SF, the baseline copying path
+    sk.ch_door = null;
+    sk.ch_two = null;
+    sk.ch_dn_three = null;
+    try std.testing.expect(sk.door(.chained) == null and sk.two(.chained) == null and sk.three(.chained) == null);
+    try std.testing.expect(sk.door(.exact) != null);
+}
+
+test "gemm, gate / up and down take TF_DS_MMA_SF's kernels before the baseline's, on the baseline grids and the twins' shared memory" {
+    const src = @embedFile("mx.zig");
+    const code = src[0..std.mem.indexOf(u8, src, "\ntest \"").?];
+    const gemm_body = code[gat .. gat + std.mem.indexOf(u8, code[gat..], "\n}\n").?];
+    try std.testing.expect(sfl < pfl);
+    const fns = [_][]const u8{ "fn gateUpOf(", "fn downOf(" };
+    const sfs = [_][]const u8{
+    };
+    for (fns, sfs) |fname, sfline| {
+        const at = std.mem.indexOf(u8, code, fname).?;
+        const body = code[at .. at + std.mem.indexOf(u8, code[at..], "\n}\n").?];
+        const tl = std.mem.indexOf(u8, body, "args.add(sc.ntiles);").?;
+        const sf_at = std.mem.indexOf(u8, body, sfline) orelse return error.TestUnexpectedResult;
+        const el = std.mem.indexOf(u8, body, "const el = pfExpertsLaunch(k.run128);").?;
+        try std.testing.expect(tl < sf_at and sf_at < el);
+    }
+}
+
+test "TF_DS_MMA_SF_EXACT's proven scale ranges: within them every scaled block sum is a normal float" {
+    const min_normal = std.math.floatMin(f32);
+    // FP8 x FP8: a nonzero block sum at least 2^-18 (two E4M3 subnormals' product), an activation scale at least 2^-22
+    // (act_quant's floor); the upper end is the baseline FAST range (2^0)
+    const lo8: i32 = sf_fp8_scales[0];
+    try std.testing.expect(std.math.ldexp(@as(f64, 1), -18 - 22 + lo8 - 127) >= min_normal);
+    try std.testing.expect(std.math.ldexp(@as(f64, 1), -18 - 22 + (lo8 - 1) - 127) < min_normal);
+    try std.testing.expectEqual(@as(u8, 127), sf_fp8_scales[1]);
+    // E4M3 x E2M1: a nonzero block sum at least 2^-10 (an E4M3 subnormal times 0.5); at most 32 x 448 x 6, with an
+    // activation scale at most 2^100 (the baseline FAST assumption) below fp32's largest
+    const lo4: i32 = sf_fp4_scales[0];
+    const hi4: i32 = sf_fp4_scales[1];
+    try std.testing.expect(std.math.ldexp(@as(f64, 1), -10 - 22 + lo4 - 127) >= min_normal);
+    try std.testing.expect(std.math.ldexp(@as(f64, 1), -10 - 22 + (lo4 - 1) - 127) < min_normal);
+    try std.testing.expect(32.0 * 448.0 * 6.0 * std.math.ldexp(@as(f64, 1), 100 + hi4 - 127) < std.math.floatMax(f32));
+    // sfProven: both ends inside
+    try std.testing.expect(sfProven(.{ 41, 127 }, false) and !sfProven(.{ 40, 100 }, false) and !sfProven(.{ 60, 128 }, false));
+    try std.testing.expect(sfProven(.{ 33, 137 }, true) and !sfProven(.{ 32, 100 }, true) and !sfProven(.{ 60, 138 }, true));
+}
+
+test "linearScales and expertScales give each scale tensor's exact bytes: owner's rest rows, the shared expert's FP8 blocks, never the packing's gaps" {
+    const l: weights.Linear = .{ .words = 1, .w = 1, .s = 0x5000, .k = 5120, .n = 1280, .fmt = .fp8 };
+    try std.testing.expectEqual(ByteRange{ .ptr = 0x5000, .len = 40 * 160 }, linearScales(l));
+    var ex = std.mem.zeroes(weights.Experts);
+    ex.count = 3; // two routed experts and the shared one
+    ex.dims = 5120;
+    ex.width = 512;
+    ex.down_k = 1152;
+    ex.down_n = 2560;
+    ex.native = .{ .w1 = 0, .w3 = 0, .s1 = 0, .s3 = 0, .w2 = 0, .s2 = 0, .tiles = 20, .rest_tiles = 4 };
+    const s1 = [_]u64{ 0x10000, 0x20000, 0x30000 };
+    const s3 = [_]u64{ 0x11000, 0x21000, 0x31000 };
+    const s2 = [_]u64{ 0x12000, 0x22000, 0x32000 };
+    var out: [9]ByteRange = undefined;
+    expertScales(ex, &s1, &s3, &s2, &[_]i32{ 1, 0, 1 }, &out);
+    // expert 0 computes its rest (640 rows), expert 1 does not (512); MXFP4 [rows, 160], down [2,560, 36]
+    try std.testing.expectEqual(ByteRange{ .ptr = 0x10000, .len = 640 * 160 }, out[0]);
+    try std.testing.expectEqual(ByteRange{ .ptr = 0x11000, .len = 640 * 160 }, out[1]);
+    try std.testing.expectEqual(ByteRange{ .ptr = 0x12000, .len = 2560 * 36 }, out[2]);
+    try std.testing.expectEqual(ByteRange{ .ptr = 0x20000, .len = 512 * 160 }, out[3]);
+    try std.testing.expectEqual(ByteRange{ .ptr = 0x22000, .len = 2560 * 36 }, out[5]);
+    // the shared expert (the last) FP8: [rows / 32, 160] and [2,560 / 32, 36]
+    try std.testing.expectEqual(ByteRange{ .ptr = 0x30000, .len = 20 * 160 }, out[6]);
+    try std.testing.expectEqual(ByteRange{ .ptr = 0x32000, .len = 80 * 36 }, out[8]);
+    // without a rest (no owner table): the main block alone
+    expertScales(ex, &s1, &s3, &s2, null, &out);
+    try std.testing.expectEqual(@as(u64, 512 * 160), out[0].len);
+    try std.testing.expectEqual(@as(u64, 16 * 160), out[6].len);
+}
+
+test "TF_DS_MMA_SF_EXACT runs only what its guard proved: a dense linear by its scale pointer, a layer's experts by their gate scale table; the kept and the unread on the baseline kernels" {
+    var k: Kernels = undefined;
+    k.sf = .exact;
+    k.sf_nkept = 0;
+    k.sf_nproven = 0;
+    k.pf_off = false;
+    k.sfk = .{ .module = undefined, .gemm = undefined, .split64 = undefined, .split128 = undefined, .zsplit = undefined, .gu = .{ .{ .d = undefined, .handle = @ptrFromInt(0x10) }, .{ .d = undefined, .handle = @ptrFromInt(0x20) } }, .dn = .{ .{ .d = undefined, .handle = @ptrFromInt(0x30) }, .{ .d = undefined, .handle = @ptrFromInt(0x40) } } };
+    const l: weights.Linear = .{ .words = 1, .w = 0x1000, .s = 0x5000, .k = 5120, .n = 1280, .fmt = .fp8 };
+    // nothing proven: the baseline kernels
+    try std.testing.expect(!sfDense(&k, l, 0x2000, 5120, 0x3000, 160, 0, 0, false));
+    try std.testing.expect(sfExperts(&k, 0x7000, false) == null);
+    // the proven keys (each once): the block-scaled kernels
+    try sfProve(&k, 0x7000);
+    try sfProve(&k, 0x5000);
+    try sfProve(&k, 0x5000);
+    try std.testing.expectEqual(@as(usize, 2), k.sf_nproven);
+    try std.testing.expect(sfProvenKey(&k, 0x5000) and sfProvenKey(&k, 0x7000) and !sfProvenKey(&k, 0x6000));
+    try std.testing.expect(sfDense(&k, l, 0x2000, 5120, 0x3000, 160, 0, 0, false));
+    try std.testing.expect(sfExperts(&k, 0x7000, false) != null and sfExperts(&k, 0x7000, true) != null);
+    try std.testing.expect(sfExperts(&k, 0x8000, true) == null);
+    // a kept key (the start line's words) is no proven one
+    try sfKeep(&k, 0x6000);
+    try std.testing.expect(sfKept(&k, 0x6000) and !sfKept(&k, 0x5000) and !sfProvenKey(&k, 0x6000));
+    // the chained arithmetic (TF_DS_MMA_SF) has no guard: neither set is read
+    k.sf = .chained;
+    k.sf_nproven = 0;
+    try std.testing.expect(sfDense(&k, l, 0x2000, 5120, 0x3000, 160, 0, 0, false));
+    try std.testing.expect(sfExperts(&k, 0x8000, false) != null);
+    // keys proven in any order are found; the sets' bounds: one more is refused
+    k.sf_nproven = 0;
+    for ([_]u64{ 0x900, 0x100, 0x500, 0x300 }) |x| try sfProve(&k, x);
+    for ([_]u64{ 0x100, 0x300, 0x500, 0x900 }) |x| try std.testing.expect(sfProvenKey(&k, x));
+    try std.testing.expect(!sfProvenKey(&k, 0x200) and !sfProvenKey(&k, 0x1000) and !sfProvenKey(&k, 0x50));
+    k.sf_nproven = 0;
+    for (0..sf_proven_max) |i| try sfProve(&k, 0x10_0000 + i * 64);
+    try std.testing.expectError(error.TooManyProven, sfProve(&k, 0x9999));
+    k.sf_nkept = 0;
+    for (0..sf_kept_max) |i| try sfKeep(&k, 0x100 + i);
+    try std.testing.expectError(error.TooManyKept, sfKeep(&k, 0x9999));
+}
+
+test "TF_DS_MMA_SF_EXACT's route: sfDense takes a dense shape only with a K split, even with its key proven; sfRoute is mx.gemm's kernel at m rows" {
+    var k: Kernels = undefined;
+    k.sf = .exact;
+    k.sf_nkept = 0;
+    k.sf_nproven = 0;
+    k.pf_off = false;
+    // Engram's wkv (3,072 x 12,800): no K split; its key proven, still the baseline kernel in the exact arithmetic
+    const unsplit: weights.Linear = .{ .words = 1, .w = 0x1000, .s = 0x5000, .k = 3072, .n = 12800, .fmt = .fp8 };
+    try std.testing.expect(sfShape(3072, 12800) and !sfExactShape(3072, 12800));
+    try sfProve(&k, unsplit.s);
+    try std.testing.expect(!sfDense(&k, unsplit, 0x2000, 3072, 0x3000, 96, 0, 0, false));
+    for ([_]usize{ 1, 64, 512, 4096 }) |m| try std.testing.expectEqual(@as(?SfGemm, null), sfRoute(&k, unsplit, 0x2000, 3072, 0x3000, 96, 0, 0, false, m));
+    // the chained arithmetic takes it (its own kernel, no guard)
+    k.sf = .chained;
+    try std.testing.expect(sfDense(&k, unsplit, 0x2000, 3072, 0x3000, 96, 0, 0, false));
+    try std.testing.expectEqual(@as(?SfGemm, .gemm), sfRoute(&k, unsplit, 0x2000, 3072, 0x3000, 96, 0, 0, false, 512));
+    // a split shape (wq_a), proven: the baseline below 64 rows, 64-row tiles to 1,024, 128-row ones past; unproven: the baseline
+    k.sf = .exact;
+    const l: weights.Linear = .{ .words = 1, .w = 0x1000, .s = 0x6000, .k = 5120, .n = 1280, .fmt = .fp8 };
+    for ([_]usize{ 1, 63, 64, 512, 1000, 1024, 1025, 4096 }) |m| try std.testing.expectEqual(@as(?SfGemm, null), sfRoute(&k, l, 0x2000, 5120, 0x3000, 160, 0, 0, false, m));
+    try sfProve(&k, l.s);
+    for ([_]usize{ 1, 63 }) |m| try std.testing.expectEqual(@as(?SfGemm, null), sfRoute(&k, l, 0x2000, 5120, 0x3000, 160, 0, 0, false, m));
+    for ([_]usize{ 64, 512, 1000, 1024 }) |m| try std.testing.expectEqual(@as(?SfGemm, .split64), sfRoute(&k, l, 0x2000, 5120, 0x3000, 160, 0, 0, false, m));
+    for ([_]usize{ 1025, 4096 }) |m| try std.testing.expectEqual(@as(?SfGemm, .split128), sfRoute(&k, l, 0x2000, 5120, 0x3000, 160, 0, 0, false, m));
+    // mx.gemm takes the route sfRoute names
+    const src = @embedFile("mx.zig");
+    const body = src[at .. at + (std.mem.indexOf(u8, src[at..], "\n}\n") orelse return error.TestUnexpectedResult)];
+}
+
+test "TF_DS_MMA_SF_EXACT's guard fails closed: a tensor proven only by a real read inside the bounds, or by a length of 0" {
+    // the kernel's answer for a range it read nothing of (255, 0); a result left unwritten (0xff filled) reads as one
+    try std.testing.expectEqual([2]u8{ 255, 0 }, readRange(255, 0));
+    try std.testing.expectEqual([2]u8{ 1, 0 }, readRange(0xffff_ffff, 0xffff_ffff));
+    try std.testing.expectEqual([2]u8{ 1, 0 }, readRange(41, 0x1ff));
+    try std.testing.expectEqual([2]u8{ 41, 127 }, readRange(41, 127));
+    try std.testing.expect(sfProvenRead(0, .{ 255, 0 }, false)); // nothing to prove
+    try std.testing.expect(!sfProvenRead(1024, .{ 255, 0 }, false)); // a tensor the kernel read nothing of
+    try std.testing.expect(!sfProvenRead(1024, readRange(0xffff_ffff, 0xffff_ffff), true)); // an unwritten result
+    try std.testing.expect(sfProvenRead(1024, .{ 41, 127 }, false) and !sfProvenRead(1024, .{ 40, 127 }, false) and !sfProvenRead(1024, .{ 41, 128 }, false));
+    try std.testing.expect(sfProvenRead(1024, .{ 33, 137 }, true) and !sfProvenRead(1024, .{ 32, 137 }, true) and !sfProvenRead(1024, .{ 33, 138 }, true));
+    // sfProven itself needs a real range (lo <= hi)
+    try std.testing.expect(!sfProven(.{ 255, 0 }, false) and !sfProven(.{ 255, 0 }, true) and !sfProven(.{ 100, 99 }, false));
+}
+
+test "TF_DS_MMA_SF_EXACT's mode after its agreement: refused, it turns only its own arithmetic off and leaves TF_DS_MMA_SF's" {
+    try std.testing.expectEqual(MmaSf.chained, sfAfterExact(.chained, false));
+    try std.testing.expectEqual(MmaSf.off, sfAfterExact(.exact, false));
+    try std.testing.expectEqual(MmaSf.exact, sfAfterExact(.exact, true));
+    try std.testing.expectEqual(MmaSf.off, sfAfterExact(.off, false));
+    try std.testing.expectEqual(MmaSf.chained, sfAfterExact(.chained, true));
+}
+
+test "TF_DS_MMA_SF_EXACT takes a dense shape only with a K split: Engram's wkv (none) stays on the baseline kernel" {
+    try std.testing.expect(sfExactShape(5120, 1280) and sfExactShape(5120, 512) and sfExactShape(1280, 8192) and sfExactShape(4096, 2560) and sfExactShape(1280, 4096));
+    try std.testing.expect(sfShape(3072, 12800) and !sfExactShape(3072, 12800));
+    try std.testing.expect(!sfExactShape(5120, 1280 - 64));
+}
+
+test "the guard's tables go up on the stream that reads them, its results filled with 0xff first" {
+    const src = @embedFile("mx.zig");
+    const at = std.mem.indexOf(u8, src, "pub fn scaleRanges(") orelse return error.TestUnexpectedResult;
+    const body = src[at .. at + (std.mem.indexOf(u8, src[at..], "\n}\n") orelse return error.TestUnexpectedResult)];
+    const up = std.mem.indexOf(u8, body, "try buf.uploadAsync(0, std.mem.sliceAsBytes(host), s.handle);") orelse return error.TestUnexpectedResult;
+    const fill = std.mem.indexOf(u8, body, "try d.check(d.api.cuMemsetD8Async(mm, 0xff, ranges.len * 8, s.handle), \"cuMemsetD8Async\");") orelse return error.TestUnexpectedResult;
+    const go = std.mem.indexOf(u8, body, "try launch(f, s,") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(up < fill and fill < go);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, body, "buf.upload(0,"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "o.* = readRange(got[2 * i], got[2 * i + 1]);"));
+}
 
 test "TF_DS_ROCI_SENT_FIRST: a launch in a row-quarter order runs every tile once, the sent quarters' tiles in its first phase" {
     for ([_]usize{ 4096, 2048 }) |rows| {

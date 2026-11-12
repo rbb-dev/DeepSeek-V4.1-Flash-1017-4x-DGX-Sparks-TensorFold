@@ -63,6 +63,7 @@ const kernels = [_]Kernel{
     .{ .name = "dsv41_rdma", .src = "dsv41/rdma_gather", .flags = &.{"-O3"} }, // ours: the decode gathers' RDMA kernel pair
     .{ .name = "dsv41_experts_par", .src = "dsv41/experts_par", .flags = &.{ "-O3", "-lineinfo" } }, // ours: the exl3 extension's gate / up with the parity split's rest in its grid (tensorfold_exl3_experts_v19's flags)
     .{ .name = "dsv41_native", .src = "dsv41/native", .flags = &.{"-O3"} }, // DeepSeek's own FP8 / MXFP4 checkpoint (mx.zig)
+    .{ .name = "dsv41_native_sf", .src = "dsv41/native_sf", .flags = &.{"-O3"}, .arch_specific = true }, // its FP8 GEMMs on the block-scaled MMA (TF_DS_MMA_SF; sm_121a)
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.

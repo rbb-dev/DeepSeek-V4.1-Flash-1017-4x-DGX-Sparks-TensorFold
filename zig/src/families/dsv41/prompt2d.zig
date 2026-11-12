@@ -232,7 +232,10 @@ pub const Settings = extern struct {
         return w.buffered();
     }
 
+        var named: u32 = 0; // (an empty name: a reserved bit, no switch of this build)
             const bit = @as(u32, 1) << @intCast(i);
+            if (name.len == 0) continue;
+            named |= bit;
             if ((mine ^ lead) & bit == 0) continue;
             w.print("{s}rank {d} has {s}={d} and rank 0 {d}: set the same on every rank", .{ sepIf(w, sep), rank, name, @intFromBool(mine & bit != 0), @intFromBool(lead & bit != 0) }) catch {};
         }
@@ -316,8 +319,26 @@ pub fn exchAsked() u32 {
 }
 
 /// text "1", switchAsked; TF_DS_QGATE_CANARY's "1", "2" or "3", qgateAsked); an empty name is a reserved bit (kern_reserved). Each is read once by Model.open, before the
+/// settings.
+pub const kern_mma_sf: u32 = 1 << 18;
+pub const kern_mma_sf_exact: u32 = 1 << 22;
 pub const kern_pass_tail: u32 = 1 << 23;
+
+/// The kernel word's reserved bits: an empty name in kern_names, a bit kept for a switch this build does not carry,
+/// never asked for here.
+pub const kern_reserved: u32 = blk: {
+    var x: u32 = 0;
+    for (kern_names, 0..) |name, i| {
+        if (name.len == 0) x |= 1 << i;
+    }
+    break :blk x;
 };
+
+/// TF_DS_MMA_SF as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useMmaSf).
+pub var mma_sf_asked: bool = false;
+
+/// TF_DS_MMA_SF_EXACT as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useMmaSf).
+pub var mma_sf_exact_asked: bool = false;
 
 
 /// TF_DS_RING_WC as Model.open read it (switchAsked), once (Settings.exch, rdma.Settings.wc): the RDMA rings' send and
@@ -369,6 +390,8 @@ pub fn qgateAsked(text: ?[]const u8) Qgate {
 /// TF_DS_QGATE_CANARY as Model.open read it (qgateAsked), once (Settings.kern: any canary; every rank's the same
 /// canary, Model.open's agreement; prompt.qgate_canary, prompt.qgate_body).
 pub var qgate_canary_asked: Qgate = .off;
+    if (mma_sf_asked) x |= kern_mma_sf;
+    if (mma_sf_exact_asked) x |= kern_mma_sf_exact;
     if (pass_tail_asked) x |= kern_pass_tail;
     if (qgate_canary_asked != .off) x |= kern_qgate_canary;
 /// TF_DS_PASS_ROWS as Model.open read it (passRowsSetting), once (Settings.pass_rows, Model.pass_rows): every rank's

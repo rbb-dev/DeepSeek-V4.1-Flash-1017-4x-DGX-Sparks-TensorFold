@@ -57,6 +57,23 @@
 //!   TF_DS_NO_COPIES=1                           a drafted stream proposes no suffix-lookup copy windows
 //!   TF_DS_PASS_ROWS=N, TF_DS_PASS_FROM=P        a prompt pass's rows at most (a multiple of 2,048 up to the build's
 //!                                               pass rows), passes of 2,048 below position P (8192 unless set)
+//!   TF_DS_MMA_SF=1                              a prompt chunk's FP8 GEMMs (the dense ones the tile kernels take and
+//!                                               the experts' gate / up and down) on the tensor core's block-scaled
+//!                                               MMA (native_sf.cu, built for sm_121a): each K block's sum scaled by
+//!                                               its UE8M0 scales in the MMA and a split's K blocks accumulated there:
+//!                                               NOT the replies' bits without it; a row's bits at every chunk size;
+//!                                               decode rounds as without; with the checkpoint's own weights, the
+//!                                               tile kernels and a GPU that loads the kernels, on every rank or none
+//!                                               (one line says which and names the GEMMs); every rank the same; the
+//!                                               SSD tier's math names it
+//!   TF_DS_MMA_SF_EXACT=1                        the same GEMMs on the block-scaled MMA with each K block's MMA from
+//!                                               zero, then the baseline fp32 add: the replies' bits without it; its guard
+//!                                               keeps on the baseline kernels every GEMM with a weight scale outside the
+//!                                               range where that is proven (each scaled block sum a normal float), and
+//!                                               one line names the GEMMs and the kept ones; TF_DS_MMA_SF=1 takes the
+//!                                               kernels first; with the checkpoint's own weights, the tile kernels and
+//!                                               a GPU that loads the kernels, on every rank or none; every rank the
+//!                                               same; the SSD tier's math names it
 //!   TF_DS_QGATE_CANARY=2 or 3                   not a serving setting: layer 0's MoE partials, each rank's before
 //!                                               their gather, in every prompt chunk and every round, take one more
 //!                                               FP8 step (2: act_quant's quant-dequant of each 32-value group) or
@@ -266,6 +283,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .pass_rows = prompt2d.pass_rows_asked,
         .pass_from = prompt2d.pass_from_asked,
         .pass_tail = prompt2d.pass_tail_asked,
+        .mma_sf = if (k) |x| x.sf == .chained else false,
+        .mma_sf_exact = if (k) |x| x.sf == .exact else false,
         .roci = two != null,
         .roci_collect = false,
         .qgate_canary = if (prompt.qgate_canary) 1 else @backingInt(prompt.qgate_body),
@@ -320,6 +339,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
 }
 
     @setEvalBranchQuota(20000);
+        if (name.len == 0) continue; // a reserved bit: no switch here
     // TF_DS_QGATE_CANARY: the canary in effect, the head's 1, the body's 2 or 3, none 0
     const keep_qb = prompt.qgate_body;
     defer prompt.qgate_body = keep_qb;
@@ -330,6 +350,16 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     try std.testing.expectEqual(@as(u8, 2), tierMath(null, null).qgate_canary);
     prompt.qgate_body = .body_ulp;
     try std.testing.expectEqual(@as(u8, 3), tierMath(null, null).qgate_canary);
+    k.sf = .off;
+    // TF_DS_MMA_SF likewise: the arithmetic in effect after the agreement, off without the native kernels
+    k.sf = .off;
+    try std.testing.expect(!tierMath(null, null).mma_sf and !tierMath(null, &k).mma_sf);
+    k.sf = .chained;
+    try std.testing.expect(tierMath(null, &k).mma_sf and !tierMath(null, &k).mma_sf_exact);
+    // TF_DS_MMA_SF_EXACT: its own field (another kernel, the baseline bits)
+    try std.testing.expect(!tierMath(null, null).mma_sf_exact);
+    k.sf = .exact;
+    try std.testing.expect(tierMath(null, &k).mma_sf_exact and !tierMath(null, &k).mma_sf);
 }
 
 test "refusals name what to set" {
@@ -338,6 +368,8 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "--streams") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "--graph-cap") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_REPLAY_FLOOR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_MMA_SF") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_MMA_SF_EXACT") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_RING_WORD") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_RING_WORD_SIGNAL") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.CanariesDiffer) orelse "", "TF_DS_QGATE_CANARY") != null);
@@ -354,6 +386,26 @@ test "an engine with graphs counts its work run eagerly after failed captures; o
     m.graphs = round.Graphs.init(std.testing.allocator, 0);
     defer m.graphs.?.deinit();
     try std.testing.expect(graphFallbacks(&st).? == &m.graph_fallbacks);
+}
+
+test "TF_DS_MMA_SF and TF_DS_MMA_SF_EXACT both set: TF_DS_MMA_SF's arithmetic stays, the exact form is off, and the tier's text says so" {
+    var k: mx.Kernels = undefined;
+    k.split = .off;
+    k.gemm5 = false;
+    k.group_tiles = false;
+    k.topk_tiles = false;
+    k.bf16_rows = false;
+    k.run128 = false;
+    k.decode_fuse = false;
+    // TF_DS_MMA_SF took the kernels (useMmaSf), then TF_DS_MMA_SF_EXACT was refused on every rank (its own reason)
+    k.sf = .chained;
+    k.sf = mx.sfAfterExact(k.sf, false);
+    try std.testing.expectEqual(mx.MmaSf.chained, k.sf);
+    const tm = tierMath(null, &k);
+    try std.testing.expect(tm.mma_sf and !tm.mma_sf_exact);
+    var buf: [768]u8 = undefined;
+    const text = try spill_start.mathText(&buf, tm);
+    try std.testing.expect(std.mem.endsWith(u8, text, " mma_sf=1 mma_sf_exact=0"));
 }
 
 test "the tier's math keeps the values the shipped settings gave the switches that no longer exist, so a store written before keeps its name; all off without a 2D node" {

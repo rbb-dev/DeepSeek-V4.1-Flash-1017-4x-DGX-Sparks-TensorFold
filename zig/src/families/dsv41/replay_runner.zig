@@ -69,7 +69,9 @@ pub const NullFail = enum { reference_unwritten, slabs_unwritten, reference_deaf
 
 pub fn nullText(f: NullFail) []const u8 {
     return switch (f) {
+        .reference_unwritten => "the baseline one launch did not write its outputs",
         .slabs_unwritten => "the slabs' launches did not write their outputs",
+        .reference_deaf => "the baseline one launch does not read the window's inputs (a changed input value left it as it was)",
     };
 }
 

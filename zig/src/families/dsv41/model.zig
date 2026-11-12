@@ -395,124 +395,232 @@ fn readPassFrom() u32 {
     pub fn joinAhead(m: *Model) void {
         if (m.ahead) |th| th.join();
         m.ahead = null;
+/// TF_DS_MMA_SF `asked` in effect: on every rank or none (each rank's check: the checkpoint's own weights, the prompt
+/// tile kernels, the block-scaled kernels loaded on this GPU, mx.Kernels.useMmaSf; one world all-gather when asked), one
+/// line when asked (mmaSfLine, `covers` the GEMMs it takes). Not the baseline bits: a prompt chunk's FP8 GEMMs accumulate
+/// their K blocks' scaled sums in the tensor core.
+fn useMmaSf(d: *const cuda.Driver, comm: *const comm_mod.Comm, stream: cuda.Stream, k: ?*mx.Kernels, asked: bool, covers: []const u8) !void {
+    if (!asked) return;
+    var why: ?[]const u8 = mx.splitOff(k != null, if (k) |x| x.pf_off else false);
+    if (why == null) if (k) |x| x.useMmaSf(d, cuda.kernels.dsv41_native_sf, .chained) catch |e| {
+        why = if (e == error.Invalid) "this build has no block-scaled kernels (native_sf.cu)" else "its block-scaled kernels (sm_121a) did not load on this GPU (the line above says why)";
+    };
+    const cannot = try prompt2d.ranksThatCannot(d, comm, stream, why == null);
+    if (!prompt2d.agreedOn(asked, cannot)) {
+        if (k) |x| x.sf = .off;
     }
+    var buf: [512]u8 = undefined;
+    std.log.info("{s}", .{mmaSfLine(&buf, cannot, why, covers)});
+}
 
-    /// A kept prompt state's own bytes (the prompt cache's snapshots; the compressed plane stays in the stream's
-    /// extent): one slot's window ring of every layer and positional stores of every ratio-2 layer.
-    pub fn snapBytes(m: *const Model) usize {
-        const pb = prompt.raw_rows * m.eng.c.head_dim * 4;
-        var n: usize = m.rings.len * m.eng.ringBytes();
-        for (m.caches.raw_kv[0..m.eng.c.layers], m.caches.raw_score[0..m.eng.c.layers]) |k, sc| {
-            if (k != 0) n += pb;
-            if (sc != 0) n += pb;
-        }
-        return n;
+/// TF_DS_MMA_SF's start line: on every rank with the GEMMs it covers, or off on every rank, the ranks that cannot and
+/// this rank's reason (`why`, null: it can).
+fn mmaSfLine(buf: []u8, cannot: u32, why: ?[]const u8, covers: []const u8) []const u8 {
+    if (cannot != 0) {
+        var rb: [64]u8 = undefined;
+        return std.fmt.bufPrint(buf, "TF_DS_MMA_SF=1: off on every rank: {s} cannot run it (this rank: {s})", .{ prompt2d.rankList(cannot, &rb), why orelse "can" }) catch buf[0..0];
     }
+    return std.fmt.bufPrint(buf, "TF_DS_MMA_SF=1: a prompt chunk's FP8 GEMMs on the block-scaled MMA, each split's K blocks accumulated in the tensor core (not the baseline bits), on every rank: {s}", .{covers}) catch buf[0..0];
+}
 
-    /// Slot `slot`'s own state into `buf` (save: true) or back from it, in the stream's order (no wait): with the
-    /// extent's compressed rows, the state a prompt pass stands in at a chunk end.
-    pub fn snapCopy(m: *Model, slot: usize, buf: u64, save: bool) !void {
-        const rb = m.eng.ringBytes();
-        const pb = prompt.raw_rows * m.eng.c.head_dim * 4;
-        var at = buf;
-        for (m.rings) |r| {
-            try m.copyState(r + slot * rb, at, rb, save);
-            at += rb;
+/// The GEMMs of these layers TF_DS_MMA_SF's kernels take: each dense FP8 linear whose shape they take (mx.sfShape) in
+/// some layer, by its field name in a fixed order, then the experts when a layer has the checkpoint's own.
+/// The dense linears' field names TF_DS_MMA_SF's kernels may take (sfCovers' order).
+const sf_fields = .{ "wq_a", "wkv", "wq_b", "wo_b", "comp_wkv", "comp_wgate", "idx_wq_b", "idx_wk", "engram_wkv" };
+
+fn sfCovers(layers: []const weights.Layer, exact_form: bool, buf: []u8) []const u8 {
+    const fields = sf_fields;
+    var w: std.Io.Writer = .fixed(buf);
+    var n: usize = 0;
+    inline for (fields) |field| {
+        var takes = false;
+        for (layers) |lay| {
+            const l: ?weights.Linear = @field(lay, field);
+            if (l) |x| takes = takes or (x.fmt == .fp8 and (if (exact_form) mx.sfExactShape(x.k, x.n) else mx.sfShape(x.k, x.n)));
         }
-        for (m.caches.raw_kv[0..m.eng.c.layers], m.caches.raw_score[0..m.eng.c.layers]) |k, sc| {
-            for ([_]u64{ k, sc }) |live| if (live != 0) {
-                try m.copyState(live + slot * pb, at, pb, save);
-                at += pb;
+        if (takes) {
+            w.print("{s}{s}", .{ if (n == 0) "" else ", ", field }) catch {};
+            n += 1;
+        }
+    }
+    for (layers) |lay| if (lay.experts.native != null) {
+        w.print("{s}the experts' gate / up and down", .{if (n == 0) "" else " and "}) catch {};
+        break;
+    };
+    return w.buffered();
+}
+
+/// TF_DS_MMA_SF_EXACT `asked` in effect: on every rank or none. Each rank's check: the checkpoint's own weights and the
+/// prompt tile kernels; TF_DS_MMA_SF not taking the kernels in its own arithmetic; the block-scaled kernels loaded on
+/// this GPU (mx.Kernels.useMmaSf); then its guard over this rank's weight scales (sfGuard: the GEMMs it keeps on the baseline
+/// kernels). One world all-gather when asked, one line (mmaSfExactLine, `covers` the GEMMs it takes). The baseline bits.
+fn useMmaSfExact(gpa: std.mem.Allocator, d: *const cuda.Driver, comm: *const comm_mod.Comm, stream: cuda.Stream, k: ?*mx.Kernels, asked: bool, layers: []const weights.Layer, covers: []const u8) !void {
+    if (!asked) return;
+    var why: ?[]const u8 = mx.splitOff(k != null, if (k) |x| x.pf_off else false);
+    if (why == null and k.?.sf == .chained) why = "TF_DS_MMA_SF=1 runs the block-scaled kernels in its own arithmetic";
+    var kb: [320]u8 = undefined;
+    var wb: [160]u8 = undefined; // (a guard error's reason)
+    var kept: []const u8 = "none";
+    if (why == null) if (k) |x| {
+        x.useMmaSf(d, cuda.kernels.dsv41_native_sf, .exact) catch |e| {
+            why = if (e == error.Invalid) "this build has no block-scaled kernels (native_sf.cu)" else "its block-scaled kernels (sm_121a) did not load on this GPU (the line above says why)";
+        };
+        if (why == null) kept = sfGuard(gpa, d, stream, x, layers, &kb) catch |e| blk: {
+            why = guardWhy(&wb, e);
+            break :blk "none";
+        };
+    };
+    const cannot = try prompt2d.ranksThatCannot(d, comm, stream, why == null);
+    const agreed = prompt2d.agreedOn(asked, cannot);
+    if (k) |x| {
+        // refused: its own arithmetic off; TF_DS_MMA_SF's, which took the kernels first, stays
+        x.sf = mx.sfAfterExact(x.sf, agreed);
+        if (!agreed) {
+            x.sf_nkept = 0;
+            x.sf_nproven = 0;
+            x.sf_apart = 0;
+        }
+    }
+    var sb: [128]u8 = undefined;
+    const seen = if (k) |x| sfSeenText(&sb, x.sf_seen) else "";
+    var buf: [768]u8 = undefined;
+    std.log.info("{s}", .{mmaSfExactLine(&buf, cannot, why, covers, kept, if (k) |x| x.sf_apart else 0, seen)});
+}
+
+/// TF_DS_MMA_SF_EXACT's start line: on every rank with the GEMMs it covers and the ones this rank's guard kept on the baseline
+/// kernels, or off on every rank, the ranks that cannot and this rank's reason (`why`, null: it can).
+/// TF_DS_MMA_SF_EXACT's reason when its guard failed with `e`: its two limits in words, any other error by its name.
+fn guardWhy(buf: []u8, e: anyerror) []const u8 {
+    return switch (e) {
+        error.TooManyKept => "more GEMMs than its guard keeps have a weight scale outside the proven range",
+        error.TooManyProven => "more GEMMs than its guard can prove",
+        else => std.fmt.bufPrint(buf, "its guard over the weight scales did not run ({s})", .{@errorName(e)}) catch "its guard over the weight scales did not run",
+    };
+}
+
+fn mmaSfExactLine(buf: []u8, cannot: u32, why: ?[]const u8, covers: []const u8, kept: []const u8, apart: usize, seen: []const u8) []const u8 {
+    if (cannot != 0) {
+        var rb: [64]u8 = undefined;
+        return std.fmt.bufPrint(buf, "TF_DS_MMA_SF_EXACT=1: off on every rank: {s} cannot run it (this rank: {s})", .{ prompt2d.rankList(cannot, &rb), why orelse "can" }) catch buf[0..0];
+    }
+    var ab: [128]u8 = undefined;
+    const ap = if (apart == 0) "" else std.fmt.bufPrint(&ab, "; kept on the baseline kernels (scale tensors packed at other lengths): the experts in {d} layer{s}", .{ apart, if (apart == 1) "" else "s" }) catch "";
+    return std.fmt.bufPrint(buf, "TF_DS_MMA_SF_EXACT=1: a prompt chunk's FP8 GEMMs on the block-scaled MMA, each K block's MMA from zero, then the baseline fp32 add (the baseline bits), on every rank: {s}; kept on the baseline kernels (a weight scale outside the proven range): {s}{s}; weight scale bytes seen: {s}", .{ covers, kept, ap, seen }) catch buf[0..0];
+}
+
+/// The weight scale bytes TF_DS_MMA_SF_EXACT's guard saw (mx.Kernels.sf_seen) in words: the smallest and the largest of
+/// the dense FP8 linears', the routed experts' MXFP4 and the shared expert's; a class with nothing read, none.
+fn sfSeenText(buf: []u8, seen: [3][2]u8) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    for ([_][]const u8{ "FP8", "MXFP4", "shared expert" }, seen, 0..) |name, r, i| {
+        if (r[0] > r[1]) w.print("{s}{s} none", .{ if (i == 0) "" else ", ", name }) catch {} else w.print("{s}{s} {d}..{d}", .{ if (i == 0) "" else ", ", name, r[0], r[1] }) catch {};
+    }
+    return w.buffered();
+}
+
+/// The GEMMs TF_DS_MMA_SF_EXACT's guard kept on the baseline kernels in words: each dense field with its layers' count
+/// (`dense`, sf_fields' order), then the experts' (`experts` layers); "none".
+fn sfKeptText(buf: []u8, dense: [sf_fields.len]usize, experts: usize) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    var n: usize = 0;
+    inline for (sf_fields, 0..) |field, i| if (dense[i] > 0) {
+        w.print("{s}{s} in {d} layer{s}", .{ if (n == 0) "" else ", ", field, dense[i], if (dense[i] == 1) "" else "s" }) catch {};
+        n += 1;
+    };
+    if (experts > 0) {
+        w.print("{s}the experts in {d} layer{s}", .{ if (n == 0) "" else ", ", experts, if (experts == 1) "" else "s" }) catch {};
+        n += 1;
+    }
+    return if (n == 0) "none" else w.buffered();
+}
+
+/// TF_DS_MMA_SF_EXACT's guard over this rank's weights, in one pass on the GPU (mx.scaleRanges): the scale bytes of
+/// every dense FP8 linear the exact form takes (mx.sfExactShape) and of every layer's experts (each expert's three
+/// tensors, their own bytes from the pointer and owner tables, at expertScaleLens' lengths). A layer whose loader did
+/// not tie its tensors to those lengths (NativeExperts.scales_match false) has none of its bytes read: its experts are
+/// kept, counted apart (k.sf_apart). It proves (mx.sfProve) a linear, or a layer's experts, whose every byte was read
+/// and lies in the proven range (mx.sfProvenRead: FP8 or MXFP4, the shared expert FP8); the block-scaled kernels take
+/// only those (mx.sfDense, mx.sfExperts). The rest are kept on the baseline kernels (mx.sfKeep, the words). It starts from
+/// empty sets; the bytes it read go to k.sf_seen. The GEMMs kept for a scale outside the range in words (sfKeptText)
+/// into `buf`.
+pub fn sfGuard(gpa: std.mem.Allocator, d: *const cuda.Driver, s: cuda.Stream, k: *mx.Kernels, layers: []const weights.Layer, buf: []u8) ![]const u8 {
+    const Tag = struct { layer: usize, field: ?usize, fp4: bool, shared: bool };
+    k.sf_nkept = 0;
+    k.sf_nproven = 0;
+    k.sf_seen = @splat(.{ 255, 0 });
+    k.sf_apart = 0;
+    var ranges: std.ArrayList(mx.ByteRange) = .empty;
+    defer ranges.deinit(gpa);
+    var tags: std.ArrayList(Tag) = .empty;
+    defer tags.deinit(gpa);
+    const layout_ok = try gpa.alloc(bool, layers.len);
+    defer gpa.free(layout_ok);
+    @memset(layout_ok, true);
+    for (layers, 0..) |lay, li| {
+        inline for (sf_fields, 0..) |field, fi| {
+            const l: ?weights.Linear = @field(lay, field);
+            if (l) |x| if (x.fmt == .fp8 and mx.sfExactShape(x.k, x.n)) {
+                try ranges.append(gpa, mx.linearScales(x));
+                try tags.append(gpa, .{ .layer = li, .field = fi, .fp4 = false, .shared = false });
             };
         }
-    }
-
-    /// The compressed rows of positions [0, at) of the extent at `from` copied into the extent at `to` (a kept prompt
-    /// resumed in another extent while a live stream holds its own), in the stream's order: every kv-source layer's
-    /// codes and scales and its index keys, the rows view() places at those positions.
-    pub fn copyExtent(m: *Model, from: usize, to: usize, at: usize) !void {
-        const c = m.eng.c;
-        const cs = &m.caches;
-        for (m.eng.w.layers, 0..) |lay, i| {
-            if (lay.comp_wkv == null) continue;
-            const r: usize = lay.ratio;
-            if (from % r != 0 or to % r != 0 or at % r != 0) return error.BadView;
-            const n = at / r;
-            try m.copySpan(cs.comp_codes[i], from / r, to / r, n, c.head_dim / 2);
-            try m.copySpan(cs.comp_scales[i], from / r, to / r, n, c.head_dim / 16);
-            if (lay.idx_wk != null) {
-                try m.copySpan(cs.idx_codes[i], from / r, to / r, n, c.index_head_dim / 2);
-                try m.copySpan(cs.idx_scales[i], from / r, to / r, n, c.index_head_dim / 32);
+        if (lay.experts.native) |nx| {
+            const e: usize = lay.experts.count;
+            const tabs = try gpa.alloc(u64, 3 * e);
+            defer gpa.free(tabs);
+            for ([_]u64{ nx.s1, nx.s3, nx.s2 }, 0..) |t, j| try d.check(d.api.cuMemcpyDtoH_v2(@ptrCast(tabs[j * e ..].ptr), t, e * 8), "cuMemcpyDtoH");
+            var owner: ?[]i32 = null;
+            defer if (owner) |o| gpa.free(o);
+            if (nx.owner != 0) {
+                const o = try gpa.alloc(i32, e);
+                owner = o;
+                try d.check(d.api.cuMemcpyDtoH_v2(@ptrCast(o.ptr), nx.owner, e * 4), "cuMemcpyDtoH");
             }
+            const out = try ranges.addManyAsSlice(gpa, 3 * e);
+            mx.expertScales(lay.experts, tabs[0..e], tabs[e .. 2 * e], tabs[2 * e .. 3 * e], owner, out);
+            // a layer packed at other lengths: none of its bytes read (its experts kept, apart)
+            if (!nx.scales_match) for (out) |*rg| {
+                rg.len = 0;
+            };
+            layout_ok[li] = nx.scales_match; // the loader packed expertScaleLens' bytes
+            for (0..3 * e) |i| try tags.append(gpa, .{ .layer = li, .field = null, .fp4 = i / 3 != e - 1, .shared = i / 3 == e - 1 });
         }
     }
-
-    fn copySpan(m: *Model, plane: u64, from: usize, to: usize, n: usize, row: usize) !void {
-        const d = m.ctx.d;
-        try d.check(d.api.cuMemcpyDtoDAsync_v2(plane + to * row, plane + from * row, n * row, m.stream.handle), "cuMemcpyDtoDAsync");
-    }
-
-    fn copyState(m: *Model, live: u64, kept: u64, bytes: usize, save: bool) !void {
-        const d = m.ctx.d;
-        const dst = if (save) kept else live;
-        const src = if (save) live else kept;
-        try d.check(d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, m.stream.handle), "cuMemcpyDtoDAsync");
-    }
-
-    /// Each layer's gate_bias_vl (f32 [experts], the checkpoint's extra file) on the device: Gate.forward's bias at
-    /// image-span positions.
-    fn loadVisionBias(m: *Model, path: []const u8) !void {
-        const core = @import("core");
-        var f = try core.safetensors.File.open(m.gpa, m.io, path);
-        defer f.close(m.io);
-        var nb: [64]u8 = undefined;
-        for (m.w.layers, 0..) |*lay, i| {
-            const t = f.get(try std.fmt.bufPrint(&nb, "layers.{d}.ffn.gate.bias_vl", .{i})) orelse return error.MissingVisionBias;
-            if (!t.is(.f32, &.{m.cfg.experts})) return error.BadVisionBias;
-            const dst = try m.arena.take(t.bytes.len);
-            const tmp = try m.gpa.dupe(u8, t.bytes); // (a copy out of the file mapping first: see vit.zig)
-            defer m.gpa.free(tmp);
-            try m.ctx.d.check(m.ctx.d.api.cuMemcpyHtoD_v2(dst, tmp.ptr, tmp.len), "cuMemcpyHtoD");
-            lay.gate_b_vl = dst;
+    const mm = try gpa.alloc([2]u8, ranges.items.len);
+    defer gpa.free(mm);
+    try mx.scaleRanges(k, d, s, gpa, ranges.items, mm);
+    var dense: [sf_fields.len]usize = @splat(0);
+    var experts: usize = 0;
+    var apart: usize = 0;
+    const bad = try gpa.alloc(bool, layers.len); // a layer's experts with a tensor not proven
+    defer gpa.free(bad);
+    @memset(bad, false);
+    for (tags.items, mm, ranges.items) |t, r, rg| {
+        if (rg.len > 0 and r[0] <= r[1]) {
+            const c: usize = if (t.field != null) 0 else if (t.shared) 2 else 1;
+            k.sf_seen[c] = .{ @min(k.sf_seen[c][0], r[0]), @max(k.sf_seen[c][1], r[1]) };
         }
-    }
-
-    /// The filling prompt's image spans (absolute positions, in order) and their rows bf16 [tokens, hidden] from the
-    /// host, after fillBegin and before its chunks.
-    pub fn setImages(m: *Model, spans: []const prompt.Span, rows: []const u8) !void {
-        if (rows.len > 0) {
-            if (m.img_buf == null or m.img_buf.?.len < rows.len) {
-                if (m.img_buf) |*b| b.free();
-                m.img_buf = null;
-                m.img_buf = try cuda.DeviceBuffer.alloc(m.ctx.d, rows.len);
-            }
-            const d = m.ctx.d;
-            try d.check(d.api.cuMemcpyHtoDAsync_v2(m.img_buf.?.ptr, rows.ptr, rows.len, m.stream.handle), "cuMemcpyHtoDAsync");
-            try m.synchronize(); // (the caller's rows may go once this returns)
+        if (mx.sfProvenRead(rg.len, r, t.fp4) and (t.field != null or layout_ok[t.layer])) {
+            if (t.field != null) try mx.sfProve(k, rg.ptr); // a dense linear's key: its scales (l.s)
+            continue;
         }
-        m.spans.clearRetainingCapacity();
-        try m.spans.appendSlice(m.gpa, spans);
-        m.ch.spans = m.spans.items;
-        m.ch.img_rows = if (m.img_buf) |b| b.ptr else 0;
-        if (m.waves) {
-            m.ch2.spans = m.ch.spans;
-            m.ch2.img_rows = m.ch.img_rows;
-        }
+        if (t.field) |fi| {
+            try mx.sfKeep(k, rg.ptr);
+            dense[fi] += 1;
+        } else bad[t.layer] = true;
     }
-
-    pub fn fillBegin(m: *Model, slot: usize, base: usize) !void {
-        if (slot >= m.streams) return error.BadSlot;
-        if (m.eh) |*eh| { // rows read ahead for another prompt are not this one's, even at the same positions
-            eh.ahead_start = std.math.maxInt(usize);
-            eh.ahead_ready = .{ false, false };
-        }
-        m.spans.clearRetainingCapacity();
-        m.ch.spans = &.{};
-        if (m.waves) m.ch2.spans = &.{};
-        m.view = try m.caches.view(&m.eng, slot, base);
-        for (m.rings, m.ring_view) |r, *v| v.* = r + slot * m.eng.ringBytes();
-        m.fill_slot = slot;
-    }
+    for (layers, bad) |lay, b| if (lay.experts.native) |nx| {
+        if (!nx.scales_match) {
+            try mx.sfKeep(k, nx.s1);
+            apart += 1;
+        } else if (b) {
+            try mx.sfKeep(k, nx.s1);
+            experts += 1;
+        } else try mx.sfProve(k, nx.s1);
+    };
+    k.sf_apart = apart;
+    return sfKeptText(buf, dense, experts);
+}
 
     /// The prompt's chunk of n rows from position `start` (seq: the stream's ids through the chunk's end) through every
     /// layer with the served bounded replay (replay = the prompt's length - the window: an encoder-only chunk stops at
@@ -657,6 +765,7 @@ fn pairShortText(buf: []u8, free: u64, pass_rows: usize, lane_arena: u64, v: Poo
     return memoryRefusal(buf, what, true, pass_rows, (lanes - 1) * pairEstimate(pass_rows, lane_arena) + pair_guard_bytes, free, v);
         why = "needs the four-node 2D split with Rocinante";
         switch (speed_defaults.verdict(why orelse "another rank cannot run it", speed_defaults.defaulted("TF_DS_ENGRAM_PARTNER"))) {
+            // the default: one WARN naming why and what it costs; every rank decided the same (all agreed above), no lane was opened
     const rc = try roci_engine.Roci.openLane(gpa, d, m.comm.rank, node, m.comm.world, m.two.?.rank_of, &m.fan, rails, Model.rdmaGid() orelse 3, 1, m.two.?.rc.?, .host);
 /// TF_DS_ROCI_STAGGER's start: two whole passes in flight need every exchange of a full pass on the transport (so no collective of
 /// another communicator runs beside a stream's memop waits), the Engram uploads from pinned memory (a pageable copy blocks the host thread
@@ -700,6 +809,7 @@ fn openPair(m: *Model, gpa: std.mem.Allocator, d: *const cuda.Driver, o: Options
                 if (why) |w| std.log.err("TF_DS_ROCI_STAGGER=1: off: {s}", .{w}) else std.log.err("TF_DS_ROCI_STAGGER=1: off: another rank cannot run it (its line names the reason)", .{});
                 return error.StaggerRefused;
             },
+            // the default: one WARN naming why and what it costs, the single pass runs (every rank decided the same, all agreed above)
                 std.log.warn("TF_DS_ROCI_STAGGER: off: {s}; without it: {s} (the engine runs one pass at a time; set TF_DS_ROCI_STAGGER=1 to make this a refusal, 0 to silence it)", .{ why orelse "another rank cannot run it (its line names the reason)", speed_defaults.costOf("TF_DS_ROCI_STAGGER") });
                 prompt2d.roci_stagger_asked = false;
                 return;
@@ -901,6 +1011,8 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         prompt2d.pass_tail_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_PASS_TAIL")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.readPassFillingEnv(); // rank 0's TF_DS_PASS_FILLING (the pass sizes are its frames'; its start line prints here)
         try prompt2d.readPromptOrderEnv(); // rank 0's TF_DS_PROMPT_ORDER and TF_DS_PROMPT_QOS (the host's prompt-step order; its start line prints here)
+        prompt2d.mma_sf_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_MMA_SF")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.mma_sf_exact_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_MMA_SF_EXACT")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.ring_wc_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_RING_WC")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.ring_inplace_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_RING_INPLACE")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         const ring_word_text: ?[]const u8 = if (std.c.getenv("TF_DS_RING_WORD")) |v| std.mem.span(v) else null;
@@ -1074,6 +1186,9 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         m.mxk = if (c.format == .native) try mx.Kernels.load(d, cuda.kernels.dsv41_native) else null;
         if (std.c.getenv("TF_DS_NACT_LOG")) |v| if (std.mem.eql(u8, std.mem.span(v), "1")) nactOpen(d);
         errdefer if (m.mxk) |*x| x.unload();
+        var sf_buf: [256]u8 = undefined;
+        try useMmaSf(d, &m.comm, m.stream, if (m.mxk) |*x| x else null, prompt2d.mma_sf_asked, sfCovers(m.w.layers, false, &sf_buf));
+        try useMmaSfExact(gpa, d, &m.comm, m.stream, if (m.mxk) |*x| x else null, prompt2d.mma_sf_exact_asked, m.w.layers, sfCovers(m.w.layers, true, &sf_buf));
         // round over the host links)
         errdefer if (m.rdma_rings) |*x| x.close(gpa);
         // the first lane's proxy threads (Roci.openLane, below) run from its start: a later failure stops them before the arena and the
@@ -2138,6 +2253,16 @@ test "TF_DS_ROUNDS_BESIDE is read after TF_DS_PASS_BESIDE, refuses a bad value o
     try std.testing.expect(std.mem.indexOf(u8, @embedFile("native.zig"), ".rounds = prompt2d.rounds_beside_asked") != null);
 }
 
+    const was_sf = prompt2d.mma_sf_asked;
+    defer prompt2d.mma_sf_asked = was_sf;
+    prompt2d.mma_sf_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_mma_sf, startSettings(o).kern);
+    prompt2d.mma_sf_asked = false;
+    const was_sfx = prompt2d.mma_sf_exact_asked;
+    defer prompt2d.mma_sf_exact_asked = was_sfx;
+    prompt2d.mma_sf_exact_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_mma_sf_exact, startSettings(o).kern);
+    prompt2d.mma_sf_exact_asked = false;
     for ([_]prompt2d.Qgate{ .head, .body_fp8, .body_ulp }) |q| {
         prompt2d.qgate_canary_asked = q;
     }
@@ -2179,6 +2304,145 @@ test "TF_DS_QGATE_CANARY: the text read once (none asked, no collective); anothe
     const same = std.mem.indexOf(u8, body, "    if (differ == 0) return;\n").?;
     const refuse = std.mem.indexOf(u8, body, "return error.CanariesDiffer;").?;
     try std.testing.expect(off < gather and gather < same and same < refuse);
+
+test "TF_DS_MMA_SF's line: on every rank with the GEMMs it covers, or off on every rank, which ranks and why" {
+    var buf: [320]u8 = undefined;
+    try std.testing.expectEqualStrings("TF_DS_MMA_SF=1: a prompt chunk's FP8 GEMMs on the block-scaled MMA, each split's K blocks accumulated in the tensor core (not the baseline bits), on every rank: wq_a, wkv and the experts' gate / up and down", mmaSfLine(&buf, 0, null, "wq_a, wkv and the experts' gate / up and down"));
+    try std.testing.expectEqualStrings("TF_DS_MMA_SF=1: off on every rank: rank 2 cannot run it (this rank: can)", mmaSfLine(&buf, 1 << 2, null, "wq_a"));
+    try std.testing.expectEqualStrings("TF_DS_MMA_SF=1: off on every rank: ranks 0 and 3 cannot run it (this rank: needs the prompt chunks' tile kernels (TF_DS_PF_TILES=0 turns them off))", mmaSfLine(&buf, 0b1001, "needs the prompt chunks' tile kernels (TF_DS_PF_TILES=0 turns them off)", "wq_a"));
+}
+
+test "TF_DS_MMA_SF's line names the layers' dense FP8 GEMMs its kernels take, each once in a fixed order, and the experts" {
+    var buf: [320]u8 = undefined;
+    var lays: [2]weights.Layer = .{ std.mem.zeroes(weights.Layer), std.mem.zeroes(weights.Layer) };
+    const fp8 = struct {
+        fn of(kdim: u32, n: u32) weights.Linear {
+            return .{ .words = 0, .k = kdim, .n = n, .fmt = .fp8 };
+        }
+    }.of;
+    for (&lays) |*l| {
+        l.wq_a = fp8(5120, 1280);
+        l.wkv = fp8(5120, 512);
+        l.wq_b = fp8(1280, 8192);
+        l.wo_b = fp8(4096, 2560);
+        l.comp_wkv = .{ .words = 0, .k = 5120, .n = 1024, .fmt = .bf16 }; // bf16: not an FP8 GEMM
+    }
+    lays[1].idx_wq_b = fp8(1280, 4096); // one layer's indexer
+    lays[0].engram_wkv = fp8(3072, 12800);
+    lays[1].idx_wk = fp8(5120, 1280 - 64); // FP8 but a shape the kernels do not take
+    try std.testing.expectEqualStrings("wq_a, wkv, wq_b, wo_b, idx_wq_b, engram_wkv", sfCovers(&lays, false, &buf));
+    lays[0].experts.native = std.mem.zeroes(weights.NativeExperts);
+    try std.testing.expectEqualStrings("wq_a, wkv, wq_b, wo_b, idx_wq_b, engram_wkv and the experts' gate / up and down", sfCovers(&lays, false, &buf));
+}
+
+test "Model.open reads TF_DS_MMA_SF with the kernel switches and puts it in effect after them, through the agreement" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "prompt2d.mma_sf_asked = prompt2d.switchAsked(if (std.c.getenv(\"TF_DS_MMA_SF\")) |v| std.mem.span(v) else null); // every rank alike (Settings)"));
+    const fuse = std.mem.indexOf(u8, code, "useDecodeFuse(if (m.mxk) |*x| x else null, d, prompt2d.decode_fuse_asked);") orelse return error.TestUnexpectedResult;
+    const sf = std.mem.indexOf(u8, code, "try useMmaSf(d, &m.comm, m.stream, if (m.mxk) |*x| x else null, prompt2d.mma_sf_asked, sfCovers(m.w.layers, false, &sf_buf));") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(fuse < sf and sf - fuse < 300);
+    // the agreement: this rank's check (the weights and tile kernels, then the block-scaled kernels' load), the
+    // all-gather, then on or off on every rank
+    const at = std.mem.indexOf(u8, code, "fn useMmaSf(") orelse return error.TestUnexpectedResult;
+    const body = code[at .. at + (std.mem.indexOf(u8, code[at..], "\n}\n") orelse return error.TestUnexpectedResult)];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "var why: ?[]const u8 = mx.splitOff(k != null, if (k) |x| x.pf_off else false);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "x.useMmaSf(d, cuda.kernels.dsv41_native_sf, .chained) catch |e| {"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "const cannot = try prompt2d.ranksThatCannot(d, comm, stream, why == null);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "if (!prompt2d.agreedOn(asked, cannot)) {\n        if (k) |x| x.sf = .off;\n    }"));
+}
+
+test "TF_DS_MMA_SF_EXACT's line: on every rank with the GEMMs it covers and the ones its guard kept, or off, which ranks and why" {
+    var buf: [400]u8 = undefined;
+    try std.testing.expectEqualStrings("TF_DS_MMA_SF_EXACT=1: a prompt chunk's FP8 GEMMs on the block-scaled MMA, each K block's MMA from zero, then the baseline fp32 add (the baseline bits), on every rank: wq_a, wkv and the experts' gate / up and down; kept on the baseline kernels (a weight scale outside the proven range): none; weight scale bytes seen: FP8 none, MXFP4 none, shared expert none", mmaSfExactLine(&buf, 0, null, "wq_a, wkv and the experts' gate / up and down", "none", 0, "FP8 none, MXFP4 none, shared expert none"));
+    try std.testing.expectEqualStrings("TF_DS_MMA_SF_EXACT=1: off on every rank: rank 3 cannot run it (this rank: can)", mmaSfExactLine(&buf, 1 << 3, null, "wq_a", "none", 0, ""));
+    try std.testing.expectEqualStrings("TF_DS_MMA_SF_EXACT=1: off on every rank: ranks 0, 1, 2 and 3 cannot run it (this rank: TF_DS_MMA_SF=1 runs the block-scaled kernels in its own arithmetic)", mmaSfExactLine(&buf, 0b1111, "TF_DS_MMA_SF=1 runs the block-scaled kernels in its own arithmetic", "wq_a", "none", 0, ""));
+}
+
+test "TF_DS_MMA_SF_EXACT's kept GEMMs in words: each field with its layers' count in sfCovers' order, then the experts; none" {
+    var buf: [256]u8 = undefined;
+    var dense: [sf_fields.len]usize = @splat(0);
+    try std.testing.expectEqualStrings("none", sfKeptText(&buf, dense, 0));
+    dense[3] = 3; // wo_b
+    dense[0] = 1; // wq_a
+    try std.testing.expectEqualStrings("wq_a in 1 layer, wo_b in 3 layers", sfKeptText(&buf, dense, 0));
+    try std.testing.expectEqualStrings("wq_a in 1 layer, wo_b in 3 layers, the experts in 2 layers", sfKeptText(&buf, dense, 2));
+    try std.testing.expectEqualStrings("the experts in 1 layer", sfKeptText(&buf, @splat(0), 1));
+}
+
+test "Model.open reads TF_DS_MMA_SF_EXACT and puts it in effect after TF_DS_MMA_SF, its guard and then the agreement" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "prompt2d.mma_sf_exact_asked = prompt2d.switchAsked(if (std.c.getenv(\"TF_DS_MMA_SF_EXACT\")) |v| std.mem.span(v) else null); // every rank alike (Settings)"));
+    const sf = std.mem.indexOf(u8, code, "try useMmaSf(d, &m.comm, m.stream,") orelse return error.TestUnexpectedResult;
+    const ex = std.mem.indexOf(u8, code, "try useMmaSfExact(gpa, d, &m.comm, m.stream, if (m.mxk) |*x| x else null, prompt2d.mma_sf_exact_asked, m.w.layers, sfCovers(m.w.layers, true, &sf_buf));") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(sf < ex and ex - sf < 400);
+    const at = std.mem.indexOf(u8, code, "fn useMmaSfExact(") orelse return error.TestUnexpectedResult;
+    const body = code[at .. at + (std.mem.indexOf(u8, code[at..], "\n}\n") orelse return error.TestUnexpectedResult)];
+    // TF_DS_MMA_SF takes the kernels first; then this rank's load and guard; the all-gather; off everywhere unless agreed
+    const chained = std.mem.indexOf(u8, body, "if (why == null and k.?.sf == .chained) why = \"TF_DS_MMA_SF=1 runs the block-scaled kernels in its own arithmetic\";") orelse return error.TestUnexpectedResult;
+    const load = std.mem.indexOf(u8, body, "x.useMmaSf(d, cuda.kernels.dsv41_native_sf, .exact) catch |e| {") orelse return error.TestUnexpectedResult;
+    const guard = std.mem.indexOf(u8, body, "sfGuard(gpa, d, stream, x, layers, &kb)") orelse return error.TestUnexpectedResult;
+    const cannot = std.mem.indexOf(u8, body, "const cannot = try prompt2d.ranksThatCannot(d, comm, stream, why == null);") orelse return error.TestUnexpectedResult;
+    const off = std.mem.indexOf(u8, body, "x.sf = mx.sfAfterExact(x.sf, agreed);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(chained < load and load < guard and guard < cannot and cannot < off);
+}
+
+test "the exact form's covered GEMMs: the dense FP8 shapes with a K split (Engram's wkv has none), then the experts" {
+    var buf: [320]u8 = undefined;
+    var lays: [1]weights.Layer = .{std.mem.zeroes(weights.Layer)};
+    const fp8 = struct {
+        fn of(kdim: u32, n: u32) weights.Linear {
+            return .{ .words = 0, .k = kdim, .n = n, .fmt = .fp8 };
+        }
+    }.of;
+    lays[0].wq_a = fp8(5120, 1280);
+    lays[0].wo_b = fp8(4096, 2560);
+    lays[0].engram_wkv = fp8(3072, 12800);
+    lays[0].experts.native = std.mem.zeroes(weights.NativeExperts);
+    try std.testing.expectEqualStrings("wq_a, wo_b, engram_wkv and the experts' gate / up and down", sfCovers(&lays, false, &buf));
+    try std.testing.expectEqualStrings("wq_a, wo_b and the experts' gate / up and down", sfCovers(&lays, true, &buf));
+}
+
+test "TF_DS_MMA_SF_EXACT's line names the weight scale bytes its guard saw, a class without tensors as none" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("FP8 41..127, MXFP4 33..137, shared expert 118..126", sfSeenText(&buf, .{ .{ 41, 127 }, .{ 33, 137 }, .{ 118, 126 } }));
+    try std.testing.expectEqualStrings("FP8 none, MXFP4 120..131, shared expert none", sfSeenText(&buf, .{ .{ 255, 0 }, .{ 120, 131 }, .{ 255, 0 } }));
+    var lb: [768]u8 = undefined;
+    try std.testing.expectEqualStrings("TF_DS_MMA_SF_EXACT=1: a prompt chunk's FP8 GEMMs on the block-scaled MMA, each K block's MMA from zero, then the baseline fp32 add (the baseline bits), on every rank: wq_a and the experts' gate / up and down; kept on the baseline kernels (a weight scale outside the proven range): none; weight scale bytes seen: FP8 118..127, MXFP4 120..131, shared expert 119..126", mmaSfExactLine(&lb, 0, null, "wq_a and the experts' gate / up and down", "none", 0, "FP8 118..127, MXFP4 120..131, shared expert 119..126"));
+}
+
+test "useMmaSfExact refused turns only its own arithmetic off (TF_DS_MMA_SF's stays) and clears its guard's sets" {
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "fn useMmaSfExact(") orelse return error.TestUnexpectedResult;
+    const body = src[at .. at + (std.mem.indexOf(u8, src[at..], "\n}\n") orelse return error.TestUnexpectedResult)];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "const agreed = prompt2d.agreedOn(asked, cannot);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "x.sf = mx.sfAfterExact(x.sf, agreed);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "if (!agreed) {\n            x.sf_nkept = 0;\n            x.sf_nproven = 0;\n            x.sf_apart = 0;\n        }"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, body, "x.sf = .off;"));
+    // the guard covers the exact form's shapes; its line names what it saw
+    const g = std.mem.indexOf(u8, src, "pub fn sfGuard(") orelse return error.TestUnexpectedResult;
+    const gb = src[g .. g + (std.mem.indexOf(u8, src[g..], "\n}\n") orelse return error.TestUnexpectedResult)];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gb, "if (x.fmt == .fp8 and mx.sfExactShape(x.k, x.n)) {"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gb, "k.sf_nkept = 0;\n    k.sf_nproven = 0;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gb, "if (mx.sfProvenRead(rg.len, r, t.fp4) and (t.field != null or layout_ok[t.layer])) {"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gb, "layout_ok[li] = nx.scales_match;"));
+    // a layer packed at other lengths: none of its bytes read, kept apart from the scale-kept ones
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gb, "if (!nx.scales_match) for (out) |*rg| {\n                rg.len = 0;\n            };"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gb, "if (!nx.scales_match) {\n            try mx.sfKeep(k, nx.s1);\n            apart += 1;\n        } else if (b) {"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gb, "k.sf_apart = apart;"));
+}
+
+test "TF_DS_MMA_SF_EXACT's line: experts kept for their packing, apart from a scale outside the range; a guard's error by its name" {
+    var buf: [768]u8 = undefined;
+    try std.testing.expectEqualStrings("TF_DS_MMA_SF_EXACT=1: a prompt chunk's FP8 GEMMs on the block-scaled MMA, each K block's MMA from zero, then the baseline fp32 add (the baseline bits), on every rank: wq_a and the experts' gate / up and down; kept on the baseline kernels (a weight scale outside the proven range): none; kept on the baseline kernels (scale tensors packed at other lengths): the experts in 40 layers; weight scale bytes seen: FP8 none, MXFP4 120..131, shared expert none", mmaSfExactLine(&buf, 0, null, "wq_a and the experts' gate / up and down", "none", 40, "FP8 none, MXFP4 120..131, shared expert none"));
+    try std.testing.expect(std.mem.indexOf(u8, mmaSfExactLine(&buf, 0, null, "wq_a", "wq_a in 1 layer", 1, "x"), "; kept on the baseline kernels (scale tensors packed at other lengths): the experts in 1 layer; ") != null);
+    var wb: [160]u8 = undefined;
+    try std.testing.expectEqualStrings("its guard over the weight scales did not run (OutOfMemory)", guardWhy(&wb, error.OutOfMemory));
+    try std.testing.expectEqualStrings("its guard over the weight scales did not run (CudaFailed)", guardWhy(&wb, error.CudaFailed));
+    try std.testing.expectEqualStrings("more GEMMs than its guard keeps have a weight scale outside the proven range", guardWhy(&wb, error.TooManyKept));
+    try std.testing.expectEqualStrings("more GEMMs than its guard can prove", guardWhy(&wb, error.TooManyProven));
+}
     const open = std.mem.indexOf(u8, code, "m.rdma_rings = try ring2d.Rings.open(gpa, d, rk, devices.items, role, ord, .{ .max_bytes = ring_bytes, .gid_index = rdmaGid(), .pdl = rdmaPdl(), .collect_peers = peers and rk.collect_peers != null, .wc = sw.wc, .inplace = sw.inplace, .roci = ringWordOf(), .roci_deadline_ns = ringWordDeadlineNs(), .wait = ring_wait_on, .wait_explicit = prompt2d.ring_wait_explicit }, &m.comm, m.stream, !weights.draft_4way);") orelse return error.TestUnexpectedResult;
 test "TF_DS_RING_WORD_SIGNAL: unset and atomic name the fetch-and-add (the guaranteed arrival), word the inline word, other text is refused" {
     try std.testing.expectEqual(@as(?rdma.Roci, .atomic), Model.ringWordSignal(null));
@@ -2643,6 +2907,7 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
         for (q0, slots) |q, s| pool.absorbed[@intCast(s)] = @intCast(q);
         try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
     // the partner split: the refusal is the operator's branch, the warning and the cleared flag the default's, and no lane is opened before either
+    const v = std.mem.indexOf(u8, body, "speed_defaults.verdict(why orelse").?;
     const refused = std.mem.indexOf(u8, body[v..], "return error.PartnerRefused;").?;
     const warn = std.mem.indexOf(u8, body[v..], "std.log.warn(\"TF_DS_ENGRAM_PARTNER: off:").?;
     try std.testing.expect(refuse < refused and refused < warn and warn < cleared);
@@ -2651,10 +2916,15 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
     const kerr = std.mem.indexOf(u8, kb[kv..], "return error.KeepAheadSharesReader;").?;
     // both are in the defaults table, so the speed report lists a fallback with its reason
     const gib: usize = 1 << 30;
+    try std.testing.expect(passRowsFallback("4096", true, 64 * gib) != null); // a small box, the default: falls back
+    try std.testing.expect(passRowsFallback("4096", true, 121 * gib) == null); // a Spark: runs
+    try std.testing.expect(passRowsFallback("4096", false, 64 * gib) == null); // the operator set 4096: theirs
+    try std.testing.expect(passRowsFallback("8192", true, 64 * gib) == null); // not the default's value
     try std.testing.expect(passRowsFallback("2048", true, 64 * gib) == null);
     try std.testing.expect(passRowsFallback(null, true, 64 * gib) == null);
 }
 
+    const v = std.mem.indexOf(u8, body, "speed_defaults.verdict(why orelse").?;
     const refused = std.mem.indexOf(u8, body[v..], "return error.StaggerRefused;").?;
     const warn = std.mem.indexOf(u8, body[v..], "std.log.warn(\"TF_DS_ROCI_STAGGER: off:").?;
     try std.testing.expect(refuse < refused and refused < warn and warn < off); // the refusal is the operator's branch, the fallback the other
@@ -2664,6 +2934,7 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
 }
 
 test "the four-way drafter's mismatch between ranks still refuses, naming the cause and the way out" {
+    try std.testing.expect(std.mem.indexOf(u8, src, "the ranks' kits differ: give every Spark the same kit, or set TF_DS_DRAFT_4WAY=0") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "set TF_DS_DRAFT_MAIN_4WAY=0 on every Spark") != null);
 }
     }

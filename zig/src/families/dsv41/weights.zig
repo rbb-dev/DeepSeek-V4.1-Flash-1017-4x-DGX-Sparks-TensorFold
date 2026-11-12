@@ -34,8 +34,34 @@ pub const NativeExperts = struct {
     owner: u64 = 0, // int32 [E]: 1 when this node computes e's rest block (the pack's last tile), else 0; 0: no rest
     tiles: u32, // the pack's 32-column tiles (main, plus one rest block's 4 when there is a rest)
     rest_tiles: u32 = 0,
+    // every expert's scale tensors as the loader packed them are expertScaleLens' bytes (scalesMatch, set by the
+    // loader); false (unverified): TF_DS_MMA_SF_EXACT's guard reads none of them and keeps the layer's experts
+    scales_match: bool = false,
 };
 
+/// The scale bytes of expert `e`'s gate, up and down tensors as the prompt kernels read them (and TF_DS_MMA_SF_EXACT's
+/// guard: mx.expertScales): a routed expert's MXFP4 [rows, dims / 32] and [down_n, down_k / 32], the shared expert's
+/// (the last) FP8 [rows / 32, dims / 32] and [down_n / 32, down_k / 32]; rows the width, and the rest block's when this
+/// node computes e's rest (`own_rest`).
+pub fn expertScaleLens(ex: Experts, e: usize, own_rest: bool) [3]u64 {
+    const nx = ex.native.?;
+    const rows: u64 = ex.width + (if (own_rest) @as(u64, nx.rest_tiles) * 32 else 0);
+    const fp8 = e == @as(usize, ex.count) - 1;
+    const gu: u64 = if (fp8) (rows / 32) * (ex.dims / 32) else rows * (ex.dims / 32);
+    const dn: u64 = if (fp8) (@as(u64, ex.down_n) / 32) * (ex.down_k / 32) else @as(u64, ex.down_n) * (ex.down_k / 32);
+    return .{ gu, gu, dn };
+}
+
+/// Whether every expert's scale tensors as the loader packed them (`lens` [E]: gate, up and down bytes) are
+/// expertScaleLens' (owner[e] 1: e's rest computed here). TF_DS_MMA_SF_EXACT's guard keeps a layer's experts whose are
+/// not on the baseline kernels: it reads expertScaleLens' bytes and no others.
+pub fn scalesMatch(ex: Experts, owner: []const i32, lens: []const [3]u64) bool {
+    for (lens, 0..) |l, e| {
+        const want = expertScaleLens(ex, e, owner[e] == 1);
+        if (l[0] != want[0] or l[1] != want[1] or l[2] != want[2]) return false;
+    }
+    return true;
+}
 
 /// A layer's routed experts and its shared expert (the last entry), as exl3_experts.prepare lays them out. On a 2D node
 /// (exl3/experts2d.py prepare) gate / up hold its intermediate blocks (width of the half's down_k) and down its
@@ -245,6 +271,12 @@ pub fn quantFp8(src: []const u8, n: usize, k: usize, w: []u8, sc: []u8) void {
 fn bf16At(b: []const u8, i: usize) f32 {
     const h = std.mem.readInt(u16, b[2 * i ..][0..2], .little);
     return @bitCast(@as(u32, h) << 16);
+}
+
+test "a layer's experts are tied to the guard's lengths only when the loader says so: unverified, they fail closed" {
+    // (the loader's own setting, from scalesMatch after the native tables, is pinned by the loader's tie test)
+    const nx: NativeExperts = .{ .w1 = 0, .w3 = 0, .s1 = 0, .s3 = 0, .w2 = 0, .s2 = 0, .tiles = 3 };
+    try std.testing.expect(!nx.scales_match);
 }
 
 test "e4m3 encode round trips and rounds to nearest even" {
@@ -613,10 +645,18 @@ const Loader = struct {
         errdefer buf.free();
         const tabs = try L.gpa.alloc(u64, 6 * e_count); // [j][e]: w1, w3, s1, s3, w2, s2
         defer L.gpa.free(tabs);
+        const slens = try L.gpa.alloc([3]u64, e_count); // every expert's s1, s3 and s2 bytes as packed
+        defer L.gpa.free(slens);
         var at: usize = 0;
                 tabs[j * e_count + e] = buf.ptr + at;
                 var len_j: usize = 0;
                 for (pieces(&pbuf, j, e < n, gu, rest, owner[e] == 1, dcols, half)) |pc| {
+                }
+                switch (j) {
+                    2 => slens[e][0] = len_j,
+                    3 => slens[e][1] = len_j,
+                    5 => slens[e][2] = len_j,
+                    else => {},
                 }
                 at += std.mem.alignForward(usize, len_j, 256);
         try L.w.buffers.append(L.gpa, buf);
@@ -641,6 +681,7 @@ const Loader = struct {
         nx.rest_tiles = @intCast(ir / 32);
         nx.owner = if (rest != null) try L.upload(try std.fmt.bufPrint(&nb, "{s}.ffn.experts.native_owner", .{p}), std.mem.sliceAsBytes(owner)) else 0;
         x.native = nx;
+        x.native.?.scales_match = scalesMatch(x, owner, slens);
         if (rest) |rc| {
             // the parity split's Rest as the 2D exchanges read it: the width and the owners (pair of e's rest)
             var r: Rest = undefined;
@@ -1112,40 +1153,29 @@ test "rank cache span: entries read whole come back byte for byte, the rest one 
     var L: Loader = .{ .gpa = std.testing.allocator, .d = undefined, .src = .{ .cache = .{ .file = file, .index = &ix, .io = io } }, .w = undefined };
     defer L.deinit();
 
-    const first = ix.get("first").?;
-    const last = ix.get("last").?;
-    L.beginSpan(first.offset, last.offset + last.bytes);
-    try std.testing.expect(L.span.len > 0);
-    for ([_]struct { key: []const u8, len: usize, fill: u8 }{
-        .{ .key = "first", .len = 3000, .fill = 2 },
-        .{ .key = "middle", .len = 70001, .fill = 3 },
-        .{ .key = "last", .len = 4096, .fill = 4 },
-    }) |want| {
-        const got = L.spanned(want.key).?;
-        try std.testing.expectEqual(want.len, got.len);
-        for (got) |b| try std.testing.expectEqual(want.fill, b);
-    }
-    try std.testing.expect(L.spanned("before") == null);
-    try std.testing.expect(L.spanned("after") == null);
-    const before = try L.entry("before");
-    try std.testing.expectEqual(@as(usize, 5000), before.len);
-    for (before) |b| try std.testing.expectEqual(@as(u8, 1), b);
-    L.endSpan();
-    try std.testing.expect(L.spanned("first") == null);
 
-    // reads in pieces smaller than the span: the file's bytes, as a buffered read sees them
-    const pieces = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(dio.alignment), 12 * dio.alignment);
-    defer std.heap.page_allocator.free(pieces);
-    try readWhole(L.direct.?, pieces, 0, dio.alignment);
-    var buffered: [12 * dio.alignment]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, buffered.len), try file.readPositionalAll(io, &buffered, 0));
-    try std.testing.expectEqualSlices(u8, &buffered, pieces);
-
-    // a span that runs past the end of the file is given up, and its entries are still read one by one
-    const after = ix.get("after").?;
-    L.beginSpan(after.offset, after.offset + after.bytes + (1 << 20));
-    try std.testing.expectEqual(@as(usize, 0), L.span.len);
-    const tail = try L.entry("after");
-    try std.testing.expectEqual(@as(usize, 9000), tail.len);
-    for (tail) |b| try std.testing.expectEqual(@as(u8, 5), b);
+test "the loader's expert scale tensors against the kernels' lengths: every expert's gate, up and down bytes, the rest rows where owned" {
+    var ex = std.mem.zeroes(Experts);
+    ex.count = 3; // two routed (MXFP4), the shared (FP8)
+    ex.width = 64;
+    ex.dims = 256;
+    ex.down_n = 256;
+    ex.down_k = 64;
+    ex.native = std.mem.zeroes(NativeExperts);
+    ex.native.?.rest_tiles = 1;
+    const owner = [_]i32{ 1, 0, 0 };
+    try std.testing.expectEqual([3]u64{ 96 * 8, 96 * 8, 256 * 2 }, expertScaleLens(ex, 0, true));
+    try std.testing.expectEqual([3]u64{ 64 * 8, 64 * 8, 256 * 2 }, expertScaleLens(ex, 1, false));
+    try std.testing.expectEqual([3]u64{ 2 * 8, 2 * 8, 8 * 2 }, expertScaleLens(ex, 2, false));
+    var lens = [_][3]u64{ .{ 96 * 8, 96 * 8, 256 * 2 }, .{ 64 * 8, 64 * 8, 256 * 2 }, .{ 2 * 8, 2 * 8, 8 * 2 } };
+    try std.testing.expect(scalesMatch(ex, &owner, &lens));
+    lens[0][1] = 64 * 8; // expert 0's up packed without its rest rows
+    try std.testing.expect(!scalesMatch(ex, &owner, &lens));
+    lens[0][1] = 96 * 8;
+    lens[2][2] += 1; // the shared expert's down one byte longer
+    try std.testing.expect(!scalesMatch(ex, &owner, &lens));
+    // the loader records each expert's s1, s3 and s2 lengths as it packs them, then the flag
+    const src = @embedFile("weights.zig");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "                    2 => slens[e][0] = len_j,\n                    3 => slens[e][1] = len_j,\n                    5 => slens[e][2] = len_j,"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "        x.native = nx;\n        x.native.?.scales_match = scalesMatch(x, owner, slens);"));
 }

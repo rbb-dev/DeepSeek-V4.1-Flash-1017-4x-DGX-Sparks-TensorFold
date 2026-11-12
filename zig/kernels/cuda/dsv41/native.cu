@@ -1286,6 +1286,9 @@ template <int BM_, int BN_, int WGM_, int WGN_, int NWT_, int FMT_, int KBS_, in
 struct Cfg {
     static constexpr int BM = BM_, BN = BN_, WGM = WGM_, WGN = WGN_, NWT = NWT_, FMT = FMT_, KBS = KBS_, STAGES = STAGES_;
     static constexpr bool SWZ = SWZ_ != 0;  // rows unpadded, their 16-byte pieces XOR-swizzled (else padded rows)
+    // SWZ_ 2: the 64-byte FP8 rows' four pieces swizzled by the row pair (r >> 1) & 3, so ldmatrix's eight rows of one
+    // piece land on eight distinct 16-byte bank groups (SWZ_ 1's swizzle puts rows r and r + 4 on the same one)
+    static constexpr bool LDSM = SWZ_ == 2;
     static constexpr int WM = BM / WGM, WN = BN / WGN, MT = WM / 16, NT = WN / 8;
     static constexpr int SA = KBS * 32 + (SWZ ? 0 : 32);
     static constexpr int SB = FMT ? KBS * 16 + (SWZ ? 0 : 16) : KBS * 32 + (SWZ ? 0 : 32);
@@ -1298,11 +1301,13 @@ struct Cfg {
     static_assert(WM % 16 == 0 && WN % 8 == 0, "warp tile");
     static_assert(FMT == 0 || KBS == 4, "MXFP4 scales stage as one 4-byte word a column");
     static_assert(KBS == 2 || KBS == 4, "stage");
+    static_assert(!LDSM || (KBS == 2 && FMT == 0 && (WN / 8) % 2 == 0), "the ldmatrix layout: FP8 weights, 2 K blocks a stage, n8 tiles in pairs");
     // a byte row's 16-byte piece c of row r: where it sits. 8-byte fragment rows (activations, FP8 weights: a half
     // warp reads rows r..r+3, two pieces each) and 4-byte ones (MXFP4: a warp reads rows r..r+7, one piece each) land
     // on distinct banks.
     __device__ static __forceinline__ int pa(int r, int c) {
         if (!SWZ) return c;
+        if (LDSM) return c ^ ((r >> 1) & 3);
         return KBS == 4 ? c ^ ((r & 3) << 1) : c ^ (((r >> 1) & 1) << 1);
     }
     __device__ static __forceinline__ int pb(int r, int c) {

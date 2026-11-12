@@ -1,0 +1,2 @@
+        std.debug.print("tf-dsv41-quant-gemv-bench: the decode tensor-core kernels are off (TF_DS_DECODE_DEC=0): the baseline chain is not the GEMV's\n", .{});
+        std.debug.print("quant-gemv-bench: the prototype's outputs are the baseline bytes in every cell\n", .{});
