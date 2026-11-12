@@ -102,6 +102,8 @@ pub fn readWorkerEnv() void {
     prompt.readAheadPassEnv(); // TF_DS_ENGRAM_AHEAD_PASS (its start line printed here, once)
     prompt.readWaitEnv(); // TF_DS_ENGRAM_WAIT_US
 }
+/// The settings table and the engine.cfg reader, which every rank runs (the followers call it from lanes_main).
+pub const cfg_settings = engine_api.settings;
 /// The KV pool's vote and ledger (core/kv_pool.zig), where the followers' flags parse their numbers.
 pub const kv_pool = engine_api.kv_pool;
 pub const live_config = engine_api.live_config;
@@ -1314,6 +1316,7 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         .pf_raster = prompt2d.pf_raster_asked,
         .pass_rows = prompt2d.pass_rows_asked,
         .pass_from = prompt2d.pass_from_asked,
+        .cfg = engine_api.settings.cfgDigest(),
     };
 }
 
@@ -1942,6 +1945,7 @@ pub const Model = struct {
     pair_t0: ?cuda.Event = null, // timing events: the pair's first queued work on stream A, and its second pass's last (pair_join)
     keep_ahead: bool = false, // TF_DS_ENGRAM_KEEP_AHEAD in effect: a round between chunks leaves the Engram worker running (keep_ahead.zig)
     keep_ahead_start: bool = false, // what the start gave it (a live `unset` returns to it)
+    graph_cap_start: usize = 0, // TF_DS_GRAPH_CAP at the start (a live `unset` returns to it)
     keep_ahead_able: bool = false, // the start verified it can run (an Engram worker, its own reader rings, no shared scratch): a live change may turn it on
     pair_log: bool = false, // TF_DS_ROCI_PAIR_LOG: one line a pair (a value starting with / also appends them to that file on rank 0)
     pair_gap: usize = roci_pair.gap,
@@ -2691,8 +2695,10 @@ pub const Model = struct {
         errdefer if (m.dr) |*dr| dr.deinit();
         errdefer if (m.pgraphs) |*g| g.deinit();
         errdefer if (m.graphs) |*g| g.deinit();
+        m.graph_cap_start = o.graph_cap; // (top level: open sets every defaulted field itself)
         if (o.graphs) {
             m.graphs = round.Graphs.init(gpa, o.graph_cap);
+            live_config.setAble(.graph_cap, true);
             m.graphs.?.lazy.fallbacks = &m.graph_fallbacks;
         }
         if (o.side) try m.rd.useSide(&m.eng);
@@ -3472,6 +3478,7 @@ pub const Model = struct {
     pub fn cfgStart(m: *const Model, slot: u8) u32 {
         return switch (slot) {
             @backingInt(live_config.Slot.keep_ahead) => @intFromBool(m.keep_ahead_start),
+            @backingInt(live_config.Slot.graph_cap) => @intCast(@min(m.graph_cap_start, std.math.maxInt(u32) - 1)),
             @backingInt(live_config.Slot.kv_free_target) => m.kv_start_target_mib,
             else => live_config.cfg_unset,
         };
@@ -3480,7 +3487,21 @@ pub const Model = struct {
     /// A cfg frame's changes on this rank, between two frames (rank 0 after it sent them, a follower when it read them): the same
     /// values on every rank by construction (rank 0 resolved `unset`, the frames are in order). A rank that could not take a
     /// value keeps what it has and says so; the Engram read-ahead is joined by the caller when the frame says it is touched.
+    pub fn applyCfg(m: *Model, version: u64, items: []const live_config.CfgItem) !void {
         for (items) |it| switch (it.slot) {
+            @backingInt(live_config.Slot.graph_cap) => {
+                const g = &(m.graphs orelse {
+                    std.log.warn("TF_DS_GRAPH_CAP: rank {d} runs no CUDA graphs: a cap changes nothing (cfg version {d})", .{ m.rank, version });
+                    continue;
+                });
+                const cap: usize = it.value;
+                if (cap == g.lru.cap) continue;
+                // lowering past what is kept destroys graphs: the device idle first, so no launch of one is still running (rank 0 at the
+                // loop top and a follower in its main loop have issued everything the earlier frames asked for; every rank waits for it)
+                if (cap != 0 and g.count() > cap) try m.ctx.synchronize();
+                std.log.info("TF_DS_GRAPH_CAP is now {d} on rank {d} (cfg version {d})", .{ cap, m.rank, version });
+                _ = g.setCap(cap);
+            },
             @backingInt(live_config.Slot.keep_ahead) => {
                 const want = it.value != 0 and it.value != live_config.cfg_unset;
                 if (want and !m.keep_ahead_able) {
@@ -6169,21 +6190,52 @@ test "a cfg frame's keep-ahead: on only where the start verified it can run, off
     m.keep_ahead_able = false;
     const slot = @backingInt(live_config.Slot.keep_ahead);
     // a rank that could not run it keeps it off (the start's check is the only thing that turns it on)
+    try m.applyCfg(1, &.{.{ .slot = slot, .value = 1 }});
     try std.testing.expect(!m.keep_ahead);
     m.keep_ahead_able = true;
+    try m.applyCfg(2, &.{.{ .slot = slot, .value = 1 }});
     try std.testing.expect(m.keep_ahead);
+    try m.applyCfg(3, &.{.{ .slot = slot, .value = 0 }});
     try std.testing.expect(!m.keep_ahead);
     // `unset` is resolved by rank 0 from its start's value before it travels; a rank never reads the marker as "on"
     try std.testing.expectEqual(@as(u32, 0), m.cfgStart(slot));
     m.keep_ahead_start = true;
     try std.testing.expectEqual(@as(u32, 1), m.cfgStart(slot));
+    try m.applyCfg(4, &.{.{ .slot = slot, .value = live_config.cfg_unset }});
     try std.testing.expect(!m.keep_ahead);
     // a slot this build does not know changes nothing
+    try m.applyCfg(5, &.{.{ .slot = 200, .value = 1 }});
     try std.testing.expect(!m.keep_ahead);
     // off stays possible when the start could not have turned it on (a start that asked, then a live off, then a live on again)
     m.keep_ahead_able = false;
     m.keep_ahead = true;
+    try m.applyCfg(6, &.{.{ .slot = slot, .value = 0 }});
     try std.testing.expect(!m.keep_ahead);
+}
+
+test "a cfg frame's graph cap: a new cap on the cache (0: all), unset is the start's, no graphs is no change; lowering synchronizes the device before it destroys" {
+    const gpa = std.testing.allocator;
+    var m: Model = undefined;
+    m.rank = 1;
+    m.graphs = null;
+    const slot = @backingInt(live_config.Slot.graph_cap);
+    try m.applyCfg(1, &.{.{ .slot = slot, .value = 64 }}); // no graphs on this rank: said, nothing changes
+    m.graphs = round.Graphs.init(gpa, 128);
+    defer m.graphs.?.deinit();
+    m.graph_cap_start = 128;
+    try m.applyCfg(2, &.{.{ .slot = slot, .value = 64 }});
+    try std.testing.expectEqual(@as(usize, 64), m.graphs.?.lru.cap);
+    try m.applyCfg(3, &.{.{ .slot = slot, .value = 0 }});
+    try std.testing.expectEqual(@as(usize, 0), m.graphs.?.lru.cap);
+    // rank 0 resolves `unset` before it travels: the start's cap
+    try std.testing.expectEqual(@as(u32, 128), m.cfgStart(slot));
+    try m.applyCfg(4, &.{.{ .slot = slot, .value = m.cfgStart(slot) }});
+    try std.testing.expectEqual(@as(usize, 128), m.graphs.?.lru.cap);
+    // the destroying path: the device is idle first, then the cache gives up its oldest (graph_cache's test holds the order)
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "@backingInt(live_config.Slot.graph_cap) => {\n                const g = &(m.graphs orelse").?;
+    const body = src[at..][0..1400];
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (cap != 0 and g.count() > cap) try m.ctx.synchronize();").? < std.mem.indexOf(u8, body, "_ = g.setCap(cap);").?);
 }
 
 test "TF_DS_RING_WAIT's fallback to the proxy threads is for the default only: unset without the kernels or libmlx5 says why, 1 is left to Ring.create to refuse by name" {
@@ -6429,6 +6481,7 @@ test "TF_DS_ENGRAM_PARTNER and TF_DS_ENGRAM_KEEP_AHEAD: a failed precondition fa
     const src = @embedFile("model.zig");
     // the partner split: the refusal is the operator's branch, the warning and the cleared flag the default's, and no lane is opened before either
     const at = std.mem.indexOf(u8, src, "fn openPartner(").?;
+    const body = src[at..][0..4000];
     const v = std.mem.indexOf(u8, body, "speed_defaults.verdict(why orelse").?;
     const refuse = std.mem.indexOf(u8, body[v..], ".refuse => {").?;
     const refused = std.mem.indexOf(u8, body[v..], "return error.PartnerRefused;").?;
@@ -6438,6 +6491,7 @@ test "TF_DS_ENGRAM_PARTNER and TF_DS_ENGRAM_KEEP_AHEAD: a failed precondition fa
     try std.testing.expect(std.mem.indexOf(u8, body, "openLane(").? > v + cleared);
     // keep-ahead: the shared reader pool refuses only a switch the operator set
     const ka = std.mem.indexOf(u8, src, "fn useKeepAhead(").?;
+    const kb = src[ka..][0..2500];
     const kv = std.mem.indexOf(u8, kb, "speed_defaults.verdict(why, speed_defaults.defaulted(\"TF_DS_ENGRAM_KEEP_AHEAD\")) == .fallback").?;
     const kwarn = std.mem.indexOf(u8, kb[kv..], "std.log.warn(\"TF_DS_ENGRAM_KEEP_AHEAD: rank").?;
     const kerr = std.mem.indexOf(u8, kb[kv..], "return error.KeepAheadSharesReader;").?;
@@ -6458,6 +6512,7 @@ test "TF_DS_ENGRAM_PARTNER and TF_DS_ENGRAM_KEEP_AHEAD: a failed precondition fa
 test "TF_DS_ROCI_STAGGER: a failed precondition falls back with one warning when it is the default and refuses by name when the operator set it" {
     const src = @embedFile("model.zig");
     const at = std.mem.indexOf(u8, src, "fn openPair(").?;
+    const body = src[at..][0..6000];
     const v = std.mem.indexOf(u8, body, "speed_defaults.verdict(why orelse").?;
     const refuse = std.mem.indexOf(u8, body[v..], ".refuse => {").?;
     const refused = std.mem.indexOf(u8, body[v..], "return error.StaggerRefused;").?;

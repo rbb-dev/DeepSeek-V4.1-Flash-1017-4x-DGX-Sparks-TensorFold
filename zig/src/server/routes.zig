@@ -13,6 +13,7 @@ const systemone = @import("systemone.zig");
 const status = @import("status_routes.zig");
 const admin = @import("admin.zig");
 const admin_requests = @import("admin_requests.zig");
+const request_policy = @import("request_policy.zig");
 const memory = @import("memory_routes.zig");
 const slide = @import("slide.zig");
 const recall = @import("recall_routes.zig");
@@ -21,6 +22,10 @@ const slide_forget = @import("slide_forget.zig");
 const Server = @import("server.zig").Server;
 const Conn = http_conn.Conn;
 const Allocator = std.mem.Allocator;
+
+fn headerOf(conn: *Conn, name: []const u8) ?[]const u8 {
+    return conn.header(name);
+}
 
 /// DELETE's per-fact route: the fact's id follows it.
 const fact_path = "/v1/slide/fact/";
@@ -32,6 +37,9 @@ pub fn dispatch(srv: *Server, conn: *Conn, a: Allocator) void {
     // with it
     admin_requests.context = .{ .label = conn.key_label orelse "unauthenticated", .route = auth.routePath(conn.path) };
     defer admin_requests.context = .{};
+    // the per-request fields carried as headers (request_policy.zig): read only where a policy file is configured
+    if (srv.policy.path != null) request_policy.carried = request_policy.fromHeaders(conn, headerOf);
+    defer request_policy.carried = .{};
     const m = conn.method;
     // a GET or DELETE that carries a body leaves it in the socket for the next request on a kept connection
     if (std.mem.eql(u8, m, "GET")) {

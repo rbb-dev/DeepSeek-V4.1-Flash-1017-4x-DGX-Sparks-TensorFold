@@ -2009,6 +2009,11 @@ pub const Lanes = struct {
 
     /// Backend.live_cfg: settings of class A changed live, at the host's loop top. Every rank applies them between the same two frames:
     /// rank 0 sends one cfg frame (kind 16: version, flags, then slot and value of each change, `unset` already the start's) and applies
+    /// them itself. Nothing here touches the Engram worker: stopping it (joinAhead) ends it at the next (chunk, layer) step it reaches,
+    /// and each step it has taken is one split read with the column partner (engram_partner.splitRead), so a stop at the moment each rank
+    /// happens to apply a frame would leave the partners with different counts of exchanges (11-09 step 7 on the Sparks: ROCI failed, class
+    /// rech). The flag only changes where the NEXT rounds join the worker, which every rank already does at the same frames (a verify,
+    /// a pass or a head_whole frame, and rank 0's own round between chunks).
     fn liveCfg(ptr: *anyopaque, version: u64, items: []const lanes.backend.CfgItem) anyerror!void {
         const self = of(ptr);
         const m = self.m;
@@ -2017,11 +2022,14 @@ pub const Lanes = struct {
         m.kv_live_floor = held.end;
         m.kv_live_loading = held.loading; // (a live resize of the KV pool never goes under what a stream or a kept state holds)
         var resolved: [live_config.CfgFrame.max_items]live_config.CfgItem = undefined;
+        const flags: u8 = 0; // (reserved)
+        for (items, 0..) |it, i| resolved[i] = .{ .slot = it.slot, .value = if (it.value == live_config.cfg_unset) m.cfgStart(it.slot) else it.value };
         if (try self.begin(.cfg)) {
             var body: [live_config.CfgFrame.head_len + 5 * live_config.CfgFrame.max_items]u8 = undefined;
             try self.wire.buf.appendSlice(self.gpa, try live_config.CfgFrame.encode(&body, version, flags, resolved[0..items.len]));
             try self.flush();
         }
+        try m.applyCfg(version, resolved[0..items.len]);
     }
 
     /// The end of the highest extent a stream or a kept state holds in the pool (a stale state's room is free).
@@ -2609,6 +2617,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model, mirror: ?*FollowMirror) !void {
                 const d = try live_config.CfgFrame.decode(r.rest());
                 var items: [live_config.CfgFrame.max_items]live_config.CfgItem = undefined;
                 for (0..d.n) |i| items[i] = live_config.CfgFrame.item(d, i);
+                try m.applyCfg(d.version, items[0..d.n]);
             },
             .rdma_idle => {
                 try m.ctx.synchronize();
@@ -3616,6 +3625,7 @@ test "a cfg frame is kind 16 behind the frame header, reads back whole, and its 
     try w.begin(gpa, .cfg, 41);
     var body: [live_config.CfgFrame.head_len + 5 * live_config.CfgFrame.max_items]u8 = undefined;
     const items = [_]live_config.CfgItem{.{ .slot = @backingInt(live_config.Slot.keep_ahead), .value = 1 }};
+    try w.buf.appendSlice(gpa, try live_config.CfgFrame.encode(&body, 9, 0, &items));
     var r: Reader = .{ .b = w.buf.items };
     try std.testing.expectEqual(@as(u8, 16), try r.int(u8));
     try std.testing.expectEqual(@as(u64, 41), try r.int(u64));
@@ -3624,17 +3634,22 @@ test "a cfg frame is kind 16 behind the frame header, reads back whole, and its 
     try std.testing.expectEqual(items[0], live_config.CfgFrame.item(d, 0));
     // the frame with its header is one send() of the link (frames up to 2,048 bytes are written whole)
     try std.testing.expect(w.buf.items.len <= 2048);
+    // the sender's order: the frame is flushed before rank 0 applies; and neither side ever stops the Engram worker for a cfg frame (step 7's Spark failure)
     const code = @embedFile("lanes.zig");
     const at = std.mem.indexOf(u8, code, "fn liveCfg(ptr: *anyopaque").?;
     const end = std.mem.indexOfPos(u8, code, at, "/// One snap_sync frame").?;
     const f = code[at..end];
     const begin = std.mem.indexOf(u8, f, "if (try self.begin(.cfg)) {").?;
     const flush = std.mem.indexOf(u8, f, "try self.flush();").?;
+    const apply = std.mem.indexOf(u8, f, "try m.applyCfg(version, resolved[0..items.len]);").?;
     try std.testing.expect(begin < flush and flush < apply);
+    try std.testing.expect(std.mem.indexOf(u8, f, "joinAhead();") == null and std.mem.indexOf(u8, f, "fill_seq") == null);
     // the follower: the frame joins the worker only on the flag, then applies; and the backend offers it
     const fol = std.mem.indexOf(u8, code, ".cfg => {\n                const d = try live_config.CfgFrame.decode(r.rest());").?;
     const fend = std.mem.indexOfPos(u8, code, fol, ".rdma_idle => {").?;
     const fb = code[fol..fend];
+    try std.testing.expect(std.mem.indexOf(u8, fb, "try m.applyCfg(d.version, items[0..d.n]);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fb, "joinAhead") == null and std.mem.indexOf(u8, fb, "fill_seq") == null);
     try std.testing.expect(std.mem.indexOf(u8, code, "v.live_cfg = liveCfg;") != null);
     // a cfg frame is no round's: no RDMA wake is asked for it
     try std.testing.expect(!usesRdma(.cfg));

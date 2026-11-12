@@ -1183,6 +1183,8 @@ function drawTray() {
   const n = T.staged.size;
   const items = [...T.staged.values()].map(({ o, value }) => `${o.label || o.name}: ${valueWord(o, currentOf(o))} → ${value === 'unset' ? 'default (' + defaultText(o) + ')' : valueWord(o, value)}`);
   const cfg = !!(S.config && S.config.engine_cfg);
+  const persist = h('input', { type: 'checkbox', id: 'persist', disabled: !cfg });
+  persist.checked = cfg && (T.persist == null ? true : T.persist);
   persist.addEventListener('change', () => { T.persist = persist.checked; });
   const reason = h('input', { type: 'text', maxlength: '200', placeholder: 'Why (kept in the history)', 'aria-label': 'Reason', value: T.reason });
   reason.addEventListener('input', () => { T.reason = reason.value; });
@@ -1225,6 +1227,7 @@ async function applyStaged() {
     const r = await api('set', '', { method: 'POST', body: JSON.stringify(req) });
     if (r.ok) {
       const pend = r.body.outcome === 'pending';
+      T.staged.clear(); T.sheet = null; T.reverts = null; T.reason = '';
       T.outcome = h('p', { class: pend ? 'dim' : 'okc', role: 'status', text: (r.body.noop ? 'No change: the engine already stands there.' : `Version ${r.body.config_version}: ` + r.body.changes.map((c) => `${(S.byName.get(c.name) || {}).label || c.name} ${c.state.replace(/_/g, ' ')}`).join(', ')) + (pend ? ' (waiting for the engine to take it)' : '') });
       await reloadConfig();
     } else {
@@ -1359,6 +1362,8 @@ function activityPage() {
       clear(reqBody).append(...(rec.length ? rec.map((x) => h('tr', { class: 'num' },
         h('td', { class: 'num' }, when(x.end_ms)), cell(x.key_label, 'mono'), cell(x.endpoint, 'mono dim'), cell(fmt(x.prompt_tokens)), cell(fmt(x.cached_tokens || 0), 'num r dim'), cell(fmt(x.generated_tokens)),
         cell(one.format(none(x.ttft_s) ? 0 : x.ttft_s) + ' s'), cell(fmt(x.decode_tps) + ' tok/s'), cell(endWord[x.finish] || String(x.finish).replace(/_/g, ' '), 'dim'))) : [h('tr', {}, h('td', { colspan: 9, class: 'dim', text: 'No request has finished yet.' }))]));
+    } catch (e) { /* the status poll shows the outage */ }
+  }
   const access = { admin: ['Full control', 'Reads everything and may change settings.'], agent: ['Limited changes', 'May change the settings its profile allows.'], read: ['Read only', 'Reads status; changes nothing.'] };
   async function pullKeys() {
     if (!alive || document.hidden || !names.has('keys') || S.scope !== 'admin') { if (S.scope !== 'admin') clear(keysList).append(h('p', { class: 'dim', text: 'Keys are listed to admin keys only.' })); return; }

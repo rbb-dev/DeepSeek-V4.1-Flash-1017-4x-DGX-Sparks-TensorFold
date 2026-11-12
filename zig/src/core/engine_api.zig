@@ -671,6 +671,7 @@ pub const Spill = struct {
         return t[0..@min(t.len, 64)];
     }
 
+    pub fn ioPrio(t: []const u8) ?IoPrio {
         if (std.mem.eql(u8, t, "idle")) return .{ .class = .idle, .level = 0 };
         if (std.mem.eql(u8, t, "none")) return .{ .class = .none, .level = 0 };
         if (!std.mem.startsWith(u8, t, "be/") or t.len != 4 or t[3] < '0' or t[3] > '7') return null;
@@ -1047,6 +1048,12 @@ pub const recall_store = lanes.recall_store;
 /// The idle keepalive's ticker and target contract.
 pub const keepalive = @import("keepalive.zig");
 
+/// Every setting the engine reads, and the engine.cfg reader (settings.zig).
+pub const settings = @import("settings.zig");
+
+/// engine.history.jsonl: the record of every change to the settings (settings_history.zig).
+pub const settings_history = @import("settings_history.zig");
+
 /// Rewriting engine.cfg for a persisted change (cfg_write.zig).
 pub const cfg_write = @import("cfg_write.zig");
 
@@ -1077,6 +1084,10 @@ test {
     _ = @import("spill_settings_test.zig");
     _ = @import("prompt_imprint.zig");
     _ = @import("keepalive.zig");
+    _ = @import("settings.zig");
+    _ = @import("settings_test.zig");
+    _ = @import("settings_history.zig");
+    _ = @import("settings_history_test.zig");
     _ = @import("kv_pool.zig");
     _ = @import("peer_mem.zig");
     _ = @import("kv_pool_test.zig");

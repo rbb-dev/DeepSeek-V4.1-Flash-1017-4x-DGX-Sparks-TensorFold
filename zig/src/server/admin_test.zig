@@ -56,14 +56,22 @@ const Engine = struct {
     watch: ?*server.Server = null,
     seen_live: u32 = 0,
     seen: ?[]u8 = null,
+    /// A held engine takes a request and says nothing until it is cancelled (then it ends the request cancelled).
+    hold: bool = false,
+    held: ?struct { id: api.Id, sink: api.Sink } = null,
     fn engine(e: *@This()) api.Engine {
         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
     }
     fn info(_: *anyopaque) api.Info {
         return .{ .context_window = 4096 };
     }
+    fn submit(ctx: *anyopaque, id: api.Id, _: *const api.Request, sink: api.Sink) api.SubmitError!void {
         const e: *@This() = @ptrCast(@alignCast(ctx));
         e.submits += 1;
+        if (e.hold) {
+            e.held = .{ .id = id, .sink = sink };
+            return;
+        }
         if (e.watch) |srv| {
             e.seen_live = srv.requests.liveCount(std.testing.io);
             var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -77,6 +85,11 @@ const Engine = struct {
     fn cancel(ctx: *anyopaque, _: api.Id) void {
         const e: *@This() = @ptrCast(@alignCast(ctx));
         e.cancels += 1;
+        if (e.held) |h| {
+            e.held = null;
+            const ev: api.Event = .{ .finished = .{ .reason = .cancelled } };
+            h.sink.event(h.sink.ctx, h.id, &ev);
+        }
     }
     fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
         out.* = .{ .healthy = true };
@@ -387,11 +400,17 @@ test "/routes lists only what the key's scope may call, with each route's method
         defer r.free();
         const rows = (try json.parse(arena.allocator(), r.body)).ok.get("routes").?.array;
         try std.testing.expect(rows.len > 0 and rows.len < all.len);
+        var has_validate = false;
         for (rows) |row| {
             const path = row.get("path").?.string;
             try std.testing.expect(!std.mem.endsWith(u8, path, "/keys") and !std.mem.endsWith(u8, path, "/logs") and !std.mem.endsWith(u8, path, "/keys/reload"));
             if (std.mem.endsWith(u8, path, "/validate") or std.mem.endsWith(u8, path, "/set")) {
+                has_validate = true;
+                try std.testing.expectEqualStrings("agent", row.get("scope").?.string);
+            } else try std.testing.expectEqualStrings("read", row.get("scope").?.string);
         }
+        // the dry run is the agent's and the admin's, not a reader's
+        try std.testing.expectEqual(h.ptr == bearer_agent.ptr, has_validate);
     }
 }
 
@@ -1414,26 +1433,448 @@ test "with polls logged, an answered admin read prints its line under the key's 
     defer r.free();
     try std.testing.expect(std.mem.indexOf(u8, captured.written(), "\"GET /admin/api/v1/status HTTP/1.1\" 200 - key=agent-night") != null);
 }
+
+// ---- step 3: validate, history, the config's sources, the schema's new fields
+
+fn say(a: std.mem.Allocator, comptime fmt: []const u8, args: anytype) []const u8 {
+    return std.fmt.allocPrint(a, fmt, args) catch @panic("oom");
+}
+
+fn q(a: std.mem.Allocator, text: []const u8) []const u8 {
+    return json.quote(a, text, .{}) catch @panic("oom");
+}
+
+fn postJson(rig: *Rig, path: []const u8, comptime head: []const u8, body: []const u8) !Reply {
+    return exchange(rig.srv, "POST", path, head ++ json_head, body);
+}
+
+/// The text a test sends for a number, the way a person would write it.
+fn num(a: std.mem.Allocator, x: f64) []const u8 {
+    if (x == @floor(x) and @abs(x) < 1e15) return say(a, "{d}", .{@as(i64, @intFromFloat(x))});
+    return say(a, "{d}", .{x});
+}
+
+/// Values worth asking of a row: each edge of its range and one past it, empty, a control character, a non-number, `unset`.
+fn candidates(a: std.mem.Allocator, o: *const settings.Option) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    try out.appendSlice(a, &.{ "", "a\x01b", "not-a-number", "unset" });
+    switch (o.kind) {
+        .flag => try out.appendSlice(a, &.{ "0", "1", "2" }),
+        .int, .float => {
+            if (o.min) |lo| try out.appendSlice(a, &.{ num(a, lo), num(a, lo - 1) });
+            if (o.max) |hi| try out.appendSlice(a, &.{ num(a, hi), num(a, hi + 1) });
+            if (o.min == null and o.max == null) try out.append(a, "7");
+            if (o.kind == .float) try out.append(a, "inf");
+        },
+        .choice => {
+            for (o.values) |v| try out.append(a, v);
+            try out.append(a, "a-value-that-is-not-a-choice");
+        },
+        .text => try out.append(a, "some text"),
+    }
+    return out.items;
+}
+
+test "validate says what settings.check says, for every visible row and every edge of its range" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open(null, admin_keys_file);
+    defer rig.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
     // the pool (TF_DS_WINDOW) and the free target may not be named together, so the pool's row is asked in a group of its own
     var checked: usize = 0;
     var buf: [400]u8 = undefined;
     for ([_]u8{ 0, 1, 2 }) |group| {
+        var rows: std.ArrayList(*const settings.Option) = .empty;
+        var cands: std.ArrayList([]const []const u8) = .empty;
+        var most: usize = 0;
+        for (&settings.options) |*o| {
+            if (o.hidden or o.secret) continue;
+            // the rows whose value the host holds to, each against the others, have their own test
+            if (o.id == 106 or o.id == 119 or o.id == 120 or o.id == 121 or o.id == 450 or o.id == 453) continue;
             if ((@as(u8, if (o.id == 504) 1 else if (o.id == 122) 2 else 0)) != group) continue;
+            try rows.append(a, o);
+            const c = try candidates(a, o);
+            try cands.append(a, c);
+            most = @max(most, c.len);
+        }
         try std.testing.expect(group != 0 or rows.items.len > 200);
+        for (0..most) |k| {
+            var body: std.ArrayList(u8) = .empty;
+            try body.appendSlice(a, "{\"set\": {");
+            var n: usize = 0;
+            for (rows.items, cands.items) |o, c| {
+                if (k >= c.len) continue;
+                if (n > 0) try body.appendSlice(a, ", ");
+                n += 1;
+                try body.print(a, "{s}: {s}", .{ q(a, o.name), q(a, c[k]) });
+            }
+            try body.appendSlice(a, "}}");
+            try std.testing.expect(body.items.len < 65536);
+            const r = try postJson(&rig, base("validate"), bearer, body.items);
+            defer r.free();
+            try std.testing.expectEqual(@as(u16, 200), r.status);
+            const doc = (try json.parse(a, r.body)).ok;
+            const refused = doc.get("refused").?.array;
+            const resolved = doc.get("resolved").?.array;
+            for (rows.items, cands.items) |o, c| {
+                if (k >= c.len) continue;
+                checked += 1;
+                const want: ?settings.Refused = if (std.mem.eql(u8, c[k], "unset")) null else settings.check(o, c[k], &buf);
+                var got: ?json.Value = null;
+                for (refused) |x| if (std.mem.eql(u8, json.strOr(x.get("name")), o.name)) {
+                    got = x;
+                };
+                var in_resolved = false;
+                for (resolved) |x| if (std.mem.eql(u8, json.strOr(x.get("name")), o.name)) {
+                    in_resolved = true;
+                };
+                if (want) |w| {
+                    try std.testing.expect(got != null);
+                    try std.testing.expect(!in_resolved);
                     // the pool below the context has its own name; every other code is settings.check's
                     const code: []const u8 = if (o.id == 504 and w.code == .below_minimum) "pool_below_window" else @tagName(w.code);
                     try std.testing.expectEqualStrings(code, got.?.get("code").?.string);
+                    try std.testing.expectEqualStrings(w.message, got.?.get("message").?.string); // settings.check's text, verbatim
+                    try std.testing.expectEqualStrings(c[k], got.?.get("value").?.string);
+                } else {
+                    try std.testing.expect(got == null);
+                    try std.testing.expect(in_resolved);
+                }
+            }
+            try std.testing.expectEqual(refused.len == 0, doc.get("ok").?.bool);
+        }
     }
+    try std.testing.expect(checked > 1500);
+    try std.testing.expectEqual(@as(u32, 0), rig.engine.submits);
+    try std.testing.expectEqual(@as(u32, 0), rig.engine.cancels);
+}
+
+fn firstRefused(a: std.mem.Allocator, body: []const u8) !json.Value {
+    const doc = (try json.parse(a, body)).ok;
+    try std.testing.expect(!doc.get("ok").?.bool);
+    const r = doc.get("refused").?.array;
+    try std.testing.expectEqual(@as(usize, 1), r.len);
+    return r[0];
+}
+
+test "validate: a retired name, a key, a hidden row and a name that does not exist are each refused by their own code, and a hidden row looks like an absent one" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open(null, admin_keys_file);
+    defer rig.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gone = settings.retired[0];
+    const r1 = try postJson(&rig, base("validate"), bearer, say(a, "{{\"set\": {{{s}: \"1\"}}}}", .{q(a, gone.env)}));
+    defer r1.free();
+    const x1 = try firstRefused(a, r1.body);
+    try std.testing.expectEqualStrings("retired_option", x1.get("code").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, x1.get("message").?.string, gone.why) != null); // the row's why, verbatim
+    try std.testing.expect(x1.get("id").? == .null);
+
+    const r2 = try postJson(&rig, base("validate"), bearer, "{\"set\": {\"tensorfold_api_key\": \"sk-canary-secret-value\"}}");
+    defer r2.free();
+    try std.testing.expectEqualStrings("secret_not_settable", (try firstRefused(a, r2.body)).get("code").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, r2.body, "sk-canary-secret-value") == null); // a key is never echoed
+
+    // hidden rows by name and by id answer exactly as a name that is nowhere
+    var shapes: [5][]const u8 = undefined;
+    const keys = [_][]const u8{ "\"tensorfold_admin_key_file\"", "\"668\"", "\"tf_ds_clock_marks\"", "\"454\"", "\"no_such_option_at_all\"" };
+    for (keys, &shapes) |k, *shape| {
+        const r = try postJson(&rig, base("validate"), bearer, say(a, "{{\"set\": {{{s}: \"1\"}}}}", .{k}));
+        defer r.free();
+        const x = try firstRefused(a, r.body);
+        try std.testing.expectEqualStrings("unknown_option", x.get("code").?.string);
+        try std.testing.expect(x.get("id").? == .null);
+        shape.* = say(a, "{s}|{s}", .{ x.get("code").?.string, if (std.mem.indexOf(u8, x.get("message").?.string, "unknown option") != null) "unknown option" else x.get("message").?.string });
+    }
+    for (shapes[1..]) |sh| try std.testing.expectEqualStrings(shapes[0], sh);
+    try std.testing.expectEqual(@as(u32, 0), rig.engine.submits);
+}
+
+test "validate: an agent key asking for a row it may not set is told so inside a 200; a read key is refused with a 403; no key is the 404" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open(null, admin_keys_file);
+    defer rig.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = "{\"set\": {\"tf_ds_rounds_beside\": 3}}";
+    const ok_admin = try postJson(&rig, base("validate"), bearer, body);
+    defer ok_admin.free();
+    try std.testing.expect((try json.parse(a, ok_admin.body)).ok.get("ok").?.bool);
+    const agent = try postJson(&rig, base("validate"), bearer_agent, body);
+    defer agent.free();
+    try std.testing.expectEqual(@as(u16, 200), agent.status);
+    try std.testing.expectEqualStrings("not_permitted_for_agent", (try firstRefused(a, agent.body)).get("code").?.string);
+    const read = try postJson(&rig, base("validate"), bearer_read, body);
+    defer read.free();
+    try std.testing.expectEqual(@as(u16, 403), read.status);
+    try std.testing.expect(std.mem.indexOf(u8, read.body, "scope_denied") != null);
+    const other = try postJson(&rig, base("validate"), bearer_other, body); // a label that names no scope reads
+    defer other.free();
+    try std.testing.expectEqual(@as(u16, 403), other.status);
+    const none = try postJson(&rig, base("validate"), "", body);
+    defer none.free();
+    try std.testing.expectEqual(@as(u16, 404), none.status);
+    const get = try request(rig.srv, "GET", base("validate"), bearer);
+    defer get.free();
+    try std.testing.expectEqual(@as(u16, 404), get.status);
+    try std.testing.expectEqual(@as(u32, 0), rig.engine.submits);
+    try std.testing.expectEqual(@as(u32, 0), rig.engine.cancels);
+}
+
+test "agentCheck: an agent's value must be inside the row's agent bounds and its lease no longer than the row allows" {
+    var o = settings.byId(122).?.*;
+    o.who = &.{ .admin, .agent };
+    o.min = 1;
+    o.max = 8;
+    o.agent = .{ .min = 2, .max = 4, .max_ttl_s = 3600 };
+    var buf: [200]u8 = undefined;
+    try std.testing.expect(admin.agentCheck(&o, "3", 600, &buf) == null);
+    try std.testing.expect(admin.agentCheck(&o, "4", 3600, &buf) == null);
+    try std.testing.expectEqualStrings("outside_agent_range", admin.agentCheck(&o, "5", null, &buf).?.code);
+    try std.testing.expectEqualStrings("outside_agent_range", admin.agentCheck(&o, "1", null, &buf).?.code);
+    try std.testing.expectEqualStrings("ttl_too_long", admin.agentCheck(&o, "3", 3601, &buf).?.code);
+    // an `out_changes` row is the admin's whatever it says
+    o.out_changes = true;
+    try std.testing.expectEqualStrings("not_permitted_for_agent", admin.agentCheck(&o, "3", null, &buf).?.code);
+    // and a row with no agent in who is
+    o.out_changes = false;
+    o.who = &.{.admin};
+    try std.testing.expectEqualStrings("not_permitted_for_agent", admin.agentCheck(&o, "3", null, &buf).?.code);
+}
+
+test "requires: a row is flagged when a condition on another option does not hold, the request's own values counting" {
+    const Look = struct {
+        pub fn value(_: @This(), name: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "alpha")) return "1";
+            return null;
+        }
+    };
+    try std.testing.expect(admin.requiresUnmet(&.{"alpha=1"}, Look{}) == null);
+    try std.testing.expectEqualStrings("alpha=2", admin.requiresUnmet(&.{ "alpha=1", "alpha=2" }, Look{}).?);
+    try std.testing.expectEqualStrings("beta=1", admin.requiresUnmet(&.{"beta=1"}, Look{}).?); // unknown: not met
+    try std.testing.expect(admin.requiresUnmet(&.{}, Look{}) == null);
+}
+
+test "validate: values are canonical text, and a request that is badly shaped is a 400 with a name" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open(null, admin_keys_file);
+    defer rig.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ok = try postJson(&rig, base("validate"), bearer, "{\"set\": {\"tf_ds_rounds_beside\": 3, \"TF_DS_SPILL_READERS\": 8.0, \"443\": null}, \"apply\": \"auto\"}");
+    defer ok.free();
+    const doc = (try json.parse(a, ok.body)).ok;
+    try std.testing.expect(doc.get("ok").?.bool);
+    const res = doc.get("resolved").?.array;
+    try std.testing.expectEqual(@as(usize, 3), res.len);
+    for (res) |x| {
+        const name = x.get("name").?.string;
+        if (std.mem.eql(u8, name, "tf_ds_rounds_beside")) try std.testing.expectEqualStrings("3", x.get("to").?.string);
+        if (std.mem.eql(u8, name, "tf_ds_spill_readers")) try std.testing.expectEqualStrings("8", x.get("to").?.string);
+        if (std.mem.eql(u8, name, "tf_ds_spill_smalls")) try std.testing.expect(x.get("to").? == .null); // null leaves it to the engine
         // a row with a live hook (the rounds beside) is taken at the next loop turn; every other row waits for the next start
         const hooked = std.mem.eql(u8, name, "tf_ds_rounds_beside");
         try std.testing.expectEqual(!hooked, x.get("needs_restart").?.bool);
         try std.testing.expectEqualStrings(if (hooked) "live" else "next_start", x.get("apply_mode").?.string);
         try std.testing.expectEqualStrings(if (hooked) "active" else "pending_restart", x.get("state_would_be").?.string);
+    }
+    try std.testing.expectEqualStrings("next_start", doc.get("effective_mode").?.string);
     var idle_off = false;
     for (doc.get("modes").?.array) |m| if (std.mem.eql(u8, m.get("mode").?.string, "idle")) {
         idle_off = !m.get("available").?.bool and m.get("why").?.string.len > 0; // there is no class I apply on this engine
+    };
     try std.testing.expect(idle_off);
+    try std.testing.expect(doc.get("derived") == null); // the pool arrives with its own step
+    var flag_row: ?*const settings.Option = null;
+    for (&settings.options) |*o| if (o.kind == .flag and !o.hidden and !o.secret) {
+        flag_row = o;
+        break;
+    };
+    const f = try postJson(&rig, base("validate"), bearer, say(a, "{{\"set\": {{{s}: true}}}}", .{q(a, flag_row.?.name)}));
+    defer f.free();
+    try std.testing.expectEqualStrings("1", (try json.parse(a, f.body)).ok.get("resolved").?.array[0].get("to").?.string);
+
+    const Bad = struct { body: []const u8, status: u16, code: []const u8 };
+    const bad = [_]Bad{
+        .{ .body = "{nope", .status = 400, .code = "bad_json" },
+        .{ .body = "[1]", .status = 400, .code = "bad_json" },
+        .{ .body = "{}", .status = 400, .code = "missing_field" },
+        .{ .body = "{\"set\": {}}", .status = 400, .code = "missing_field" },
+        .{ .body = "{\"set\": [1]}", .status = 400, .code = "bad_json" },
+        .{ .body = "{\"set\": {\"tf_ds_rounds_beside\": [1]}}", .status = 400, .code = "bad_json" },
+        .{ .body = "{\"set\": {\"tf_ds_rounds_beside\": 1}, \"reason\": \"x\"}", .status = 400, .code = "unknown_field" },
+        .{ .body = "{\"set\": {\"tf_ds_rounds_beside\": 1}, \"apply\": \"sometime\"}", .status = 400, .code = "invalid_apply_mode" },
         .{ .body = "{\"set\": {\"tf_ds_rounds_beside\": 1}, \"apply\": \"idle\"}", .status = 400, .code = "apply_not_supported" },
+        .{ .body = "{\"set\": {\"tf_ds_rounds_beside\": 1}, \"apply\": \"now\"}", .status = 400, .code = "apply_not_supported" },
+        .{ .body = "{\"set\": {\"tf_ds_rounds_beside\": 1, \"122\": 2}}", .status = 400, .code = "duplicate_option" },
+        .{ .body = "{\"set\": {\"tf_ds_rounds_beside\": 1}, \"ttl_s\": 0}", .status = 400, .code = "bad_json" },
+    };
+    for (bad) |b| {
+        const r = try postJson(&rig, base("validate"), bearer, b.body);
+        defer r.free();
+        try std.testing.expectEqual(b.status, r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, b.code) != null);
+    }
+    const ct = try exchange(rig.srv, "POST", base("validate"), bearer ++ "Content-Type: text/plain\r\n", "{}");
+    defer ct.free();
+    try std.testing.expectEqual(@as(u16, 415), ct.status);
+    try std.testing.expectEqual(@as(u32, 0), rig.engine.submits);
+}
+
+test "/history: the rows newest first, with filters and paging; a hidden row's change is left out; with no engine.cfg it is an empty view that says why" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open(null, admin_keys_file);
+    defer rig.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const none = try request(rig.srv, "GET", base("history"), bearer_read);
+    defer none.free();
+    try std.testing.expect(std.mem.indexOf(u8, none.body, "\"rows\": []") != null);
+    try std.testing.expect(std.mem.indexOf(u8, none.body, "\"note\"") != null);
+
+    const saved = api.settings_history.path;
+    defer api.settings_history.path = saved;
+    const file = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/engine.history.jsonl", .{rig.tmp.sub_path});
+    api.settings_history.path = file;
+    const row1 = "{\"version\":1,\"at_ms\":1794000000000,\"label\":\"cli\",\"outcome\":\"imported\",\"changes\":[{\"id\":122,\"name\":\"tf_ds_rounds_beside\",\"from\":null,\"to\":\"3\"}]}\n";
+    const row2 = "{\"version\":2,\"at_ms\":1794000100000,\"label\":\"admin\",\"outcome\":\"applied\",\"changes\":[{\"id\":668,\"name\":\"tensorfold_admin_key_file\",\"from\":null,\"to\":\"/secret/path\"},{\"id\":122,\"name\":\"tf_ds_rounds_beside\",\"from\":\"3\",\"to\":\"5\"}]}\n";
+    const row3 = "{\"version\":3,\"at_ms\":1794000200000,\"label\":\"admin\",\"outcome\":\"rejected\",\"changes\":[]}\n";
+    try rig.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "engine.history.jsonl", .data = row1 ++ row2 ++ "not json\n" ++ row3 });
+    const all = try request(rig.srv, "GET", base("history"), bearer_read);
+    defer all.free();
+    try std.testing.expectEqual(@as(u16, 200), all.status);
+    const doc = (try json.parse(a, all.body)).ok;
+    const rows = doc.get("rows").?.array;
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    try std.testing.expectEqualStrings("3", rows[0].get("version").?.int);
+    try std.testing.expectEqualStrings("1", rows[2].get("version").?.int);
+    try std.testing.expect(std.mem.indexOf(u8, rows[0].get("at").?.string, "2026-") != null); // the RFC 3339 time is added on read
+    try std.testing.expect(std.mem.indexOf(u8, all.body, "/secret/path") == null);
+    try std.testing.expect(std.mem.indexOf(u8, all.body, "tensorfold_admin_key_file") == null);
+    try std.testing.expectEqual(@as(usize, 1), rows[1].get("changes").?.array.len);
+    try std.testing.expectEqualStrings("1", doc.get("damaged").?.int);
+    const page = try request(rig.srv, "GET", base("history?limit=1&before_version=3"), bearer_read);
+    defer page.free();
+    const pd = (try json.parse(a, page.body)).ok;
+    try std.testing.expectEqual(@as(usize, 1), pd.get("rows").?.array.len);
+    try std.testing.expectEqualStrings("2", pd.get("rows").?.array[0].get("version").?.int);
+    try std.testing.expectEqualStrings("2", pd.get("next_before_version").?.int);
+    const last = try request(rig.srv, "GET", base("history?before_version=2"), bearer_read);
+    defer last.free();
+    try std.testing.expect(std.mem.indexOf(u8, last.body, "\"next_before_version\": null") != null);
+    const by = try request(rig.srv, "GET", base("history?outcome=imported"), bearer_read);
+    defer by.free();
+    try std.testing.expectEqual(@as(usize, 1), (try json.parse(a, by.body)).ok.get("rows").?.array.len);
+    const byname = try request(rig.srv, "GET", base("history?name=tf_ds_rounds_beside"), bearer_read);
+    defer byname.free();
+    try std.testing.expectEqual(@as(usize, 2), (try json.parse(a, byname.body)).ok.get("rows").?.array.len);
+    const bylabel = try request(rig.srv, "GET", base("history?label=admin"), bearer_read);
+    defer bylabel.free();
+    try std.testing.expectEqual(@as(usize, 2), (try json.parse(a, bylabel.body)).ok.get("rows").?.array.len);
+}
+
+test "/config says where each value came from, what it replaced, and the file's counts; /status carries the config version" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open(null, admin_keys_file);
+    defer rig.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const smalls = settings.indexOf(settings.byEnv("TF_DS_SPILL_SMALLS").?);
+    const dbg = settings.indexOf(settings.byId(917).?);
+    const saved = .{ settings.resolved[smalls], settings.resolved[dbg], settings.report, api.settings_history.version.load(.acquire) };
+    defer {
+        settings.resolved[smalls] = saved[0];
+        settings.resolved[dbg] = saved[1];
+        settings.report = saved[2];
+        api.settings_history.version.store(saved[3], .release);
+    }
+    settings.resolved[smalls] = .{ .source = .cfg, .value = "5", .other_source = .env, .other = "9" };
+    settings.resolved[dbg] = .{ .source = .env, .value = "0", .other_source = .cfg, .other = "1" };
+    settings.report = .{ .path = "/x/engine.cfg", .applied = 1, .cfg_won = 1, .env_won = 1 };
+    api.settings_history.version.store(7, .release);
+    const r = try request(rig.srv, "GET", base("config"), bearer_read);
+    defer r.free();
+    const doc = (try json.parse(a, r.body)).ok;
+    try std.testing.expectEqualStrings("7", doc.get("config_version").?.int);
+    try std.testing.expectEqualStrings("7", doc.get("active_version").?.int);
+    const cfg = doc.get("engine_cfg").?;
+    try std.testing.expectEqualStrings("1", cfg.get("cfg_won").?.int);
+    try std.testing.expectEqualStrings("1", cfg.get("environment_won").?.int);
+    var saw_smalls = false;
+    for (doc.get("values").?.array) |v| {
+        if (std.mem.eql(u8, v.get("name").?.string, "tf_ds_spill_smalls")) {
+            saw_smalls = true;
+            try std.testing.expectEqualStrings("cfg", v.get("source").?.string);
+            try std.testing.expectEqualStrings("env", v.get("other").?.get("source").?.string);
+            try std.testing.expectEqualStrings("9", v.get("other").?.get("value").?.string);
+            try std.testing.expectEqualStrings("active", v.get("state").?.string);
+            try std.testing.expect(v.get("requested").? == .null);
+        } else try std.testing.expect(v.get("other").? == .null);
+    }
+    try std.testing.expect(saw_smalls);
+    // hidden: the debug row is not in /config at all (it is the environment's, for one run)
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "tf_round_log") == null);
+    const st = try request(rig.srv, "GET", base("status"), bearer_read);
+    defer st.free();
+    const sd = (try json.parse(a, st.body)).ok;
+    const c = sd.get("config").?;
+    try std.testing.expectEqualStrings("7", c.get("config_version").?.int);
+    try std.testing.expectEqualStrings("7", c.get("active_version").?.int);
+    try std.testing.expectEqual(@as(usize, 0), c.get("pending").?.array.len);
+}
+
+test "/schema carries the new fields: tabs in order, the classes' apply times (unmeasured, never a guess), env_override, out_changes, now_ok, agent, requires, cost" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open(null, admin_keys_file);
+    defer rig.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const r = try request(rig.srv, "GET", base("schema"), bearer_read);
+    defer r.free();
+    const doc = (try json.parse(a, r.body)).ok;
+    const tabs = doc.get("tabs").?.array;
+    try std.testing.expectEqual(settings.tabs.len, tabs.len);
+    try std.testing.expectEqualStrings("Generation", tabs[0].get("name").?.string);
+    try std.testing.expect(tabs[0].get("about").?.string.len > 0);
+    const classes = doc.get("apply_classes").?.object;
+    for (classes.keys(), classes.values()) |k, v| {
+        try std.testing.expect(v.get("text").?.string.len > 0);
+        const t = v.get("apply_time").?;
+        try std.testing.expect(t.get("value_s").? == .null); // no probe has run
+        try std.testing.expectEqualStrings("unmeasured", t.get("label").?.string);
+        try std.testing.expectEqual(!(std.mem.eql(u8, k, "R") or std.mem.eql(u8, k, "P")), v.get("now_ok").?.bool);
+    }
+    var seen: usize = 0;
+    for (doc.get("options").?.array) |o| {
+        const row = settings.byId(@intCast(std.fmt.parseInt(u32, o.get("id").?.int, 10) catch unreachable)).?;
+        try std.testing.expectEqual(row.env_override, o.get("env_override").?.bool);
+        try std.testing.expectEqual(row.out_changes, o.get("out_changes").?.bool);
+        try std.testing.expectEqual(row.now_ok, o.get("now_ok").?.bool);
+        try std.testing.expectEqual(live_config_for_test.isWired(row.id), o.get("live").?.bool);
+        try std.testing.expect(o.get("agent").? == .null);
+        try std.testing.expect(o.get("requires").? == .array and o.get("cost").? == .array);
+        // every option a page can show carries a human name and a plain description, served as the table holds them
+        try std.testing.expectEqualStrings(row.label, o.get("label").?.string);
+        try std.testing.expectEqualStrings(row.doc, o.get("doc").?.string);
+        try std.testing.expect(row.label.len > 0 and row.label.len <= 40 and std.mem.indexOfScalar(u8, row.label, '_') == null);
+        try std.testing.expect(row.doc.len > 0 and std.mem.indexOf(u8, row.doc, row.env) == null);
+        // an option shows its real default: a value, or the words for one the engine computes
+        try std.testing.expectEqualStrings(row.default_text, o.get("default_text").?.string);
+        try std.testing.expect(row.default.len > 0 or row.default_text.len > 0);
+        if (row.id == 504) try std.testing.expect(!o.get("now_ok").?.bool);
+        seen += 1;
+    }
+    try std.testing.expect(seen > 200);
+}
 
 // ---- step 4: the ledger, the pool and what a dry run says of it
 
@@ -2035,6 +2476,232 @@ test "revert: the plan that undoes a history row or returns to a version applies
     try std.testing.expectEqual(@as(u16, 403), agent.status);
 }
 
+test "set: the active value, not engine.cfg's, decides what is no change; a live set with persist false leaves the file and the answer shows both" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open(null, admin_keys_file);
+    defer rig.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = try Writable.open(&rig, "schema 1\n");
+    defer w.restore();
+    var seen: u64 = 0;
+    var vals: [live.slot_count]u64 = undefined;
+    const rounds = @backingInt(live.Slot.rounds_beside);
+    const Run = struct {
+        fn set(r: *Rig, al: std.mem.Allocator, body: []const u8) !json.Value {
+            const reply = try setBody(r, body);
+            defer reply.free();
+            try std.testing.expectEqual(@as(u16, 200), reply.status);
+            return (try json.parse(al, try al.dupe(u8, reply.body))).ok;
+        }
+    };
+    // 1. 8, kept in the file; the host takes it
+    const first = try Run.set(&rig, a, "{\"set\": {\"tf_ds_rounds_beside\": 8}, \"wait_ms\": 0}");
+    try std.testing.expect(!first.get("noop").?.bool);
+    try std.testing.expect(live.block.turn(&seen, &vals));
+    try std.testing.expectEqual(@as(u64, 8), vals[rounds]);
+    // 2. 6 live only: the engine runs 6, the file keeps 8
+    const second = try Run.set(&rig, a, "{\"set\": {\"tf_ds_rounds_beside\": 6}, \"persist\": false, \"wait_ms\": 0}");
+    try std.testing.expect(!second.get("noop").?.bool);
+    try std.testing.expectEqualStrings("8", second.get("changes").?.array[0].get("from").?.string); // what the engine ran
+    try std.testing.expect(live.block.turn(&seen, &vals));
+    try std.testing.expectEqual(@as(u64, 6), vals[rounds]);
+    try std.testing.expectEqualStrings("schema 1\ntf_ds_rounds_beside = 8\n", try w.cfgText(a));
+    // 3. 8 live only: the engine runs 6, so this is a change; it was judged against the file's 8 before and dropped
+    const before_version = api.settings_history.version.load(.acquire);
+    const third = try Run.set(&rig, a, "{\"set\": {\"tf_ds_rounds_beside\": 8}, \"persist\": false, \"wait_ms\": 0}");
+    try std.testing.expect(!third.get("noop").?.bool);
+    try std.testing.expectEqual(before_version + 1, api.settings_history.version.load(.acquire));
+    const ch = third.get("changes").?.array[0];
+    try std.testing.expectEqualStrings("6", ch.get("from").?.string); // the engine ran 6
+    try std.testing.expectEqualStrings("8", ch.get("from_file").?.string); // and the file held 8
+    try std.testing.expect(live.block.turn(&seen, &vals));
+    try std.testing.expectEqual(@as(u64, 8), vals[rounds]); // published and taken
+    // the same again: the engine runs 8 and nothing is asked of the file: no change
+    const again = try Run.set(&rig, a, "{\"set\": {\"tf_ds_rounds_beside\": 8}, \"persist\": false, \"wait_ms\": 0}");
+    try std.testing.expect(again.get("noop").?.bool);
+    // the storm: 6 and 8 alternately, every one a change, every one a row and a publication
+    var last = api.settings_history.version.load(.acquire);
+    for (0..10) |i| {
+        const v: []const u8 = if (i % 2 == 0) "6" else "8";
+        const body = try std.fmt.allocPrint(a, "{{\"set\": {{\"tf_ds_rounds_beside\": {s}}}, \"persist\": false, \"wait_ms\": 0, \"reason\": \"storm\"}}", .{v});
+        const r = try Run.set(&rig, a, body);
+        try std.testing.expect(!r.get("noop").?.bool);
+        try std.testing.expectEqual(last + 1, api.settings_history.version.load(.acquire));
+        last += 1;
+        try std.testing.expect(live.block.turn(&seen, &vals));
+        try std.testing.expectEqual(try std.fmt.parseInt(u64, v, 10), vals[rounds]);
+        const row = r.get("changes").?.array[0].get("from").?.string;
+        try std.testing.expectEqualStrings(if (i % 2 == 0) "8" else "6", row);
+    }
+    // persist true after persist false: the engine runs 8 (last storm set), the file holds 8: set 6 with persist writes the file
+    const keep = try Run.set(&rig, a, "{\"set\": {\"tf_ds_rounds_beside\": 6}, \"wait_ms\": 0}");
+    try std.testing.expect(!keep.get("noop").?.bool);
+    try std.testing.expectEqualStrings("schema 1\ntf_ds_rounds_beside = 6\n", try w.cfgText(a));
+    // the engine runs 6 from that set; now a live-only 7, then persisted 7: the engine already runs 7 but the file holds 6: a change to the file
+    _ = live.block.turn(&seen, &vals);
+    _ = try Run.set(&rig, a, "{\"set\": {\"tf_ds_rounds_beside\": 7}, \"persist\": false, \"wait_ms\": 0}");
+    _ = live.block.turn(&seen, &vals);
+    const filed = try Run.set(&rig, a, "{\"set\": {\"tf_ds_rounds_beside\": 7}, \"wait_ms\": 0}");
+    try std.testing.expect(!filed.get("noop").?.bool);
+    try std.testing.expectEqualStrings("schema 1\ntf_ds_rounds_beside = 7\n", try w.cfgText(a));
+    const done = try Run.set(&rig, a, "{\"set\": {\"tf_ds_rounds_beside\": 7}, \"wait_ms\": 0}");
+    try std.testing.expect(done.get("noop").?.bool);
+    // every row of a persist-false change is in the history, and only the persisted ones are the file's replayed state
+    var rows_unpersisted: usize = 0;
+    for (try w.histLines(a)) |l| if (std.mem.indexOf(u8, l, "\"persisted\":false") != null) {
+        rows_unpersisted += 1;
+    };
+    try std.testing.expect(rows_unpersisted >= 12);
+}
+
+test "set: with no engine.cfg a live row is set with persist false, the history is kept in memory and says so, and nothing is a 500" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open(null, admin_keys_file);
+    defer rig.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = try Writable.open(&rig, "schema 1\n");
+    defer w.restore();
+    settings.report.path = "";
+    api.settings_history.path = "";
+    api.settings_history.resetMemory();
+    const r = try setBody(&rig, "{\"set\": {\"tf_ds_rounds_beside\": 5}, \"persist\": false, \"wait_ms\": 0, \"reason\": \"no file\"}");
+    defer r.free();
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    const d = (try json.parse(a, r.body)).ok;
+    try std.testing.expectEqualStrings("1", d.get("config_version").?.int);
+    var kept_note = false;
+    for (d.get("warnings").?.array) |x| if (std.mem.eql(u8, json.strOr(x.get("code")), "history_in_memory")) {
+        kept_note = true;
+    };
+    try std.testing.expect(kept_note);
+    const h = try request(rig.srv, "GET", base("history"), bearer_read);
+    defer h.free();
+    const hd = (try json.parse(a, h.body)).ok;
+    try std.testing.expectEqual(@as(usize, 1), hd.get("rows").?.array.len);
+    try std.testing.expectEqualStrings("no file", hd.get("rows").?.array[0].get("reason").?.string);
+    try std.testing.expect(hd.get("memory_only").?.bool);
+    // the host takes it; a second change, and the revert plan reads the same rows
+    var seen: u64 = 0;
+    var vals: [live.slot_count]u64 = undefined;
+    try std.testing.expect(live.block.turn(&seen, &vals));
+    const r2 = try setBody(&rig, "{\"set\": {\"tf_ds_rounds_beside\": 7}, \"persist\": false, \"wait_ms\": 0}");
+    r2.free();
+    const rv = try exchange(rig.srv, "POST", base("revert"), bearer ++ json_head, "{\"history_version\": 2}");
+    defer rv.free();
+    try std.testing.expectEqual(@as(u16, 200), rv.status);
+    try std.testing.expectEqualStrings("5", (try json.parse(a, rv.body)).ok.get("plan").?.get("set").?.get("tf_ds_rounds_beside").?.string);
+    // persist (the default) with no file is still a named refusal, not a 500
+    const p = try setBody(&rig, "{\"set\": {\"tf_ds_rounds_beside\": 3}}");
+    defer p.free();
+    try std.testing.expectEqual(@as(u16, 422), p.status);
+    api.settings_history.resetMemory();
+}
+
+test "/config says what the values mean now that a change can be live" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const c = try admin.config(arena.allocator());
+    const text = json.strOr(c.get("active_means"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "nothing changes while it runs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "live change") != null);
+}
+
+fn turnOnce(seen: *u64) !api.live_config.Snapshot {
+    var snap: api.live_config.Snapshot = undefined;
+    try std.testing.expect(live.block.turnAll(seen, &snap));
+    return snap;
+}
+
+test "set: the share, the step rows, the tier's timings and the prompt-step order are live: each reaches the host's block whole, and the rules the host holds are refused first" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open(null, admin_keys_file);
+    defer rig.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = try Writable.open(&rig, "schema 1\n");
+    defer w.restore();
+    var seen: u64 = 0;
+    const slotv = struct {
+        fn at(sn: api.live_config.Snapshot, sl: live.Slot) u64 {
+            return sn.vals[@backingInt(sl)];
+        }
+    }.at;
+    const Run = struct {
+        fn go(r: *Rig, al: std.mem.Allocator, body: []const u8) !Reply {
+            _ = al;
+            return setBody(r, body);
+        }
+    };
+    // the share
+    const r1 = try Run.go(&rig, a, "{\"set\": {\"tensorfold_prefill_share\": 0.5}, \"wait_ms\": 0}");
+    defer r1.free();
+    try std.testing.expectEqual(@as(u16, 200), r1.status);
+    const s1 = try turnOnce(&seen);
+    try std.testing.expectEqual(@as(f64, 0.5), @as(f64, @bitCast(slotv(s1, .prefill_share))));
+    try std.testing.expectEqualStrings("live", (try json.parse(a, r1.body)).ok.get("changes").?.array[0].get("apply_mode").?.string);
+    // a count of rounds beside that share: refused (the host would refuse the pair at its start)
+    settings.resolved[settings.indexOf(settings.byEnv("TENSORFOLD_PREFILL_SHARE").?)] = .{ .source = .cfg, .value = "0.5" };
+    defer settings.resolved[settings.indexOf(settings.byEnv("TENSORFOLD_PREFILL_SHARE").?)] = .{};
+    const rc = try Run.go(&rig, a, "{\"set\": {\"tf_ds_rounds_beside\": 4}, \"wait_ms\": 0}");
+    defer rc.free();
+    try std.testing.expectEqual(@as(u16, 422), rc.status);
+        const bad = try Run.go(&rig, a, body);
+        defer bad.free();
+        try std.testing.expectEqual(@as(u16, 422), bad.status);
+        try std.testing.expect(std.mem.indexOf(u8, bad.body, code) != null);
+    }
+    const pass_ix = settings.indexOf(settings.byEnv("TF_DS_PASS_ROWS").?);
+    const saved_pass = settings.resolved[pass_ix];
+    defer settings.resolved[pass_ix] = saved_pass;
+    settings.resolved[pass_ix] = .{ .source = .cfg, .value = "8192" };
+    const r2 = try Run.go(&rig, a, "{\"set\": {\"tf_ds_pass_beside\": 4096}, \"wait_ms\": 0}");
+    defer r2.free();
+    try std.testing.expectEqual(@as(u16, 200), r2.status);
+    try std.testing.expectEqual(@as(u64, 4096), slotv(try turnOnce(&seen), .pass_beside));
+    // the tier's timings: staging's share may not pass the service's budget, and a pair that fits is taken together
+    const bad_pump = try Run.go(&rig, a, "{\"set\": {\"tf_spill_pump_ms\": 200}}");
+    defer bad_pump.free();
+    try std.testing.expectEqual(@as(u16, 422), bad_pump.status);
+    try std.testing.expect(std.mem.indexOf(u8, bad_pump.body, "conflicting_options") != null);
+    const r3 = try Run.go(&rig, a, "{\"set\": {\"tf_spill_load_ms\": 300, \"tf_spill_pump_ms\": 200, \"tf_spill_poll_ms\": 5}, \"wait_ms\": 0}");
+    defer r3.free();
+    try std.testing.expectEqual(@as(u16, 200), r3.status);
+    const s3 = try turnOnce(&seen);
+    try std.testing.expectEqual(@as(u64, 300), slotv(s3, .spill_load_ms));
+    try std.testing.expectEqual(@as(u64, 200), slotv(s3, .spill_pump_ms));
+    try std.testing.expectEqual(@as(u64, 5), slotv(s3, .spill_poll_ms));
+    // the order of prompt steps: one policy from its three rows
+    const bad_order = try Run.go(&rig, a, "{\"set\": {\"tf_ds_prompt_order\": \"seriel\"}}");
+    defer bad_order.free();
+    try std.testing.expectEqual(@as(u16, 422), bad_order.status);
+    try std.testing.expect(std.mem.indexOf(u8, bad_order.body, "not one of the choices") != null);
+    const bad_qos = try Run.go(&rig, a, "{\"set\": {\"tf_ds_prompt_qos\": \"garbage\"}}");
+    defer bad_qos.free();
+    try std.testing.expectEqual(@as(u16, 422), bad_qos.status);
+    const r4 = try Run.go(&rig, a, "{\"set\": {\"tf_ds_prompt_order\": \"turns\", \"tf_ds_prompt_max_wait_s\": 12}, \"wait_ms\": 0}");
+    defer r4.free();
+    try std.testing.expectEqual(@as(u16, 200), r4.status);
+    const s4 = try turnOnce(&seen);
+    try std.testing.expect(s4.fill != null and s4.fill.?.order == .turns and s4.fill.?.max_wait_s == 12);
+    // all three back to the engine's own: the start's order returns
+    const r5 = try Run.go(&rig, a, "{\"set\": {\"tf_ds_prompt_order\": null, \"tf_ds_prompt_max_wait_s\": null}, \"wait_ms\": 0}");
+    defer r5.free();
+    try std.testing.expectEqual(@as(u16, 200), r5.status);
+    try std.testing.expect((try turnOnce(&seen)).fill == null);
+    // every one of them is a row the page may call live
+    const sc = try request(rig.srv, "GET", base("schema"), bearer_read);
+    defer sc.free();
+    var live_rows: usize = 0;
+    for ((try json.parse(a, sc.body)).ok.get("options").?.array) |o| if (o.get("live").?.bool) {
+        live_rows += 1;
+    };
+}
+
 test "set: keep-ahead (class A) is live only where the engine can take it, then it is published for the host to send to every rank" {
     var rig: Rig = .{ .arena = undefined, .tmp = undefined };
     try rig.open(null, admin_keys_file);
@@ -2082,6 +2749,156 @@ test "set: keep-ahead (class A) is live only where the engine can take it, then 
     try std.testing.expectEqual(@as(u16, 200), un.status);
     try std.testing.expect(live.block.turn(&seen, &vals));
     try std.testing.expectEqual(live.unset, vals[@backingInt(live.Slot.keep_ahead)]);
+}
+
+// ---- step 8: the per-request fields, under the caps of the key's label (request_policy.zig) ----
+
+const shared_bearer = "Authorization: Bearer shared-key-1\r\n";
+
+/// Writes `text` as the policy file and loads it into the rig's server.
+fn loadPolicy(rig: *Rig, text: []const u8) !void {
+    try rig.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "admin-policy.json", .data = text });
+    const path = try std.fmt.allocPrint(rig.arena.allocator(), ".zig-cache/tmp/{s}/admin-policy.json", .{rig.tmp.sub_path});
+    rig.srv.policy.load(std.testing.io, path);
+}
+
+/// One chat request through the gate with `extra` headers and `body`; the engine (watching) refuses its submit, so what the admin
+/// surface showed of it is in `rig.engine.seen`.
+fn chatSeen(rig: *Rig, extra: []const u8, body: []const u8) !void {
+    if (rig.engine.seen) |s| std.testing.allocator.free(s);
+    rig.engine.seen = null;
+    const head = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}{s}", .{ shared_bearer, json_head, extra });
+    defer std.testing.allocator.free(head);
+    const r = try exchange(rig.srv, "POST", "/v1/chat/completions", head, body);
+    r.free();
+}
+
+const plain_chat = "{\"model\": \"m\", \"max_tokens\": 4, \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}]}";
+
+test "per-request fields: a header from a trusted label and a body tf from a batch-only label make the request background; elsewhere they are dropped and counted" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open("shared-key-1", admin_keys_file);
+    defer rig.close();
+    rig.engine.watch = rig.srv;
+    defer if (rig.engine.seen) |s| std.testing.allocator.free(s);
+    // no policy file: the field is not looked at
+    try chatSeen(&rig, "X-TF-Priority: batch\r\n", plain_chat);
+    try std.testing.expect(std.mem.indexOf(u8, rig.engine.seen.?, "\"priority\": \"foreground\"") != null);
+    try loadPolicy(&rig, "{\"request_caps\": {\"cli-1\": {\"headers\": true}}}");
+    try chatSeen(&rig, "X-TF-Priority: batch\r\n", plain_chat);
+    try std.testing.expect(std.mem.indexOf(u8, rig.engine.seen.?, "\"priority\": \"background\"") != null);
+    try chatSeen(&rig, "X-TF: pri=batch\r\n", plain_chat);
+    try std.testing.expect(std.mem.indexOf(u8, rig.engine.seen.?, "\"priority\": \"background\"") != null);
+    // the same label's body field, no header: its row allows it
+    try chatSeen(&rig, "", "{\"model\": \"m\", \"max_tokens\": 4, \"tf\": {\"pri\": \"batch\"}, \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}]}");
+    try std.testing.expect(std.mem.indexOf(u8, rig.engine.seen.?, "\"priority\": \"background\"") != null);
+    // a label whose row does not trust headers: the header is dropped
+    try loadPolicy(&rig, "{\"request_caps\": {\"cli-1\": {}}}");
+    try chatSeen(&rig, "X-TF-Priority: batch\r\n", plain_chat);
+    try std.testing.expect(std.mem.indexOf(u8, rig.engine.seen.?, "\"priority\": \"foreground\"") != null);
+    // the key is the policy: a batch-only label asking for nothing, or for normal, is background
+    try loadPolicy(&rig, "{\"request_caps\": {\"cli-1\": {\"batch_only\": true}}}");
+    try chatSeen(&rig, "", "{\"model\": \"m\", \"max_tokens\": 4, \"tf\": {\"pri\": \"normal\"}, \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}]}");
+    try std.testing.expect(std.mem.indexOf(u8, rig.engine.seen.?, "\"priority\": \"background\"") != null);
+    // a label with no row: the body field is dropped
+    try loadPolicy(&rig, "{\"request_caps\": {\"other\": {\"batch_only\": true}}}");
+    try chatSeen(&rig, "", "{\"model\": \"m\", \"max_tokens\": 4, \"tf\": {\"pri\": \"batch\"}, \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}]}");
+    try std.testing.expect(std.mem.indexOf(u8, rig.engine.seen.?, "\"priority\": \"foreground\"") != null);
+    // the counters, in /status and /policy: this label's last request dropped one field, and the earlier ones are in its row
+    const pol = try request(rig.srv, "GET", base("policy"), bearer_read);
+    defer pol.free();
+    try std.testing.expectEqual(@as(u16, 200), pol.status);
+    try std.testing.expect(std.mem.indexOf(u8, pol.body, "\"profiles\": []") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pol.body, "\"label\": \"other\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pol.body, "\"batch_only\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pol.body, "\"label\": \"cli-1\", \"requests\": ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pol.body, "\"label\": \"cli-1\", \"requests\": 6, \"applied\": 4, \"clamped\": 1, \"dropped\": 2") != null);
+    const st = try request(rig.srv, "GET", base("status"), bearer_read);
+    defer st.free();
+    try std.testing.expect(std.mem.indexOf(u8, st.body, "\"request_fields\": [{\"label\": \"cli-1\"") != null);
+}
+
+test "per-request fields: a bad policy file leaves no row, says why on /policy, and keys/reload rereads it" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open(null, admin_keys_file);
+    defer rig.close();
+    try loadPolicy(&rig, "{\"request_caps\": {\"gateway\": {\"speed\": 9}}}");
+    const bad = try request(rig.srv, "GET", base("policy"), bearer);
+    defer bad.free();
+    try std.testing.expect(std.mem.indexOf(u8, bad.body, "\"valid\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bad.body, "unknown field speed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bad.body, "\"request_caps\": []") != null);
+    try rig.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "admin-policy.json", .data = "{\"request_caps\": {\"gateway\": {\"headers\": true, \"wait_ms_max\": 5000}}}" });
+    const reload = try exchange(rig.srv, "POST", base("keys/reload"), bearer ++ json_head, "{}");
+    defer reload.free();
+    try std.testing.expectEqual(@as(u16, 200), reload.status);
+    try std.testing.expect(std.mem.indexOf(u8, reload.body, "\"policy\": {\"configured\": true, \"valid\": true, \"labels\": 1") != null);
+    const good = try request(rig.srv, "GET", base("policy"), bearer);
+    defer good.free();
+    try std.testing.expect(std.mem.indexOf(u8, good.body, "\"wait_ms_max\": 5000") != null);
+}
+
+test "per-request fields: a request that bound its wait gives up when the engine has not taken its prompt, and says 503" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open("shared-key-1", admin_keys_file);
+    defer rig.close();
+    rig.engine.hold = true;
+    try loadPolicy(&rig, "{\"request_caps\": {\"cli-1\": {\"wait_ms_max\": 150}}}");
+    // asked 60000, capped to 150: the held engine never takes the prompt
+    const r = try exchange(rig.srv, "POST", "/v1/chat/completions", shared_bearer ++ json_head, "{\"model\": \"m\", \"max_tokens\": 4, \"tf\": {\"wait_ms\": 60000}, \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}]}");
+    defer r.free();
+    try std.testing.expectEqual(@as(u16, 503), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "wait_ms (150 ms)") != null);
+    try std.testing.expectEqual(@as(u32, 1), rig.engine.submits);
+    try std.testing.expectEqual(@as(u32, 1), rig.engine.cancels);
+}
+
+test "per-request fields: the Messages translation carries a tf object to the chat request, and only when there is one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cx: @import("errors.zig").Cx = .{ .a = a };
+    const with = (try json.parse(a, "{\"model\": \"m\", \"max_tokens\": 8, \"tf\": {\"pri\": \"batch\"}, \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}]}")).ok;
+    const chat = try @import("anthropic_translate.zig").translate(&cx, with, false);
+    try std.testing.expectEqualStrings("batch", chat.get("tf").?.get("pri").?.string);
+    const without = (try json.parse(a, "{\"model\": \"m\", \"max_tokens\": 8, \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}]}")).ok;
+    const plain = try @import("anthropic_translate.zig").translate(&cx, without, false);
+    try std.testing.expect(plain.get("tf") == null);
+}
+
+test "set: the graph cap (class A) is live only where the engine runs graphs, travels as a count with 0 for all, and a value past a u32 is refused" {
+    var rig: Rig = .{ .arena = undefined, .tmp = undefined };
+    try rig.open(null, admin_keys_file);
+    defer rig.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = try Writable.open(&rig, "schema 1\n");
+    defer w.restore();
+    defer live.able.store(0, .release);
+    live.able.store(0, .release);
+    const no = try setBody(&rig, "{\"set\": {\"tf_ds_graph_cap\": 64}, \"persist\": false, \"wait_ms\": 0}");
+    defer no.free();
+    try std.testing.expectEqual(@as(u16, 400), no.status); // an engine with no graphs: a setting for the next start
+    live.setAble(.graph_cap, true);
+    const big = try setBody(&rig, "{\"set\": {\"tf_ds_graph_cap\": 4294967295}, \"persist\": false, \"wait_ms\": 0}");
+    defer big.free();
+    try std.testing.expect(big.status >= 400 and big.status < 500);
+    var seen: u64 = 0;
+    var vals: [live.slot_count]u64 = undefined;
+    try std.testing.expect(!live.block.turn(&seen, &vals));
+    const ok = try setBody(&rig, "{\"set\": {\"tf_ds_graph_cap\": 64}, \"persist\": false, \"wait_ms\": 0}");
+    defer ok.free();
+    try std.testing.expectEqual(@as(u16, 200), ok.status);
+    const ch = (try json.parse(a, ok.body)).ok.get("changes").?.array[0];
+    try std.testing.expectEqualStrings("live", ch.get("apply_mode").?.string);
+    try std.testing.expect(live.block.turn(&seen, &vals));
+    try std.testing.expectEqual(@as(u64, 64), vals[@backingInt(live.Slot.graph_cap)]);
+    const un = try setBody(&rig, "{\"set\": {\"tf_ds_graph_cap\": null}, \"persist\": false, \"wait_ms\": 0}");
+    defer un.free();
+    try std.testing.expectEqual(@as(u16, 200), un.status);
+    try std.testing.expect(live.block.turn(&seen, &vals));
+    try std.testing.expectEqual(live.unset, vals[@backingInt(live.Slot.graph_cap)]);
 }
 test "set: the KV free target (class A) is live only with a virtual-memory pool, travels as whole MiB, and null returns to the start's" {
     var rig: Rig = .{ .arena = undefined, .tmp = undefined };

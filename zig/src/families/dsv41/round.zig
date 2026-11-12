@@ -1091,6 +1091,20 @@ pub const Graphs = struct {
         g.* = undefined;
     }
 
+    /// A new cap (TF_DS_GRAPH_CAP live; 0: all): past it the least recently replayed stretches are destroyed now, oldest first, the same on
+    /// every rank (the same replays in the same order, so the same ticks). The caller has the device idle: a graph's launches are done.
+    pub fn setCap(g: *Graphs, cap: usize) usize {
+        const n = g.lru.setCap(cap, g, destroyOld);
+        if (n != 0) std.log.info("dsv41: CUDA graphs: the cap is now {d}: {d} destroyed, {d} kept", .{ cap, n, g.lru.count() });
+        return n;
+    }
+
+    fn destroyOld(_: *Graphs, en: Entry) void {
+        var x = en.exec;
+        ring_wait.forget(@intFromPtr(x.handle));
+        x.deinit();
+    }
+
     /// The captured stretches.
     pub fn count(g: *const Graphs) usize {
         return g.lru.count();

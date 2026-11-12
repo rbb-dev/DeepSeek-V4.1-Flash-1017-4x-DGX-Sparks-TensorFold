@@ -171,7 +171,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
         input.temperature = if (t == .float) t.float else std.fmt.parseFloat(f64, t.int) catch 0;
     };
     const sampling = try json.newObject(cx.a);
-    for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "seed", "priority", "draft", "thinking_budget", "ignore_eos", "stop" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
+    for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "seed", "priority", "tf", "draft", "thinking_budget", "ignore_eos", "stop" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
     try grammar.refusal(cx, body);
     if (input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
     if (body.field("parallel_tool_calls")) |p| if (p == .bool and !p.bool) try sampling.put(cx.a, "tool_call_single", .{ .bool = true });
@@ -366,7 +366,7 @@ const Run = struct {
         const a = r.a;
         const kind_ok = cx.kind != .other and cx.kind != .server;
         const body = (if (kind_ok) errorBody(a, cx, field) else errorOther(a, cx.message)) catch return;
-        r.out.vt.reply(r.out.ctx, if (kind_ok) 400 else 500, wrapError(a, body) catch return);
+        r.out.vt.reply(r.out.ctx, if (kind_ok) cx.status() else 500, wrapError(a, body) catch return);
     }
 
     /// A reply that ended before anything was sent: a refusal's 400, a failure's 500, nothing when the client left.

@@ -18,8 +18,10 @@
 const std = @import("std");
 const api = @import("engine_api");
 const settings = api.settings;
+const settings_history = api.settings_history;
 const kv_pool = api.kv_pool;
 const live_config = api.live_config;
+const fill_order = api.fill_order;
 const cfg_write = api.cfg_write;
 const admin_state = @import("admin_state.zig");
 const json = @import("json");
@@ -53,6 +55,7 @@ pub const page_css = @embedFile("admin_ui/app.css");
 pub const page_csp = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 const Method = enum { get, post };
+const Need = enum { read, agent, admin };
 const Route = struct { name: []const u8, method: Method, need: Need, step: u8 };
 
 /// Every route that answers. A route that is not here is the unknown-path 404 for everyone, whatever its method; a POST
@@ -71,6 +74,7 @@ pub const table = [_]Route{
     .{ .name = "leases", .method = .get, .need = .read, .step = 5 },
     .{ .name = "policy", .method = .get, .need = .read, .step = 5 },
     .{ .name = "keys/reload", .method = .post, .need = .admin, .step = 2 },
+    .{ .name = "validate", .method = .post, .need = .agent, .step = 3 },
     .{ .name = "set", .method = .post, .need = .agent, .step = 5 },
     .{ .name = "revert", .method = .post, .need = .admin, .step = 5 },
 };
@@ -93,6 +97,16 @@ fn pageFile(raw_path: []const u8) ?Page {
     if (std.mem.eql(u8, raw_path, "/admin/ui/app.js")) return .js;
     if (std.mem.eql(u8, raw_path, "/admin/ui/app.css")) return .css;
     return null;
+}
+
+/// Whether a key of `scope` may call a route that needs `need`: the admin may call all, an agent the agent's and the read
+/// ones, a reader the read ones.
+fn allows(need: Need, scope: auth.Scope) bool {
+    return switch (need) {
+        .read => true,
+        .agent => scope == .admin or scope == .agent,
+        .admin => scope == .admin,
+    };
 }
 
 const Who = struct { label: []const u8, scope: auth.Scope };
@@ -122,6 +136,7 @@ pub fn handle(srv: *Server, conn: *Conn, a: Allocator, discard: *const fn (*Conn
         discard(conn, a);
         return routes.unknown(conn, a);
     };
+    if (!allows(found.need, who.scope)) {
         discard(conn, a);
         return fail(conn, a, 403, "scope_denied", "this key may not call this route");
     }
@@ -137,8 +152,11 @@ pub fn handle(srv: *Server, conn: *Conn, a: Allocator, discard: *const fn (*Conn
     if (std.mem.eql(u8, name, "series")) return seriesReply(ctx);
     if (std.mem.eql(u8, name, "logs")) return logsReply(ctx);
     if (std.mem.eql(u8, name, "keys")) return reply(ctx, keysValue(srv, a));
+    if (std.mem.eql(u8, name, "history")) return historyReply(ctx);
     if (std.mem.eql(u8, name, "leases")) return reply(ctx, emptyView(a, "leases", "no lease exists in this release"));
+    if (std.mem.eql(u8, name, "policy")) return reply(ctx, policyValue(srv, a));
     if (std.mem.eql(u8, name, "keys/reload")) return keysReload(ctx);
+    if (std.mem.eql(u8, name, "validate")) return validateReply(ctx);
     if (std.mem.eql(u8, name, "set")) return setReply(ctx);
     if (std.mem.eql(u8, name, "revert")) return revertReply(ctx);
     routes.unknown(conn, a);
@@ -255,9 +273,11 @@ pub fn routesValue(a: Allocator, scope: auth.Scope) !Value {
     try root.put(a, "api", .{ .object = ver });
     var rows: std.ArrayList(Value) = .empty;
     for (&table) |*t| {
+        if (!allows(t.need, scope)) continue;
         const o = try json.newObject(a);
         try o.put(a, "method", str(if (t.method == .get) "GET" else "POST"));
         try o.put(a, "path", str(try std.fmt.allocPrint(a, "{s}/{s}", .{ prefix, t.name })));
+        try o.put(a, "scope", str(@tagName(t.need)));
         try o.put(a, "step", try json.intValue(a, t.step));
         try rows.append(a, .{ .object = o });
     }
@@ -277,9 +297,36 @@ pub fn schema(a: Allocator) !Value {
     const root = try json.newObject(a);
     try root.put(a, "schema_version", try json.intValue(a, settings.schema_version));
     try root.put(a, "count", try json.intValue(a, visibleCount()));
+    // each class says how long its apply takes: no probe has measured one, so the value is null and the label says so
     const apply = try json.newObject(a);
     inline for (.{
+        .{ "P", "per request", false },
+        .{ "H", "live: rank 0's host at its next loop turn", true },
+        .{ "A", "live on all four ranks at one step", true },
+        .{ "I", "when the engine is idle", true },
+        .{ "N", "now, after closing admission and draining", true },
+        .{ "R", "at a restart (engine.cfg)", false },
+    }) |p| {
+        const c = try json.newObject(a);
+        try c.put(a, "text", str(p[1]));
+        const t = try json.newObject(a);
+        try t.put(a, "value_s", .null);
+        try t.put(a, "label", str("unmeasured"));
+        try t.put(a, "source", str("step-1 probe"));
+        try c.put(a, "apply_time", .{ .object = t });
+        try c.put(a, "now_ok", .{ .bool = p[2] });
+        try apply.put(a, p[0], .{ .object = c });
+    }
     try root.put(a, "apply_classes", .{ .object = apply });
+    const tab_rows = try a.alloc(Value, settings.tabs.len);
+    for (&settings.tabs, tab_rows) |*t, *slot| {
+        const o = try json.newObject(a);
+        try o.put(a, "name", str(t.name));
+        try o.put(a, "title", str(t.title));
+        try o.put(a, "about", str(t.about));
+        slot.* = .{ .object = o };
+    }
+    try root.put(a, "tabs", .{ .array = tab_rows });
     var rows: std.ArrayList(Value) = .empty;
     for (&settings.options) |*o| {
         if (o.hidden) continue;
@@ -294,6 +341,7 @@ pub fn schema(a: Allocator) !Value {
         try r.put(a, "min", try optNum(a, o.min));
         try r.put(a, "max", try optNum(a, o.max));
         try r.put(a, "default", if (o.default.len == 0) .null else str(o.default));
+        try r.put(a, "default_text", str(o.default_text));
         try r.put(a, "default_checked", .{ .bool = o.check == .tested });
         try r.put(a, "apply", str(@tagName(o.apply)));
         try r.put(a, "secret", .{ .bool = o.secret });
@@ -303,8 +351,33 @@ pub fn schema(a: Allocator) !Value {
         const values = try a.alloc(Value, o.values.len);
         for (o.values, values) |v, *s| s.* = str(v);
         try r.put(a, "values", .{ .array = values });
+        try r.put(a, "label", str(o.label));
         try r.put(a, "doc", str(o.doc));
+        try r.put(a, "env_override", .{ .bool = o.env_override });
+        try r.put(a, "out_changes", .{ .bool = o.out_changes });
+        try r.put(a, "now_ok", .{ .bool = o.now_ok });
         // whether the engine takes a change to this row while it runs (a hook in rank 0's host or on a server thread)
+        try r.put(a, "live", .{ .bool = live_config.isWired(o.id) });
+        if (o.agent) |ag| {
+            const g = try json.newObject(a);
+            try g.put(a, "min", try optNum(a, ag.min));
+            try g.put(a, "max", try optNum(a, ag.max));
+            try g.put(a, "max_ttl_s", try json.intValue(a, ag.max_ttl_s));
+            try r.put(a, "agent", .{ .object = g });
+        } else try r.put(a, "agent", .null);
+        const req = try a.alloc(Value, o.requires.len);
+        for (o.requires, req) |c, *slot| slot.* = str(c);
+        try r.put(a, "requires", .{ .array = req });
+        const costs = try a.alloc(Value, o.cost.len);
+        for (o.cost, costs) |c, *slot| {
+            const k = try json.newObject(a);
+            try k.put(a, "what", str(c.what));
+            try k.put(a, "value", str(c.value));
+            try k.put(a, "label", str(c.label));
+            try k.put(a, "source", str(c.source));
+            slot.* = .{ .object = k };
+        }
+        try r.put(a, "cost", .{ .array = costs });
         try rows.append(a, .{ .object = r });
     }
     try root.put(a, "options", .{ .array = rows.items });
@@ -325,6 +398,8 @@ pub fn schema(a: Allocator) !Value {
 pub fn config(a: Allocator) !Value {
     const root = try json.newObject(a);
     try root.put(a, "schema_version", try json.intValue(a, settings.schema_version));
+    try root.put(a, "active_means", str("the value the engine runs: what it read at its start (engine.cfg where it names the option, else the environment) unless a live change since has been taken: then the value it runs now"));
+    // the newest row of engine.history.jsonl: the requested and the active state are one while nothing applies at run time
     const version_now = settings_history.version.load(.acquire);
     try root.put(a, "config_version", try json.intValue(a, version_now));
     try root.put(a, "active_version", try json.intValue(a, admin_state.activeVersion(version_now)));
@@ -338,6 +413,7 @@ pub fn config(a: Allocator) !Value {
         try cfg.put(a, "bytes", try json.intValue(a, rep.bytes));
         try cfg.put(a, "declared_schema", try json.intValue(a, rep.declared));
         try cfg.put(a, "applied", try json.intValue(a, rep.applied));
+        try cfg.put(a, "cfg_won", try json.intValue(a, rep.cfg_won));
         try cfg.put(a, "environment_won", try json.intValue(a, rep.env_won));
         try cfg.put(a, "unset", try json.intValue(a, rep.unset));
         try cfg.put(a, "unknown", try json.intValue(a, rep.unknown));
@@ -359,6 +435,14 @@ pub fn config(a: Allocator) !Value {
             try r.put(a, "value", if (std.mem.eql(u8, t, "unset")) .null else str(t));
         } else try r.put(a, "value", if (res.source == .default) .null else if (o.secret) str("(set)") else str(res.value));
         try r.put(a, "default", if (o.default.len == 0) .null else str(o.default));
+        try r.put(a, "default_text", str(o.default_text));
+        // what the environment and engine.cfg both named, and the one that did not apply
+        if (res.other_source != .default) {
+            const other = try json.newObject(a);
+            try other.put(a, "source", str(@tagName(res.other_source)));
+            try other.put(a, "value", if (o.secret) str("(set)") else str(res.other));
+            try r.put(a, "other", .{ .object = other });
+        } else try r.put(a, "other", .null);
         const st = admin_state.stateOf(o, currentText(o));
         const mine = admin_state.get(o);
         try r.put(a, "requested", if (st.requested) |t| str(t) else .null);
@@ -414,7 +498,17 @@ pub fn statusValue(srv: *Server, a: Allocator, who: Who) !Value {
     try root.put(a, "health", try status_routes.healthValue(srv, a, false));
     const version_now = settings_history.version.load(.acquire);
     const version = try json.intValue(a, version_now);
+    const cv = try json.newObject(a);
+    try cv.put(a, "config_version", version);
     try cv.put(a, "active_version", try json.intValue(a, admin_state.activeVersion(version_now)));
+    try cv.put(a, "schema_version", try json.intValue(a, settings.schema_version));
+    // rank 0 only: the other ranks report no version until a change can reach them
+    const rank0 = try json.newObject(a);
+    try rank0.put(a, "rank", try json.intValue(a, 0));
+    try rank0.put(a, "version", version);
+    const ranks = try a.alloc(Value, 1);
+    ranks[0] = .{ .object = rank0 };
+    try cv.put(a, "ranks", .{ .array = ranks });
     const waiting = try admin_state.pendingNames(a);
     const pend = try a.alloc(Value, if (waiting.len > 0) 1 else 0);
     if (waiting.len > 0) {
@@ -426,6 +520,7 @@ pub fn statusValue(srv: *Server, a: Allocator, who: Who) !Value {
         pend[0] = .{ .object = pv };
     }
     try cv.put(a, "pending", .{ .array = pend });
+    try root.put(a, "config", .{ .object = cv });
     try putPoolStatus(a, root);
     // the build's release (empty where the server's main set none) and each rank's memory NOW: rank 0's MemAvailable read on this
     // request, each follower's last report (they send one every 2 s over a link of their own: families/dsv41/peer_mem.zig) with its
@@ -456,6 +551,12 @@ pub fn statusValue(srv: *Server, a: Allocator, who: Who) !Value {
     try cfg.put(a, "from_engine_cfg", try json.intValue(a, from_cfg));
     try cfg.put(a, "engine_cfg", if (rep.path.len > 0) str(rep.path) else .null);
     try root.put(a, "settings", .{ .object = cfg });
+    // what the requests did with the per-request fields, per key label (counts only)
+    const adm = try json.newObject(a);
+    try adm.put(a, "policy_file", try policySummary(srv, a));
+    try adm.put(a, "request_fields", try srv.policy.countsValue(srv.io, a));
+    try adm.put(a, "request_fields_uncounted", try json.intValue(a, srv.policy.uncounted));
+    try root.put(a, "admin", .{ .object = adm });
     return .{ .object = root };
 }
 
@@ -1127,6 +1228,29 @@ fn writeBody(ctx: Ctx) ?[]const u8 {
     }
 }
 
+/// The policy file's state: whether one is configured, whether it loaded, why not, and how many labels have a row.
+fn policySummary(srv: *Server, a: Allocator) !Value {
+    const s = try srv.policy.summary(srv.io, a);
+    const o = try json.newObject(a);
+    try o.put(a, "configured", .{ .bool = s.configured });
+    try o.put(a, "valid", .{ .bool = s.valid });
+    try o.put(a, "labels", try json.intValue(a, s.labels));
+    try o.put(a, "refused_reason", if (s.refusal.len > 0) str(s.refusal) else .null);
+    return .{ .object = o };
+}
+
+/// GET /policy: what a caller may set about its own request, per key label, from the policy file; the agent profiles are not
+/// built in this release (`profiles` is empty).
+pub fn policyValue(srv: *Server, a: Allocator) !Value {
+    const root = try json.newObject(a);
+    try root.put(a, "profiles", .{ .array = try a.alloc(Value, 0) });
+    try root.put(a, "note", str("no agent profile exists in this release; request_caps are the per-key limits on a request's own fields (pri, think_budget, wait_ms)"));
+    try root.put(a, "policy_file", try policySummary(srv, a));
+    try root.put(a, "request_caps", try srv.policy.capsValue(srv.io, a));
+    try root.put(a, "request_fields", try srv.policy.countsValue(srv.io, a));
+    return .{ .object = root };
+}
+
 /// POST /keys/reload: both key stores reread their files now (what SIGHUP does), and say how many keys each holds.
 fn keysReload(ctx: Ctx) void {
     const body = writeBody(ctx) orelse return;
@@ -1142,7 +1266,158 @@ fn keysReload(ctx: Ctx) void {
     const admin_summary: ?auth.Store.Summary = if (ctx.srv.admin_keys) |k| k.reloadNow() else null;
     root.put(ctx.a, "api", storeValue(ctx.a, api_summary) catch return) catch return;
     root.put(ctx.a, "admin", storeValue(ctx.a, admin_summary) catch return) catch return;
+    if (ctx.srv.policy.path != null) {
+        ctx.srv.policy.reload(ctx.srv.io);
+        root.put(ctx.a, "policy", policySummary(ctx.srv, ctx.a) catch return) catch return;
+    }
     sendValue(ctx, 200, .{ .object = root });
+}
+
+/// GET /history?limit=&before_version=&label=&name=&outcome=: engine.history.jsonl's rows, newest first. A change to an option
+/// the surface hides is left out of its row, so a filter by name cannot find one; a line that is no row is counted, never shown.
+fn historyReply(ctx: Ctx) void {
+    const a = ctx.a;
+    const memory_only = settings_history.path.len == 0;
+    if (memory_only) {
+        const kept = settings_history.memoryLines(a) catch return fail(ctx.conn, a, 500, "internal", "admin: out of memory");
+        if (kept.len == 0) return reply(ctx, emptyView(a, "rows", "no engine.cfg was read at the start, so no history file is kept"));
+    }
+    const limit = queryNumber(ctx, "limit", 100, 1000) orelse return fail(ctx.conn, a, 400, "bad_query", "limit: a whole number");
+    const before = queryNumber(ctx, "before_version", std.math.maxInt(u64), std.math.maxInt(u64)) orelse return fail(ctx.conn, a, 400, "bad_query", "before_version: a whole number");
+    const want_label = queryValue(a, ctx.conn.path, "label");
+    const want_name = queryValue(a, ctx.conn.path, "name");
+    const want_outcome = queryValue(a, ctx.conn.path, "outcome");
+    const loaded: settings_history.Loaded = if (memory_only) .{ .lines = settings_history.memoryLines(a) catch return fail(ctx.conn, a, 500, "internal", "admin: out of memory") } else settings_history.load(a, ctx.srv.io, settings_history.path) catch |e| switch (e) {
+        error.OutOfMemory => return fail(ctx.conn, a, 500, "internal", "admin: out of memory"),
+        else => return reply(ctx, emptyView(a, "rows", std.fmt.allocPrint(a, "the history file cannot be read ({s})", .{@errorName(e)}) catch return)),
+    };
+    var kept: std.ArrayList(Value) = .empty;
+    var damaged: usize = 0;
+    var more = false;
+    var i = loaded.lines.len;
+    while (i > 0) {
+        i -= 1;
+        const parsed = json.parse(a, loaded.lines[i]) catch return fail(ctx.conn, a, 500, "internal", "admin: out of memory");
+        const row = switch (parsed) {
+            .ok => |v| v,
+            .err => {
+                damaged += 1;
+                continue;
+            },
+        };
+        if (row != .object) {
+            damaged += 1;
+            continue;
+        }
+        const vtext = if (row.get("version")) |v| (if (v == .int) v.int else "") else "";
+        const version = std.fmt.parseInt(u64, vtext, 10) catch {
+            damaged += 1;
+            continue;
+        };
+        if (version >= before) continue;
+        if (want_label) |l| if (!std.mem.eql(u8, json.strOr(row.get("label")), l)) continue;
+        if (want_outcome) |o| if (!std.mem.eql(u8, json.strOr(row.get("outcome")), o)) continue;
+        // the changes the surface may show: a hidden option's change is dropped
+        var shown: std.ArrayList(Value) = .empty;
+        if (row.get("changes")) |cs| if (cs == .array) for (cs.array) |c| {
+            const idt = if (c.get("id")) |x| (if (x == .int) x.int else "") else "";
+            const id = std.fmt.parseInt(u32, idt, 10) catch 0;
+            if (settings.byId(id)) |o| if (o.hidden) continue;
+            shown.append(a, c) catch return;
+        };
+        if (want_name) |n| {
+            const found = for (shown.items) |c| {
+                if (std.mem.eql(u8, json.strOr(c.get("name")), n)) break true;
+            } else false;
+            if (!found) continue;
+        }
+        if (kept.items.len >= limit) {
+            more = true;
+            break;
+        }
+        row.object.put(a, "changes", .{ .array = shown.items }) catch return;
+        if (row.get("at_ms")) |ms| if (ms == .int) if (std.fmt.parseInt(i64, ms.int, 10)) |m| {
+            row.object.put(a, "at", str(rfc3339(a, m) catch return)) catch return;
+        } else |_| {};
+        kept.append(a, row) catch return;
+    }
+    // the rows after this page are older: ask again for versions below the last one shown
+    const root = json.newObject(a) catch return;
+    root.put(a, "rows", .{ .array = kept.items }) catch return;
+    const last_version: ?Value = if (more and kept.items.len > 0) kept.items[kept.items.len - 1].get("version") else null;
+    root.put(a, "next_before_version", last_version orelse .null) catch return;
+    root.put(a, "damaged", json.intValue(a, damaged) catch return) catch return;
+    if (memory_only) {
+        root.put(a, "memory_only", .{ .bool = true }) catch return;
+        root.put(a, "note", str("no engine.cfg was read at the start: this history is kept in memory and is lost when the engine stops")) catch return;
+    } else root.put(a, "memory_only", .{ .bool = false }) catch return;
+    sendValue(ctx, 200, .{ .object = root });
+}
+
+/// An agent key's limits on a row, or null when it passes: the row must be one an agent may set (not an `out_changes` row), the
+/// value inside the row's agent bounds, and a lease no longer than the row's longest. A value that is no number is left to
+/// `settings.check`.
+pub const Why = struct { code: []const u8, message: []const u8 };
+pub fn agentCheck(o: *const settings.Option, value: []const u8, ttl_s: ?u64, buf: []u8) ?Why {
+    var permitted = o.agent != null and !o.out_changes;
+    if (permitted) permitted = for (o.who) |w| {
+        if (w == .agent) break true;
+    } else false;
+    if (!permitted) return .{ .code = "not_permitted_for_agent", .message = std.fmt.bufPrint(buf, "{s}: an agent key may not set this option", .{o.name}) catch "an agent key may not set this option" };
+    const ag = o.agent.?;
+    if (std.fmt.parseFloat(f64, value)) |x| {
+        if (x < ag.min or x > ag.max) return .{ .code = "outside_agent_range", .message = std.fmt.bufPrint(buf, "{s}={s}: an agent may set it from {d} to {d} {s}", .{ o.name, value, ag.min, ag.max, o.unit }) catch "outside the range an agent may set" };
+    } else |_| {}
+    if (ttl_s) |t| if (t > ag.max_ttl_s) return .{ .code = "ttl_too_long", .message = std.fmt.bufPrint(buf, "{s}: a lease on it lasts at most {d} s", .{ o.name, ag.max_ttl_s }) catch "the lease is too long" };
+    return null;
+}
+
+/// The first condition of `requires` (`name=value`) that `look` (anything with `value(name) ?[]const u8`) says does not hold, or
+/// null. An option `look` does not know holds no value, so a condition on it is not met.
+pub fn requiresUnmet(requires: []const []const u8, look: anytype) ?[]const u8 {
+    for (requires) |cond| {
+        const eq = std.mem.indexOfScalar(u8, cond, '=') orelse cond.len;
+        const have = look.value(cond[0..eq]) orelse return cond;
+        if (!std.mem.eql(u8, have, if (eq < cond.len) cond[eq + 1 ..] else "")) return cond;
+    }
+    return null;
+}
+
+/// What a request key names: an option, a retired name, or nothing the caller may know of (a hidden option too).
+const Named = union(enum) { option: *const settings.Option, retired: *const settings.Retired, nothing };
+
+fn named(key: []const u8) Named {
+    if (settings.retiredByKey(key)) |r| return .{ .retired = r };
+    const o = settings.byKey(key) orelse return .nothing;
+    if (o.hidden) return .nothing;
+    return .{ .option = o };
+}
+
+/// The canonical text of a request's value: a string as it is, a number as its shortest decimal, true and false as 1 and 0
+/// for a flag (as the words for any other kind, which `settings.check` then refuses), null as `unset`. Null: not a value.
+fn valueText(a: Allocator, v: Value, flag: bool) ?[]const u8 {
+    return switch (v) {
+        .null => "unset",
+        .string => |t| t,
+        .int => |t| t,
+        .float => |x| blk: {
+            if (!std.math.isFinite(x)) break :blk "nan";
+            if (x == @floor(x) and @abs(x) < 1e15) break :blk std.fmt.allocPrint(a, "{d}", .{@as(i64, @intFromFloat(x))}) catch null;
+            break :blk std.fmt.allocPrint(a, "{d}", .{x}) catch null;
+        },
+        .bool => |b| if (flag) (if (b) "1" else "0") else (if (b) "true" else "false"),
+        else => null,
+    };
+}
+
+fn refusedRow(a: Allocator, name: []const u8, id: ?u16, value: ?[]const u8, code: []const u8, message: []const u8) !Value {
+    const o = try json.newObject(a);
+    try o.put(a, "name", str(name));
+    try o.put(a, "id", if (id) |x| try json.intValue(a, x) else .null);
+    try o.put(a, "value", if (value) |x| str(x) else .null);
+    try o.put(a, "code", str(code));
+    try o.put(a, "message", str(message));
+    return .{ .object = o };
 }
 
 /// One change a request asks for, once it passed every check: the option, the canonical text (`unset`: leave it to the engine),
@@ -1188,9 +1463,14 @@ fn reasonOk(t: []const u8) bool {
 /// Reads a request body's shape and checks every change it names against the table, the pool and the caller's scope, answering a
 /// malformed request itself (null). `for_set`: the fields only a write takes are allowed.
 fn analyze(ctx: Ctx, doc: Value, for_set: bool) ?Analysis {
+    const a = ctx.a;
+    const conn = ctx.conn;
     _ = conn;
     var out: Analysis = .{ .changes = &.{}, .resolved = .empty, .refused = .empty, .warnings = .empty, .pool_decision = null, .fit_out = undefined, .start_world = 0 };
     if (doc != .object) return badField(ctx, "bad_json", "the body is a JSON object");
+    for (doc.object.keys(), doc.object.values()) |k, v| {
+        if (std.mem.eql(u8, k, "set")) continue;
+        if (std.mem.eql(u8, k, "apply")) {
             if (v != .string) return badField(ctx, "bad_json", "apply: a string");
             if (std.mem.eql(u8, v.string, "auto") or std.mem.eql(u8, v.string, "live") or std.mem.eql(u8, v.string, "next_start")) {
                 out.apply = v.string;
@@ -1199,8 +1479,13 @@ fn analyze(ctx: Ctx, doc: Value, for_set: bool) ?Analysis {
             if (std.mem.eql(u8, v.string, "idle") or std.mem.eql(u8, v.string, "now"))
                 return badField(ctx, "apply_not_supported", "this engine applies a change live (a row with a live hook) or at the next start: apply is auto, live or next_start");
             return badField(ctx, "invalid_apply_mode", "apply: auto, live, idle, now or next_start");
+        }
+        if (std.mem.eql(u8, k, "ttl_s")) {
+            const t = if (v == .int) std.fmt.parseInt(u64, v.int, 10) catch 0 else 0;
             if (t == 0 or t > 31_536_000) return badField(ctx, "bad_json", "ttl_s: a whole number of seconds, at least 1");
             out.ttl = t;
+            continue;
+        }
         if (!for_set) return badField(ctx, "unknown_field", k);
         if (std.mem.eql(u8, k, "if_version") or std.mem.eql(u8, k, "reverts_version") or std.mem.eql(u8, k, "schema_version") or std.mem.eql(u8, k, "wait_ms")) {
             const n = if (v == .int) std.fmt.parseInt(u64, v.int, 10) catch null else null;
@@ -1209,6 +1494,7 @@ fn analyze(ctx: Ctx, doc: Value, for_set: bool) ?Analysis {
             if (std.mem.eql(u8, k, "if_version")) out.if_version = x else if (std.mem.eql(u8, k, "reverts_version")) out.reverts_version = x else if (std.mem.eql(u8, k, "schema_version")) out.schema_version = x else {
                 if (x > 5000) return badField(ctx, "bad_json", "wait_ms: 0 to 5000");
                 out.wait_ms = x;
+            }
             continue;
         }
         if (std.mem.eql(u8, k, "reason")) {
@@ -1228,12 +1514,35 @@ fn analyze(ctx: Ctx, doc: Value, for_set: bool) ?Analysis {
     const set = doc.get("set") orelse return badField(ctx, "missing_field", "set");
     if (set != .object) return badField(ctx, "bad_json", "set: an object of option name or id to value");
     if (set.object.count() == 0) return badField(ctx, "missing_field", "set: no change is named");
+
+    // every key's option first: one option named twice (by name and by id) is a malformed request, whatever it holds
+    const keys = set.object.keys();
+    const vals = set.object.values();
     const what = a.alloc(Named, keys.len) catch return oom(ctx);
+    for (keys, what, 0..) |k, *w, i| {
+        w.* = named(k);
         if (vals[i] == .array or vals[i] == .object) return badField(ctx, "bad_json", "a value is a string, a number, true, false or null");
+        if (w.* == .option) for (what[0..i], 0..) |prev, j| if (prev == .option and prev.option == w.option)
             return badField(ctx, "duplicate_option", std.fmt.allocPrint(a, "{s} and {s} are the same option", .{ keys[j], k }) catch "the same option twice");
+    }
+
+    const Look = struct {
+        keys: []const []const u8,
+        what: []const Named,
+        texts: []const ?[]const u8,
+        pub fn value(l: @This(), name: []const u8) ?[]const u8 {
+            for (l.what, l.texts) |w, t| if (w == .option and std.mem.eql(u8, w.option.name, name)) {
+                const x = t orelse continue;
                 return if (std.mem.eql(u8, x, "unset")) currentText(w.option) else x;
+            };
+            const o = settings.byKey(name) orelse return null;
             return currentText(o);
+        }
+    };
     const texts = a.alloc(?[]const u8, keys.len) catch return oom(ctx);
+    for (what, vals, texts) |w, v, *t| t.* = valueText(a, v, w == .option and w.option.kind == .flag);
+    const look: Look = .{ .keys = keys, .what = what, .texts = texts };
+    var buf: [400]u8 = undefined;
     // the pool: a free target in the request is re-fitted from the numbers the start voted on; the pool named in the same request,
     // or in engine.cfg beside it, is a conflict the start would refuse
     const target_opt = settings.byEnv("TF_DS_KV_FREE_TARGET_GIB").?;
@@ -1264,12 +1573,27 @@ fn analyze(ctx: Ctx, doc: Value, for_set: bool) ?Analysis {
     }
     const rounds_opt = settings.byEnv("TF_DS_ROUNDS_BESIDE").?;
     var changes: std.ArrayList(Change) = .empty;
+    for (keys, what, texts) |key, w, text_opt| {
+        const text = text_opt orelse "";
+        switch (w) {
             .nothing => out.refused.append(a, refusedRow(a, key, null, text, "unknown_option", std.fmt.allocPrint(a, "{s}: unknown option", .{key}) catch return oom(ctx)) catch return oom(ctx)) catch return oom(ctx),
+            .retired => |r| {
+                if (settings.retiredRefusal(r, text, &buf)) |why| {
                     out.refused.append(a, refusedRow(a, r.env, null, text, "retired_option", a.dupe(u8, why) catch return oom(ctx)) catch return oom(ctx)) catch return oom(ctx);
                 } else out.warnings.append(a, warning(a, "retired_unset", r.env, null) catch return oom(ctx)) catch return oom(ctx);
+            },
+            .option => |o| {
+                const id = o.id;
+                if (o.secret) {
                     out.refused.append(a, refusedRow(a, o.name, id, null, "secret_not_settable", std.fmt.allocPrint(a, "{s} is a key: keys are not set through the admin surface", .{o.name}) catch return oom(ctx)) catch return oom(ctx)) catch return oom(ctx);
+                    continue;
+                }
                 if (ctx.who.scope == .agent) if (agentCheck(o, text, out.ttl, &buf)) |why| if (!std.mem.eql(u8, why.code, "outside_agent_range") or !std.mem.eql(u8, text, "unset")) {
                     out.refused.append(a, refusedRow(a, o.name, id, text, why.code, a.dupe(u8, why.message) catch return oom(ctx)) catch return oom(ctx)) catch return oom(ctx);
+                    continue;
+                };
+                const unset = std.mem.eql(u8, text, "unset");
+                if (!unset) if (settings.check(o, text, &buf)) |bad| {
                     // the pool below the context has its own name: the context is never lowered
                     const code: []const u8 = if (o == window_opt and bad.code == .below_minimum) "pool_below_window" else @tagName(bad.code);
                     out.refused.append(a, refusedRow(a, o.name, id, text, code, a.dupe(u8, bad.message) catch return oom(ctx)) catch return oom(ctx)) catch return oom(ctx);
@@ -1289,14 +1613,24 @@ fn analyze(ctx: Ctx, doc: Value, for_set: bool) ?Analysis {
                         continue;
                     }
                 }
+                // the rows the host takes live have rules the host holds to: the order of prompt steps must parse, the step rows are whole
+                // resume units within the booted pass rows, staging's share may not pass the service's budget
+                if (!unset) if (liveRule(a, o, text, what, texts)) |why| {
+                    out.refused.append(a, refusedRow(a, o.name, id, text, why.code, a.dupe(u8, why.message) catch return oom(ctx)) catch return oom(ctx)) catch return oom(ctx);
+                    continue;
+                };
                 // a free target the Sparks cannot keep and still hold the context
                 if (o == target_opt and !unset) if (out.pool_decision) |dec| if (dec.verdict == .refused) {
                     var tb: [1600]u8 = undefined;
                     out.refused.append(a, refusedRow(a, o.name, id, text, "memory_does_not_fit", a.dupe(u8, kv_pool.refusalText(&tb, shifted_parts[0..out.start_world], dec)) catch return oom(ctx)) catch return oom(ctx)) catch return oom(ctx);
+                    continue;
+                };
+                const wired = live_config.isWired(id);
                 const live = wired and !std.mem.eql(u8, out.apply, "next_start");
                 const row = json.newObject(a) catch return oom(ctx);
                 row.put(a, "name", str(o.name)) catch return oom(ctx);
                 row.put(a, "id", json.intValue(a, id) catch return oom(ctx)) catch return oom(ctx);
+                const from = if (live) currentText(o) else standingText(o); // what the engine runs (a live row), or what waits for the next start
                 row.put(a, "from", if (from) |f| str(f) else .null) catch return oom(ctx);
                 row.put(a, "to", if (unset) .null else str(text)) catch return oom(ctx);
                 row.put(a, "apply_class", str(@tagName(o.apply))) catch return oom(ctx);
@@ -1308,9 +1642,13 @@ fn analyze(ctx: Ctx, doc: Value, for_set: bool) ?Analysis {
                 changes.append(a, .{ .o = o, .text = text, .from = from, .file_from = fileText(o), .live = live }) catch return oom(ctx);
                 if (!live) out.warnings.append(a, warning(a, if (o.apply == .H and !wired) "no_live_hook" else "restart_needed", o.name, null) catch return oom(ctx)) catch return oom(ctx);
                 if (requiresUnmet(o.requires, look)) |cond| out.warnings.append(a, warning(a, "requires_unmet", o.name, cond) catch return oom(ctx)) catch return oom(ctx);
+            },
+        }
+    }
     out.changes = changes.items;
     return out;
 }
+
 /// The parts of the start's vote with a request's free target in them (what `memory_does_not_fit` words against).
 var shifted_parts: [4]kv_pool.Part = undefined;
 
@@ -1331,6 +1669,7 @@ fn validateReply(ctx: Ctx) void {
         .err => return fail(conn, a, 400, "bad_json", "the body is not JSON"),
     };
     const an = analyze(ctx, doc, false) orelse return;
+    const root = json.newObject(a) catch return;
     root.put(a, "ok", .{ .bool = an.refused.items.len == 0 }) catch return;
     root.put(a, "resolved", .{ .array = an.resolved.items }) catch return;
     var all_live = an.changes.len > 0;
@@ -1338,10 +1677,20 @@ fn validateReply(ctx: Ctx) void {
         all_live = false;
     };
     root.put(a, "effective_mode", str(if (all_live) "live" else "next_start")) catch return;
+    const modes = a.alloc(Value, 4) catch return;
+    inline for (.{
         .{ "live", true, "a row with a live hook is taken by the engine at its next loop turn; every other row is stored for the next start" },
         .{ "idle", false, "this engine has no class I apply" },
         .{ "now", false, "this engine has no class N apply" },
         .{ "next_start", true, "stored in engine.cfg (persist) and applied when the engine is next started with it" },
+    }, 0..) |m, i| {
+        const o = json.newObject(a) catch return;
+        o.put(a, "mode", str(m[0])) catch return;
+        o.put(a, "available", .{ .bool = m[1] }) catch return;
+        o.put(a, if (m[1]) "cost" else "why", str(m[2])) catch return;
+        modes[i] = .{ .object = o };
+    }
+    root.put(a, "modes", .{ .array = modes }) catch return;
     root.put(a, "warnings", .{ .array = an.warnings.items }) catch return;
     root.put(a, "refused", .{ .array = an.refused.items }) catch return;
     if (an.pool_decision) |dec| if (dec.verdict != .refused) {
@@ -1350,6 +1699,10 @@ fn validateReply(ctx: Ctx) void {
         derived.put(a, "kv_pool", derivedPool(a, dec, an.fit_out[0..an.start_world]) catch return) catch return;
         root.put(a, "derived", .{ .object = derived }) catch return;
     };
+    root.put(a, "config_version", json.intValue(a, settings_history.version.load(.acquire)) catch return) catch return;
+    sendValue(ctx, 200, .{ .object = root });
+}
+
 /// An error answer that names what a caller needs to go on: `details` is a JSON value.
 fn failDetails(conn: *Conn, a: Allocator, code: u16, name: []const u8, message: []const u8, details: Value, retry_after: ?u32) void {
     const err = json.newObject(a) catch return;
@@ -1384,6 +1737,8 @@ fn changeValue(a: Allocator, c: Change, state: []const u8, version: u64, persist
     try o.put(a, "id", try json.intValue(a, c.o.id));
     try o.put(a, "name", str(c.o.name));
     try o.put(a, "from", if (c.from) |f| str(f) else .null);
+    // what engine.cfg held, which differs from what the engine ran after a live change with persist false
+    try o.put(a, "from_file", if (c.file_from) |f| str(f) else .null);
     try o.put(a, "to", if (std.mem.eql(u8, c.text, "unset")) .null else str(c.text));
     try o.put(a, "apply_class", str(@tagName(c.o.apply)));
     try o.put(a, "apply_mode", str(if (c.live) "live" else "next_start"));
@@ -1393,6 +1748,31 @@ fn changeValue(a: Allocator, c: Change, state: []const u8, version: u64, persist
     try o.put(a, "lease_id", .null);
     try o.put(a, "out_changes", .{ .bool = c.o.out_changes });
     return .{ .object = o };
+}
+
+/// An option's value in an engine.cfg's text (its first line), or null when the file has none.
+fn fileValueIn(a: Allocator, text: []const u8, o: *const settings.Option) ?[]const u8 {
+    const cfg = settings.parseCfg(a, text) catch return null;
+    for (cfg.lines) |l| {
+        const found = settings.byKey(l.key) orelse continue;
+        if (found == o) return if (std.mem.eql(u8, l.value, "unset")) null else l.value;
+    }
+    return null;
+}
+
+/// Whether the engine's value `active` (null: the code decides) is what `wanted` asks (`unset`: the option's own default).
+fn sameActive(o: *const settings.Option, active: ?[]const u8, wanted: []const u8) bool {
+    if (std.mem.eql(u8, wanted, "unset")) {
+        const def: ?[]const u8 = if (o.default.len == 0) null else o.default;
+        return if (active) |x| (if (def) |d| std.mem.eql(u8, x, d) else false) else def == null;
+    }
+    return if (active) |x| std.mem.eql(u8, x, wanted) else false;
+}
+
+/// Whether engine.cfg's line for an option (null: none) is what `wanted` asks (`unset`: no line).
+fn sameFile(file: ?[]const u8, wanted: []const u8) bool {
+    if (std.mem.eql(u8, wanted, "unset")) return file == null;
+    return if (file) |x| std.mem.eql(u8, x, wanted) else false;
 }
 
 /// The text a row would have to hold for a change to be no change: what the engine runs now, or what is waiting for the next start.
@@ -1414,15 +1794,112 @@ fn fileText(o: *const settings.Option) ?[]const u8 {
 /// Hands a live value to the engine: the rounds beside go into the live block (the host takes them at its next turn), the log of polls
 /// is a server flag set here.
 fn publishLive(srv: *Server, c: Change, version: u64) void {
+    const unset = std.mem.eql(u8, c.text, "unset");
+    if (live_config.isFillRow(c.o.id)) return; // the three rows of the fill order are published together, after the loop (publishFillOrder)
     const slot = live_config.slotOf(c.o.id) orelse return;
+    const n: u64 = if (unset) live_config.unset else switch (slot) {
+        .log_polls => @intFromBool(std.mem.eql(u8, c.text, "1")),
+        .prefill_share => @as(u64, @bitCast(std.fmt.parseFloat(f64, c.text) catch return)),
         .kv_free_target => blk: { // GiB (a decimal) as whole MiB: what a cfg item's u32 carries
             const g = std.fmt.parseFloat(f64, c.text) catch return;
             if (!std.math.isFinite(g) or g <= 0) return;
             break :blk @intFromFloat(@round(g * 1024.0));
         },
+        else => std.fmt.parseInt(u64, c.text, 10) catch return,
+    };
+    if (slot == .log_polls) @atomicStore(bool, &srv.config.log_polls, !unset and n == 1, .monotonic);
+    live_config.block.publish(slot, n, version);
+}
+
+/// A request's own value for option `id`, if it names one.
+fn requestText(id: u16, what: []const Named, texts: []const ?[]const u8) ?[]const u8 {
+    for (what, texts) |w, t| if (w == .option and w.option.id == id) return t;
+    return null;
+}
+
+/// What the host refuses of a live row's value in the company of the others (null: nothing). `texts` are the request's values.
+fn liveRule(a: Allocator, o: *const settings.Option, text: []const u8, what: []const Named, texts: []const ?[]const u8) ?Why {
+    switch (o.id) {
+        119, 120, 121 => {
+            const named_o: ??[]const u8 = requestText(120, what, texts);
+            const named_q: ??[]const u8 = requestText(121, what, texts);
+            const named_w: ??[]const u8 = requestText(119, what, texts);
+            // a row named `unset` in the request leaves its text to the engine's own (none)
+            const un = struct {
+                fn f(n: ??[]const u8) ??[]const u8 {
+                    const t = n orelse return null;
+                    const v = t orelse return @as(??[]const u8, @as(?[]const u8, null));
+                    return if (std.mem.eql(u8, v, "unset")) @as(??[]const u8, @as(?[]const u8, null)) else @as(??[]const u8, v);
+                }
+            }.f;
+            const t = fillTexts(un(named_o), un(named_q), un(named_w));
+            const r = fill_order.parse(t.order, t.qos, t.wait);
+            if (o.id == 120 and !r.order_ok) return .{ .code = "invalid_value", .message = std.fmt.allocPrint(a, "{s}: not serial or turns", .{text}) catch "not serial or turns" };
+            if (o.id == 121 and !r.qos_ok) return .{ .code = "invalid_value", .message = std.fmt.allocPrint(a, "{s}: refused ({s}); a table is size:class:overtakes[:max_wait_s],... smallest first, sizes ascending, classes not falling", .{ text, r.qos_why }) catch "not a table" };
+            if (o.id == 119 and !r.wait_ok) return .{ .code = "invalid_value", .message = std.fmt.allocPrint(a, "{s}: not whole seconds from 1 to 86400", .{text}) catch "not whole seconds" };
         },
+        // the graph cap travels as a u32 in a cfg frame, the top value being the marker for `unset`
+        105 => {
+            const v = std.fmt.parseInt(u64, text, 10) catch return null; // (`unset`, or text the kind's own check refuses)
+            if (v >= std.math.maxInt(u32)) return .{ .code = "invalid_value", .message = std.fmt.allocPrint(a, "{s}: above 4,294,967,294 graphs", .{text}) catch "too many" };
         },
+        106 => {
+            const unit: u64 = if (o.min) |m| @intFromFloat(m) else 1;
+            const v = std.fmt.parseInt(u64, text, 10) catch return null;
+            if (unit > 0 and v % unit != 0) return .{ .code = "invalid_value", .message = std.fmt.allocPrint(a, "{s}: a whole number of {d}-row resume units", .{ text, unit }) catch "not whole resume units" };
+            const pass_text = currentText(settings.byId(110).?) orelse "2048";
+            const pass = std.fmt.parseInt(u64, pass_text, 10) catch 2048;
+            if (v > pass) return .{ .code = "above_booted_pass_rows", .message = std.fmt.allocPrint(a, "{s}: above the booted pass rows ({d}, TF_DS_PASS_ROWS): the passes' buffers are sized by them", .{ text, pass }) catch "above the booted pass rows" };
+        },
+        450, 453 => {
+            const pump_o = settings.byId(453).?;
+            const load_o = settings.byId(450).?;
+            const pump_t = requestText(453, what, texts) orelse currentText(pump_o);
+            const load_t = requestText(450, what, texts) orelse currentText(load_o);
+            const pump = std.fmt.parseInt(u64, if (pump_t) |t| (if (std.mem.eql(u8, t, "unset")) pump_o.default else t) else pump_o.default, 10) catch return null;
+            const load = std.fmt.parseInt(u64, if (load_t) |t| (if (std.mem.eql(u8, t, "unset")) load_o.default else t) else load_o.default, 10) catch return null;
+            if (pump > load) return .{ .code = "conflicting_options", .message = std.fmt.allocPrint(a, "TF_SPILL_PUMP_MS={d} is more than TF_SPILL_LOAD_MS={d}: staging's share of a service cannot pass the service", .{ pump, load }) catch "pump above load" };
+        },
+        else => {},
     }
+    return null;
+}
+
+/// The three fill-order rows' effective texts, `named` rows replaced by a request's values, for fill_order.parse.
+const FillTexts = struct { order: ?[]const u8, qos: ?[]const u8, wait: ?[]const u8 };
+
+fn fillTexts(named_order: ??[]const u8, named_qos: ??[]const u8, named_wait: ??[]const u8) FillTexts {
+    const order_o = settings.byId(120).?;
+    const qos_o = settings.byId(121).?;
+    const wait_o = settings.byId(119).?;
+    return .{
+        .order = if (named_order) |t| t else currentText(order_o),
+        .qos = if (named_qos) |t| t else currentText(qos_o),
+        .wait = if (named_wait) |t| t else currentText(wait_o),
+    };
+}
+
+/// Publishes the prompt-step order a request's fill rows (and the standing ones) make, or the start's when none stands.
+fn publishFillOrder(changes: []const Change, version: u64) void {
+    var no: ??[]const u8 = null;
+    var nq: ??[]const u8 = null;
+    var nw: ??[]const u8 = null;
+    var any = false;
+    for (changes) |c| {
+        if (!live_config.isFillRow(c.o.id)) continue;
+        any = true;
+        const t: ?[]const u8 = if (std.mem.eql(u8, c.text, "unset")) null else c.text;
+        switch (c.o.id) {
+            120 => no = t,
+            121 => nq = t,
+            else => nw = t,
+        }
+    }
+    if (!any) return;
+    const t = fillTexts(no, nq, nw);
+    if (t.order == null and t.qos == null and t.wait == null) return live_config.block.publishFill(null, version);
+    const r = fill_order.parse(t.order, t.qos, t.wait);
+    if (r.order_ok and r.qos_ok and r.wait_ok) live_config.block.publishFill(r.policy, version);
 }
 
 fn readJsonBody(ctx: Ctx) ?Value {
@@ -1466,8 +1943,16 @@ fn setReply(ctx: Ctx) void {
     if (an.schema_version) |sv| if (sv != settings.schema_version) return fail(conn, a, 409, "schema_changed", "the schema changed: read it again");
     const persist = an.persist orelse true;
     var any_file = persist;
+    // engine.cfg as it is now: what a change is judged against, not what this process started with
+    const cfg_now: ?[]const u8 = if (settings.report.path.len > 0) std.Io.Dir.cwd().readFileAlloc(srv.io, settings.report.path, a, .limited(1 << 20)) catch null else null;
+    const changes = a.dupe(Change, an.changes) catch return fail(conn, a, 500, "internal", "admin: out of memory");
+    if (cfg_now) |text| for (changes) |*c| {
+        c.file_from = fileValueIn(a, text, c.o);
+    };
+    for (changes) |c| if (!c.live) {
         any_file = true;
     };
+    if (!persist) for (changes) |c| if (!c.live) return fail(conn, a, 400, "invalid_apply_mode", "a change for the next start is kept by persisting it: persist is true for these rows");
     admin_state.lockWrites();
     defer admin_state.unlockWrites();
     const before = settings_history.version.load(.acquire);
@@ -1475,6 +1960,7 @@ fn setReply(ctx: Ctx) void {
         const d = json.newObject(a) catch return;
         d.put(a, "config_version", json.intValue(a, before) catch return) catch return;
         var cur: std.ArrayList(Value) = .empty;
+        for (changes) |c| {
             const r = json.newObject(a) catch return;
             r.put(a, "name", str(c.o.name)) catch return;
             const st = admin_state.stateOf(c.o, currentText(c.o));
@@ -1488,7 +1974,11 @@ fn setReply(ctx: Ctx) void {
         d.put(a, "current", .{ .array = cur.items }) catch return;
         return failDetails(conn, a, 409, "version_conflict", "the settings changed since this request was drawn up", .{ .object = d }, null);
     };
+    // the same request twice is no change: a live row's change is judged against what the engine RUNS (and against engine.cfg only when this
+    // request keeps it there), a row for the next start against what engine.cfg holds; the two differ after a live change with persist false
     var all_same = true;
+    for (changes) |c| {
+        const same = if (c.live) sameActive(c.o, currentText(c.o), c.text) and (!persist or sameFile(c.file_from, c.text)) else sameFile(c.file_from, c.text);
         if (!same) all_same = false;
     }
     if (all_same) {
@@ -1512,6 +2002,8 @@ fn setReply(ctx: Ctx) void {
     if (any_file) {
         const old = std.Io.Dir.cwd().readFileAlloc(srv.io, cfg_path, a, .limited(1 << 20)) catch |e| return fail(conn, a, 500, "internal", std.fmt.allocPrint(a, "engine.cfg: cannot read it ({s}): nothing was changed", .{@errorName(e)}) catch "engine.cfg: cannot read it");
         old_text = old;
+        const edits = a.alloc(cfg_write.Edit, changes.len) catch return;
+        for (changes, edits) |c, *e| e.* = .{ .o = c.o, .value = c.text };
         const text = cfg_write.rewrite(a, old, edits, settings.schema_version) catch return fail(conn, a, 500, "internal", "admin: out of memory");
         cfg_write.writeAtomic(a, cfg_path, text) catch |e| return fail(conn, a, 500, "internal", std.fmt.allocPrint(a, "engine.cfg: cannot write it ({s}): nothing was changed", .{@errorName(e)}) catch "engine.cfg: cannot write it");
         wrote = true;
@@ -1520,6 +2012,8 @@ fn setReply(ctx: Ctx) void {
         new_sha = h;
     }
     // the history row, before anything is applied or answered
+    const hist_changes = a.alloc(settings_history.WriteChange, changes.len) catch return;
+    for (changes, hist_changes) |c, *hc| hc.* = .{ .id = c.o.id, .from = if (persist) c.file_from else c.from, .from_file = c.file_from, .to = if (std.mem.eql(u8, c.text, "unset")) null else c.text, .persisted = persist, .state_after = if (c.live) "active" else "pending_restart" };
     var hex_buf: [64]u8 = undefined;
     const hex: ?[]const u8 = if (new_sha) |h| blk: {
         hex_buf = std.fmt.bytesToHex(h, .lower);
@@ -1528,6 +2022,7 @@ fn setReply(ctx: Ctx) void {
     const req_id = std.fmt.allocPrint(a, "r-{d}", .{request_counter.fetchAdd(1, .monotonic) + 1}) catch return;
     var mode_live = false;
     var mode_next = false;
+    for (changes) |c| if (c.live) {
         mode_live = true;
     } else {
         mode_next = true;
@@ -1557,14 +2052,26 @@ fn setReply(ctx: Ctx) void {
     }
     // apply: a live value goes to the engine, every row is remembered
     var any_rounds = false;
+    for (changes) |c| {
+        // a live value the engine already runs is not published again (it would wait for a turn to be taken for nothing)
+        const runs = c.live and sameActive(c.o, currentText(c.o), c.text);
+        if (c.live and !runs) {
             publishLive(srv, c, version);
+            if (live_config.slotOf(c.o.id) != .log_polls) any_rounds = true; // a row the host takes: the answer waits for its turn
         }
+        admin_state.record(c.o, if (c.live and !runs) c.text else null, if (persist) c.text else null, ctx.who.label, version);
     }
+    publishFillOrder(changes, version);
+    for (changes) |c| if (live_config.isFillRow(c.o.id) and c.live) {
+        any_rounds = true;
+    };
     if (any_rounds and an.wait_ms > 0) {
         const t0 = clock.nowNs(srv.io);
         while (live_config.block.active_version.load(.acquire) < version and clock.nowNs(srv.io) - t0 < @as(i96, @intCast(an.wait_ms)) * std.time.ns_per_ms) std.Io.sleep(srv.io, .fromMilliseconds(5), .awake) catch {};
     }
+    const rows = a.alloc(Value, changes.len) catch return;
     var pending = false;
+    for (changes, rows) |c, *slot| {
         const st = admin_state.stateOf(c.o, currentText(c.o));
         if (st.state == .pending_step) pending = true;
         slot.* = changeValue(a, c, @tagName(st.state), version, persist) catch return;
@@ -1578,6 +2085,7 @@ fn setReply(ctx: Ctx) void {
     root.put(a, "effective_mode", str(if (mode_live and !mode_next) "live" else "next_start")) catch return;
     root.put(a, "changes", .{ .array = rows }) catch return;
     var warns = an.warnings;
+    if (settings_history.path.len == 0) warns.append(a, warningText(a, "history_in_memory", "history", "no engine.cfg was read at the start: the history of this change is kept in memory and is lost when the engine stops") catch return) catch return;
     if (persist) warns.append(a, warningText(a, "other_ranks_take_it_at_next_start", "engine.cfg", "the other ranks take it at the next start (start.sh copies the file)") catch return) catch return;
     root.put(a, "warnings", .{ .array = warns.items }) catch return;
     sendValue(ctx, 200, .{ .object = root });
@@ -1597,6 +2105,7 @@ fn revertReply(ctx: Ctx) void {
         if (std.mem.eql(u8, k, "to_version")) to_version = n orelse return fail(conn, a, 400, "bad_json", "to_version: a whole number") else if (std.mem.eql(u8, k, "history_version")) undo = n orelse return fail(conn, a, 400, "bad_json", "history_version: a whole number") else return fail(conn, a, 400, "unknown_field", k);
     }
     if ((to_version == null) == (undo == null)) return fail(conn, a, 400, "missing_field", "name one of to_version or history_version");
+    const loaded: settings_history.Loaded = if (settings_history.path.len == 0) .{ .lines = settings_history.memoryLines(a) catch return fail(conn, a, 500, "internal", "admin: out of memory") } else settings_history.load(a, ctx.srv.io, settings_history.path) catch return fail(conn, a, 500, "internal", "the history cannot be read");
     const Replay = struct { version: u64 = 0, changes: []const struct { id: u32 = 0, from: ?[]const u8 = null, to: ?[]const u8 = null, persisted: bool = true } = &.{} };
     var rows: std.ArrayList(Replay) = .empty;
     for (loaded.lines) |l| {
@@ -1705,10 +2214,25 @@ fn warningText(a: Allocator, code: []const u8, name: []const u8, message: []cons
     return .{ .object = o };
 }
 
+fn warning(a: Allocator, code: []const u8, name: []const u8, requires: ?[]const u8) !Value {
+    const o = try json.newObject(a);
+    try o.put(a, "code", str(code));
+    try o.put(a, "name", str(name));
+    if (requires) |r| try o.put(a, "requires", str(r));
+    return .{ .object = o };
+}
+
 /// An option's value as the engine runs it now: a live change the engine has taken, else the start's value; null when the code decides.
 fn currentText(o: *const settings.Option) ?[]const u8 {
     if (admin_state.liveValue(o)) |t| return if (std.mem.eql(u8, t, "unset")) (if (o.default.len == 0) null else o.default) else t;
     return activeText(o);
+}
+
+/// An option's value as the engine started with it: the value start-up recorded, or its default; null when the code decides.
+fn activeText(o: *const settings.Option) ?[]const u8 {
+    const res = settings.resolved[settings.indexOf(o)];
+    if (res.source != .default and !o.secret) return res.value;
+    return if (o.default.len == 0) null else o.default;
 }
 
 /// RFC 3339 UTC time of a unix time in milliseconds.

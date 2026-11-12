@@ -191,6 +191,7 @@ pub fn translate(cx: *Cx, body: Value, count: bool) errors.Refused!Value {
         try chat.put(a, "stream", s);
     }
     for ([_][]const u8{ "temperature", "top_p", "top_k" }) |k| if (body.get(k)) |v| try chat.put(a, k, v);
+    if (body.field("tf")) |v| try chat.put(a, "tf", v); // the per-request fields (request_policy.zig), read under the key's caps
     if (body.get("stop_sequences")) |stops| {
         const ok = stops == .array and for (stops.array) |s| {
             if (s != .string or s.string.len == 0) break false;

@@ -299,6 +299,11 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
     };
     defer srv.deinit();
     if (admin_on) srv.admin_keys = &admin_store;
+    // the per-key caps on a request's own fields (pri, think_budget, wait_ms): none configured, and the fields are ignored
+    if (env(s, "TENSORFOLD_ADMIN_POLICY")) |path| if (path.len > 0) {
+        srv.policy.load(io, path);
+        if (srv.policy.valid) log.line("request fields: caps for {d} key labels from the policy file; the other labels' fields are dropped", .{srv.policy.rows.len});
+    };
     var sampler: ?*admin_series.Sampler = null;
     if (admin_on) if (admin_series.Sampler.create(gpa)) |smp| {
         sampler = smp;
@@ -436,4 +441,21 @@ test "the raise lifts a low soft limit, and a second raise does nothing" {
     try std.testing.expectEqual(@as(u64, 256), raised[0]);
     try std.testing.expectEqual(raised[1], @as(u64, @intCast((try posix.getrlimit(.NOFILE)).cur)));
     try std.testing.expect(raiseOpenFileLimit() == null);
+}
+
+test "the schema's defaults for the server's settings are the parsers' own" {
+    const settings = api.settings;
+    const t = std.testing;
+    const close = settings.byEnv("TENSORFOLD_CLOSE_MS").?;
+    try t.expectEqual(default_close_ms, try std.fmt.parseInt(u32, close.default, 10));
+    try t.expectEqual(default_close_ms, try closeMs(null));
+    try t.expectEqual(default_close_ms, try closeMs(""));
+    const keepalive = settings.byEnv("TF_SSE_KEEPALIVE_S").?;
+    try t.expectEqual(keepaliveSeconds(null).?, try std.fmt.parseFloat(f64, keepalive.default));
+    try t.expectEqual(@as(f64, 0), keepalive.min.?);
+    const floor = settings.byEnv("TENSORFOLD_PREPARE_FLOOR_GIB").?;
+    try t.expectEqual(prepare_gate.default_floor_gib, try std.fmt.parseFloat(f64, floor.default));
+    try t.expectEqual(prepare_gate.default_floor_gib, try prepare_gate.floorGib(null));
+    // every environment name the server reads here has a row
+    for ([_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_SEED_SALT", "TF_SSE_KEEPALIVE_S", "TENSORFOLD_CLOSE_MS", "TENSORFOLD_REQUEST_LOG", "TENSORFOLD_LOG_POLLS", "TENSORFOLD_PREPARE_FLOOR_GIB", "TENSORFOLD_NO_LIVE" }) |name| try t.expect(settings.byEnv(name) != null);
 }

@@ -3,6 +3,7 @@ const std = @import("std");
 const json = @import("json");
 const cli = @import("cli.zig");
 const log = @import("log.zig");
+const api = @import("engine_api");
 const hub = @import("hub.zig");
 const engines = @import("engines.zig");
 const serve = @import("serve.zig");
@@ -10,7 +11,6 @@ const hf_text = @import("hf_text.zig");
 const startup = @import("startup.zig");
 const slide_cli = @import("slide_cli.zig");
 const slide_key = @import("slide_key.zig");
-const api = @import("engine_api");
 const recall_open = @import("recall_open.zig");
 const benchmark = @import("benchmark.zig");
 const checkpoint_cli = @import("checkpoint_cli");
@@ -73,8 +73,19 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("usage: tensorfold-native capabilities --json | models | info MODEL | pull REPO[@REVISION] | slide rollback FOLDER | serve MODEL [flags] | benchmark MODEL [flags]\n", .{});
         return 2;
     }
+    {
+        // engine.cfg (TF_ENGINE_CFG) puts values where the engine's parsers read them, for options the environment leaves unset;
+        // without the variable nothing is read, logged or changed
+        var cfg_problem: []const u8 = "";
         api.settings.bootstrap(a, io, init.environ_map, init.environ_map.get("TF_ENGINE_CFG"), log, true, &cfg_problem) catch return fail(cfg_problem);
+        // a hand edit made while the engine was stopped is recorded as an `imported` row of engine.history.jsonl; a history
+        // that cannot be written is told and the start goes on
+        if (init.environ_map.get("TF_ENGINE_CFG")) |cfg_path| {
+            const now_ms: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).toNanoseconds(), std.time.ns_per_ms));
+            _ = api.settings_history.recordStart(a, io, cfg_path, api.settings.report, @import("build_options").version, now_ms, log) catch {};
             @import("admin_state.zig").release = @import("build_options").version;
+        }
+    }
     const started = std.Io.Clock.awake.now(io).toNanoseconds();
     var u: cli.Usage = .{};
     var args = cli.parse(a, argv[2..], &u) catch |e| switch (e) {

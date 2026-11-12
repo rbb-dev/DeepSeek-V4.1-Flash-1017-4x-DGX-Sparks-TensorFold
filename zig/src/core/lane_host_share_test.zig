@@ -530,6 +530,96 @@ test "the host takes a live rounds-beside at its next turn, falls back to the st
     try std.testing.expectEqual(@as(u32, 0), host.share.rounds);
 }
 
+test "the host takes a live share, step rows, tier timings and fill order at its next turn, and returns to the start's on unset" {
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.chunkedBackend(), clock.clock());
+    defer core.deinit();
+    var host = api.LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2, .resume_rows = 4, .beside_rows = 8 });
+    const live = api.live_config;
+    var blk: live.Block = .{};
+    host.live = &blk;
+    host.captureBoot();
+    var v: u64 = 0;
+    const slot = struct {
+        fn at(s: live.Slot) usize {
+            return @backingInt(s);
+        }
+    }.at;
+    // the share
+    v += 1;
+    blk.publish(.prefill_share, @bitCast(@as(f64, 0.5)), v);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(f64, 0.5), host.share.p);
+    v += 1;
+    blk.publish(.prefill_share, live.unset, v);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(f64, 1), host.share.p);
+    // a share below 1 beside a count of rounds is two controls: kept as it was
+    v += 1;
+    blk.publish(.rounds_beside, 3, v);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(u32, 3), host.share.rounds);
+    v += 1;
+    blk.publish(.prefill_share, @bitCast(@as(f64, 0.5)), v);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(f64, 1), host.share.p);
+    v += 1;
+    blk.publish(.rounds_beside, live.unset, v);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(u32, 0), host.share.rounds);
+    // the step rows: a multiple of the resume grid; one that is not is not taken
+    v += 1;
+    blk.publish(.pass_beside, 16, v);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(u32, 16), host.info_.beside_rows);
+    v += 1;
+    blk.publish(.pass_beside, 10, v);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(u32, 16), host.info_.beside_rows);
+    v += 1;
+    blk.publish(.pass_beside, live.unset, v);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(u32, 8), host.info_.beside_rows);
+    // the tier's timings, in milliseconds
+    v += 1;
+    blk.publish(.spill_load_ms, 80, v);
+    blk.publish(.spill_poll_ms, 5, v);
+    blk.publish(.spill_defer_min, 4096, v);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(u64, 80 * std.time.ns_per_ms), host.tier.service_ns);
+    try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_ms), host.tier.poll_ns);
+    try std.testing.expectEqual(@as(u32, 4096), host.tier.defer_min);
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_ms), host.tier.pump_ns); // untouched
+    // staging's share may not pass the service's budget: a pump above the load is not taken
+    v += 1;
+    blk.publish(.spill_pump_ms, 200, v);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_ms), host.tier.pump_ns);
+    v += 1;
+    blk.publish(.spill_load_ms, live.unset, v);
+    blk.publish(.spill_poll_ms, live.unset, v);
+    blk.publish(.spill_defer_min, live.unset, v);
+    blk.publish(.spill_pump_ms, live.unset, v);
+    host.liveTurn();
+    try std.testing.expectEqual(@as(u64, 40 * std.time.ns_per_ms), host.tier.service_ns);
+    try std.testing.expectEqual(@as(u32, 0), host.tier.defer_min);
+    _ = slot;
+    // the fill order
+    const turns = api.fill_order.parse("turns", null, "9").policy;
+    v += 1;
+    blk.publishFill(turns, v);
+    host.liveTurn();
+    try std.testing.expect(host.info_.fill.on and host.info_.fill.order == .turns and host.info_.fill.max_wait_s == 9);
+    v += 1;
+    blk.publishFill(null, v);
+    host.liveTurn();
+    try std.testing.expect(!host.info_.fill.on);
+}
+
 var cfg_seen: [8]api.live_config.CfgItem = undefined;
 var cfg_versions: [8]u64 = undefined;
 var cfg_count: usize = 0;

@@ -17,6 +17,7 @@ const Server = @import("server.zig").Server;
 const chunk_plan = @import("chunk_plan.zig");
 const prepare_gate = @import("prepare_gate.zig");
 const admin_requests = @import("admin_requests.zig");
+const request_policy = @import("request_policy.zig");
 const Mailbox = @import("mailbox.zig").Mailbox;
 const Value = json.Value;
 const Cx = errors.Cx;
@@ -108,6 +109,8 @@ pub const Prepared = struct {
     drafts: bool,
     stops: fields_mod.Stops,
     preparing: bool,
+    /// The most time the request waits for the engine to take its prompt (the request's own `wait_ms`, under its key's cap).
+    wait_ms: ?u32 = null,
 };
 
 /// Render ``input`` and run every check that can refuse it, before anything reaches the client or the engine.
@@ -119,7 +122,14 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     const stops_opt = try fields_mod.stopOptions(cx, f);
     var limit: i64 = @max(1, if (input.max_tokens) |m| (if (m != 0) m else srv.config.default_max_tokens) else srv.config.default_max_tokens);
     const priority = f.get("priority");
-    const background = prompt_mod.isTitle(input.messages, input.tools.len > 0) or
+    // the per-request fields, under the caps of the key's label (request_policy.zig); no policy file: none apply
+    var applied: request_policy.Applied = .{};
+    if (srv.policy.path != null) {
+        const who = admin_requests.context.label;
+        applied = request_policy.resolve(srv.policy.row(io, who), request_policy.fromBody(a, f), request_policy.carried);
+        if (applied.touched) srv.policy.note(io, who, applied);
+    }
+    const background = prompt_mod.isTitle(input.messages, input.tools.len > 0) or applied.batch or
         (priority != null and priority.? == .string and std.mem.eql(u8, priority.?.string, "background"));
     const preparing = !background;
     if (preparing) _ = srv.preparing.fetchAdd(1, .acq_rel);
@@ -166,7 +176,6 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         .rewind_len = @intCast(rendered.rewind_len),
         .shared_prefixes = shared.items,
         .chunks = try chunk_plan.withCut(a, try srv.chunks.starts(a, rendered.ids), if (srv.chunks.step > 0) @intCast(@max(system_len, 1) - 1) else 0, rendered.ids.len, srv.chunks.min_chunk), // a cut before the conversation's own text: fresh sessions resume their whole harness
-        .decode_spans = try prompt_mod.replySpans(srv, cx, rendered.ids), // from the tokens alone, for every request: cached states are keyed by tokens
         .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
         .decide = if (input.prompt == null and !background) prompt_mod.decideOf(srv, rendered.ids) else null,
         .images = rendered.images,
@@ -175,7 +184,8 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
     if (thinking) {
         const budget_field = f.get("thinking_budget");
-        const budget: i64 = if (budget_field != null and budget_field.?.truthy()) budget_field.?.int64() orelse 0 else srv.config.thinking_budget;
+        const asked: i64 = if (budget_field != null and budget_field.?.truthy()) budget_field.?.int64() orelse 0 else srv.config.thinking_budget;
+        const budget = applied.capBudget(if (applied.think_budget) |t| @as(i64, t) else asked);
         if (budget > 0 and !srv.info.thinking_budget)
             return cx.refuse("thinking_budget is not supported by this native engine");
         if (srv.think_close.len > 0) request.loop_guard = srv.config.loop_guard;
@@ -192,6 +202,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         .json, .json_schema => .structured_json,
         else => .automatic,
     } else .automatic;
+    return .{ .response_channel = response_channel, .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .stops = stops_opt, .preparing = preparing, .wait_ms = applied.wait_ms };
 }
 
 /// Submit a prepared request and collect its reply; ``sink`` hears the stream (null: not streamed).
@@ -240,8 +251,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     };
     release(srv, preparing); // a background request waits only while a foreground one prepares
     preparing = false;
-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = input.token_ids, .sent_ns = nowNs(io), .lp = if (request.logprobs != null) .{} else null };
-    defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, &box.stats.depths, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
+    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = if (prepared.response_channel == .structured_json) &.{} else input.tools, .token_ids = input.token_ids, .response_channel = prepared.response_channel, .deadline_ns = if (prepared.wait_ms) |w| received + @as(i96, w) * std.time.ns_per_ms else null, .sent_ns = nowNs(io), .lp = if (request.logprobs != null) .{} else null };
     if (tracked) |t| gen.live = &t.generated;
     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, &box.stats.depths, box.stats.rounds, box.stats.plans, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
@@ -252,6 +262,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
             // client gets the parsed calls at the end, the ones a non-streaming client gets
             gen.calls.?.calls_off = tool_grammar.writesDsml(srv, a);
         }
+        gen.loop(gone) catch |e| break :blk if (gen.timed_out) cx.fail(.capacity, "the engine did not take the request within its wait_ms ({d} ms); retry shortly", .{prepared.wait_ms.?}) else e;
         break :blk gen.finish(cx, prepared.prompt_len, received, thinking, effort, prepared.sampled, prepared.drafts);
     };
     done = .{
@@ -335,6 +346,8 @@ const Generation = struct {
     engine_done: bool = false,
     consumed: usize = 0,
     chunk_index: usize = 0,
+    deadline_ns: ?i96 = null,
+    timed_out: bool = false,
     sent_ns: i96 = 0, // when the stream last sent the client something (its keepalive's clock)
     lp: ?@import("logprobs.zig").Stream = null, // the request asked for logprobs: its rows, copied with each round
 
@@ -460,7 +473,7 @@ const Generation = struct {
     fn cancel(g: *Generation) void {
         if (!g.engine_done) g.srv.engine.cancel(g.id);
         g.drain();
-        if (g.box.reason == .cancelled and g.reason == null) g.srv.metrics.disconnected(g.srv.io);
+        if (g.box.reason == .cancelled and g.reason == null and !g.timed_out) g.srv.metrics.disconnected(g.srv.io);
     }
 
     /// Waits for the engine's own end, so the request it holds may be freed.
@@ -503,6 +516,12 @@ const Generation = struct {
                 g.cancel();
                 return error.Cancelled;
             }
+            // a request that bound its wait gives up when the engine has not taken its prompt by then (one clock read a turn)
+            if (!started) if (g.deadline_ns) |d| if (nowNs(g.srv.io) >= d) {
+                g.timed_out = true;
+                g.cancel();
+                return error.Cancelled;
+            };
                 // Queueing and long prefills send no tokens; keep the connection alive through those gaps.
                 const now = nowNs(g.srv.io);
                 const since = g.wrote_ns orelse now;

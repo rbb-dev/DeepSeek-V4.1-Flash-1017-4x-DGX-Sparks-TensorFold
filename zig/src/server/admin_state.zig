@@ -68,6 +68,9 @@ pub fn record(o: *const settings.Option, live: ?[]const u8, file: ?[]const u8, w
 /// Whether the engine has taken a live value: the host's active version has reached it (a row on a server thread is taken at once).
 fn taken(o: *const settings.Option, r: Row) bool {
     if (r.live_text == null) return false;
+    if (live_config.slotOf(o.id)) |slot| {
+    } else if (!live_config.isFillRow(o.id)) return false;
+    return live_config.block.active_version.load(.acquire) >= r.live_version;
 }
 
 /// The value the engine runs now, when this process changed it live and the engine took it; null: no live change (the start's value).

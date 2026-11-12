@@ -80,6 +80,8 @@ pub const LaneHost = struct {
     /// the start gave (what `unset` returns to).
     live: ?*live_config.Block = null,
     live_seen: u64 = 0,
+    /// What the start gave the rows a live change may replace (what `unset` returns to).
+    boot: Boot = .{},
     /// What every rank was last told for each slot of class A (`unset`: nothing yet, the start's): a cfg frame goes out only when a
     /// slot's published value differs.
     live_sent: [live_config.slot_count]u64 = @splat(live_config.unset),
@@ -158,6 +160,13 @@ pub const LaneHost = struct {
         defer_min: u32 = 0, // TF_SPILL_DEFER_MIN
         /// How often an idle host polls work in flight: restores, staged writes, deferred retries (TF_SPILL_POLL_MS).
         poll_ns: u64 = 2 * std.time.ns_per_ms,
+    };
+
+    pub const Boot = struct {
+        tier: TierPolicy = .{},
+        share_p: f64 = 1,
+        beside_rows: u32 = 0,
+        fill: api.fill_order.Policy = .{},
     };
 
     pub const HostCounts = struct {
@@ -345,6 +354,7 @@ pub const LaneHost = struct {
     }
 
     pub fn start(h: *LaneHost) !void {
+        h.captureBoot();
         if (share_mod.Share.refusal(h.share)) |why| {
             noteErr("{s}", .{why});
             return error.RoundsBesideWithShare;
@@ -1165,14 +1175,92 @@ pub const LaneHost = struct {
         };
         if (tele) |t| h.tele = t;
         if (h.spill_asked) h.spill = spill;
+    /// What the start gave, kept for `unset` to return to. Called by `start`, after the tier was configured.
+    pub fn captureBoot(h: *LaneHost) void {
+        h.boot = .{ .tier = h.tier, .share_p = h.share.p, .beside_rows = h.info_.beside_rows, .fill = h.info_.fill };
+    }
+
+    /// The host's once-a-turn look at the live block: one atomic load while nothing was published. A published value replaces what the
+    /// host runs: the rounds beside a long step (what was owed at the old count is forgiven), the share, the rows a step runs beside a
+    /// decoding stream, the tier's timings and the order prompt steps go in; `unset` returns a slot to what the start gave. A value
+    /// the host cannot run is not taken (a count of rounds beside a share below 1; step rows that are not whole resume units; staging's
+    /// share above the service's budget): the API refuses each before it publishes, and a host that is handed one anyway keeps what it had.
     pub fn liveTurn(h: *LaneHost) void {
         const blk = h.live orelse return;
+        var snap: live_config.Snapshot = undefined;
+        if (!blk.turnAll(&h.live_seen, &snap)) return;
+        const S = live_config.Slot;
+        const at = struct {
+            fn get(sn: *const live_config.Snapshot, s: S) ?u64 {
+                const v = sn.vals[@backingInt(s)];
+                return if (v == live_config.unset) null else v;
+            }
+        }.get;
+        // rounds beside
+        {
+            const want: u32 = if (at(&snap, .rounds_beside)) |v| (std.math.cast(u32, v) orelse h.share.rounds) else h.info_.rounds_beside;
             var next = h.share;
             next.rounds = want;
+            if (want != h.share.rounds and share_mod.Share.refusal(next) == null) {
                 h.share.rounds = want;
                 h.share.due = 0;
                 std.log.info("TF_DS_ROUNDS_BESIDE is now {d} (taken live at version {d})", .{ want, h.live_seen });
             }
+        }
+        // the share
+        {
+            const want: f64 = if (at(&snap, .prefill_share)) |v| @bitCast(v) else h.boot.share_p;
+            var next = h.share;
+            next.p = want;
+            const ok = std.math.isFinite(want) and want >= share_mod.Share.min_share and want <= 1;
+            if (ok and want != h.share.p and share_mod.Share.refusal(next) == null) {
+                h.share.p = want;
+                if (want >= 1) h.share.debt_ns = 0;
+                std.log.info("TENSORFOLD_PREFILL_SHARE is now {d} (taken live at version {d})", .{ want, h.live_seen });
+            }
+        }
+        // the rows a prompt step runs beside a decoding stream
+        {
+            const want: u32 = if (at(&snap, .pass_beside)) |v| (std.math.cast(u32, v) orelse h.info_.beside_rows) else h.boot.beside_rows;
+            const unit = h.info_.resume_rows;
+            const whole = want == 0 or (unit != 0 and want % unit == 0);
+            if (whole and want != h.info_.beside_rows) {
+                h.info_.beside_rows = want;
+                std.log.info("TF_DS_PASS_BESIDE is now {d} rows (taken live at version {d})", .{ if (want != 0) want else unit, h.live_seen });
+            }
+        }
+        // the tier's timings
+        {
+            var next = h.tier;
+            const ms = std.time.ns_per_ms;
+            const b = h.boot.tier;
+            const U = struct {
+                fn ns(v: ?u64, boot: u64) u64 {
+                    return if (v) |x| x *| ms else boot;
+                }
+            };
+            next.service_ns = U.ns(at(&snap, .spill_load_ms), b.service_ns);
+            next.pump_ns = U.ns(at(&snap, .spill_pump_ms), b.pump_ns);
+            next.poll_ns = U.ns(at(&snap, .spill_poll_ms), b.poll_ns);
+            next.flush_ns = U.ns(at(&snap, .spill_flush_ms), b.flush_ns);
+            next.load_wait_ns = if (at(&snap, .spill_load_wait_ms)) |x| @as(i96, x) * ms else b.load_wait_ns;
+            next.defer_ns = if (at(&snap, .spill_defer_ms)) |x| @as(i96, x) * ms else b.defer_ns;
+            next.defer_retry_ns = if (at(&snap, .spill_defer_retry_ms)) |x| @as(i96, x) * ms else b.defer_retry_ns;
+            next.defer_min = if (at(&snap, .spill_defer_min)) |x| (std.math.cast(u32, x) orelse h.tier.defer_min) else b.defer_min;
+            if (next.pump_ns <= next.service_ns and !std.meta.eql(next, h.tier)) {
+                h.tier = next;
+                std.log.info("the tier's timings changed live (version {d}): service {d} ms, staging {d} ms, poll {d} ms, load wait {d} ms, defer {d} ms / retry {d} ms / min {d}, flush {d} ms", .{ h.live_seen, next.service_ns / ms, next.pump_ns / ms, next.poll_ns / ms, @divTrunc(next.load_wait_ns, ms), @divTrunc(next.defer_ns, ms), @divTrunc(next.defer_retry_ns, ms), next.defer_min, next.flush_ns / ms });
+            }
+        }
+        // the order prompt steps go in
+        {
+            const want = snap.fill orelse h.boot.fill;
+            if (!std.meta.eql(want, h.info_.fill)) {
+                h.info_.fill = want;
+                var buf: [512]u8 = undefined;
+                std.log.info("the prompt-step order is now live (version {d}): {s}", .{ h.live_seen, api.fill_order.describe(&want, &buf) });
+            }
+        }
         // the slots of class A: one cfg frame to every rank when one changed
         h.sendCfg(snap.vals);
     }
@@ -1199,6 +1287,7 @@ pub const LaneHost = struct {
             return;
         };
         if (!sent) std.log.warn("a live change of class A was published and this backend has no frame for it: it applies at the next start", .{});
+    }
 
     fn run(h: *LaneHost) void {
         while (true) {

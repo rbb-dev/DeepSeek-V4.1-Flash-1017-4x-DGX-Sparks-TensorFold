@@ -260,6 +260,7 @@ pub const Settings = extern struct {
     pf_split: u32 = 0, // TF_DS_PF_SPLIT asked for (mx.PfSplit): the same
     pass_rows: u32 = 2048, // TF_DS_PASS_ROWS (pass_rows_asked: a pass's rows at most, the chunk's allocation): the same
     pf_raster: u32 = 0, // TF_DS_PF_RASTER's group of row tiles (pf_raster_asked; 0: off): the same (this word was the layout's padding, always 0)
+    cfg: u64 = 0, // the digest of what engine.cfg set on this rank (settings.cfgDigest; 0: no file read): the same on every rank
 
     // "DS41" is another build's frame (its replay floor where this one carries graphs and the graph cap). A change of
     // the fields or of the follower's answer bumps the last letter, so a follower refuses a rank 0 of another layout.
@@ -296,6 +297,14 @@ pub const Settings = extern struct {
         if (mine.exch != lead.exch) bitsDiffer(&w, sep, &exch_names, "exchange", mine.exch, lead.exch, rank);
         if (mine.kern != lead.kern) bitsDiffer(&w, sep, &kern_names, "kernel", mine.kern, lead.kern, rank);
         if (mine.kern2 != lead.kern2) bitsDiffer(&w, sep, &kern2_names, "kernel (second word)", mine.kern2, lead.kern2, rank);
+        if (mine.cfg != lead.cfg) {
+            if (mine.cfg == 0)
+                w.print("{s}rank {d} read no engine.cfg and rank 0 did: give every rank the same file (TF_ENGINE_CFG)", .{ sepIf(&w, sep), rank }) catch {}
+            else if (lead.cfg == 0)
+                w.print("{s}rank {d} read an engine.cfg and rank 0 read none: give every rank the same file (TF_ENGINE_CFG)", .{ sepIf(&w, sep), rank }) catch {}
+            else
+                w.print("{s}rank {d} applied another engine.cfg than rank 0 (the values it sets differ): give every rank the same file (TF_ENGINE_CFG)", .{ sepIf(&w, sep), rank }) catch {};
+        }
         if (mine.pf_raster != lead.pf_raster)
             w.print("{s}rank {d} has TF_DS_PF_RASTER={d} and rank 0 {d} (0: unset): set the same on every rank", .{ sepIf(&w, sep), rank, mine.pf_raster, lead.pf_raster }) catch {};
         if (mine.pf_split != lead.pf_split) {
@@ -2131,6 +2140,16 @@ test "TF_DS_PF_RASTER: unset is off, 2 4 8 16 are the groups, any other text is 
     same.pf_raster = 4;
     try std.testing.expectEqualStrings("rank 1 has TF_DS_PF_RASTER=4 and rank 0 8 (0: unset): set the same on every rank", same.differ(lead, 1, &buf));
     try std.testing.expectEqual(@as(usize, 0), @sizeOf(Settings) % 8);
+    // a rank that applied another engine.cfg than rank 0 is named, and one that read none
+    var cfg = lead;
+    cfg.cfg = 0x1234;
+    var lead_cfg = lead;
+    lead_cfg.cfg = 0x9999;
+    try std.testing.expect(std.mem.indexOf(u8, cfg.differ(lead_cfg, 2, &buf), "rank 2 applied another engine.cfg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cfg.differ(lead_cfg, 2, &buf), "TF_ENGINE_CFG") != null);
+    cfg.cfg = 0;
+    try std.testing.expect(std.mem.indexOf(u8, cfg.differ(lead_cfg, 3, &buf), "rank 3 read no engine.cfg") != null);
+    try std.testing.expectEqualStrings("", lead_cfg.differ(lead_cfg, 1, &buf));
 }
 
 test "an answer too short for a weight digest is refused" {

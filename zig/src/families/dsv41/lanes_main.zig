@@ -72,8 +72,21 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("{s}", .{usage});
         return 2;
     }
+    // engine.cfg (TF_ENGINE_CFG), the same file as rank 0's: its values replace the environment's here as they do there, and the
+    // start's exchange refuses a rank that applied other values than rank 0 (prompt2d.Settings.cfg). Only rank 0 keeps the history.
+    {
+        const Say = struct {
+            pub fn line(comptime fmt: []const u8, largs: anytype) void {
+                std.debug.print(fmt ++ "\n", largs);
+            }
+        };
+        var problem: []const u8 = "";
         dsv41.model.cfg_settings.bootstrap(a, io, init.environ_map, init.environ_map.get("TF_ENGINE_CFG"), Say, true, &problem) catch {
+            std.debug.print("tf-dsv41-lanes: {s}\n", .{problem});
+            return 1;
+        };
         dsv41.model.speed_defaults.applyFamily(); // before the CUDA context reads them
+    }
     var o: dsv41.model.Options = .{
         .model_dir = args[1],
         .cache_dir = args[2],

@@ -1,3 +1,177 @@
+//! engine.history.jsonl: the start's `imported` rows, the replay that finds the last recorded state, and the file's lines.
+const std = @import("std");
+const settings = @import("settings.zig");
+const history = @import("settings_history.zig");
+
+const Cap = struct {
+    var buf: [4096]u8 = undefined;
+    var len: usize = 0;
+    pub fn line(comptime fmt: []const u8, args: anytype) void {
+        const s = std.fmt.bufPrint(buf[len..], fmt ++ "\n", args) catch return;
+        len += s.len;
+    }
+    fn text() []const u8 {
+        return buf[0..len];
+    }
+    fn reset() void {
+        len = 0;
+    }
+};
+
+fn rep(sha_byte: u8, entries: []const settings.Entry) settings.Report {
+    var r: settings.Report = .{ .path = "x", .entries = entries };
+    r.sha256 = @splat(sha_byte);
+    return r;
+}
+
+fn id(env: []const u8) u16 {
+    return settings.byEnv(env).?.id;
+}
+
+fn cfgIn(tmp: *std.testing.TmpDir, a: std.mem.Allocator) ![]const u8 {
+    return std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/engine.cfg", .{tmp.sub_path});
+}
+
+fn lines(a: std.mem.Allocator, path: []const u8) ![]const []const u8 {
+    const l = try history.load(a, std.testing.io, path);
+    return l.lines;
+}
+
+test "the first start with an engine.cfg writes one imported row naming every value; the same file again writes none" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try cfgIn(&tmp, a);
+    const e = [_]settings.Entry{ .{ .id = id("TF_DS_SPILL_READERS"), .value = "8" }, .{ .id = id("TF_DS_SPILL_SMALLS"), .value = "5" } };
+    Cap.reset();
+    const r1 = try history.recordStart(a, std.testing.io, cfg, rep(1, &e), "rel-a", 1_794_000_000_000, Cap);
+    try std.testing.expectEqual(@as(u64, 1), r1.version);
+    try std.testing.expect(r1.written);
+    const path = try history.pathFor(a, cfg);
+    const ls = try lines(a, path);
+    try std.testing.expectEqual(@as(usize, 1), ls.len);
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, ls[0], .{});
+    try std.testing.expectEqualStrings("imported", v.object.get("outcome").?.string);
+    try std.testing.expectEqualStrings("cli", v.object.get("label").?.string);
+    try std.testing.expectEqualStrings("rel-a", v.object.get("release").?.string);
+    try std.testing.expectEqual(@as(i64, 1), v.object.get("version").?.integer);
+    try std.testing.expectEqual(@as(i64, 1_794_000_000_000), v.object.get("at_ms").?.integer);
+    const ch = v.object.get("changes").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), ch.len);
+    try std.testing.expect(ch[0].object.get("from").? == .null);
+    try std.testing.expectEqualStrings("8", ch[0].object.get("to").?.string);
+    try std.testing.expectEqualStrings("tf_ds_spill_readers", ch[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("default", ch[0].object.get("source_before").?.string);
+    // the same file again: nothing is written, the version stays
+    const r2 = try history.recordStart(a, std.testing.io, cfg, rep(1, &e), "rel-a", 1_794_000_001_000, Cap);
+    try std.testing.expect(!r2.written);
+    try std.testing.expectEqual(@as(u64, 1), r2.version);
+    try std.testing.expectEqual(@as(usize, 1), (try lines(a, path)).len);
+}
+
+test "an edited engine.cfg is imported as the difference from the last recorded state: changed, added, removed; a comment-only edit has none" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try cfgIn(&tmp, a);
+    const readers = id("TF_DS_SPILL_READERS");
+    const smalls = id("TF_DS_SPILL_SMALLS");
+    const quota = id("TF_DS_SPILL_QUOTA");
+    _ = try history.recordStart(a, std.testing.io, cfg, rep(1, &.{ .{ .id = readers, .value = "8" }, .{ .id = smalls, .value = "5" } }), "r", 1, Cap);
+    // readers 8 -> 6, smalls removed, quota added
+    const r2 = try history.recordStart(a, std.testing.io, cfg, rep(2, &.{ .{ .id = readers, .value = "6" }, .{ .id = quota, .value = "100" } }), "r", 2, Cap);
+    try std.testing.expectEqual(@as(u64, 2), r2.version);
+    try std.testing.expectEqual(@as(usize, 3), r2.changes);
+    // a new sha with the same values: a row, no changes
+    const r3 = try history.recordStart(a, std.testing.io, cfg, rep(3, &.{ .{ .id = readers, .value = "6" }, .{ .id = quota, .value = "100" } }), "r", 3, Cap);
+    try std.testing.expectEqual(@as(u64, 3), r3.version);
+    try std.testing.expectEqual(@as(usize, 0), r3.changes);
+    const ls = try lines(a, try history.pathFor(a, cfg));
+    try std.testing.expectEqual(@as(usize, 3), ls.len);
+    const v2 = try std.json.parseFromSliceLeaky(std.json.Value, a, ls[1], .{});
+    for (v2.object.get("changes").?.array.items) |c| {
+        const name = c.object.get("name").?.string;
+        if (std.mem.eql(u8, name, "tf_ds_spill_readers")) {
+            try std.testing.expectEqualStrings("8", c.object.get("from").?.string);
+            try std.testing.expectEqualStrings("6", c.object.get("to").?.string);
+            try std.testing.expectEqualStrings("cfg", c.object.get("source_before").?.string);
+        } else if (std.mem.eql(u8, name, "tf_ds_spill_smalls")) {
+            try std.testing.expectEqualStrings("5", c.object.get("from").?.string);
+            try std.testing.expect(c.object.get("to").? == .null);
+        } else try std.testing.expectEqualStrings("tf_ds_spill_quota", name);
+    }
+}
+
+test "a stopped engine's edit after a long history is found by replaying every row, and a damaged line is skipped, counted and never written over" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try cfgIn(&tmp, a);
+    const readers = id("TF_DS_SPILL_READERS");
+    _ = try history.recordStart(a, std.testing.io, cfg, rep(1, &.{.{ .id = readers, .value = "8" }}), "r", 1, Cap);
+    const path = try history.pathFor(a, cfg);
+    {
+        const old = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(1 << 20));
+        const damaged = try std.fmt.allocPrint(a, "{s}this is not json\n", .{old});
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = damaged });
+    }
+    Cap.reset();
+    const r = try history.recordStart(a, std.testing.io, cfg, rep(2, &.{.{ .id = readers, .value = "9" }}), "r", 2, Cap);
+    try std.testing.expectEqual(@as(u64, 2), r.version);
+    try std.testing.expectEqual(@as(usize, 1), r.changes);
+    try std.testing.expect(std.mem.indexOf(u8, Cap.text(), "1 line") != null);
+    const l = try history.load(a, std.testing.io, path);
+    try std.testing.expectEqual(@as(usize, 3), l.lines.len); // nothing was removed
+}
+
+test "every row is one valid JSON line, whatever the value holds" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try cfgIn(&tmp, a);
+    const dir = id("TF_DS_SPILL_DIR");
+    const nasty = "a\"b\\c\td\xff\xfe/é\x01";
+    _ = try history.recordStart(a, std.testing.io, cfg, rep(1, &.{.{ .id = dir, .value = nasty }}), "rel\"x", 1, Cap);
+    const ls = try lines(a, try history.pathFor(a, cfg));
+    try std.testing.expectEqual(@as(usize, 1), ls.len);
+    try std.testing.expect(std.mem.indexOfScalar(u8, ls[0], '\n') == null);
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, ls[0], .{});
+    try std.testing.expectEqualStrings("rel\"x", v.object.get("release").?.string);
+    // a value that is valid text comes back as it went in (the replay compares by text)
+    _ = try history.recordStart(a, std.testing.io, cfg, rep(2, &.{.{ .id = dir, .value = "a\"b\\c\t/é" }}), "r", 2, Cap);
+    const again = try history.recordStart(a, std.testing.io, cfg, rep(2, &.{.{ .id = dir, .value = "a\"b\\c\t/é" }}), "r", 3, Cap);
+    try std.testing.expect(!again.written);
+}
+
+test "a history that cannot be written does not end the start: it is told, once" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    Cap.reset();
+    const r = try history.recordStart(a, std.testing.io, ".zig-cache/tmp/no-such-dir-here/engine.cfg", rep(1, &.{.{ .id = id("TF_DS_SPILL_READERS"), .value = "8" }}), "r", 1, Cap);
+    try std.testing.expect(!r.written);
+    try std.testing.expect(std.mem.indexOf(u8, Cap.text(), "engine.history.jsonl") != null);
+}
+
+test "the version is the newest recorded row's, and a missing file is version 0" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try cfgIn(&tmp, a);
+    try std.testing.expectEqual(@as(u64, 0), (try history.state(a, std.testing.io, try history.pathFor(a, cfg))).version);
+    _ = try history.recordStart(a, std.testing.io, cfg, rep(1, &.{}), "r", 1, Cap);
+    try std.testing.expectEqual(@as(u64, 1), (try history.state(a, std.testing.io, try history.pathFor(a, cfg))).version);
+}
 
 test "a write row is one line; its persisted values are the replayed state, an unpersisted one is not, and its sha is the file's so the next start imports nothing" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
