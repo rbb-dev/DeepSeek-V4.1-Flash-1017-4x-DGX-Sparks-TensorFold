@@ -69,6 +69,7 @@ pub const Ops = struct {
     gather: cuda.Function,
     copy16: cuda.Function,
     argmax_rows: cuda.Function,
+    argmax_part: cuda.Function,
     top_cand_rows: cuda.Function,
     gpu_clock: cuda.Function,
     rest_group: cuda.Function,
@@ -119,6 +120,7 @@ pub const Ops = struct {
             .gather = try mv.function("tf_gather_rows_kernel"),
             .copy16 = try fm.function("tf_ds_copy_rows16_kernel"),
             .argmax_rows = try fm.function("tf_ds_argmax_rows_kernel"),
+            .argmax_part = try fm.function("tf_ds_argmax_part_kernel"),
             .top_cand_rows = try fm.function("tf_ds_top_cand_rows_kernel"),
             .gpu_clock = try fm.function("tf_ds_clock_kernel"),
             .rest_group = try fm.function("tf_ds_rest_group_kernel"),
@@ -397,6 +399,18 @@ pub const Ops = struct {
         a.add(@as(c_int, @intCast(n)));
         a.add(out);
         try go(o.argmax_rows, s, rows, 1024, &a);
+    }
+
+    /// TF_DS_HEAD_KEY: each row's best on these columns as argmaxRows scans them, before its last step: out [rows] of 16
+    /// bytes (the value fp32, its index i32 or 0x7fffffff, whether column 0 is a NaN i32, a zero word).
+    pub fn argmaxPart(o: *const Ops, s: cuda.Stream, logits: u64, ld: usize, n: usize, rows: usize, out: u64) !void {
+        if (rows == 0 or n == 0) return;
+        var a: cuda.Args = .{};
+        a.add(logits);
+        a.add(@as(u64, ld));
+        a.add(@as(c_int, @intCast(n)));
+        a.add(out);
+        try go(o.argmax_part, s, rows, 1024, &a);
     }
 
     /// Track B: each row's first `count` (value, id) in sampling.topCandidates' order into vals [rows, count] fp32 and ids

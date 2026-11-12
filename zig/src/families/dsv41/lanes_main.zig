@@ -219,6 +219,12 @@ pub fn main(init: std.process.Init) !u8 {
     const text = try std.Io.Dir.cwd().readFileAlloc(io, requests_file orelse return error.NoRequests, a, .limited(1 << 30));
     const Requests = struct { requests: []Request };
     const reqs = (try std.json.parseFromSliceLeaky(Requests, a, text, .{ .ignore_unknown_fields = true })).requests;
+    // rows read whole on the host need the whole head (a sharded head leaves rd.logits unwritten)
+    if (dsv41.lanes.wholeRowsRefusal(log_path != null or dsv41.lanes.logits_sha >= 2, m.head_key, m.head_cand)) |why| {
+        try w.print("{{\"rank\": 0, \"error\": \"{s}\"}}\n", .{why});
+        try w.flush();
+        return 1;
+    }
         const mxk: ?*const dsv41.mx.Kernels = if (m.mxk) |*k| k else null; // (the rank's kernels: the two decode defaults read in mx.Kernels.open)
         const speed = dsv41.logits_log.speedWord(.{
             .twin = @backingInt(dsv41.tri_attn.attn_twin),

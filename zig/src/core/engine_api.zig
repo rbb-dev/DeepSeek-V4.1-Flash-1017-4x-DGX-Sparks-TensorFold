@@ -445,6 +445,10 @@ pub const Status = struct {
     preemptions: ?u64 = null,
     /// CUDA graph captures that failed, their work run eagerly instead; null when the engine does not count them.
     graph_fallbacks: ?u64 = null,
+    /// Decode rounds by the path the output head's logits took to the draws, in this order: the device's argmax, the
+    /// tokens merged from the nodes' bests, the GPU's candidates, the candidates merged from the nodes' parts,
+    /// candidates a flag sent on to whole rows, whole rows; null when the engine does not count them.
+    head_rounds: ?[6]u64 = null,
     /// The drafter on a pruned vocabulary (DeepSeek's TF_DS_DRAFT_VOCAB): its passes and its guard's counts; null when
     /// the engine does not run one.
     draft_vocab: ?DraftVocab = null,

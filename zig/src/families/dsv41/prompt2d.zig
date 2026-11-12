@@ -176,8 +176,11 @@ pub const Fan = struct {
     /// the ranks' weight digests by rank: rank 0 holds every rank's, a follower its own (no_digest: none sent, or
     };
 
+/// 13; 4 = 1-11 (fill_resume 10, rdma_idle 11); 5 = 1-12 (and snap_land 12, the SSD tier's landing); 6 = 1-13 (and
 /// head_whole 13, TF_DS_HEAD_CAND's whole head after a round's candidates fell back); 7 = 1-14 (and fill_pair 14, TF_DS_ROCI_STAGGER's two passes); 8 = 1-15 (and snap_sync 15, the SSD tier's stores on every rank); 9 = the same kinds, a Settings of the Rocinante-only layout (no
 /// NCCL cores, retired exchange and kernel bits) and a start-up exchange without a library's id. 10 = 1-16 (and cfg 16, a live change of settings of class A to every rank: live_config.CfgFrame). 11 = the same kinds, a fill_pair frame that carries the third pass's rows (TF_DS_ROCI_STAGGER_LANES; 0: a pair). A new set of kinds takes the next
+/// number, never an old one, so a follower image with other kinds refuses at the start (Settings) instead of ending
+/// with BadFrame at a kind's first use.
 pub const frame_protocol: u32 = 11;
 /// What the ranks of a run must agree on, checked at the start (Fan.settingsChecked) from Model.open's options.
 pub const Settings = extern struct {
@@ -372,6 +375,8 @@ pub const kern_mma_sf: u32 = 1 << 18;
 pub const kern_attn_epilogue: u32 = 1 << 16;
 pub const kern_mma_sf_exact: u32 = 1 << 22;
 pub const kern_pass_tail: u32 = 1 << 23;
+pub const kern_head_cand: u32 = 1 << 24;
+pub const kern_head_key: u32 = 1 << 25;
 pub const kern_gemm_w16: u32 = 1 << 28;
 pub const kern_hc_fused: u32 = 1 << 21;
 pub const kern_attn_epi_fused: u32 = 1 << 27;
@@ -472,6 +477,12 @@ pub var mma_sf_asked: bool = false;
 
 /// TF_DS_MMA_SF_EXACT as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useMmaSf).
 pub var mma_sf_exact_asked: bool = false;
+
+/// TF_DS_HEAD_CAND as Model.open read it (switchAsked), once (Settings.kern, Model.head_cand).
+pub var head_cand_asked: bool = false;
+
+/// TF_DS_HEAD_KEY as Model.open read it (switchAsked), once (Settings.kern, Model.head_key).
+pub var head_key_asked: bool = false;
 
 /// TF_DS_GEMM_W16 as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useGemmW16).
 pub var gemm_w16_asked: bool = false;
@@ -577,6 +588,8 @@ pub fn kernAsked() u32 {
     if (mma_sf_asked) x |= kern_mma_sf;
     if (mma_sf_exact_asked) x |= kern_mma_sf_exact;
     if (pass_tail_asked) x |= kern_pass_tail;
+    if (head_cand_asked) x |= kern_head_cand;
+    if (head_key_asked) x |= kern_head_key;
     if (gemm_w16_asked) x |= kern_gemm_w16;
     if (hc_fused_asked) x |= kern_hc_fused;
     if (attn_epi_fused_asked) x |= kern_attn_epi_fused;

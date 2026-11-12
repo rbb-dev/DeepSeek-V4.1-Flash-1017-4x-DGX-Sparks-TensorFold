@@ -53,6 +53,8 @@ pub const draft_vocab = @import("draft_vocab.zig");
 pub const markov_tokens = @import("markov_tokens.zig");
 pub const draft = @import("draft.zig");
 pub const sampling = @import("sampling.zig");
+/// TF_DS_HEAD_CAND: a sampled round's candidates from each node's columns of the head, merged on rank 0.
+pub const head_cand = @import("head_cand.zig");
 pub const model = @import("model.zig");
 pub const lanes = @import("lanes.zig");
 /// tf-dsv41-rows-replay's pass sizes and, at each, the nodes' quarters, the planes' offsets and a control's row.
@@ -134,6 +136,7 @@ test {
     refAll(markov_tokens);
     refAll(draft);
     refAll(sampling);
+    refAll(head_cand);
     refAll(model);
     refAll(lanes);
     refAll(ring_watch);

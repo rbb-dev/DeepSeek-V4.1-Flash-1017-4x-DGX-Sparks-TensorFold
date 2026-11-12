@@ -446,6 +446,12 @@ pub fn graphFallbacks(ctx: *anyopaque) ?*const std.atomic.Value(u64) {
     return if (st.m.graphs != null) &st.m.graph_fallbacks else null;
 }
 
+/// Rank 0's decode rounds by the head's path (lanes.HeadPath), read at any time.
+pub fn headRounds(ctx: *anyopaque) ?*const [6]std.atomic.Value(u64) {
+    const st: *State = @ptrCast(@alignCast(ctx));
+    return &st.lanes.head_rounds;
+}
+
 /// TF_DS_DRAFT_VOCAB's counters (rank 0's: its guard decides each pass, the followers run it); null unless the list
 /// is in effect.
 pub fn draftVocab(ctx: *anyopaque) ?*const api.DraftVocabCounters {
@@ -634,6 +640,8 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_MMA_SF") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_MMA_SF_EXACT") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_GEMM_R2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_HEAD_CAND") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_HEAD_KEY") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_HC_FUSED") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_RING_WORD") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_RING_WORD_SIGNAL") != null);
@@ -672,6 +680,11 @@ test "TF_DS_MMA_SF and TF_DS_MMA_SF_EXACT both set: TF_DS_MMA_SF's arithmetic st
     var buf: [768]u8 = undefined;
     const text = try spill_start.mathText(&buf, tm);
     try std.testing.expect(std.mem.endsWith(u8, text, " mma_sf=1 mma_sf_exact=0"));
+}
+
+test "the engine's decode rounds by the head's path are its lanes' own counters" {
+    var st: State = undefined;
+    try std.testing.expectEqual(@as(?*const [6]std.atomic.Value(u64), &st.lanes.head_rounds), headRounds(&st));
 }
 
 test "the tier's math keeps the values the shipped settings gave the switches that no longer exist, so a store written before keeps its name; all off without a 2D node" {

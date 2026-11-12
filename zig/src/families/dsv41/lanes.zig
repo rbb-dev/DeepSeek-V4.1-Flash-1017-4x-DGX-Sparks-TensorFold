@@ -24,6 +24,7 @@ const round = @import("round.zig");
 const draft = @import("draft.zig");
 const draft_vocab = @import("draft_vocab.zig");
 const sampling = @import("sampling.zig");
+const head_cand = @import("head_cand.zig");
 const link = @import("link.zig");
 const cuda = @import("cuda");
 
@@ -41,6 +42,18 @@ pub const image_piece = 32 << 10;
 
 /// A gate's diagnostic (the tools' --logits-sha 1): each prompt's logits' sha256 on stderr.
 pub var logits_sha = false;
+/// Why a run that reads every round's whole rows on the host (`reads_rows`: --logits-log, --logits-sha 2) cannot, or null.
+/// TF_DS_HEAD_KEY (`head_key`) and TF_DS_HEAD_CAND (`head_cand_on`) make a round's head each node's own bests or candidates,
+/// which leave rd.logits unwritten (round.zig: headWhole runs only at head_k 0): the rows read would be stale memory, not
+/// the round's (a quality gate scored such rows, NLL 11.75 = ln(vocabulary)). Turning both off changes no number
+/// the model computes, only which node picks the token.
+pub fn wholeRowsRefusal(reads_rows: bool, head_key: bool, head_cand_on: bool) ?[]const u8 {
+    if (!reads_rows) return null;
+    if (head_key) return "TF_DS_HEAD_KEY is on: a greedy round's head keeps each node's best and writes no whole rows; run the logits log with TF_DS_HEAD_KEY=0 on every rank";
+    if (head_cand_on) return "TF_DS_HEAD_CAND is on: a sampled round's head keeps each node's candidates and writes no whole rows; run the logits log with TF_DS_HEAD_CAND=0 on every rank";
+    return null;
+}
+
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
 pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_switch = 10 };
@@ -740,6 +753,32 @@ pub const pass_from_default = 8192;
 /// First tokens a handle names (each prompt's draw, read back right after its prefill).
 const ring = 1024;
 
+/// How a decode round's head logits reach rank 0's draws: the device's argmax (every row greedy, none masked), the
+/// tokens merged from the nodes' bests (TF_DS_HEAD_KEY), the GPU's candidates, the candidates merged from the nodes'
+/// parts (TF_DS_HEAD_CAND), candidates a flag (a NaN, a tie past the kernel's room) sent on to whole rows, or whole
+/// rows to the host.
+pub const HeadPath = enum(u3) { argmax, keys, candidates, merged, flagged, whole };
+
+/// A round's HeadPath from its choices: `greedy` (its tokens), `keyed` (they are the nodes' bests merged: headTokens),
+/// `cand` (candidates came back), `merged` (they are the nodes' parts merged: headCandidates), `whole` (roundLogits).
+pub fn headPath(greedy: bool, keyed: bool, cand: bool, merged: bool, whole: bool) HeadPath {
+    if (greedy) return if (keyed) .keys else .argmax;
+    if (cand) return if (whole) .flagged else if (merged) .merged else .candidates;
+    return .whole;
+}
+
+/// The verify frame's head byte (with TF_DS_HEAD_CAND or TF_DS_HEAD_KEY on every rank: Model.head_cand, head_key): 0
+/// the whole rows, head_cand.key the nodes' bests (with `key`), the count each node selects (head_cand.kFor, with
+/// `cand`); any other value refused.
+pub fn readHead(r: *Reader, cand: bool, key: bool) !u8 {
+    if (!cand and !key) return 0;
+    const k = try r.int(u8);
+    if (k == 0) return 0;
+    if (key and k == head_cand.key) return k;
+    if (cand and (k == head_cand.kFor(1) or k == head_cand.kFor(sampling.max_candidates))) return k;
+    return error.BadFrame;
+}
+
 pub const Lanes = struct {
     gpa: std.mem.Allocator,
     m: *Model,
@@ -791,6 +830,8 @@ pub const Lanes = struct {
     first_row: []f32 = &.{},
     first_of: ?*const lanes.Stream = null,
     masked: []f32 = &.{},
+    // rank 0's decode rounds by HeadPath (the server reads them at any time: /metrics' decode_rounds_by_head_path_total)
+    head_rounds: [6]std.atomic.Value(u64) = @splat(.init(0)),
     // TF_DS_DRAFT_VOCAB's guard (rank 0's: the pass frame carries its call): the committed tokens outside the list
     guard: draft_vocab.Guard = .{},
 
@@ -983,12 +1024,23 @@ pub const Lanes = struct {
         if (try self.begin(kind)) try self.flush();
     }
 
-    // -- the vtable ---------------------------------------------------------------------------------------------
-
-    /// The lowest free slot, the first extent that fits, the prompt in chunks of the served size (at multiples of it:
-    /// the chunks the gates checked; the host's chunk plan is not followed), the head's draw of the first token.
-    fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
-        if (!try of(ptr).prefillPart(s, std.math.maxInt(usize))) return error.FillUnfinished;
+    /// A sampled round's first `count` candidates a row: with the round's head by candidates (`head`, a node's count:
+    /// TF_DS_HEAD_CAND) the nodes' parts merged (`merged` set); when the merge cannot rule out the baseline kernel flagging
+    /// a row, or without it, the whole head (every rank: the head_whole frame) and the baseline kernel on it.
+    fn candidates(self: *Lanes, R: usize, count: usize, head: u8, merged: *bool) !Model.Candidates {
+        const m = self.m;
+        if (head != 0) {
+            if (try m.headCandidatesMerged(R, count, head)) |cd| {
+                merged.* = true;
+                return cd;
+            }
+            if (try self.begin(.head_whole)) {
+                try self.wire.int(self.gpa, u32, @intCast(R));
+                try self.flush();
+            }
+            try m.headWhole(R);
+        }
+        return m.roundCandidates(R, count);
     }
 
     /// Two-phase world-wide idle boundary. No rank parks while another may
@@ -1383,12 +1435,17 @@ pub const Lanes = struct {
                 cand_count = @max(cand_count, sampling.candidateCount(m.vocab, .{ .seed = sm.seed, .temperature = sm.temperature, .top_k = sm.top_k, .top_p = sm.top_p, .min_p = sm.min_p }));
             };
         }
+        // TF_DS_HEAD_KEY: a greedy round's head as each node's own bests; TF_DS_HEAD_CAND: a sampled round's as each
+        // node's own first candidates (every rank told in the frame)
+        const head: u8 = if (greedy and m.head_key) head_cand.key else if (m.head_cand and cand_count > 0) head_cand.kFor(cand_count) else 0;
+        try m.checkTransport(); // (a failed engine sends no frame and runs no round)
         const t0 = m.now();
         where.set(.round, @intCast(windows.len), 0);
         defer where.set(.after_backend, 0, 0); // (the lane core's own work until the next backend call or the gate's next mark)
         defer m.flushDiag(false); // (TF_DS_ROCI_XLOG / TF_DS_NACT_LOG's files, every 256th call: nothing when both are off)
         if (try self.begin(.verify)) {
             try self.wire.int(gpa, u32, @intCast(windows.len));
+            if (m.head_cand or m.head_key) try self.wire.int(gpa, u8, head);
             for (wins[0..windows.len]) |w| {
                 try self.wire.int(gpa, u32, @intCast(w.slot));
                 try self.wire.int(gpa, u64, w.base);
@@ -1400,23 +1457,21 @@ pub const Lanes = struct {
             try self.flush();
         }
         const t1 = m.now();
+        if (self.spill) |t| for (wins[0..windows.len]) |w| t.bump(w.base + w.start, w.base + w.start + w.ids.len);
         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
-        try m.verify(rows, self.built.absorb[0..windows.len]);
-        const t2 = m.now();
-        // every row greedy and none masked: the device's argmax (R tokens back); else the logits for the host's draws
-        var greedy = !masked;
-        for (windows) |w| {
-            if (w.stream.sampling) |sm| if (sm.temperature > 0) {
-                greedy = false;
-            };
-        }
-        const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
-        const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
-        const t3 = m.now();
+        // TF_DS_CAND_FIRST: the round's reads before the drafter's absorb (Model.verifyHead), read back after.
+        // TF_DS_HEAD_CAND: with both on, the early reads are the device's merge, read back by headCandidatesMerged.
+        if (m.cand_first) try m.verifyHead(rows, self.built.absorb[0..windows.len], if (greedy) .argmax else if (cand_count > 0) .{ .candidates = cand_count } else .none) else try m.verify(rows, self.built.absorb[0..windows.len], head);
+        try m.checkTransport(); // (a round that ended on released waits delivers nothing)
+        const keyed = head == head_cand.key;
+        const tokens: []const u32 = if (!greedy) &.{} else if (keyed) try m.headTokens(rows.ids.len) else if (m.cand_first) try m.headArgmax(rows.ids.len) else try m.roundArgmax(rows.ids.len);
+        var merged = false;
+        const cand = if (cand_count > 0) try self.candidates(rows.ids.len, cand_count, head, &merged) else null;
         var whole = cand == null;
         if (cand) |cd| for (cd.flags) |fl| {
             whole = whole or fl != 0;
         };
+        _ = self.head_rounds[@backingInt(headPath(greedy, keyed, cand != null, merged, whole))].fetchAdd(1, .monotonic);
         defer if (self.prof) |*p| {
             p.send += t1 - t0;
             p.enqueue += m.t_enqueue;
@@ -1879,6 +1934,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             9 => .done,
             10 => .fill_resume,
             11 => .rdma_idle,
+            13 => .head_whole,
             14 => .fill_pair,
             else => return error.BadFrame,
         };
@@ -2362,13 +2418,113 @@ test "a prefix two conversations share: the second one resuming it in place woul
     try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
 }
     m.watch = .{}; // (finish and deinit end the watch)
+        &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 },
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 },
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, // 9: the same kinds, the Rocinante-only Settings
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }, // 11: the same kinds, fill_pair carries the third pass's rows
     m.watch = .{}; // (finish and deinit end the watch)
     m.watch = .{}; // (finish and deinit end the watch)
+        "if (m.cand_first) try m.verifyHead(rows, self.built.absorb[0..windows.len], if (greedy) .argmax else if (cand_count > 0) .{ .candidates = cand_count } else .none) else try m.verify(rows, self.built.absorb[0..windows.len], head);",
+        "const keyed = head == head_cand.key;\n        const tokens: []const u32 = if (!greedy) &.{} else if (keyed) try m.headTokens(rows.ids.len) else if (m.cand_first) try m.headArgmax(rows.ids.len) else try m.roundArgmax(rows.ids.len);",
+        "const cand = if (cand_count > 0) try self.candidates(rows.ids.len, cand_count, head, &merged) else null;",
+
+test "a decode round's head path: argmax when greedy, the nodes' merged candidates or the GPU's unless a flag sent them on to whole rows, else whole" {
+    try std.testing.expectEqual(HeadPath.argmax, headPath(true, false, false, false, false));
+    try std.testing.expectEqual(HeadPath.keys, headPath(true, true, false, false, false));
+    try std.testing.expectEqual(HeadPath.candidates, headPath(false, false, true, false, false));
+    try std.testing.expectEqual(HeadPath.merged, headPath(false, false, true, true, false));
+    try std.testing.expectEqual(HeadPath.flagged, headPath(false, false, true, false, true));
+    try std.testing.expectEqual(HeadPath.whole, headPath(false, false, false, false, true));
+    // the round counts its path once, right after its choices (the round's code comes before this test's text)
+    const src = @embedFile("lanes.zig");
+    const line = "_ = self.head_rounds[@backingInt(headPath(greedy, keyed, cand != null, merged, whole))].fetchAdd(1, .monotonic);";
+    const at = std.mem.indexOf(u8, src, line) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(logits < at and at - logits < 200);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, line)); // the round's, and this test's text
+    // merged: the nodes' parts came back merged (TF_DS_HEAD_CAND)
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "            if (try m.headCandidatesMerged(R, count, head)) |cd| {\n                merged.* = true;\n                return cd;\n            }"));
+}
+
+test "the verify frame's head byte: read only with TF_DS_HEAD_CAND, 0 or a node's count, anything else refused" {
+    const gpa = std.testing.allocator;
+    var w: Wire = .{};
+    defer w.deinit(gpa);
+    try w.begin(gpa, .verify, 3);
+    try w.int(gpa, u32, 2);
+    try w.int(gpa, u8, head_cand.kFor(28));
+    try w.int(gpa, u32, 5);
+    var r: Reader = .{ .b = w.buf.items[9..] };
+    try std.testing.expectEqual(@as(u32, 2), try r.int(u32));
+    try std.testing.expectEqual(@as(u8, 32), try readHead(&r, true, false));
+    try std.testing.expectEqual(@as(u32, 5), try r.int(u32)); // the windows after it
+    // off: nothing read
+    var off: Reader = .{ .b = &.{ 7, 0, 0, 0 } };
+    try std.testing.expectEqual(@as(u8, 0), try readHead(&off, false, false));
+    try std.testing.expectEqual(@as(u32, 7), try off.int(u32));
+    // each switch's values with it alone, both with both; any other value refused
+    const Case = struct { k: u8, cand: bool, key: bool, ok: bool };
+    for ([_]Case{
+        .{ .k = 0, .cand = true, .key = false, .ok = true },   .{ .k = 32, .cand = true, .key = false, .ok = true },
+        .{ .k = 64, .cand = true, .key = false, .ok = true },  .{ .k = 1, .cand = true, .key = false, .ok = false },
+        .{ .k = 0, .cand = false, .key = true, .ok = true },   .{ .k = 1, .cand = false, .key = true, .ok = true },
+        .{ .k = 32, .cand = false, .key = true, .ok = false }, .{ .k = 64, .cand = false, .key = true, .ok = false },
+        .{ .k = 1, .cand = true, .key = true, .ok = true },    .{ .k = 64, .cand = true, .key = true, .ok = true },
+        .{ .k = 28, .cand = true, .key = true, .ok = false },  .{ .k = 33, .cand = true, .key = true, .ok = false },
+        .{ .k = 65, .cand = true, .key = true, .ok = false },  .{ .k = 255, .cand = true, .key = true, .ok = false },
+    }) |c| {
+        var one: Reader = .{ .b = &.{c.k} };
+        if (c.ok) try std.testing.expectEqual(c.k, try readHead(&one, c.cand, c.key)) else try std.testing.expectError(error.BadFrame, readHead(&one, c.cand, c.key));
+    }
+    var short: Reader = .{ .b = &.{} };
+    try std.testing.expectError(error.ShortFrame, readHead(&short, true, false));
+    // rank 0 writes it right after the windows' count, a follower reads it there; the fallback's frame carries the
+    // round's rows, a follower's reads them and runs the whole head; it uses the rings (a parked ring wakes)
+    const src = @embedFile("lanes.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"a decode round's head path") orelse return error.TestUnexpectedResult];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "            try self.wire.int(gpa, u32, @intCast(windows.len));\n            if (m.head_cand or m.head_key) try self.wire.int(gpa, u8, head);\n            for (wins[0..windows.len]) |w| {"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "                if (nw == 0 or nw > max_streams) return error.BadFrame;\n                const head = try readHead(r, c.m.head_cand, c.m.head_key);\n"));
+    // a greedy round's head by the nodes' bests (TF_DS_HEAD_KEY), its tokens from them
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "        const head: u8 = if (greedy and m.head_key) head_cand.key else if (m.head_cand and cand_count > 0) head_cand.kFor(cand_count) else 0;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "        const keyed = head == head_cand.key;\n        const tokens: []const u32 = if (!greedy) &.{} else if (keyed) try m.headTokens(rows.ids.len) else if (m.cand_first) try m.headArgmax(rows.ids.len) else try m.roundArgmax(rows.ids.len);"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "            c.m.verify(rows, c.built.absorb[0..nw], head) catch |err| try refusedExchange(c.m, err);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "            if (try self.begin(.head_whole)) {\n                try self.wire.int(self.gpa, u32, @intCast(R));\n                try self.flush();\n            }\n            try m.headWhole(R);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "            13 => .head_whole,")); // (the main loop's kind table)
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "                const n: usize = try r.int(u32);\n                c.m.headWhole(n) catch |err| try refusedExchange(c.m, err);"));
+    try std.testing.expect(usesRdma(.head_whole));
+    try std.testing.expectEqual(@as(u8, 13), @backingInt(Kind.head_whole));
+}
+
+test "TF_DS_CAND_FIRST with TF_DS_HEAD_CAND or TF_DS_HEAD_KEY: the early read is the nodes' parts, and the whole-head launch is skipped" {
+    const lanes_src = @embedFile("lanes.zig");
+    // the verify frame carries the head byte with either switch, and a follower reads it there
+    try std.testing.expect(std.mem.indexOf(u8, lanes_src, "if (m.head_cand or m.head_key) try self.wire.int(gpa, u8, head);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lanes_src, "const head = try readHead(r, c.m.head_cand, c.m.head_key);") != null);
+    // with CAND_FIRST on, the round's reads run early through verifyHead; the candidates come from self.candidates,
+    // which merges the nodes' parts when the frame names a head (head != 0) and falls back to the baseline whole head
+    const vf = std.mem.indexOf(u8, lanes_src, "    fn verifyFn(") orelse return error.TestUnexpectedResult;
+    const vb = lanes_src[vf .. vf + (std.mem.indexOf(u8, lanes_src[vf..], "\n    }\n") orelse return error.TestUnexpectedResult)];
+    try std.testing.expect(std.mem.indexOf(u8, vb, "if (m.cand_first) try m.verifyHead(rows, self.built.absorb[0..windows.len], if (greedy) .argmax else if (cand_count > 0) .{ .candidates = cand_count } else .none) else try m.verify(rows, self.built.absorb[0..windows.len], head);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vb, "const cand = if (cand_count > 0) try self.candidates(rows.ids.len, cand_count, head, &merged) else null;") != null);
+    // a greedy round with the key switch reads the nodes' bests; CAND_FIRST's whole-head argmax read is only the
+    // fallback for a greedy round without it (never both: no second argmax launch)
+    try std.testing.expect(std.mem.indexOf(u8, vb, "const tokens: []const u32 = if (!greedy) &.{} else if (keyed) try m.headTokens(rows.ids.len) else if (m.cand_first) try m.headArgmax(rows.ids.len) else try m.roundArgmax(rows.ids.len);") != null);
+    const cf = std.mem.indexOf(u8, lanes_src, "    fn candidates(") orelse return error.TestUnexpectedResult;
+    const cb = lanes_src[cf .. cf + (std.mem.indexOf(u8, lanes_src[cf..], "\n    }\n") orelse return error.TestUnexpectedResult)];
+    try std.testing.expect(std.mem.indexOf(u8, cb, "if (try m.headCandidatesMerged(R, count, head)) |cd| {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cb, "try m.headWhole(R);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cb, "return m.roundCandidates(R, count);") != null);
+    // Model.verifyHead: the head byte set for the forward's last stretch skips both whole-head launches; the event is
+    // recorded after the forward (the head's kernel) and before the absorb, so the host's early read waits for the
+    // head alone
+    const model_src = @embedFile("model.zig");
+    const vh = std.mem.indexOf(u8, model_src, "    pub fn verifyHead(") orelse return error.TestUnexpectedResult;
+    const vhb = model_src[vh .. vh + (std.mem.indexOf(u8, model_src[vh..], "\n    }\n") orelse return error.TestUnexpectedResult)];
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, vhb, "if (hb == 0) try m.launchHead(head, R);"));
+    try std.testing.expect(std.mem.indexOf(u8, vhb, "try m.forwardRows(rows);\n        if (hb == 0) try m.launchHead(head, R); // (hb != 0: round.forward's last stretch ran it)\n        try m.head_ready.?.record(m.stream);\n        try m.absorbRows(rows, absorb);") != null);
+    // the head byte is the key for a greedy round (HEAD_KEY) or the nodes' count (HEAD_CAND); neither is 0
+    try std.testing.expect(std.mem.indexOf(u8, vhb, ".argmax => if (m.head_key) head_cand.key else 0,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vhb, ".candidates => |count| if (m.head_cand) head_cand.kFor(count) else 0,") != null);
+}
 
     const src = @embedFile("lanes.zig");
     const step = std.mem.indexOf(u8, src, "fn prefillStep(") orelse return error.TestUnexpectedResult;
@@ -2565,4 +2721,14 @@ test "draft chances are the prefix survivals chooseK sums" {
     try std.testing.expectApproxEqAbs(0.25 / (1.0 + @exp(@as(f64, -2.0))), out[2], 1e-12);
 }
 
+
+test "a run that reads whole rows on the host (--logits-log, --logits-sha 2) is refused while the head is sharded: rd.logits would be unwritten" {
+    try std.testing.expect(wholeRowsRefusal(false, true, true) == null); // nothing read: any head
+    try std.testing.expect(wholeRowsRefusal(true, false, false) == null); // the baseline whole head
+    try std.testing.expect(std.mem.indexOf(u8, wholeRowsRefusal(true, true, false).?, "TF_DS_HEAD_KEY=0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wholeRowsRefusal(true, false, true).?, "TF_DS_HEAD_CAND=0") != null);
+    // tf-dsv41-lanes asks before it opens the log
+    const src = @embedFile("lanes_main.zig");
+    const ask = std.mem.indexOf(u8, src, "dsv41.lanes.wholeRowsRefusal(log_path != null or dsv41.lanes.logits_sha >= 2, m.head_key, m.head_cand)") orelse return error.NotAsked;
+    try std.testing.expect(ask < std.mem.indexOf(u8, src, "sink = try dsv41.logits_log.Sink.init(").?);
 }

@@ -457,6 +457,56 @@ extern "C" __global__ void __launch_bounds__(1024) tf_ds_argmax_rows_kernel(cons
     if (lane == 0) out[blockIdx.x] = row[0] != row[0] ? 0u : (unsigned)bi;
 }
 
+// A greedy row's best on one node's columns (TF_DS_HEAD_KEY): tf_ds_argmax_rows_kernel's scan and reductions (the first
+// index of the largest value, a NaN never larger) without its last step, so the nodes' bests merge into its token: out
+// [rows] of 16 bytes, the best value (fp32; -inf when no value is a number), its index (int32; 0x7fffffff when none),
+// whether the row's first column holds a NaN (int32, 1 or 0: the token is 0 when the vocabulary's first value is one)
+// and a zero word. logits [rows, n] fp32 (row stride ld); a row a block (1024 threads).
+extern "C" __global__ void __launch_bounds__(1024) tf_ds_argmax_part_kernel(const float* logits, unsigned long long ld,
+                                                                            int n, int4* out) {
+    const float* row = logits + (unsigned long long)blockIdx.x * ld;
+    const float ninf = -__int_as_float(0x7f800000);
+    float bv = ninf;
+    int bi = 0x7fffffff;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = row[i];
+        if (v == v && (v > bv || (v == bv && i < bi))) {
+            bv = v;
+            bi = i;
+        }
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(0xffffffffu, bv, off);
+        const int oi = __shfl_down_sync(0xffffffffu, bi, off);
+        if (ov > bv || (ov == bv && oi < bi)) {
+            bv = ov;
+            bi = oi;
+        }
+    }
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) {
+        sv[warp] = bv;
+        si[warp] = bi;
+    }
+    __syncthreads();
+    if (warp != 0) return;
+    const int nw = (blockDim.x + 31) >> 5;
+    bv = lane < nw ? sv[lane] : ninf;
+    bi = lane < nw ? si[lane] : 0x7fffffff;
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(0xffffffffu, bv, off);
+        const int oi = __shfl_down_sync(0xffffffffu, bi, off);
+        if (ov > bv || (ov == bv && oi < bi)) {
+            bv = ov;
+            bi = oi;
+        }
+    }
+    if (lane == 0) out[blockIdx.x] = make_int4(__float_as_int(bv), bi, row[0] != row[0] ? 1 : 0, 0);
+}
+
 // The decode plan's Track B (docs/UNIFIED-DECODE-IMPROVEMENTS.md, TF_DS_SAMPLE_CAND=1): a row's first `count` (value,
 // id) in sampling.topCandidates' order (the larger value first, of equal values the lower id; +0 and -0 equal), on the
 // GPU, so the host's draws read count candidates instead of the whole row. logits [rows, n] fp32 (row stride ld); out

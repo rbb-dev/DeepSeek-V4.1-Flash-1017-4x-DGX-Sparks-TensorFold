@@ -32,6 +32,8 @@ const ops_mod = @import("ops.zig");
 const graph_cache = @import("graph_cache.zig");
 const ring_wait = @import("ring_wait.zig");
 const graph_fallback = @import("graph_fallback.zig");
+const head_cand = @import("head_cand.zig");
+const sampling = @import("sampling.zig");
 
 const Engine = prompt.Engine;
 const Chunk = prompt.Chunk;
@@ -179,6 +181,12 @@ pub const Round = struct {
     hl: u64, // fp32 [R, columns]
     hg: u64, // fp32 [world, R, columns]
     logits: u64, // fp32 [R, world * columns]: the rows' logits, the ranks' columns in rank order
+    // TF_DS_HEAD_CAND / TF_DS_HEAD_KEY (useHeadCand): a round's head as this node's first `head_k` candidates of each
+    // row of its own columns, or (head_cand.key) each row's best of them (0: the baseline whole rows into `logits`); its part
+    // (head_cand.layout, or key_row bytes a row) and the four nodes' parts as they land, in the vocabulary's order
+    head_k: u8 = 0,
+    cpart: u64 = 0,
+    call: u64 = 0,
     taps: u64, // bf16 [R, taps * D]
     // wo_a's suh concatenated a layer (wo_a_rot: torch.cat of the slices' suh, cached on the layer)
     wo_suh: []u64,
@@ -317,6 +325,9 @@ pub const Round = struct {
         rd.hl = (try e.ringSendSlot(e.s, R * @max(w.head.n, if (e.two) |tw| @max(tw.hw[0], tw.hw[1]) else 0) * 4)) orelse try a.take(R * w.head.n * 4);
         rd.hg = try a.take(e.world * R * hh * 4);
         rd.logits = try a.take(R * e.world * hh * 4);
+        rd.head_k = 0;
+        rd.cpart = 0;
+        rd.call = 0;
         rd.taps = try a.take(R * @max(c.dspark_taps.slice().len, 1) * d * 2);
         // wo_a_rot's suh: the slices' suh one after another (torch.cat's bytes)
         rd.wo_suh = try gpa.alloc(u64, w.layers.len);
@@ -364,6 +375,18 @@ pub const Round = struct {
         rd.join = try cuda.Event.init(e.d, false);
         rd.side = s;
         rd.sink.s = s;
+    }
+
+    /// TF_DS_HEAD_CAND / TF_DS_HEAD_KEY: the parts of a round's head by candidates or by best (a node's at the most rows
+    /// and the larger count, which holds a row's best too, and the four nodes'), zeroed once; a round runs it when its
+    /// head_k is set. Once: the second switch finds them made.
+    pub fn useHeadCand(rd: *Round, e: *const Engine, a: *prompt.Arena) !void {
+        if (rd.cpart != 0) return;
+        const bytes = head_cand.layout(max_rows, head_cand.kFor(sampling.max_candidates)).bytes;
+        rd.cpart = try a.take(bytes);
+        rd.call = try a.take(4 * bytes);
+        try prompt.fill(e, rd.cpart, 0, bytes);
+        try prompt.fill(e, rd.call, 0, 4 * bytes);
     }
 
     pub fn dropSide(rd: *Round, e: *const Engine) void {
@@ -1015,7 +1038,7 @@ pub const Graphs = struct {
     lru: graph_cache.Lru(Key, Entry),
     lazy: Lazy = .{}, // the stretches held eager after a failed capture, the captures attempted (TF_DS_GRAPH_FAIL_TEST)
 
-    pub const Key = struct { rows: u32, bucket: u64, stretch: u32 };
+    pub const Key = struct { rows: u32, bucket: u64, stretch: u32, head: u8 = 0 }; // head: the last stretch's head_k
     const Entry = struct { exec: cuda.graph.Exec, start: Carry, end: Carry };
     const Lazy = graph_fallback.Lazy(graph_fallback.Cuda, Key);
 
@@ -1178,7 +1201,7 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
         }
         try rd.clock(e, Round.clock_wait);
         if (graphs) |g| {
-            try g.run(.{ .rows = @intCast(R), .bucket = rd.bucket, .stretch = sn }, e, rd, ch, cs, rings, &cy, li, end);
+            try g.run(.{ .rows = @intCast(R), .bucket = rd.bucket, .stretch = sn, .head = if (end == w.layers.len) rd.head_k else 0 }, e, rd, ch, cs, rings, &cy, li, end);
         } else try stretch(e, rd, ch, cs, rings, &cy, li, end, probe);
         try rd.clock(e, Round.clock_tail);
         if (!ahead) try engramAhead(e, eh orelse return error.NoEngramTables, seq, rows, &ah);
@@ -1186,7 +1209,7 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
         li = end;
     }
     if (graphs != null) {
-        try Probe.check(probe, .logits, w.layers.len, rd.logits);
+        if (rd.head_k == 0) try Probe.check(probe, .logits, w.layers.len, rd.logits);
         if (cy.ntap > 0) try Probe.check(probe, .taps, w.layers.len, rd.taps);
     }
 }
@@ -1274,13 +1297,48 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
     const hn: usize = w.head.n;
     try e.prepareRingSend(e.s); // the head's columns are written into the ring's send slot
     try Probe.check(probe, .head_cols, w.layers.len, rd.hl);
+    if (rd.head_k == 0) try headWhole(e, rd, R, probe) else if (rd.head_k == head_cand.key) try headKeys(e, rd, R) else try headCandidates(e, rd, R, rd.head_k);
+    try rd.mark(e, .head);
+    if (rd.head_k == 0) try Probe.check(probe, .logits, w.layers.len, rd.logits);
+    if (ntap > 0) try Probe.check(probe, .taps, w.layers.len, rd.taps);
+}
+
+/// The head's columns of every node into rd.logits [R, vocabulary] (the ranks' columns in rank order): the quarters
+/// exchange (2D: in ring-sized row blocks, a full round's rows of the vocabulary's quarters are wider than a slot) or the
+/// gather, then the copies. A round's head (head_k 0), or a round's own after its candidates
+/// fell back (Model.headWhole: rd.hl is still the round's, only the head's GEMV writes it).
+pub fn headWhole(e: *const Engine, rd: *Round, R: usize, probe: ?Probe) !void {
+    const w = e.w;
+    const hn: usize = w.head.n;
     const hh = if (e.two) |tw| tw.hw[0] + tw.hw[1] else hn; // a rank's vocabulary half (2D: both pairs' quarters)
-    if (e.two) |tw| try tw.quarters(e, rd.hl, rd.hg, R, tw.hw, 4) else try e.gatherF32(rd.hl, rd.hg, R * hn);
+    if (e.two) |tw| try tw.quartersDecode(e, rd.hl, rd.hg, R, tw.hw, 4) else try e.gatherF32(rd.hl, rd.hg, R * hn);
     try Probe.check(probe, .head_gather, w.layers.len, rd.hg);
     for (0..e.world) |k| try e.ops.copyRows(e.s, rd.hg + k * R * hh * 4, hh * 4, rd.logits + k * hh * 4, e.world * hh * 4, hh * 4, R);
-    try rd.mark(e, .head);
-    try Probe.check(probe, .logits, w.layers.len, rd.logits);
-    if (ntap > 0) try Probe.check(probe, .taps, w.layers.len, rd.taps);
+}
+
+/// TF_DS_HEAD_CAND: this node's first `k` candidates of each row of its own columns (tf_ds_top_cand_rows on rd.hl,
+/// into its part: head_cand.layout), then the part to every node (one quarters exchange of a one-row part: rd.call
+/// holds the four parts in the vocabulary's order, which rank 0 merges).
+/// TF_DS_HEAD_KEY: each row's best of this node's own columns (tf_ds_argmax_part on rd.hl: key_row bytes a row into
+/// its part), then the part to every node (one quarters exchange of a one-row part: rd.call holds the four parts in the
+/// vocabulary's order, which rank 0 merges into the tokens).
+fn headKeys(e: *const Engine, rd: *Round, R: usize) !void {
+    const tw = e.two orelse return error.HeadCandNeeds2D;
+    if (rd.cpart == 0) return error.HeadCandOff;
+    const hn: usize = e.w.head.n;
+    try e.ops.argmaxPart(e.s, rd.hl, hn, hn, R, rd.cpart);
+    const pw = R * head_cand.key_row / 4;
+    try tw.quarters(e, rd.cpart, rd.call, 1, .{ pw, pw }, 4);
+}
+
+fn headCandidates(e: *const Engine, rd: *Round, R: usize, k: u8) !void {
+    const tw = e.two orelse return error.HeadCandNeeds2D;
+    if (rd.cpart == 0) return error.HeadCandOff;
+    const hn: usize = e.w.head.n;
+    const lay = head_cand.layout(R, k);
+    try e.ops.topCandRows(e.s, rd.hl, hn, hn, R, k, rd.cpart, rd.cpart + lay.ids, rd.cpart + lay.flags);
+    const pw = lay.bytes / 4;
+    try tw.quarters(e, rd.cpart, rd.call, 1, .{ pw, pw }, 4);
 }
 
 /// rounds.py pre_mix: hc_pre2 of the streams h with the pending gathered partials posted in (into the spare buffer,
@@ -1406,4 +1464,62 @@ test "context buckets as graph.py makes them" {
 fn notPorted(src: std.builtin.SourceLocation) error{NotPortedYet} {
     std.debug.print("{{\"not_ported\": \"{s}:{d}\"}}\n", .{ src.file, src.line });
     return error.NotPortedYet;
+}
+
+test "TF_DS_HEAD_CAND: the last stretch's head by the round's head_k, its graph keyed by it; head_k 0 runs the baseline head" {
+    const src = @embedFile("round.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    // the round's buffers start with the baseline head
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "        rd.head_k = 0;\n        rd.cpart = 0;\n        rd.call = 0;\n"));
+    // the head: the baseline whole rows at 0, else this node's candidates and their exchange
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "    try Probe.check(probe, .head_cols, w.layers.len, rd.hl);\n    if (rd.head_k == 0) try headWhole(e, rd, R, probe) else if (rd.head_k == head_cand.key) try headKeys(e, rd, R) else try headCandidates(e, rd, R, rd.head_k);\n    try rd.mark(e, .head);\n    if (rd.head_k == 0) try Probe.check(probe, .logits, w.layers.len, rd.logits);\n"));
+    // the bests (TF_DS_HEAD_KEY): the baseline scan on this node's columns into its part, the part to every node as one row
+    const hk = std.mem.indexOf(u8, code, "fn headKeys(") orelse return error.TestUnexpectedResult;
+    const kb = code[hk .. hk + (std.mem.indexOf(u8, code[hk..], "\n}\n") orelse return error.TestUnexpectedResult)];
+    const scan = std.mem.indexOf(u8, kb, "    try e.ops.argmaxPart(e.s, rd.hl, hn, hn, R, rd.cpart);") orelse return error.TestUnexpectedResult;
+    const kex = std.mem.indexOf(u8, kb, "    try tw.quarters(e, rd.cpart, rd.call, 1, .{ pw, pw }, 4);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(scan < kex);
+    try std.testing.expect(head_cand.key != 0 and head_cand.key != head_cand.kFor(1) and head_cand.key != head_cand.kFor(64));
+    try std.testing.expect(max_rows * head_cand.key_row <= head_cand.layout(max_rows, head_cand.kFor(64)).bytes); // the part holds the bests
+    // the baseline head, as it was: the exchange, its probe, the copies (in that order)
+    const hw = std.mem.indexOf(u8, code, "pub fn headWhole(") orelse return error.TestUnexpectedResult;
+    const body = code[hw .. hw + (std.mem.indexOf(u8, code[hw..], "\n}\n") orelse return error.TestUnexpectedResult)];
+    const q = std.mem.indexOf(u8, body, "    if (e.two) |tw| try tw.quartersDecode(e, rd.hl, rd.hg, R, tw.hw, 4) else try e.gatherF32(rd.hl, rd.hg, R * hn);") orelse return error.TestUnexpectedResult;
+    const pr = std.mem.indexOf(u8, body, "    try Probe.check(probe, .head_gather, w.layers.len, rd.hg);") orelse return error.TestUnexpectedResult;
+    const cp = std.mem.indexOf(u8, body, "    for (0..e.world) |k| try e.ops.copyRows(e.s, rd.hg + k * R * hh * 4, hh * 4, rd.logits + k * hh * 4, e.world * hh * 4, hh * 4, R);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(q < pr and pr < cp);
+    // the candidates: the baseline kernel on this node's columns into its part, the part to every node as one row
+    const hc = std.mem.indexOf(u8, code, "fn headCandidates(") orelse return error.TestUnexpectedResult;
+    const cb = code[hc .. hc + (std.mem.indexOf(u8, code[hc..], "\n}\n") orelse return error.TestUnexpectedResult)];
+    const sel = std.mem.indexOf(u8, cb, "    try e.ops.topCandRows(e.s, rd.hl, hn, hn, R, k, rd.cpart, rd.cpart + lay.ids, rd.cpart + lay.flags);") orelse return error.TestUnexpectedResult;
+    const ex = std.mem.indexOf(u8, cb, "    try tw.quarters(e, rd.cpart, rd.call, 1, .{ pw, pw }, 4);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(sel < ex);
+    // the last stretch's graph is keyed by the round's head_k (the others' by 0: one graph each, as before)
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "try g.run(.{ .rows = @intCast(R), .bucket = rd.bucket, .stretch = sn, .head = if (end == w.layers.len) rd.head_k else 0 }, e, rd, ch, cs, rings, &cy, li, end);"));
+    const k0: Graphs.Key = .{ .rows = 2, .bucket = 4096, .stretch = 2 };
+    try std.testing.expectEqual(@as(u8, 0), k0.head);
+    try std.testing.expect(!std.meta.eql(k0, Graphs.Key{ .rows = 2, .bucket = 4096, .stretch = 2, .head = 32 }));
+}
+
+
+test "the whole head's quarters exchange goes round in ring-sized row blocks: a full round's rows of the vocabulary's quarters (48 x 129,536 bytes) are wider than a 4,456,448-byte slot, and TF_DS_HEAD_KEY=0 TF_DS_HEAD_CAND=0 failed the first round with RingRefused" {
+    const prompt2d = @import("prompt2d.zig");
+    const slot: usize = 4456448; // model.ring_bytes
+    const part: usize = 32384 * 4; // a pair-0 row of the head's quarters (a rank's 32,384 fp32 columns)
+    // the cause: one whole exchange does not fit a slot at the engine's real round rows ...
+    try std.testing.expect(max_rows * part > slot);
+    // ... and 34 rows is the most that does (35 rows is already refused)
+    try std.testing.expect(34 * part <= slot and 35 * part > slot);
+    // the blocks the ring takes: two, covering every row once
+    var bb: [prompt2d.max_decode_blocks][2]usize = undefined;
+    const blocks = try prompt2d.decodeBlocks(max_rows, part, slot, &bb);
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    // the code: headWhole sends the head through quartersDecode (row blocks), never the one-piece quarters
+    const code = @embedFile("round.zig");
+    const hw = std.mem.indexOf(u8, code, "pub fn headWhole(") orelse return error.TestUnexpectedResult;
+    const body = code[hw .. hw + (std.mem.indexOf(u8, code[hw..], "\n}\n") orelse return error.TestUnexpectedResult)];
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, body, "tw.quarters("));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "tw.quartersDecode(e, rd.hl, rd.hg, R, tw.hw, 4)"));
+    // every other one-piece quarters in a round is of parts narrower than the slot at max_rows (ow, dw, ew, a one-row candidate part)
+    // (decodeOff refuses the ring for a shape whose blocks do not fit, so they are covered there)
 }

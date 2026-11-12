@@ -219,6 +219,10 @@ pub const Metrics = struct {
         try gauge(w, "client_disconnections_total", "counter", "Requests a client left before the reply left the server.", snap.disconnects);
         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
         if (status.graph_fallbacks) |n| try gauge(w, "graph_fallbacks_total", "counter", "CUDA graph captures that failed on a rank; every rank ran that work eagerly instead.", n);
+        if (status.head_rounds) |hr| {
+            try family(w, "decode_rounds_by_head_path_total", "counter", "Decode rounds by the path the output head's logits took to the draws: the device's argmax (every row greedy, none masked), the tokens merged from the nodes' bests (TF_DS_HEAD_KEY), the GPU's candidates, the candidates merged from the nodes' own (TF_DS_HEAD_CAND), candidates a flag sent on to whole rows, or whole rows to the host.");
+            for ([_][]const u8{ "argmax", "keys", "candidates", "merged", "flagged", "whole" }, hr) |name, n| try w.print("{s}decode_rounds_by_head_path_total{{path=\"{s}\"}} {d}\n", .{ prefix, name, n });
+        }
         if (status.draft_vocab) |v| try draftVocabFamilies(w, v);
     }
 };
@@ -566,6 +570,29 @@ test "render counts failed graph captures only for an engine that counts them" {
     try std.testing.expect(std.mem.indexOf(u8, some.written(), "# TYPE tensorfold:graph_fallbacks_total counter\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, some.written(), "tensorfold:graph_fallbacks_total 3\n") != null);
 }
+test "render counts decode rounds by the head's path only for an engine that counts them" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    var stub: RenderStub = .{};
+    var none: std.Io.Writer.Allocating = .init(gpa);
+    defer none.deinit();
+    try m.render(std.testing.io, &none.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, none.written(), "decode_rounds_by_head_path") == null);
+    stub.status_value.head_rounds = .{ 11, 5, 22, 7, 3, 4 };
+    var some: std.Io.Writer.Allocating = .init(gpa);
+    defer some.deinit();
+    try m.render(std.testing.io, &some.writer, stub.engine(), 4096);
+    const want =
+        "# TYPE tensorfold:decode_rounds_by_head_path_total counter\n" ++
+        "tensorfold:decode_rounds_by_head_path_total{path=\"argmax\"} 11\n" ++
+        "tensorfold:decode_rounds_by_head_path_total{path=\"keys\"} 5\n" ++
+        "tensorfold:decode_rounds_by_head_path_total{path=\"candidates\"} 22\n" ++
+        "tensorfold:decode_rounds_by_head_path_total{path=\"merged\"} 7\n" ++
+        "tensorfold:decode_rounds_by_head_path_total{path=\"flagged\"} 3\n" ++
+        "tensorfold:decode_rounds_by_head_path_total{path=\"whole\"} 4\n";
+    try std.testing.expect(std.mem.indexOf(u8, some.written(), want) != null);
+}
+
 test "render counts the drafter's pruned-list passes, its guard's tokens and misses only for an engine that runs the list" {
     const gpa = std.testing.allocator;
     var m: Metrics = .{ .gpa = gpa };

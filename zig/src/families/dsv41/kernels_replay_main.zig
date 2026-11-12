@@ -137,6 +137,19 @@
 //!     still collect under the deadline; a lane's
 //!     word that never arrives ends in the failure record within the deadline (the ring's abort word set, nothing
 //!     copied); the abort word alone ends a wait with the record's abort reason, far under the deadline.
+//!   - TF_DS_HEAD_CAND: tf_ds_top_cand_rows on whole rows of the head's 129,280 columns (the baseline) against the same
+//!     kernel on each node's own columns ([rows, 32,384 / 32,256], each node's count 32 or 64) merged on the host
+//!     (head_cand.merge), at 1 .. 48 rows and counts 1 .. 64: the candidates' value bits and ids equal; ties at the cut
+//!     in one node (2,000), across the nodes (grids of 1/8, 1, 2), signed zeros at the cut: the baseline or a fallback where the baseline
+//!     could flag; 2,400 ties over the nodes and a NaN: the baseline kernel flags, the merge falls back; one raised value
+//!     changes the candidates; two lines time the baseline kernel, a node's and the host merge.
+//!   - TF_DS_HEAD_KEY: tf_ds_argmax_rows on whole rows (the baseline) against tf_ds_argmax_part on each node's own columns
+//!     merged on the host (head_cand.mergeKeys) at 1 .. 48 rows: the tokens equal; the largest value in three nodes,
+//!     NaNs at the vocabulary's first column and at a node's first, every node's layout (the largest at each node's
+//!     first and last column, ties across each boundary, NaNs at nodes' edges, nodes without a number, +inf in two
+//!     nodes, signed zeros), a row of NaNs and a row of -inf: the baseline tokens (its NaN rules: never larger, token 0 when
+//!     the first value is one); one raised value changes a token; two lines time the baseline kernel, a node's and the host
+//!     merge.
 //!   - TF_DS_ROCI's two-block readers (_hc_mix_pf_2b, _hc_post_2b, _engram_gate_2b): the blocks as the transport lands them against
 //!     widenPairs + the baseline readers (the fp32 planes), byte for byte, at 1 to 1,024 rows with NaN, +-0, subnormals and infinities
 //!     in the sums; a sum changed must change each output.
@@ -4042,20 +4055,390 @@ fn gemmW16(r: *Run, rng: std.Random) !void {
     r.report("collect_peers odd widths (1, 3, 255, 1,023, 1,024, 1,025, 2,049 float4) at 1, 2 and 5 rows, a gap of 3 float4 between rows, rank 0 without a destination, on rank 2: against the baseline's, and the baseline against the slots' bytes", odd, true);
     r.report("collect_peers zero-width destination: rank 1's destination has a pointer and row4 0 in the 4-rank gather at 2 rows on rank 0: against the baseline's, and the baseline against the slots' bytes", zw, true);
     r.note("collect_peers: the switch runs dsv41_rdma_collect_peers (the ring's probe counts the baseline launch, 1, and not the switch's, 0)", counts[0] == 1 and counts[1] == 0);
+// -- TF_DS_HEAD_CAND -------------------------------------------------------------------------------------------------
+
+/// The head's columns of the four nodes in the vocabulary's order (g0, g2, g1, g3: a rank's half, pair 0's columns then
+/// pair 1's) and where each starts.
+const hc_widths = [4]usize{ 32384, 32256, 32384, 32256 };
+const hc_off = dsv41.head_cand.vocabOffsets(.{ 32384, 32256 });
+const hc_vocab: usize = 129280;
+
+const HcRound = struct {
+    merged: bool, // the merge took the round
+    flagged: usize, // rows the baseline kernel flags
+    equal: bool, // the merged vals' bits and ids are the baseline (when merged)
+    vals: []f32, // the merged candidates (when merged; r.a)
+    ids: []i64,
+    neg_zero: bool, // a -0 among the merged values
+};
+
+/// One round of [R, 129,280] fp32 logits: the baseline kernel on the whole rows (count c), then each node's launch of the
+/// same kernel on its own columns alone ([R, its width], count head_cand.kFor(c)) into its part of one buffer laid out
+/// as the exchange lands the parts (poisoned first), read back and merged on the host (head_cand.merge).
+/// The monotonic clock, ns (the host merge's time).
+fn monoNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+fn hcRound(r: *Run, logits: []const f32, R: usize, c: usize) !HcRound {
+    const d = r.d;
+    const ops = r.ops orelse return error.NoOps;
+    const V = hc_vocab;
+    const k = dsv41.head_cand.kFor(c);
+    const lay = dsv41.head_cand.layout(R, k);
+    var whole = try cuda.DeviceBuffer.alloc(d, R * V * 4);
+    defer whole.free();
+    var tv = try cuda.DeviceBuffer.alloc(d, R * c * 4);
+    defer tv.free();
+    var ti = try cuda.DeviceBuffer.alloc(d, R * c * 8);
+    defer ti.free();
+    var tf = try cuda.DeviceBuffer.alloc(d, R * 4);
+    defer tf.free();
+    var parts = try cuda.DeviceBuffer.alloc(d, 4 * lay.bytes);
+    defer parts.free();
+    var node: [4]cuda.DeviceBuffer = undefined;
+    var made: usize = 0;
+    defer for (node[0..made]) |*b| b.free();
+    for (0..4) |j| {
+        node[j] = try cuda.DeviceBuffer.alloc(d, R * hc_widths[j] * 4);
+        made += 1;
+    }
+    // stream-ordered copies: every launch below reads what was copied
+    const cols = try r.a.alloc(f32, R * hc_widths[0]);
+    for (0..4) |j| {
+        const w = hc_widths[j];
+        for (0..R) |row| @memcpy(cols[row * w ..][0..w], logits[row * V + hc_off[j] ..][0..w]);
+        try r.s.synchronize(); // (cols is reused for the next node)
+    }
+    try poison(parts.ptr, 4 * lay.bytes, d, r.s);
+    try ops.topCandRows(r.s, whole.ptr, V, V, R, c, tv.ptr, ti.ptr, tf.ptr);
+    for (0..4) |j| {
+        const p = parts.ptr + j * lay.bytes;
+        try ops.topCandRows(r.s, node[j].ptr, hc_widths[j], hc_widths[j], R, k, p, p + lay.ids, p + lay.flags);
+    }
+    try r.s.synchronize();
+    const want_v = try r.a.alloc(f32, R * c);
+    const want_i = try r.a.alloc(i64, R * c);
+    const flags = try r.a.alloc(i32, R);
+    const host = try r.a.alloc(u8, 4 * lay.bytes);
+    const vals = try r.a.alloc(f32, R * c);
+    const ids = try r.a.alloc(i64, R * c);
+    const merged = dsv41.head_cand.merge(host, lay, hc_off, c, vals, ids);
+    var flagged: usize = 0;
+    for (flags) |f| flagged += @intFromBool(f != 0);
+    var equal = merged and flagged == 0;
+    var neg_zero = false;
+    if (merged) for (0..R * c) |i| {
+        if (@as(u32, @bitCast(vals[i])) != @as(u32, @bitCast(want_v[i])) or ids[i] != want_i[i]) equal = false;
+        neg_zero = neg_zero or @as(u32, @bitCast(vals[i])) == 0x80000000;
+    };
+    return .{ .merged = merged, .flagged = flagged, .equal = equal, .vals = vals, .ids = ids, .neg_zero = neg_zero };
+}
+
+fn headCand(r: *Run, rng: std.Random) !void {
+    const V = hc_vocab;
+    var line: [400]u8 = undefined;
+    const logits = try r.a.alloc(f32, 48 * V);
+    const normal = struct {
+        fn fill(x: []f32, g: std.Random) void {
+            for (x) |*v| v.* = g.floatNorm(f32) * 3.0;
+        }
+    };
+    // random rows (no ties at any cut): every round merged, the baseline bytes, at production's row counts and both k
+    for ([_]usize{ 1, 2, 5, 16, 34, 48 }) |R| for ([_]usize{ 28, 64 }) |c| {
+        normal.fill(logits[0 .. R * V], rng);
+        const x = try hcRound(r, logits, R, c);
         r.note(try std.fmt.bufPrint(&line, "head_cand {d} rows, count {d} (each node's {d}): the baseline kernel flags none; the nodes' parts merged into the baseline candidates, values' bits and ids", .{ R, c, dsv41.head_cand.kFor(c) }), x.flagged == 0 and x.merged and x.equal);
+    };
+    for ([_]usize{ 1, 32, 33 }) |c| {
+        normal.fill(logits[0 .. 2 * V], rng);
+        const x = try hcRound(r, logits, 2, c);
         r.note(try std.fmt.bufPrint(&line, "head_cand 2 rows, count {d} (each node's {d}): the baseline kernel flags none; the nodes' parts merged into the baseline candidates, values' bits and ids", .{ c, dsv41.head_cand.kFor(c) }), x.flagged == 0 and x.merged and x.equal);
+    }
+    // 2,000 values at the cut in node g0 alone, the rest below: its kernel holds them, the baseline does not flag
+    {
+        for (logits[0..V]) |*v| v.* = rng.float(f32) * 0.5 - 1.0;
+        for (0..2000) |i| logits[i * 16] = 1.0;
+        const x = try hcRound(r, logits, 1, 28);
         r.note("head_cand 2,000 ties at the cut, all in node g0: the baseline kernel flags none; merged into the baseline candidates", x.flagged == 0 and x.merged and x.equal);
+    }
+    // ties across the nodes (values on grids of 1/8, 1 and 2: the cut's value held by several nodes; on the coarsest it
+    // is often some node's k-th too): every merged round the baseline bytes, and the rest fall back
+    {
+        var merged: usize = 0;
+        var fell: usize = 0;
+        var flagged: usize = 0;
+        var bad: usize = 0;
+        for (0..24) |i| {
+            const grid = [_]f32{ 0.125, 1.0, 2.0 };
+            const g = grid[i % grid.len];
+            for (logits[0 .. 2 * V]) |*v| v.* = @round(rng.floatNorm(f32) * 3.0 / g) * g;
+            const x = try hcRound(r, logits, 2, 28);
+            flagged += x.flagged;
+            if (x.merged) {
+                merged += 1;
+                if (!x.equal) bad += 1;
+            } else fell += 1;
+        }
         r.note(try std.fmt.bufPrint(&line, "head_cand ties across the nodes (grids of 1/8, 1, 2), 24 rounds of 2 rows, count 28: the baseline kernel flags {d} rows; {d} rounds merged into the baseline candidates ({d} not), {d} fell back (a cut value some node holds at its k-th and two nodes hold)", .{ flagged, merged, bad, fell }), flagged == 0 and merged > 0 and fell > 0 and bad == 0);
+    }
+    // more than 2,048 ties at the cut, 600 in each node: the baseline kernel flags the row (2); no node does; the merge falls back
+    {
+        for (logits[0..V]) |*v| v.* = rng.float(f32) * 0.5 - 1.0;
+        for (hc_widths, hc_off) |w, o| for (0..600) |i| {
+            logits[o + i * (w / 600)] = 1.0;
+        };
+        const x = try hcRound(r, logits, 1, 28);
         r.note("head_cand 2,400 ties at the cut, 600 in each node: the baseline kernel flags the row; the merge falls back to the whole head", x.flagged == 1 and !x.merged);
+    }
+    // a NaN in node g1's columns (row 1 of 2): its kernel and the baseline flag the row; the merge falls back
+    {
+        normal.fill(logits[0 .. 2 * V], rng);
+        logits[V + hc_off[2] + 777] = std.math.nan(f32);
+        const x = try hcRound(r, logits, 2, 28);
         r.note("head_cand a NaN in node g1's columns: the baseline kernel flags the row; the merge falls back to the whole head", x.flagged == 1 and !x.merged);
+    }
+    // signed zeros at the cut: 10 positive values, 40 zeros of either sign over the nodes, the rest negative; count 28
+    // takes the 18 zeros of lowest id, each with its own sign bit
+    {
+        for (logits[0..V]) |*v| v.* = -1.0 - rng.float(f32);
+        for (0..10) |_| logits[rng.uintLessThan(usize, V)] = 1.0 + rng.float(f32);
+        for (0..40) |_| logits[rng.uintLessThan(usize, V)] = if (rng.boolean()) 0.0 else -0.0;
+        logits[hc_off[1] + 5] = -0.0; // (one -0 surely among the lowest ids)
+        const x = try hcRound(r, logits, 1, 28);
         r.note("head_cand signed zeros at the cut over the nodes: the baseline kernel flags none; merged into the baseline candidates, each zero's sign bit kept", x.flagged == 0 and x.merged and x.equal and x.neg_zero);
+    }
+    // the control: one value of node g2's columns raised above the row's largest; the merged candidates change
+    {
+        normal.fill(logits[0 .. 2 * V], rng);
+        const a = try hcRound(r, logits, 2, 28);
+        logits[hc_off[1] + 4321] = 1000.0;
+        const b = try hcRound(r, logits, 2, 28);
+        r.report("head_cand control: one value of node g2's raised above the row's largest, merged candidates against the unchanged round's", differs(std.mem.sliceAsBytes(a.ids), std.mem.sliceAsBytes(b.ids)), false);
+        _ = b.equal;
+    }
+    // the times: the baseline kernel on the whole rows against one node's on its 32,384 columns, us a launch (a mean of 20
+    // after 3), and the host merge of the four parts; the engine's trace decides, not this
+    for ([_]usize{ 2, 34 }) |R| {
+        normal.fill(logits[0 .. R * V], rng);
+        const ops = r.ops orelse return error.NoOps;
+        const k = dsv41.head_cand.kFor(28);
+        const lay = dsv41.head_cand.layout(R, k);
+        var whole = try cuda.DeviceBuffer.alloc(r.d, R * V * 4);
+        defer whole.free();
+        var out = try cuda.DeviceBuffer.alloc(r.d, 4 * lay.bytes);
+        defer out.free();
+        const Time = struct {
+            fn us(rr: *Run, o: *const dsv41.ops.Ops, src: u64, ld: usize, n: usize, rows: usize, count: usize, dst: u64, l: dsv41.head_cand.Layout) !f64 {
+                var e0 = try cuda.Event.init(rr.d, true);
+                defer e0.deinit();
+                var e1 = try cuda.Event.init(rr.d, true);
+                defer e1.deinit();
+                for (0..23) |it| {
+                    if (it == 3) try e0.record(rr.s);
+                    try o.topCandRows(rr.s, src, ld, n, rows, count, dst, dst + l.ids, dst + l.flags);
+                }
+                try e1.record(rr.s);
+                try e1.synchronize();
+                return @as(f64, try cuda.Event.elapsedMs(e0, e1)) * 1000.0 / 20.0;
+            }
+        };
+        const today = try Time.us(r, ops, whole.ptr, V, V, R, 28, out.ptr, dsv41.head_cand.layout(R, 28));
+        const one = try Time.us(r, ops, whole.ptr, V, hc_widths[0], R, k, out.ptr, lay);
+        // the merge on the host: the four parts of a round (real lists: four launches on the nodes' columns)
+        const x = try hcRound(r, logits, R, 28);
+        const host = try r.a.alloc(u8, 4 * lay.bytes);
+        for (0..4) |j| {
+            const p = out.ptr + j * lay.bytes;
+            try ops.topCandRows(r.s, whole.ptr + hc_off[j] * 4, V, hc_widths[j], R, k, p, p + lay.ids, p + lay.flags);
+        }
+        try r.s.synchronize();
+        const vals = try r.a.alloc(f32, R * 28);
+        const ids = try r.a.alloc(i64, R * 28);
+        const t0 = monoNs();
+        var ok = true;
+        for (0..100) |_| ok = ok and dsv41.head_cand.merge(host, lay, hc_off, 28, vals, ids);
+        const merge_us = @as(f64, @floatFromInt(monoNs() - t0)) / 100.0 / 1000.0;
         r.note(try std.fmt.bufPrint(&line, "head_cand timing {d} rows, count 28 (each node's {d}), us (a mean of 20 after 3; the engine's trace decides): the baseline kernel on 129,280 columns {d:.1}, a node's on 32,384 {d:.1} (x{d:.3}), the host merge {d:.2}; its lists merged as the baseline's", .{ R, k, today, one, one / today, merge_us }), today > 0 and one > 0 and ok and x.merged and x.equal and std.mem.eql(i64, ids, x.ids));
+    }
+}
+
+// -- TF_DS_HEAD_KEY --------------------------------------------------------------------------------------------------
+
+const HkRound = struct { equal: bool, tokens: []u32 };
+
+/// One greedy round of [R, 129,280] fp32 logits: the baseline tf_ds_argmax_rows on the whole rows, then each node's
+/// tf_ds_argmax_part on its own columns alone ([R, its width]) into its part of one buffer laid out as the exchange lands
+/// the parts (poisoned first), read back and merged on the host (head_cand.mergeKeys).
+fn hkRound(r: *Run, logits: []const f32, R: usize) !HkRound {
+    const d = r.d;
+    const ops = r.ops orelse return error.NoOps;
+    const V = hc_vocab;
+    const pb = R * dsv41.head_cand.key_row;
+    var whole = try cuda.DeviceBuffer.alloc(d, R * V * 4);
+    defer whole.free();
+    var amax = try cuda.DeviceBuffer.alloc(d, R * 4);
+    defer amax.free();
+    var parts = try cuda.DeviceBuffer.alloc(d, 4 * pb);
+    defer parts.free();
+    var node: [4]cuda.DeviceBuffer = undefined;
+    var made: usize = 0;
+    defer for (node[0..made]) |*b| b.free();
+    for (0..4) |j| {
+        node[j] = try cuda.DeviceBuffer.alloc(d, R * hc_widths[j] * 4);
+        made += 1;
+    }
+    const cols = try r.a.alloc(f32, R * hc_widths[0]);
+    for (0..4) |j| {
+        const w = hc_widths[j];
+        for (0..R) |row| @memcpy(cols[row * w ..][0..w], logits[row * V + hc_off[j] ..][0..w]);
+        try r.s.synchronize(); // (cols is reused for the next node)
+    }
+    try poison(parts.ptr, 4 * pb, d, r.s);
+    try ops.argmaxRows(r.s, whole.ptr, V, V, R, amax.ptr);
+    for (0..4) |j| try ops.argmaxPart(r.s, node[j].ptr, hc_widths[j], hc_widths[j], R, parts.ptr + j * pb);
+    try r.s.synchronize();
+    const want = try r.a.alloc(u32, R);
+    const host = try r.a.alloc(u8, 4 * pb);
+    const tokens = try r.a.alloc(u32, R);
+    dsv41.head_cand.mergeKeys(host, R, hc_off, tokens);
+    return .{ .equal = std.mem.eql(u32, want, tokens), .tokens = tokens };
+}
+
+fn headKey(r: *Run, rng: std.Random) !void {
+    const V = hc_vocab;
+    var line: [400]u8 = undefined;
+    const logits = try r.a.alloc(f32, 48 * V);
+    const normal = struct {
+        fn fill(x: []f32, g: std.Random) void {
+            for (x) |*v| v.* = g.floatNorm(f32) * 3.0;
+        }
+    };
+    for ([_]usize{ 1, 2, 5, 16, 34, 48 }) |R| {
+        normal.fill(logits[0 .. R * V], rng);
+        const x = try hkRound(r, logits, R);
         r.note(try std.fmt.bufPrint(&line, "head_key {d} rows: the nodes' bests merged into the baseline argmax tokens", .{R}), x.equal);
+    }
+    // the largest value in three nodes (none in g0's columns): the lowest id among them, as in the baseline
+    {
+        normal.fill(logits[0 .. 3 * V], rng);
+        for (0..3) |row| {
+            for ([_]usize{ 1, 2, 3 }) |j| logits[row * V + hc_off[j] + 100 + row * 7 + j] = 99.0;
+            logits[row * V + hc_off[1] + 30000 + row] = 99.0; // a second in node g2, another thread's column
+        }
+        const x = try hkRound(r, logits, 3);
         r.note("head_key the largest value twice in node g2 and in g1 and g3: the lowest id among them, the baseline tokens", x.equal and x.tokens[0] == hc_off[1] + 101);
+    }
+    // a NaN at the vocabulary's first column (token 0) and at node g2's first column (an ordinary NaN, never larger)
+    {
+        normal.fill(logits[0 .. 2 * V], rng);
+        logits[0] = std.math.nan(f32);
+        logits[V + hc_off[1]] = std.math.nan(f32);
+        const x = try hkRound(r, logits, 2);
         r.note("head_key a NaN at the vocabulary's first column (token 0) and at node g2's first (never larger): the baseline tokens", x.equal and x.tokens[0] == 0 and x.tokens[1] != 0);
+    }
+    // every node's layout: the row's largest at each node's first and at its last column, a tie across each boundary
+    // between two nodes (the lower id: the earlier node's last column), NaNs at nodes' first and last columns, nodes
+    // without a number around a row whose first value is one, the same row with a NaN first value (token 0), +inf in two
+    // nodes, and signed zeros alone (the first index)
+    {
+        const R = 16;
+        normal.fill(logits[0 .. R * V], rng);
+        var want: [R]u32 = undefined;
+        for (0..4) |j| {
+            const first = hc_off[j];
+            const last = hc_off[j] + @as(u32, @intCast(hc_widths[j])) - 1;
+            logits[j * V + first] = 50.0;
+            want[j] = first;
+            logits[(4 + j) * V + last] = 50.0;
+            want[4 + j] = last;
+            if (j < 3) {
+                logits[(8 + j) * V + last] = 50.0;
+                logits[(8 + j) * V + hc_off[j + 1]] = 50.0;
+                want[8 + j] = last;
+            }
+        }
+        const row11 = logits[11 * V ..][0..V];
+        row11[hc_off[1]] = std.math.nan(f32);
+        row11[hc_off[3] - 1] = std.math.nan(f32);
+        row11[hc_off[3] + 17] = 50.0;
+        want[11] = hc_off[3] + 17;
+        const row12 = logits[12 * V ..][0..V];
+        @memset(row12, std.math.nan(f32));
+        row12[0] = -5.0;
+        row12[hc_off[3] + 9] = 7.0;
+        want[12] = hc_off[3] + 9;
+        const row13 = logits[13 * V ..][0..V];
+        @memset(row13, std.math.nan(f32));
+        row13[hc_off[3] + 9] = 7.0;
+        want[13] = 0;
+        const row14 = logits[14 * V ..][0..V];
+        @memset(row14, -std.math.inf(f32));
+        row14[hc_off[2] + 3] = std.math.inf(f32);
+        row14[hc_off[3] + 2] = std.math.inf(f32);
+        want[14] = hc_off[2] + 3;
+        const row15 = logits[15 * V ..][0..V];
+        for (row15) |*v| v.* = if (rng.boolean()) 0.0 else -0.0;
+        want[15] = 0;
+        const x = try hkRound(r, logits, R);
         r.note("head_key every node's layout: the largest at each node's first and last column, ties across each boundary, NaNs at nodes' edges, nodes without a number, +inf in two nodes, signed zeros: the baseline tokens", x.equal and std.mem.eql(u32, &want, x.tokens));
+    }
+    // a row without a number (every value NaN: token 0) and a row of -inf alone (the first index)
+    {
+        @memset(logits[0..V], std.math.nan(f32));
+        @memset(logits[V .. 2 * V], -std.math.inf(f32));
+        const x = try hkRound(r, logits, 2);
         r.note("head_key a row of NaNs and a row of -inf alone: the baseline tokens (0, 0)", x.equal and x.tokens[0] == 0 and x.tokens[1] == 0);
+    }
+    // the control: one value of node g3's raised above the row's largest changes the token
+    {
+        normal.fill(logits[0 .. 2 * V], rng);
+        const a = try hkRound(r, logits, 2);
+        logits[hc_off[3] + 4321] = 1000.0;
+        const b = try hkRound(r, logits, 2);
+        r.report("head_key control: one value of node g3's raised above the row's largest, tokens against the unchanged round's", differs(std.mem.sliceAsBytes(a.tokens), std.mem.sliceAsBytes(b.tokens)), false);
+    }
+    // the times: the baseline argmax on the whole rows against one node's part on its 32,384 columns, us a launch (a mean of
+    // 20 after 3), and the host merge; the engine's trace decides, not this
+    for ([_]usize{ 2, 34 }) |R| {
+        normal.fill(logits[0 .. R * V], rng);
+        const ops = r.ops orelse return error.NoOps;
+        var whole = try cuda.DeviceBuffer.alloc(r.d, R * V * 4);
+        defer whole.free();
+        var out = try cuda.DeviceBuffer.alloc(r.d, 4 * R * dsv41.head_cand.key_row);
+        defer out.free();
+        const Time = struct {
+            fn us(rr: *Run, o: *const dsv41.ops.Ops, part: bool, src: u64, n: usize, rows: usize, dst: u64) !f64 {
+                var e0 = try cuda.Event.init(rr.d, true);
+                defer e0.deinit();
+                var e1 = try cuda.Event.init(rr.d, true);
+                defer e1.deinit();
+                for (0..23) |it| {
+                    if (it == 3) try e0.record(rr.s);
+                    if (part) try o.argmaxPart(rr.s, src, hc_vocab, n, rows, dst) else try o.argmaxRows(rr.s, src, hc_vocab, n, rows, dst);
+                }
+                try e1.record(rr.s);
+                try e1.synchronize();
+                return @as(f64, try cuda.Event.elapsedMs(e0, e1)) * 1000.0 / 20.0;
+            }
+        };
+        const today = try Time.us(r, ops, false, whole.ptr, V, R, out.ptr);
+        const one = try Time.us(r, ops, true, whole.ptr, hc_widths[0], R, out.ptr);
+        const x = try hkRound(r, logits, R);
+        const pb = R * dsv41.head_cand.key_row;
+        for (0..4) |j| try ops.argmaxPart(r.s, whole.ptr + hc_off[j] * 4, V, hc_widths[j], R, out.ptr + j * pb);
+        try r.s.synchronize();
+        const host = try r.a.alloc(u8, 4 * pb);
+        const tokens = try r.a.alloc(u32, R);
+        const t0 = monoNs();
+        for (0..100) |_| dsv41.head_cand.mergeKeys(host, R, hc_off, tokens);
+        const merge_us = @as(f64, @floatFromInt(monoNs() - t0)) / 100.0 / 1000.0;
         r.note(try std.fmt.bufPrint(&line, "head_key timing {d} rows, us (a mean of 20 after 3; the engine's trace decides): the baseline argmax on 129,280 columns {d:.1}, a node's part on 32,384 {d:.1} (x{d:.3}), the host merge {d:.2}; its bests merged as the baseline's", .{ R, today, one, one / today, merge_us }), today > 0 and one > 0 and x.equal and std.mem.eql(u32, tokens, x.tokens));
+    }
+}
+
 // -- the rings' data slots: write-combined and in-place --------------------------------------------------------------
 
 /// A ring's two data regions and its metadata without the NIC: enough to run the staging, publish, await and collecting
@@ -10472,6 +10855,8 @@ fn qgateBody(r: *Run, rng: std.Random) !void {
     .{ "ring_wc", ringWc, 6 },
     .{ "ring_inplace", ringInplace, 8 },
     .{ "ring_word", ringWord, 9 },
+    .{ "head_cand", headCand, 23 },
+    .{ "head_key", headKey, 13 },
     .{ "roci_readers", rociReaders, 1 + 7 * 3 + 3 },
     .{ "roci_stage", rociStage, 2 * 4 + 1 },
     .{ "roci_collect", rociCollect, 3 },

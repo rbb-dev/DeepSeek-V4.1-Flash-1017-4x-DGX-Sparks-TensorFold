@@ -57,6 +57,27 @@ test "a lane host reports its backend's failed graph captures, and none without 
     try std.testing.expectEqual(@as(?u64, 3), status.graph_fallbacks);
 }
 
+test "a lane host reports its backend's decode rounds by the head's path, and none without a count" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{}, 1, 0);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 1 });
+    var status: api.Status = .{};
+    var streams: [4]u32 = undefined;
+    host.engine().status(&status, &streams);
+    try std.testing.expect(status.head_rounds == null);
+    var rounds: [6]std.atomic.Value(u64) = .{ .init(5), .init(6), .init(7), .init(8), .init(9), .init(4) };
+    host.head_rounds = &rounds;
+    _ = rounds[2].fetchAdd(3, .monotonic);
+    host.engine().status(&status, &streams);
+    try std.testing.expectEqual(@as(?[6]u64, .{ 5, 6, 10, 8, 9, 4 }), status.head_rounds);
+}
+
 test "a request the backend refuses fails alone, in the backend's words" {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);

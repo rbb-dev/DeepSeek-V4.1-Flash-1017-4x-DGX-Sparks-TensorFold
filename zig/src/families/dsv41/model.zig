@@ -34,6 +34,7 @@ const prompt = @import("prompt.zig");
 const prompt2d = @import("prompt2d.zig");
 const round = @import("round.zig");
 const sampling = @import("sampling.zig");
+const head_cand = @import("head_cand.zig");
 const draft = @import("draft.zig");
 const draft_vocab = @import("draft_vocab.zig");
 const engram = @import("engram.zig");
@@ -1117,6 +1118,64 @@ fn extraVariants(a: std.mem.Allocator, io: std.Io, extra_dir: []const u8, functi
     return m.variants(function);
 }
 
+/// TF_DS_HEAD_CAND `asked` in effect: on every rank or none (a rank can on the four-node 2D split; one world all-gather
+/// when asked), the round's parts and the host's copy of them made, one line when asked (headCandLine).
+fn useHeadCand(m: *Model, a: std.mem.Allocator, d: *const cuda.Driver, asked: bool) !void {
+    m.head_cand = false;
+    if (!asked) return;
+    const why: ?[]const u8 = if (m.two == null) "needs the four-node 2D split" else null;
+    const cannot = try prompt2d.ranksThatCannot(d, &m.comm, m.stream, why == null);
+    if (prompt2d.agreedOn(asked, cannot)) {
+        try headParts(m, a);
+        m.head_cand = true;
+    }
+    var buf: [400]u8 = undefined;
+    std.log.info("{s}", .{headCandLine(&buf, cannot, why)});
+}
+
+/// The round's parts of a head by the nodes' own columns and the host's copy of the four (once: both switches share
+/// them).
+fn headParts(m: *Model, a: std.mem.Allocator) !void {
+    if (m.cand_parts.len != 0) return;
+    try m.rd.useHeadCand(&m.eng, &m.arena);
+    m.cand_parts = try a.alloc(u8, 4 * head_cand.layout(round.max_rows, head_cand.kFor(sampling.max_candidates)).bytes);
+}
+
+/// TF_DS_HEAD_KEY `asked` in effect: on every rank or none (a rank can on the four-node 2D split; one world all-gather
+/// when asked), the parts made (headParts), one line when asked (headKeyLine).
+fn useHeadKey(m: *Model, a: std.mem.Allocator, d: *const cuda.Driver, asked: bool) !void {
+    m.head_key = false;
+    if (!asked) return;
+    const why: ?[]const u8 = if (m.two == null) "needs the four-node 2D split" else null;
+    const cannot = try prompt2d.ranksThatCannot(d, &m.comm, m.stream, why == null);
+    if (prompt2d.agreedOn(asked, cannot)) {
+        try headParts(m, a);
+        m.head_key = true;
+    }
+    var buf: [400]u8 = undefined;
+    std.log.info("{s}", .{headKeyLine(&buf, cannot, why)});
+}
+
+/// TF_DS_HEAD_KEY's start line: on every rank, or off on every rank, the ranks that cannot and this rank's reason
+/// (`why`, null: it can).
+fn headKeyLine(buf: []u8, cannot: u32, why: ?[]const u8) []const u8 {
+    if (cannot != 0) {
+        var rb: [64]u8 = undefined;
+        return std.fmt.bufPrint(buf, "TF_DS_HEAD_KEY=1: off on every rank: {s} cannot run it (this rank: {s})", .{ prompt2d.rankList(cannot, &rb), why orelse "can" }) catch buf[0..0];
+    }
+    return std.fmt.bufPrint(buf, "TF_DS_HEAD_KEY=1: a greedy round's tokens from each node's best of each row of its own columns of the head, merged on rank 0 into the baseline argmax; on every rank", .{}) catch buf[0..0];
+}
+
+/// TF_DS_HEAD_CAND's start line: on every rank, or off on every rank, the ranks that cannot and this rank's reason
+/// (`why`, null: it can).
+fn headCandLine(buf: []u8, cannot: u32, why: ?[]const u8) []const u8 {
+    if (cannot != 0) {
+        var rb: [64]u8 = undefined;
+        return std.fmt.bufPrint(buf, "TF_DS_HEAD_CAND=1: off on every rank: {s} cannot run it (this rank: {s})", .{ prompt2d.rankList(cannot, &rb), why orelse "can" }) catch buf[0..0];
+    }
+    return std.fmt.bufPrint(buf, "TF_DS_HEAD_CAND=1: a sampled round's candidates from each node's own columns of the head (its first 32 or 64 of each row) merged on rank 0 into the baseline's; a round the baseline kernel could flag reads the whole head as the baseline; on every rank", .{}) catch buf[0..0];
+}
+
 /// TF_DS_MERGE_D as asked: unset, empty or 3 (16 columns a program: 32 programs a row and head group, measured the fastest of
 /// the kit's widths), 1 (128), 2 (64), 0 (off); null for any other text (Model.open refuses the start with it: a typo must not
 /// run the default unseen). Pure: the refusal is logged at the call site.
@@ -1482,6 +1541,24 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     cand_vals: [round.max_rows * sampling.max_candidates]f32 = undefined,
     cand_ids: [round.max_rows * sampling.max_candidates]i64 = undefined,
     cand_flags: [round.max_rows]i32 = undefined,
+    // TF_DS_HEAD_CAND, agreed at the start (useHeadCand): a sampled round's candidates from the four nodes' parts
+    // (rd.call), read back into cand_parts and merged here (headCandidates); TF_DS_HEAD_KEY (useHeadKey): a greedy
+    // round's tokens from the nodes' bests the same way (headTokens)
+    head_cand: bool = false,
+    head_key: bool = false,
+    cand_parts: []u8 = &.{},
+    // the stream a fill is running: its slot and its view of the caches (its extent from base)
+    fill_slot: usize = 0,
+    // the prompt a fill's chunks come from (the caller's, set for the fill) and the thread reading the next chunk's
+    // Engram rows during this one (fillChunk), joined before the prompt can change (joinAhead)
+    fill_seq: []const i32 = &.{},
+    ahead: ?std.Thread = null,
+    view: prompt.Caches = undefined,
+    // the filling prompt's image spans and their rows (setImages; cleared by fillBegin)
+    spans: std.ArrayList(prompt.Span) = .empty,
+    img_buf: ?cuda.DeviceBuffer = null,
+    // profiling (lanes' --profile): the last round's forward and absorb, synchronized apart (ns)
+    prof: bool = false,
     // TF_DS_ROCI_STAGGER: the second lane of a pair of passes in flight: its node of the 2D split (own scratch, own transport), chunk,
     // stream, cuBLAS handle, the per-layer cache events and its host id and position arrays.
     pair: bool = false,
@@ -1541,6 +1618,9 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         m.gpa = gpa;
         m.spans = .empty;
         m.img_buf = null;
+        m.cand_parts = &.{};
+        m.head_cand = false;
+        m.head_key = false;
         // WP6 (docs/prefill-plan.md): TF_DS_IDX_RB=2 batches the indexer's prompt-chunk scoring kernel to the
         // kit's own captured RB=2 variant (dequantizing a 64-key tile once for 2 rows instead of 1); the kit
         // never captured RB above 2. Off (RB=1, today's behavior) unless set; validate on your own ring first.
@@ -1612,6 +1692,8 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         prompt2d.assemble_quant_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ASSEMBLE_QUANT")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.attn_epilogue_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ATTN_EPILOGUE")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.hc_stride_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_HC_STRIDE")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.head_cand_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_HEAD_CAND")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.head_key_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_HEAD_KEY")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.ring_wc_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_RING_WC")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.ring_inplace_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_RING_INPLACE")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         const ring_word_text: ?[]const u8 = if (std.c.getenv("TF_DS_RING_WORD")) |v| std.mem.span(v) else null;
@@ -2077,6 +2159,9 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             m.graphs.?.lazy.fallbacks = &m.graph_fallbacks;
         }
         if (o.side) try m.rd.useSide(&m.eng);
+        try useHeadCand(m, a, d, prompt2d.head_cand_asked);
+        try useHeadKey(m, a, d, prompt2d.head_key_asked);
+        if (o.drafts) {
                 m.pgraphs.?.lazy.fallbacks = &m.graph_fallbacks;
                 m.dr.?.graphs = &m.pgraphs.?;
             }
@@ -2974,7 +3059,24 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     }
 
         try m.pairJoin();
+        // TF_DS_HEAD_CAND: the device's merge needs the count each node keeps (the frame's head byte); without it, 0.
+        const hb: u8 = switch (head) {
+            .none => 0,
+            .argmax => if (m.head_key) head_cand.key else 0,
+            .candidates => |count| if (m.head_cand) head_cand.kFor(count) else 0,
+        };
+        m.rd.head_k = hb;
+            try m.verify(rows, absorb, hb);
+            if (hb == 0) try m.launchHead(head, R); // (hb != 0: round.forward's last stretch ran it)
+            try m.stream.synchronize();
+        if (hb == 0) try m.launchHead(head, R); // (hb != 0: round.forward's last stretch ran it)
+        try m.head_ready.?.record(m.stream);
+    /// `head`: the round's head (Lanes' frame): 0 the whole rows (rd.logits), head_cand.key TF_DS_HEAD_KEY's bests,
+    /// else TF_DS_HEAD_CAND's count a node.
+    pub fn verify(m: *Model, rows: round.Rows, absorb: []const bool, head: u8) !void {
         try m.pairJoin();
+        if (head != 0 and !(if (head == head_cand.key) m.head_key else m.head_cand)) return error.HeadCandOff;
+        m.rd.head_k = head;
                 }
                 m.clk_rounds += 1;
             }
@@ -3041,10 +3143,62 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     /// The round's logits, R rows of the vocabulary, on the host (after verify).
     /// The round's greedy tokens, R rows (the device's argmax of the round's logits, as sampling.argmax), on the host.
     pub fn roundArgmax(m: *Model, R: usize) ![]const u32 {
+    /// A round's candidates on the host: vals and ids [R, count], flags [R] (non-zero: that row must be read whole).
+    pub const Candidates = struct { vals: []const f32, ids: []const i64, flags: []const i32 };
+
     /// Track B: the round's first `count` candidates a row (sampling.topCandidates' set and order) on the host, from the
     /// device's logits: vals and ids [R, count], flags [R] (non-zero: that row must be read whole, roundLogits).
+    pub const Cands = Candidates;
+    pub fn roundCandidates(m: *Model, R: usize, count: usize) !Candidates {
     }
 
+    /// TF_DS_HEAD_CAND: a round's first `count` candidates a row merged from the four nodes' parts (their first `k`
+    /// of their own columns, verify's head): the baseline set and order with no flag; null when the baseline kernel could flag a
+    /// row (a node flagged one, or ties at the cut the parts cannot rule out): the round then reads the whole head
+    /// (headWhole on every rank, then roundCandidates).
+    pub fn headCandidatesMerged(m: *Model, R: usize, count: usize, k: u8) !?Candidates {
+        const d = m.ctx.d;
+        const tw = m.two orelse return error.HeadCandNeeds2D;
+        if (!m.head_cand or m.rd.head_k != k or count == 0 or count > k or R > round.max_rows) return error.HeadCandOff;
+        const lay = head_cand.layout(R, k);
+        try d.check(d.api.cuMemcpyDtoH_v2(m.cand_parts.ptr, m.rd.call, 4 * lay.bytes), "cuMemcpyDtoH");
+        if (!head_cand.merge(m.cand_parts[0 .. 4 * lay.bytes], lay, head_cand.vocabOffsets(tw.hw), count, m.cand_vals[0 .. R * count], m.cand_ids[0 .. R * count])) return null;
+        @memset(m.cand_flags[0..R], 0);
+        return .{ .vals = m.cand_vals[0 .. R * count], .ids = m.cand_ids[0 .. R * count], .flags = m.cand_flags[0..R] };
+    }
+
+    /// TF_DS_HEAD_KEY: a greedy round's tokens, R rows, merged from the four nodes' bests (verify's head
+    /// head_cand.key): the baseline argmax on the whole rows, on the host.
+    pub fn headTokens(m: *Model, R: usize) ![]const u32 {
+        const d = m.ctx.d;
+        const tw = m.two orelse return error.HeadCandNeeds2D;
+        if (!m.head_key or m.rd.head_k != head_cand.key or R > round.max_rows) return error.HeadCandOff;
+        const n = 4 * R * head_cand.key_row;
+        try d.check(d.api.cuMemcpyDtoH_v2(m.cand_parts.ptr, m.rd.call, n), "cuMemcpyDtoH");
+        head_cand.mergeKeys(m.cand_parts[0..n], R, head_cand.vocabOffsets(tw.hw), m.amax_host[0..R]);
+        return m.amax_host[0..R];
+    }
+
+    /// The round's whole head into rd.logits after its candidates fell back (every rank, in the same frame): the
+    /// exchange and the copies a whole-row round runs, on the round's own head columns (rd.hl).
+    pub fn headWhole(m: *Model, R: usize) !void {
+        if (m.rd.head_k == 0 or R != m.rd.r) return error.HeadCandOff;
+        try round.headWhole(&m.eng, &m.rd, R, null);
+        try m.stream.synchronize();
+    }
+
+    pub fn roundLogits(m: *Model, R: usize) ![]const f32 {
+        const d = m.ctx.d;
+        try m.stream.synchronize();
+        try d.check(d.api.cuMemcpyDtoH_v2(m.logits.ptr, m.rd.logits, R * m.vocab * 4), "cuMemcpyDtoH");
+        return m.logits[0 .. R * m.vocab];
+    }
+
+    /// The prompt's logits on the host (after a fill's last chunk).
+    pub fn promptLogitsHost(m: *Model) ![]const f32 {
+        const d = m.ctx.d;
+        try m.stream.synchronize();
+        try d.check(d.api.cuMemcpyDtoH_v2(m.logits.ptr, m.ch.head_g, m.vocab * 4), "cuMemcpyDtoH");
         if (m.two) |t| if (t.rc) |rc| {
             try rc.t.check(); // a failed transport stops the pass before its tokens are used
             rc.passLine();
@@ -3170,6 +3324,16 @@ test "the start-up settings carry TF_DS_PF_SPLIT and the kernel switches as Mode
     prompt2d.gemm_r2_asked = true;
     try std.testing.expectEqual(prompt2d.kern_gemm_r2, startSettings(o).kern);
     prompt2d.gemm_r2_asked = false;
+    const was_hc = prompt2d.head_cand_asked;
+    defer prompt2d.head_cand_asked = was_hc;
+    prompt2d.head_cand_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_head_cand, startSettings(o).kern);
+    prompt2d.head_cand_asked = false;
+    const was_hk = prompt2d.head_key_asked;
+    defer prompt2d.head_key_asked = was_hk;
+    prompt2d.head_key_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_head_key, startSettings(o).kern);
+    prompt2d.head_key_asked = false;
     for ([_]prompt2d.Qgate{ .head, .body_fp8, .body_ulp }) |q| {
         prompt2d.qgate_canary_asked = q;
     }
@@ -3724,6 +3888,70 @@ test "TF_DS_RING_WC and TF_DS_RING_INPLACE: the settings after their checks, and
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "prompt2d.ring_inplace_asked = prompt2d.switchAsked(if (std.c.getenv(\"TF_DS_RING_INPLACE\")) |v| std.mem.span(v) else null);"));
 }
 
+
+test "TF_DS_HEAD_CAND's line: on every rank, or off on every rank, which ranks and why" {
+    var buf: [400]u8 = undefined;
+    try std.testing.expectEqualStrings("TF_DS_HEAD_CAND=1: a sampled round's candidates from each node's own columns of the head (its first 32 or 64 of each row) merged on rank 0 into the baseline's; a round the baseline kernel could flag reads the whole head as the baseline; on every rank", headCandLine(&buf, 0, null));
+    try std.testing.expectEqualStrings("TF_DS_HEAD_CAND=1: off on every rank: ranks 0 and 1 cannot run it (this rank: needs the four-node 2D split)", headCandLine(&buf, 0b11, "needs the four-node 2D split"));
+    try std.testing.expectEqualStrings("TF_DS_HEAD_CAND=1: off on every rank: rank 3 cannot run it (this rank: can)", headCandLine(&buf, 1 << 3, null));
+}
+
+test "Model.open reads TF_DS_HEAD_CAND with the kernel switches and puts it in effect after the round and the 2D node, through the agreement" {
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator") orelse return error.TestUnexpectedResult;
+    const body = src[at .. at + (std.mem.indexOf(u8, src[at..], "\n    }\n") orelse return error.TestUnexpectedResult)];
+    const read = std.mem.indexOf(u8, body, "prompt2d.head_cand_asked = prompt2d.switchAsked(if (std.c.getenv(\"TF_DS_HEAD_CAND\")) |v| std.mem.span(v) else null); // every rank alike (Settings)") orelse return error.TestUnexpectedResult;
+    const settings = std.mem.indexOf(u8, body, "const mine = startSettings(o);") orelse return error.TestUnexpectedResult;
+    const two = std.mem.indexOf(u8, body, "m.eng = .{ .d = d,") orelse return error.TestUnexpectedResult;
+    const rd = std.mem.indexOf(u8, body, "m.rd = try round.Round.init(&m.eng, &m.arena, a, m.ctx_cap);") orelse return error.TestUnexpectedResult;
+    const use = std.mem.indexOf(u8, body, "try useHeadCand(m, a, d, prompt2d.head_cand_asked);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(read < settings and settings < two and two < rd and rd < use);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "useHeadCand("));
+    // the agreement before anything is made; the round's parts only when every rank can
+    const f = std.mem.indexOf(u8, src, "fn useHeadCand(") orelse return error.TestUnexpectedResult;
+    const fb = src[f .. f + (std.mem.indexOf(u8, src[f..], "\n}\n") orelse return error.TestUnexpectedResult)];
+    const agree = std.mem.indexOf(u8, fb, "const cannot = try prompt2d.ranksThatCannot(d, &m.comm, m.stream, why == null);") orelse return error.TestUnexpectedResult;
+    const on = std.mem.indexOf(u8, fb, "if (prompt2d.agreedOn(asked, cannot)) {") orelse return error.TestUnexpectedResult;
+    const made = std.mem.indexOf(u8, fb, "try headParts(m, a);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(agree < on and on < made);
+    // a round's head as rank 0's frame says, refused when the switch is not in effect here; the merge's parts in the
+    // vocabulary's order
+    const v = std.mem.indexOf(u8, src, "    pub fn verify(m: *Model, rows: round.Rows, absorb: []const bool, head: u8) !void {") orelse return error.TestUnexpectedResult;
+    const vb = src[v .. v + (std.mem.indexOf(u8, src[v..], "\n    }\n") orelse return error.TestUnexpectedResult)];
+    const refuse = std.mem.indexOf(u8, vb, "if (head != 0 and !(if (head == head_cand.key) m.head_key else m.head_cand)) return error.HeadCandOff;") orelse return error.TestUnexpectedResult;
+    const set = std.mem.indexOf(u8, vb, "m.rd.head_k = head;") orelse return error.TestUnexpectedResult;
+    const fwd = std.mem.indexOf(u8, vb, "try m.forwardRows(rows);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(refuse < set and set < fwd);
+    const fr = std.mem.indexOf(u8, src, "    fn forwardRows(") orelse return error.TestUnexpectedResult;
+    const frb = src[fr .. fr + (std.mem.indexOf(u8, src[fr..], "\n    }\n") orelse return error.TestUnexpectedResult)];
+    try std.testing.expect(std.mem.indexOf(u8, frb, "try round.forward(e, &m.rd,") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, "head_cand.merge(m.cand_parts[0 .. 4 * lay.bytes], lay, head_cand.vocabOffsets(tw.hw), count, m.cand_vals[0 .. R * count], m.cand_ids[0 .. R * count])")); // headCandidates', and this test's text
+}
+
+test "TF_DS_HEAD_KEY's line, its read with the kernel switches, its agreement before the shared parts" {
+    var buf: [400]u8 = undefined;
+    try std.testing.expectEqualStrings("TF_DS_HEAD_KEY=1: a greedy round's tokens from each node's best of each row of its own columns of the head, merged on rank 0 into the baseline argmax; on every rank", headKeyLine(&buf, 0, null));
+    try std.testing.expectEqualStrings("TF_DS_HEAD_KEY=1: off on every rank: rank 2 cannot run it (this rank: needs the four-node 2D split)", headKeyLine(&buf, 1 << 2, "needs the four-node 2D split"));
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator") orelse return error.TestUnexpectedResult;
+    const body = src[at .. at + (std.mem.indexOf(u8, src[at..], "\n    }\n") orelse return error.TestUnexpectedResult)];
+    const read = std.mem.indexOf(u8, body, "prompt2d.head_key_asked = prompt2d.switchAsked(if (std.c.getenv(\"TF_DS_HEAD_KEY\")) |v| std.mem.span(v) else null); // every rank alike (Settings)") orelse return error.TestUnexpectedResult;
+    const settings = std.mem.indexOf(u8, body, "const mine = startSettings(o);") orelse return error.TestUnexpectedResult;
+    const cand = std.mem.indexOf(u8, body, "try useHeadCand(m, a, d, prompt2d.head_cand_asked);") orelse return error.TestUnexpectedResult;
+    const use = std.mem.indexOf(u8, body, "try useHeadKey(m, a, d, prompt2d.head_key_asked);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(read < settings and settings < cand and cand < use);
+    const f = std.mem.indexOf(u8, src, "fn useHeadKey(") orelse return error.TestUnexpectedResult;
+    const fb = src[f .. f + (std.mem.indexOf(u8, src[f..], "\n}\n") orelse return error.TestUnexpectedResult)];
+    const agree = std.mem.indexOf(u8, fb, "const cannot = try prompt2d.ranksThatCannot(d, &m.comm, m.stream, why == null);") orelse return error.TestUnexpectedResult;
+    const on = std.mem.indexOf(u8, fb, "if (prompt2d.agreedOn(asked, cannot)) {") orelse return error.TestUnexpectedResult;
+    const made = std.mem.indexOf(u8, fb, "try headParts(m, a);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(agree < on and on < made);
+    // the parts made once for both switches; the tokens merged with the parts' offsets
+    const hp = std.mem.indexOf(u8, src, "fn headParts(") orelse return error.TestUnexpectedResult;
+    const hb = src[hp .. hp + (std.mem.indexOf(u8, src[hp..], "\n}\n") orelse return error.TestUnexpectedResult)];
+    try std.testing.expect(std.mem.indexOf(u8, hb, "if (m.cand_parts.len != 0) return;") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, "head_cand.mergeKeys(m.cand_parts[0..n], R, head_cand.vocabOffsets(tw.hw), m.amax_host[0..R]);")); // headTokens', and this test's text
+}
 
 test "TF_DS_ROCI_STAGGER: every write to state a later pass reads is issued before the cache event that gates it, and the tier's copies join the pair first" {
     const model_src = @embedFile("model.zig");
@@ -4335,6 +4563,7 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
     const refused = std.mem.indexOf(u8, body[v..], "return error.PartnerRefused;").?;
     const warn = std.mem.indexOf(u8, body[v..], "std.log.warn(\"TF_DS_ENGRAM_PARTNER: off:").?;
     try std.testing.expect(refuse < refused and refused < warn and warn < cleared);
+    const ka = std.mem.indexOf(u8, src, "fn useKeepAhead(").?;
     const kv = std.mem.indexOf(u8, kb, "speed_defaults.verdict(why, speed_defaults.defaulted(\"TF_DS_ENGRAM_KEEP_AHEAD\")) == .fallback").?;
     const kwarn = std.mem.indexOf(u8, kb[kv..], "std.log.warn(\"TF_DS_ENGRAM_KEEP_AHEAD: rank").?;
     const kerr = std.mem.indexOf(u8, kb[kv..], "return error.KeepAheadSharesReader;").?;

@@ -115,6 +115,7 @@ const Host = struct {
     recording: ?*record.Recording = null, // --record: the recorder in front of the family's backend
     snap_vt: api.prompt_cache.Snapshots.VTable = undefined, // a family's own kept states (Loaded.snaps), `store` copies through it
     graph_fallbacks: ?*const std.atomic.Value(u64) = null, // the family's failed graph captures, when it counts them
+    head_rounds: ?*const [6]std.atomic.Value(u64) = null, // the family's decode rounds by the head's path, when counted
     draft_vocab: ?*const api.DraftVocabCounters = null, // the family's drafter on a pruned vocabulary, when it runs one
 
     fn close(p: *anyopaque) void {
@@ -166,6 +167,7 @@ const Host = struct {
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true, .logprobs = h.inner.vtable.first_row != null, .structures = h.inner.vtable.first_masked != null, .min_budget = nemotron.native.lone_min_budget, .resumes = true };
         if (h.learn != null) h.host.learner = h.learner();
         h.host.graph_fallbacks = h.graph_fallbacks;
+        h.host.head_rounds = h.head_rounds;
         h.host.draft_vocab = h.draft_vocab;
         try h.host.start();
     }
@@ -453,6 +455,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     });
     errdefer gpa.free(h.startup);
     if (@hasDecl(F, "graphFallbacks")) h.graph_fallbacks = F.graphFallbacks(loaded.ctx);
+    if (@hasDecl(F, "headRounds")) h.head_rounds = F.headRounds(loaded.ctx);
     if (@hasDecl(F, "draftVocab")) h.draft_vocab = F.draftVocab(loaded.ctx);
         }
     }
@@ -554,6 +557,40 @@ test "context windows: the family default inside the model's, 0 for the model's,
     try std.testing.expectError(error.PastNative, contextWindow(300000, 262144, 16384));
     try std.testing.expectError(error.Negative, contextWindow(-5, 262144, 16384));
     try std.testing.expectError(error.NoNative, contextWindow(0, 0, 16384));
+}
+
+test "the DeepSeek family hands the host its decode rounds by the head's path (the declaration openWith reads)" {
+    // openWith takes it by @hasDecl: a rename on either side would leave /metrics without the counts, silently
+    try std.testing.expect(@hasDecl(dsv41.native, "headRounds"));
+    try std.testing.expect(@typeInfo(@TypeOf(dsv41.native.headRounds)).@"fn".return_type.? == @FieldType(Host, "head_rounds"));
+    const src = @embedFile("cuda.zig");
+    const read = "if (@hasDecl(F, \"headRounds\")) h.head_rounds = F.headRounds(loaded.ctx);";
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, read)); // openWith's (this text escapes its quotes)
+}
+
+test "serve: the family's decode rounds by the head's path reach status; a family without them reports none" {
+    const gpa = std.testing.allocator;
+    const Fam = struct {
+        fn release(_: *anyopaque) void {}
+    };
+    var rounds: [6]std.atomic.Value(u64) = .{ .init(1), .init(2), .init(3), .init(4), .init(5), .init(6) };
+    for ([_]bool{ false, true }) |counted| {
+        var target: lanes.fake.Fake = .{ .gpa = gpa };
+        defer target.deinit();
+        const h = try gpa.create(Host);
+        defer gpa.destroy(h);
+        h.* = .{ .gpa = gpa, .gpu = null, .family = &target, .release = Fam.release, .inner = target.backend(), .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined };
+        if (counted) h.head_rounds = &rounds;
+        try h.serve(std.testing.io, .{ .exact_width = 8 }, 8, .{ .lanes = 2 }, null);
+        defer {
+            h.host.stop();
+            h.core.deinit();
+            h.cfg.deinit(gpa);
+        }
+        var st: api.Status = .{};
+        h.host.engine().status(&st, &.{});
+        try std.testing.expectEqual(if (counted) @as(?[6]u64, .{ 1, 2, 3, 4, 5, 6 }) else null, st.head_rounds);
+    }
 }
 
 test "a cancel during a long prompt stops it, and the next request's reply is unchanged (#291)" {
