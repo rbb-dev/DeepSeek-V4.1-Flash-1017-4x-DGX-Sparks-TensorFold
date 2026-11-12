@@ -1,5 +1,4 @@
 const std = @import("std");
-const glm_expiry_build = @import("zig/build/glm_expiry.zig");
 const builtin = @import("builtin");
 const cuda_build = @import("zig/build/cuda.zig");
 const dist_build = @import("zig/build/dist.zig");
@@ -134,6 +133,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const release_version = b.option([]const u8, "version", "Release version, exactly MAJOR.MINOR.PATCH");
     if (release_version) |v| if (!dist_build.validVersion(v)) @panic("-Dversion must be exactly MAJOR.MINOR.PATCH");
+    // a release is never built with test instruments: its version and the flag together stop the build
+    if (release_version != null and cuda_build.testInstruments(b)) @panic("-Dtest_instruments=true cannot build a release (-Dversion): test instruments are for a test arm's binary alone");
     const build_options = b.addOptions();
     // Keep the existing manifest version for developer builds; releases require an explicit override.
     const manifest = @import("build.zig.zon");
@@ -171,37 +172,18 @@ pub fn build(b: *std.Build) void {
     cuda_build.hostTests(b, draft_ids, build_options, test_step, target.result.os.tag != .macos);
     xpu_build.hostTests(b, test_step);
     if (target.result.os.tag == .linux) {
-        // the engine seam's tests (lane_host.zig and its siblings), which the macOS branch runs from its own api module
-        const lanes_mod = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });
-        const api_mod = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes_mod }} });
+        // the engine seam's tests (lane_host.zig and its siblings), which the macOS branch runs from its own api module; in a debug
+        // build whatever the engine's optimisation, as the lane host's fence panics only there (its tests assert that)
+        const lanes_mod = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = .Debug, .link_libc = true });
+        const api_mod = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = .Debug, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes_mod }} });
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api_mod })).step);
     }
     hip_build.steps(b, target, optimize, build_options, test_step);
     exlr8_build.hostTests(b, target, test_step);
     xpu_build.steps(b, target, optimize, build_options);
     video_build.steps(b, target);
-    const lanes_cpu = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = b.graph.host, .optimize = .debug, .link_libc = true });
-    const disk_cpu = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("zig/src/glm_disk_tests.zig"),
-        .target = b.graph.host,
-        .optimize = .debug,
-        .link_libc = true,
-        .imports = &.{.{ .name = "lanes", .module = lanes_cpu }},
-    }) });
-    const disk_run = b.addRunArtifact(disk_cpu);
-    test_step.dependOn(&disk_run.step);
-    b.step("test-learn-recovery", "CPU learned-state recovery and admission tests").dependOn(&disk_run.step);
-    glm_expiry_build.steps(b, test_step, lanes_cpu);
-    const warning = b.addExecutable(.{ .name = "learned-warning-test", .root_module = b.createModule(.{
-        .root_source_file = b.path("zig/src/learned_warning_test.zig"),
-        .target = b.graph.host,
-        .optimize = .debug,
-        .link_libc = true,
-        .imports = &.{.{ .name = "lanes", .module = lanes_cpu }},
-    }) });
-    const warning_run = b.addRunArtifact(warning);
-    test_step.dependOn(&warning_run.step);
-    b.step("test-learn-warning", "CPU production-log refusal, backoff and recovery test").dependOn(&warning_run.step);
+    // (his learned-disk, GLM-expiry and learned-warning host tests need his prompt-cache redesign, which this tree does not carry:
+    // prompt_cache_fake.zig drives vtable fields our core/prompt_cache.zig lacks; they are out of the build with it)
     grammar_build.steps(b, target, xgrammar);
     contract_build.hostTests(b);
 }

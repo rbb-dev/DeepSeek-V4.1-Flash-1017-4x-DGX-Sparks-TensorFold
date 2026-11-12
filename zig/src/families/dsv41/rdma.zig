@@ -1685,8 +1685,10 @@ pub const Ring = struct {
         const was_running = r.running.swap(false, .acq_rel);
         if (was_running and r.cd != null) {
             r.cd.?.stopJanitor(); // no proxy: the queue pairs stay armed until the ring is destroyed or fails
+            if (comptime wait.counting) { // (the posting counters exist only in a test-instrument build)
                 var sb: [512]u8 = undefined;
                 r.logLine(wait.statsLine(&sb));
+            }
         } else if (was_running) {
             r.idle_gate.wake(); // a parked proxy must wake before join
             // the doorbell's 64-byte granule is the nap's monitor: a same-value store clears it and ends the nap. It

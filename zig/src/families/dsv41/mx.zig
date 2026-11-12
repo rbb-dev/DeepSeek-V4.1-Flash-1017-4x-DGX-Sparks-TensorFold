@@ -363,6 +363,8 @@ pub const Kernels = struct {
     sf_apart: usize = 0, // the layers whose experts the guard kept for their packing (other lengths than its reads)
     // TF_DS_GEMM_R2 in effect (useGemmR2): the exact arithmetic's split GEMMs and expert tiles on its kernels (SfKernels.r2)
     gemm_r2: bool = false,
+    // the test instruments' load-only expert kernels chosen (sfExperts): a replay's flag, never set by the engine
+    sf_loadonly: bool = false,
 
     pub fn load(d: *const cuda.Driver, image: []const u8) !Kernels {
         var m = try cuda.Module.load(d, image);
@@ -837,6 +839,9 @@ pub const SfKernels = struct {
     w16: W16 = .{},
     // TF_DS_GEMM_R2's kernels (the exact arithmetic's): null each in an image built without it
     r2: R2 = .{},
+    // the test instruments' load-only twins of gate / up and of down on the pack's parts (native_sf.cu, TF_SF_LOAD_ONLY): null in a release's image
+    gu_loadonly: ?cuda.Function = null,
+    dn_three_loadonly: ?cuda.Function = null,
     ranges: ?cuda.Function = null, // tf_dsn_sf_ranges: TF_DS_MMA_SF_EXACT's guard
     // the whole-line twins for a y in the transport's arena (Kernels.useStaged)
     st_gemm: [2]?cuda.Function = @splat(null),
@@ -926,6 +931,8 @@ pub const SfKernels = struct {
         sk.split64n = pf(m, "tf_dsn_sf_split64n_exact_kernel", sf_split64n_smem) catch null;
         sk.dn_three = pf(m, "tf_dsn_sf_dn_exact_three_kernel", pf_dn_r128_smem) catch null;
         sk.ch_dn_three = pf(m, "tf_dsn_sf_dn_three_kernel", pf_dn_r128_smem) catch null;
+        sk.gu_loadonly = pf(m, "tf_dsn_sf_gu_loadonly_kernel", pf_gu_r128_smem) catch null;
+        sk.dn_three_loadonly = pf(m, "tf_dsn_sf_dn_three_loadonly_kernel", pf_dn_r128_smem) catch null;
         return sk;
     }
 };
@@ -1208,6 +1215,9 @@ pub fn sfExperts(k: *const Kernels, key: u64, of_down: bool) ?Launch {
     if (k.sf == .off or (k.sf == .exact and !sfProvenKey(k, key))) return null;
     const sk = k.sfk orelse return null;
     const x: usize = @intFromBool(k.sf == .exact);
+    if (k.sf_loadonly and x == 1 and !of_down) {
+        if (sk.gu_loadonly) |f| return .{ .f = f, .threads = 256, .smem = pf_gu_r128_smem };
+    }
     if (k.gemm_r2 and x == 1) {
         if (of_down) {
             if (sk.r2.dn) |f| return .{ .f = f, .threads = 256, .smem = r2_dn_smem };

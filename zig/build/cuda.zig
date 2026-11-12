@@ -291,11 +291,27 @@ fn radioModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     return b.createModule(.{ .root_source_file = b.path("zig/src/families/radio/radio.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core }, .{ .name = "lanes", .module = lanes } } });
 }
 
+/// -Dtest_instruments (default false): the DeepSeek family's test instruments (families/dsv41/test_instruments.zig), measurements
+/// in hot paths that a build made for a test arm carries and a release never does. Declared once: both the targets and the host
+/// tests build the family. A binary built with it refuses to serve unless TF_DS_TEST_INSTRUMENTS=1.
+pub fn testInstruments(b: *std.Build) bool {
+    const S = struct {
+        var value: ?bool = null;
+    };
+    if (S.value) |v| return v;
+    const v = b.option(bool, "test_instruments", "Build the test instruments into the DeepSeek engine (a test arm's binary: it refuses to serve unless TF_DS_TEST_INSTRUMENTS=1; never a release's)") orelse false;
+    S.value = v;
+    return v;
+}
+
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
 fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, heat: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module, dsv41: *std.Build.Module } {
     // DeepSeek-V4.1-Flash (our port): its module reads the runtime and the lane core, as Nemotron's does
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
     const dsv41 = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/dsv41.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const instruments = b.addOptions();
+    instruments.addOption(bool, "test_instruments", testInstruments(b));
+    dsv41.addOptions("instruments", instruments);
     dsv41.addImport("cuda", cuda);
     dsv41.addImport("lanes", lanes);
     dsv41.addImport("core", core);
@@ -411,6 +427,8 @@ fn fatbin(b: *std.Build, nvcc: []const u8, version: std.Build.LazyPath, k: Kerne
     run.addFileInput(version);
     run.addArgs(&torch_flags);
     run.addArgs(k.flags);
+    // the block-scaled kernels' load-only instruments (native_sf.cu) belong to a test arm's build alone
+    if (std.mem.eql(u8, k.name, "dsv41_native_sf") and testInstruments(b)) run.addArg("-DTF_SF_LOAD_ONLY=1");
     var it = std.mem.tokenizeScalar(u8, sms, ',');
     while (it.next()) |sm| {
         // arch-specific features (the block-scaled FP4 mma) from sm_120 on; older targets build the trapping fallback

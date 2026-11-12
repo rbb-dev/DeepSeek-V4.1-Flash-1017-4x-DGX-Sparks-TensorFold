@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const roci = @import("rocinante.zig");
+const ti = @import("test_instruments.zig");
 const R = roci.Region;
 const C = roci.Class;
 
@@ -1403,6 +1404,64 @@ test "the wake causes: a nap that a doorbell ends counts as a bell wake" {
     for (&net.nodes) |*nd| try nd.t.send(s, .own1, 0);
     for (&net.nodes) |*nd| try nd.t.wait(s, .own1);
     try std.testing.expect(totalCounters(net).wake_bell > 0);
+}
+
+/// Every node's proxies ended (their timers filed, an instrument build's), their transports kept.
+fn joinProxies(net: *Net) void {
+    for (&net.nodes) |*nd| nd.t.stop.store(true, .release);
+    for (&net.nodes) |*nd| for (&nd.t.threads) |*th| if (th.*) |x| {
+        x.join();
+        th.* = null;
+    };
+}
+
+test "the nap timer: a default build carries none; an instrument build's proxies time every nap they take" {
+    if (!ti.enabled) return error.SkipZigTest;
+    const net = try Net.open(.{}, .{ .nap = true }, roci.identity);
+    defer net.close();
+    try net.start();
+    sleep(30 * std.time.ns_per_ms);
+    joinProxies(net);
+    for (&net.nodes) |*nd| {
+        for (0..roci.rails) |r| {
+            const t = ti.filedFor(nd.t, @intCast(r)).?;
+            const c = nd.t.rail_counters[r];
+            // the idle loop naps once a turn, and the timer saw every nap: its count is the loop's wakes by cause
+            try std.testing.expect(t.naps > 0);
+            try std.testing.expectEqual(c.wake_bell + c.backstop_wakes, t.naps);
+            var in_hist: u64 = 0;
+            for (t.hist) |h| in_hist += h;
+            try std.testing.expectEqual(t.naps, in_hist);
+            var early: u64 = 0;
+            for (t.early_hist) |h| early += h;
+            try std.testing.expectEqual(c.wake_early, early);
+            // nothing rang the doorbell: every nap ran its 100 us deadline or an early wake ended it
+            try std.testing.expectEqual(@as(u64, 0), c.wake_bell);
+            try std.testing.expect(t.ticks > 0);
+        }
+    }
+}
+
+test "the nap timer: a nap a doorbell ends is timed as a bell wake, and the naps that waited for it lasted 100 us or more" {
+    if (!ti.enabled) return error.SkipZigTest;
+    const net = try Net.open(.{}, .{ .nap = true, .backstop_us = 100_000 }, roci.identity);
+    defer net.close();
+    try net.start();
+    sleep(5 * std.time.ns_per_ms);
+    const s: FakeStream = .{};
+    for (&net.nodes) |*nd| try nd.t.send(s, .own1, 0);
+    for (&net.nodes) |*nd| try nd.t.wait(s, .own1);
+    joinProxies(net);
+    var bells: u64 = 0;
+    var long: u64 = 0;
+    for (&net.nodes) |*nd| {
+        for (0..roci.rails) |r| {
+            bells += nd.t.rail_counters[r].wake_bell;
+            long += ti.filedFor(nd.t, @intCast(r)).?.hist[ti.buckets - 1];
+        }
+    }
+    try std.testing.expect(bells > 0);
+    try std.testing.expect(long > 0);
 }
 
 test "the idle loop reads the clock once every housekeep_every turns, not every turn (control: every turn reads it every turn)" {

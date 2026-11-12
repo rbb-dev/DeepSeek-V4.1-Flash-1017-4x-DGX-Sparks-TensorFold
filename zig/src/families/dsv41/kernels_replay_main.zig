@@ -79,6 +79,9 @@
 //!     padding row's copies left out; down on 128-row tiles): the experts' pack, entry outputs and combined rows at
 //!     37 .. 4,096 rows against its kernels, their route asserted, and one dense shape's outputs with the switch on
 //!     against off (the dense split GEMMs stay on the exact kernels); one changed x value differs.
+//!   - expert_loadonly (a test-instruments image's): the exact expert kernels (gate / up, down on the pack's two parts) at a
+//!     4,096-row pass beside their twins with the MMAs and adds taken out, kernel ms in A-B-A order; the twins' outputs
+//!     differ from the shipping kernels' (a control).
 //!   - TF_DS_ATTN_EPILOGUE: a prompt chunk's attention output takes the inverse RoPE and wo_a's quant in one launch,
 //!     against rope_heads followed by the quant, at 1, 17 and 4,096 rows of 16 heads of 512: the roped o, the codes
 //!     and scales, and wo_a's fake rows byte-equal; one o value in the roped columns changed differs.
@@ -2182,6 +2185,164 @@ fn gemmR2(r: *Run, rng_in: std.Random) !void {
         try put(d, at, &was, 2);
         r.report("gemm_r2 experts control: gate / up's pack with one x value of row 30 set to 64", differs(base[0], ctl[0]), false);
     }
+}
+
+// -- the expert tiles without the tensor core (test instruments) --------------------------------------------------------------------
+
+/// What the exact expert kernels cost with the MMAs and the adds taken out (native_sf.cu's TF_SF_LOAD_ONLY twins, in an image built with
+/// the test instruments): gate / up and down on the pack's two parts at a 4,096-row pass, kernel time in A-B-A order (the shipping
+/// kernel, the load-only twin, the shipping kernel again), the same grids, tiles, loads, barriers and stores. Gate / up goes through
+/// mx.gateUp (its grouping launches are in both arms); down is the kernel alone. The twin's outputs differ from the shipping kernel's
+/// (it computes nothing), which the controls assert.
+fn expertLoadOnly(r: *Run, rng_in: std.Random) !void {
+    _ = rng_in;
+    var prng = std.Random.DefaultPrng.init(0x10ad);
+    const rng = prng.random();
+    const d = r.d;
+    const have = if (r.k.sfk) |x| x.gu_loadonly != null and x.dn_three_loadonly != null and x.dn_three != null else false;
+    r.note("expert_loadonly: the load-only twins (native_sf.cu's TF_SF_LOAD_ONLY kernels, a test-instruments image) are in this image", have);
+    if (!have) return;
+    defer {
+        r.k.sf = .off;
+        r.k.sf_loadonly = false;
+        r.k.sf_nkept = 0;
+        r.k.sf_nproven = 0;
+    }
+    var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sarena.deinit();
+    const ha = sarena.allocator();
+    var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer for (keep.items) |*b| b.free();
+    const R = @as(usize, 4096); // a 4,096-row pass, the chunk the engine launches
+    const P = R * X_SL;
+    const ex = try xExperts(d, rng, ha, &keep);
+    const sc = try xScratch(d, R, true, ha, &keep);
+    const x = try upload(d, try bf16s(R * X_D, rng, 0.5, ha));
+    const hdn = try upload(d, try bf16s(P * X_I, rng, 0.5, ha));
+    const pw = try xPicks(R, rng, ha);
+    const pb = try upload(d, std.mem.sliceAsBytes(pw.pick));
+    const wb = try upload(d, std.mem.sliceAsBytes(pw.wts));
+    const ps = try xPicksSkew(R, rng, ha);
+    const pbs = try upload(d, std.mem.sliceAsBytes(ps.pick));
+    const wbs = try upload(d, std.mem.sliceAsBytes(ps.wts));
+    const h = try cuda.DeviceBuffer.alloc(d, P * X_W * 2);
+    const out = try cuda.DeviceBuffer.alloc(d, R * X_N * 4);
+    for ([_]cuda.DeviceBuffer{ x, hdn, pb, wb, pbs, wbs, h, out }) |b| try keep.append(ha, b);
+    const nx = ex.native.?;
+    try mx.sfProve(r.k, nx.s1);
+    const G = struct {
+        r: *Run,
+        e: weights.Experts,
+        sc: mx.ExpertScratch,
+        x: u64,
+        pk: u64,
+        wt: u64,
+        h: u64,
+        lo: bool,
+        fn go(c: @This()) anyerror!void {
+            c.r.k.run128 = true;
+            c.r.k.sf = .exact;
+            c.r.k.sf_loadonly = c.lo;
+            defer {
+                c.r.k.run128 = false;
+                c.r.k.sf = .off;
+                c.r.k.sf_loadonly = false;
+            }
+            try mx.gateUp(c.r.k, c.r.s, c.r.d, c.e, c.sc, c.x, X_D, c.pk, c.wt, 4096, 7.0, c.h, X_MAIN, false);
+        }
+    };
+    const gs: G = .{ .r = r, .e = ex, .sc = sc, .x = x.ptr, .pk = pb.ptr, .wt = wb.ptr, .h = h.ptr, .lo = false };
+    var gl = gs;
+    gl.lo = true;
+    const g1 = try kernelBest(r, G, gs, G.go);
+    const g2 = try kernelBest(r, G, gl, G.go);
+    const g3 = try kernelBest(r, G, gs, G.go);
+    // the controls: the twin's pack differs from the shipping kernel's
+    try poison(h.ptr, h.len, d, r.s);
+    try G.go(gs);
+    try r.s.synchronize();
+    const ship_h = try get(h.ptr, 4096 * X_SL * X_W * 2, d);
+    defer free(ship_h);
+    try poison(h.ptr, h.len, d, r.s);
+    try G.go(gl);
+    try r.s.synchronize();
+    const lo_h = try get(h.ptr, 4096 * X_SL * X_W * 2, d);
+    defer free(lo_h);
+    var t: WcText = .{};
+    try t.add("expert_loadonly gate / up (4,096 rows x 7 slots, K {d}, {d} columns), kernel and grouping ms, A-B-A: shipping {d:.3}, load-only {d:.3}, shipping {d:.3}; load-only is {d:.1} % of shipping", .{ X_D, X_W, g1, g2, g3, 100.0 * g2 / (0.5 * (g1 + g3)) });
+    r.note(t.buf[0..t.n], true);
+    r.report("expert_loadonly gate / up control: the load-only twin's pack differs from the shipping kernel's", differs(ship_h, lo_h), false);
+
+    // down on the pack's two parts (tf_dsn_sf_dn_exact_three_kernel) beside its load-only twin, the same arguments
+    if (X_I != 1152 or X_MAIN != 512 or X_W != 640) return r.note("expert_loadonly: the pack is 512 + 512 main columns and a 128-column rest", false);
+    try mx.quant(r.k, r.s, x.ptr, .bf16, X_D, R, X_D, sc.q, X_D, sc.s, X_D / 32);
+    try mx.grouping(r.k, r.s, d, X_E, sc, pb.ptr, R);
+    try mx.tileList(r.k, r.s, sc);
+    const pc = try dsv41.prompt2d.packCodesPlan(P, 512, 128);
+    var parts: [2]u64 = undefined;
+    for (0..2) |i| {
+        const xd = try upload(d, try bf16s(P * X_W, rng, 0.5, ha));
+        const pbuf = try cuda.DeviceBuffer.alloc(d, pc.bytes);
+        try keep.append(ha, xd);
+        try keep.append(ha, pbuf);
+        parts[i] = pbuf.ptr;
+        try dsv41.prompt2d.packQuant(r.k, r.s, xd.ptr, pbuf.ptr, pc);
+    }
+    const o_a = try cuda.DeviceBuffer.alloc(d, P * X_N * 4);
+    const o_b = try cuda.DeviceBuffer.alloc(d, P * X_N * 4);
+    try keep.append(ha, o_a);
+    try keep.append(ha, o_b);
+    const grid_y: usize = P / mx.pf_bm + X_E;
+    const bk = mx.packBlocks(pc.p, 512, 128);
+    const bytes = P * X_N * 4;
+    const Three = struct {
+        fn go(rr: *Run, f: cuda.Function, scx: mx.ExpertScratch, nxx: weights.NativeExperts, prt: [2]u64, blk: anytype, o: u64, gy: usize) !void {
+            var args: cuda.Args = .{};
+            var a: mx.DnArgs = .{ .q = prt[0] + blk.main_q, .s = prt[0] + blk.main_s, .ldq = 512, .lds = 16, .ent = scx.ent, .off = scx.off, .act = scx.act, .nact = scx.nact, .w2 = nxx.w2, .s2 = nxx.s2, .ldw = X_I / 2, .ldws = X_I / 32, .fmt = 1, .shared = X_E - 1, .sldw = X_I, .sldws = X_I / 32, .I = X_I, .N = X_N, .round_bf16 = 0, .out = o, .ldo = X_N };
+            _ = &a;
+            args.add(a);
+            args.add(scx.tiles);
+            args.add(scx.ntiles);
+            const p3: mx.Part3 = .{ .q1 = prt[1] + blk.main_q, .s1 = prt[1] + blk.main_s, .qr0 = prt[0] + blk.rest_q, .sr0 = prt[0] + blk.rest_s, .qr1 = prt[1] + blk.rest_q, .sr1 = prt[1] + blk.rest_s, .owner = nxx.owner, .ldq_rest = 128, .lds_rest = 4, .kb_main = 16 };
+            args.add(p3);
+            try cuda.launch.launch(f, .{ .grid = .{ .x = X_N / 128, .y = @intCast(gy), .z = 1 }, .block = .{ .x = 256 }, .shared = mx.pf_dn_r128_smem }, rr.s, &args);
+        }
+    };
+    const sk = r.k.sfk.?;
+    const D = struct {
+        r: *Run,
+        f: cuda.Function,
+        sc: mx.ExpertScratch,
+        nx: weights.NativeExperts,
+        parts: [2]u64,
+        bk: @TypeOf(bk),
+        o: u64,
+        gy: usize,
+        fn go(c: @This()) anyerror!void {
+            try Three.go(c.r, c.f, c.sc, c.nx, c.parts, c.bk, c.o, c.gy);
+        }
+    };
+    const ds: D = .{ .r = r, .f = sk.dn_three.?, .sc = sc, .nx = nx, .parts = parts, .bk = bk, .o = o_a.ptr, .gy = grid_y };
+    var dl = ds;
+    dl.f = sk.dn_three_loadonly.?;
+    dl.o = o_b.ptr;
+    const d1 = try kernelBest(r, D, ds, D.go);
+    const d2 = try kernelBest(r, D, dl, D.go);
+    const d3 = try kernelBest(r, D, ds, D.go);
+    try poison(o_a.ptr, bytes, d, r.s);
+    try D.go(ds);
+    try r.s.synchronize();
+    const ship_o = try get(o_a.ptr, bytes, d);
+    defer free(ship_o);
+    try poison(o_b.ptr, bytes, d, r.s);
+    try D.go(dl);
+    try r.s.synchronize();
+    const lo_o = try get(o_b.ptr, bytes, d);
+    defer free(lo_o);
+    var t2: WcText = .{};
+    try t2.add("expert_loadonly down on the pack's two parts (4,096 rows x 7 slots, I {d}, N {d}), kernel only ms, A-B-A: shipping {d:.3}, load-only {d:.3}, shipping {d:.3}; load-only is {d:.1} % of shipping", .{ X_I, X_N, d1, d2, d3, 100.0 * d2 / (0.5 * (d1 + d3)) });
+    r.note(t2.buf[0..t2.n], true);
+    r.report("expert_loadonly down control: the load-only twin's outputs differ from the shipping kernel's", differs(ship_o, lo_o), false);
 }
 
 // -- the tensor core's accumulation window ------------------------------------------------------------------------------------------------

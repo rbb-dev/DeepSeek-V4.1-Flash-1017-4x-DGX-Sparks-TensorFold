@@ -191,6 +191,7 @@ test {
     _ = @import("engram_partner.zig");
     _ = @import("rocinante_test.zig");
     _ = @import("rocinante_cd_test.zig");
+    _ = @import("test_instruments.zig");
     _ = @import("kset_test.zig");
     _ = @import("any_check.zig");
     refAll(replay_runner);

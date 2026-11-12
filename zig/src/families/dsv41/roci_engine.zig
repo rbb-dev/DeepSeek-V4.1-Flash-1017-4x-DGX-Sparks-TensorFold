@@ -10,6 +10,7 @@ const rv = @import("rocinante_verbs.zig");
 const cd = @import("rocinante_cd.zig");
 const mx = @import("mlx5_devx.zig");
 const nap = @import("rdma_nap.zig");
+const ti = @import("test_instruments.zig");
 const prompt2d = @import("prompt2d.zig");
 const rdma = @import("rdma.zig");
 
@@ -136,6 +137,11 @@ pub const Roci = struct {
     /// on that part of the block, with its own control block, queue pairs and proxies, and pairs the transports (a failure on one stops
     /// the others: the caller links three with Transport.ring3). The last lane is closed first, lane 0 last.
     pub fn openLane(gpa: std.mem.Allocator, d: *const cuda.Driver, rank: u32, node: u8, world: u32, order: [4]u32, fan: *const prompt2d.Fan, devices: [roci.rails][]const u8, gid: u8, lanes: u8, first: ?*Roci, layout_set: roci.LayoutSet) !*Roci {
+        // a binary built with test instruments serves only on a test arm's say-so (a default build has no gate: this compiles out)
+        if (comptime ti.enabled) if (ti.gate() == .refused) {
+            std.log.err("{s}", .{ti.refusal});
+            return error.TestInstrumentsRefused;
+        };
         const pages: Pages = .mmap; // (locked anonymous pages registered with cuMemHostRegister: the arena the transport's kernels run at device speed on)
         if (world != roci.world) return error.NotFourRanks;
         if (lanes < 1 or lanes > 3) return error.BadLanes;
@@ -244,6 +250,7 @@ pub const Roci = struct {
         engine_api.transport.facts.rocinante_known = true;
         engine_api.transport.facts.rocinante_wait = set.wait_qp;
         engine_api.transport.facts.rocinante_signal = if (signal == .atomic) .atomic else .write;
+        if (comptime ti.enabled) std.log.warn("{s}", .{ti.warning});
         std.log.info("{s}lane {d} of {d}: registration and exchange {d} ms, nap {}, arena {s}", .{ w.buffered(), r.lane, if (first) |f| @as(u8, @intCast((f.span[1] - f.span[0]) / total)) else lanes, (nowNs() - t0) / std.time.ns_per_ms, set.nap, "locked anonymous pages registered with cuMemHostRegister" });
         return r;
     }

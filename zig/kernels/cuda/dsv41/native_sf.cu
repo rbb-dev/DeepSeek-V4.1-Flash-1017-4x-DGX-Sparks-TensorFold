@@ -29,6 +29,10 @@ using pf::Ops;
 
 constexpr int kChained = 0;  // the switch's arithmetic: a split's K blocks accumulate in the MMA
 constexpr int kExact = 1;    // each K block's MMA from zero, then an fp32 add: native.cu's bits
+// Instrument only (the kernels under TF_SF_LOAD_ONLY, built with the test instruments): the exact tiles' every load, barrier and
+// store with no MMA and no add; a K block's fragments fold into the accumulator by xor so their shared-memory loads stay.
+// Its output is meaningless; its time is what the tile costs without the tensor core and the adds.
+constexpr int kLoadOnly = 3;
 
 // d (+)= the block-scaled m16n8k32 MMA of A (E4M3) and B (E4M3; FP4: E2M1, the code at bits 5..2 of each byte), each
 // operand's K block scaled by its UE8M0 byte, byte KK of the thread's scale words. Thread-id 0 on both sides: row g's
@@ -93,6 +97,14 @@ __device__ __forceinline__ void block(float (&part)[C::MT][C::NT][4], const uint
             for (int i = 0; i < C::MT; i++) {
                 if (!FULL && wm * C::WM + i * 16 >= mvalid) continue;
                 mma<KK, FP4>(part[i][j], af[i], b[j], saw[i], sbw[j]);
+            }
+        } else if constexpr (MODE == kLoadOnly) {
+#pragma unroll
+            for (int i = 0; i < C::MT; i++) {
+                if (!FULL && wm * C::WM + i * 16 >= mvalid) continue;
+                const uint32_t x = af[i][0] ^ af[i][1] ^ af[i][2] ^ af[i][3] ^ b[j][0] ^ b[j][1] ^ saw[i] ^ sbw[j];
+#pragma unroll
+                for (int c = 0; c < 4; c++) part[i][j][c] = __uint_as_float(__float_as_uint(part[i][j][c]) ^ x);
             }
         } else {
             float d[C::MT][4];
@@ -1173,6 +1185,16 @@ extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_dn_exact_three_ke
 extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_dn_exact_kernel(DnArgs a, const int2* __restrict__ tiles, const int* __restrict__ ntiles) {
     sf::dn<sf::kExact>(a, tiles, ntiles);
 }
+
+#ifdef TF_SF_LOAD_ONLY
+// The experts' tiles of the exact kernels with the MMAs and the adds taken out (kLoadOnly): the same grids, tiles, loads and stores.
+extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_gu_loadonly_kernel(GuArgs a, const int2* __restrict__ tiles, const int* __restrict__ ntiles) {
+    sf::gu<sf::kLoadOnly>(a, tiles, ntiles);
+}
+extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_sf_dn_three_loadonly_kernel(DnArgs a, const int2* __restrict__ tiles, const int* __restrict__ ntiles, sf::Part3 p) {
+    sf::dn<sf::kLoadOnly, true>(a, tiles, ntiles, p);
+}
+#endif
 
 // The exact arithmetic's split tiles and experts on 16 warps a block (TF_DS_GEMM_W16). The tile, its K blocks a
 // stage, its stages and its loads are the 8-warp kernels'; only the warp grid moves, so every output element is still

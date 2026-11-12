@@ -6497,9 +6497,28 @@
    "seed": "name",
    "first_use": "families/dsv41/roci_engine.zig:158",
    "secret": false
+  },
+  {
+   "id": 920,
+   "name": "tf_ds_test_instruments",
+   "env": "TF_DS_TEST_INSTRUMENTS",
+   "group": "transport",
+   "tab": "Transport",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
    "default": "0",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
    "label": "Allow a test-instrument build to serve",
    "doc": "Diagnostics: only a test build with extra instruments reads this. Set to 1 it lets that build serve; without it the build refuses to start. A release build ignores it.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/test_instruments.zig:31",
    "secret": false,
    "hidden": true,
    "env_override": true

@@ -20,6 +20,7 @@ const builtin = @import("builtin");
 const cuda = @import("cuda");
 const mx = @import("mlx5_devx.zig");
 const seqs = @import("rdma_seq.zig");
+const ti = @import("test_instruments.zig");
 
 pub const max_ranks = seqs.max_ranks;
 pub const max_devices = seqs.max_devices;
@@ -191,6 +192,9 @@ fn cqeError(c: *const Cq, idx: u64) CqeError {
 }
 
 // -- what posting costs: counters the log line reports ---------------------------------------------------------------------------------
+// A measurement that sits in the posting path exists only in a binary built for it (-Dtest_instruments, test_instruments.zig): a default
+// build has no counter, no clock read for one and no atomic for one (MEASURED before this: 184 ns an exchange in all, of which the counters'
+// two clock reads and their atomics are ESTIMATED 100-130 ns). `stats` stays zero in a default build and its line says so.
 
 /// The engine thread's posting, summed over every ring of the process (relaxed counters; the engine thread writes them, the log reads).
 pub const Stats = struct {
@@ -205,13 +209,19 @@ pub const Stats = struct {
     waits: std.atomic.Value(u64) = .init(0), // posts that had to wait for room
 };
 
+/// Whether this build keeps the posting counters (a test-instrument build): the one place the others ask.
+pub const counting = ti.enabled;
+
 pub var stats: Stats = .{};
 
+inline fn bump(c: *std.atomic.Value(u64), n: u64) void {
+    if (comptime !ti.enabled) return;
     _ = c.fetchAdd(n, .monotonic);
 }
 
 /// The line the Sparks read: per graph launch and per exchange, the posting's mean and the longest launch, the queue entries and rings it made.
 pub fn statsLine(buf: []u8) []const u8 {
+    if (comptime !ti.enabled) return "RING_WAIT posting counters: not in this build (a test-instrument build keeps them)";
     const l = stats.launches.load(.monotonic);
     const ln = stats.launch_ns.load(.monotonic);
     const p = stats.posts.load(.monotonic);
@@ -268,6 +278,11 @@ pub const Geometry = struct {
 
 /// The chain of exchange `q` of `n` bytes on `l`, its data read from send slot `send_slot`.
 pub fn laneChain(g: Geometry, l: Lane, q: u64, n: u64, send_slot: usize) Chain {
+    return laneChainAt(g, l, q, q % g.slots, n, send_slot);
+}
+
+/// laneChain with the landing slot of sequence `q` (q % slots) given: the post computes it once for every lane of an exchange.
+pub fn laneChainAt(g: Geometry, l: Lane, q: u64, slot: u64, n: u64, send_slot: usize) Chain {
     const pt = seqs.part(n, l.lanes, l.lane);
     const at: u64 = (slot * g.world + g.rank) * g.max_bytes + pt.off;
     return .{
@@ -493,10 +508,16 @@ pub const Backend = struct {
         b.acquire();
         defer b.release();
         if (b.fenced) return error.Fenced;
+        const t0: u64 = if (comptime ti.enabled) nowNs() else 0;
+        defer if (comptime ti.enabled) {
             bump(&stats.posts, 1);
             bump(&stats.post_ns, nowNs() - t0);
+        };
         const q = b.q + 1;
+        const slot_q: u64 = q % b.geo.slots; // (one divide an exchange, not one a lane)
+        const source: usize = send_slot orelse @as(usize, @intCast(slot_q));
         for (b.lanes.items) |l| {
+            const c = laneChainAt(b.geo, l, q, slot_q, n, source);
             try b.reserve(l.qp, chainEntries(c.data != null));
             writeChain(l.qp, c);
             if (!defer_ring) ringQp(l.qp);
@@ -748,6 +769,8 @@ pub fn replay(handle: usize) ReplayError!void {
     defer unlockPlans();
     const list = plans.get(handle) orelse return;
     if (list.len == 0) return;
+    const t0: u64 = if (comptime ti.enabled) nowNs() else 0;
+    defer if (comptime ti.enabled) {
         const dt = nowNs() - t0;
         bump(&stats.launch_ns, dt);
         bump(&stats.launch_exchanges, list.len);
@@ -757,6 +780,7 @@ pub fn replay(handle: usize) ReplayError!void {
             var lb: [512]u8 = undefined;
             std.log.info("{s}", .{statsLine(&lb)});
         }
+    };
     try postPlan(list);
 }
 
@@ -1409,8 +1433,14 @@ test "the posting counters: entries and rings counted as written, the exchange's
     Backend.writeChain(&q, testChain(1, true));
     Backend.writeChain(&q, testChain(2, false));
     ringQpTest(&q);
+    if (!ti.enabled) {
+        // a default build counts nothing and reads no clock for it: the posts above and the replays below leave every counter at zero
+        try testing.expectEqual(@as(u64, 0), stats.entries.load(.monotonic));
+        try testing.expectEqual(@as(u64, 0), stats.rings.load(.monotonic));
+    } else {
         try testing.expectEqual(@as(u64, 5), stats.entries.load(.monotonic));
         try testing.expectEqual(@as(u64, 1), stats.rings.load(.monotonic));
+    }
     var r: PlanRing = .{};
     recordBegin();
     try note(.{ .ops = &PlanRing.ops, .ring = &r, .n = 16, .user = -1 });
@@ -1421,8 +1451,16 @@ test "the posting counters: entries and rings counted as written, the exchange's
     try replay(0x99);
     var lb: [512]u8 = undefined;
     const line = statsLine(&lb);
+    if (!ti.enabled) {
+        try testing.expectEqual(@as(u64, 0), stats.launches.load(.monotonic));
+        try testing.expectEqual(@as(u64, 0), stats.launch_exchanges.load(.monotonic));
+        try testing.expect(std.mem.indexOf(u8, line, "not in this build") != null);
+    } else {
+        try testing.expectEqual(@as(u64, 2), stats.launches.load(.monotonic));
+        try testing.expectEqual(@as(u64, 4), stats.launch_exchanges.load(.monotonic));
         try testing.expect(std.mem.indexOf(u8, line, "2 planned graph launches") != null);
         try testing.expect(std.mem.indexOf(u8, line, "5 queue entries, 1 doorbell rings") != null);
+    }
     forget(0x99);
     stats = .{};
 }

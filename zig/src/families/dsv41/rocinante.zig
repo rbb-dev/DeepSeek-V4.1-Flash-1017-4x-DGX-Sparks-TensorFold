@@ -15,6 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const nap = @import("rdma_nap.zig");
+const ti = @import("test_instruments.zig");
 const slabs = @import("slab_plan.zig");
 
 pub const world: usize = 4;
@@ -791,6 +792,7 @@ pub const Transport = struct {
             t.janitor = try std.Thread.spawn(.{}, janitorMain, .{t});
             return;
         }
+        for (0..rails) |r| t.threads[r] = try std.Thread.spawn(.{}, proxyThread, .{ t, @as(u8, @intCast(r)), if (cpus) |c| c[r] else null });
     }
 
     pub fn deinit(t: *Transport) void {
@@ -1315,6 +1317,7 @@ pub const Transport = struct {
         const now = t.rail_counters[rail];
         const prev = t.rail_prev[rail];
         t.rail_prev[rail] = now;
+        var buf: [if (ti.enabled) 1536 else 768]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
         w.print("ROCI rail {c} event {d}: posts {d} data_writes {d} words {d} bytes_out {d} backstop_wakes {d} wake_bell {d} wake_deadline {d} wake_early {d} parks {d} park_timeouts {d} post_ns_max {d} wire_us(mean/max n)", .{ @as(u8, 'A') + rail, t.ctl.done[rail].v, now.posts - prev.posts, now.data_writes - prev.data_writes, now.words - prev.words, now.bytes_out - prev.bytes_out, now.backstop_wakes - prev.backstop_wakes, now.wake_bell - prev.wake_bell, now.wake_deadline - prev.wake_deadline, now.wake_early - prev.wake_early, now.parks - prev.parks, now.park_timeouts - prev.park_timeouts, now.post_ns_max }) catch return;
         for (0..n_classes) |c| {
@@ -1325,6 +1328,7 @@ pub const Transport = struct {
             const n = cur.n - pw.n;
             w.print(" {s} {d}/{d} {d}", .{ @tagName(@as(Class, @fromBackingInt(@intCast(c)))), (cur.sum_ns - pw.sum_ns) / n / 1000, cur.max_ns / 1000, n }) catch return;
         }
+        if (comptime ti.enabled) ti.lineFor(&w) catch return;
         std.log.info("{s}", .{w.buffered()});
     }
 
@@ -1366,10 +1370,13 @@ fn nowNs() u64 {
 
 /// One rail's proxy: waits on the doorbell (a nap on its line, a backstop for a write the nap missed), posts the
 /// chains of every send the doorbell has passed, reaps its completions and watches its peers.
+fn proxyThread(t: *Transport, rail: u8, cpu: ?u16) void {
     t.proxy_tid[rail].store(@intCast(std.Thread.getCurrentId()), .release);
     defer t.proxy_out[rail].store(1, .release);
+    proxyMain(t, rail, cpu);
 }
 
+fn proxyMain(t: *Transport, rail: u8, cpu: ?u16) void {
     if (cpu) |c| pinCpu(c);
     const ctr = &t.rail_counters[rail];
     var done: u64 = 0;
@@ -1382,6 +1389,8 @@ fn nowNs() u64 {
     const housekeep: u32 = @max(1, t.set.housekeep_every);
     var turn: u32 = 0;
     var idle_from: u64 = if (park_ticks != 0) nap.now() else 0;
+    ti.attach(t, rail, ticks);
+    defer ti.detach();
     while (!t.stop.load(.acquire)) {
         t.reapWire(rail);
         const d = @atomicLoad(u64, &t.ctl.doorbell.v, .acquire);
@@ -1405,10 +1414,21 @@ fn nowNs() u64 {
                 ctr.sleeps += 1;
             } else if (can_nap) {
                 const dl = nap.now() + ticks * t.set.backstop_us;
+                const nap_at = ti.napStart();
+                const ran = nap.napOnce(&t.ctl.doorbell.v, d, dl);
+                ti.napEnded(nap_at, ran);
                 if (@atomicLoad(u64, &t.ctl.doorbell.v, .acquire) != d) {
                     ctr.wake_bell += 1;
+                    ti.woke(.bell);
                 } else {
                     ctr.backstop_wakes += 1;
+                    if (nap.now() >= dl) {
+                        ctr.wake_deadline += 1;
+                        ti.woke(.deadline);
+                    } else {
+                        ctr.wake_early += 1;
+                        ti.woke(.early);
+                    }
                 }
             } else std.atomic.spinLoopHint();
             ctr.wakes += 1;
