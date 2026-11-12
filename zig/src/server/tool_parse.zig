@@ -56,9 +56,15 @@ fn allSpace(s: []const u8) bool {
     return strip(s).len == 0;
 }
 
-/// The first DeepSeek-V4.1 calls opener at or after `from` that opens a block: reply_text's, which the prose hider reads
-/// too.
-const open41 = reply_text.open41;
+/// (start, end, payload) of each tool-call block in order; a block inside an earlier one is part of it.
+/// What lies between a whole DSML block's opener and its closer (null: `body` is not one, such as a ``<tool_call>``
+/// payload that only starts with an opener).
+fn wholeBlock(body: []const u8, open: []const u8, close: []const u8) ?[]const u8 {
+    if (body.len < open.len + close.len) return null;
+    if (!std.mem.startsWith(u8, body, open) or !std.mem.endsWith(u8, body, close)) return null;
+    return body[open.len .. body.len - close.len];
+}
+
 /// The text before the first DSML calls block: a ``<tool_call>`` inside one is an argument's text, not a call.
 pub fn beforeDsml(text: []const u8) []const u8 {
     const v41 = find(text, dsml41_open, 0) orelse text.len;
@@ -175,19 +181,13 @@ fn parseEnvelopes(a: Allocator, text: []const u8, envs: []const Envelope, known:
     for (envs) |env| {
         try residue.appendSlice(a, text[cursor..env.start]);
         cursor = env.end;
-        if (!env.complete) {
-            try residue.appendSlice(a, text[env.start..env.end]);
-            continue;
-        }
-        if (whole(env.payload, dsml41_open, dsml41_close)) {
-            try dsml41Calls(a, env.payload[dsml41_open.len .. env.payload.len - dsml41_close.len], &known, max_calls, &calls, &residue);
+        if (wholeBlock(env.payload, dsml41_open, dsml41_close)) |inner| {
             try dsml41Calls(a, inner, known, max_calls, &calls);
             continue;
         }
         if (max_calls) |m| if (calls.items.len >= m) continue;
         const parsed: ?[]Call = blk: {
-            if (whole(env.payload, dsml_open, dsml_close)) {
-                const inner = env.payload[dsml_open.len .. env.payload.len - dsml_close.len];
+            if (wholeBlock(env.payload, dsml_open, dsml_close)) |inner| {
                 break :blk dsmlCalls(a, inner) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.Invalid => null,

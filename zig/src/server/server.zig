@@ -138,6 +138,7 @@ pub const Server = struct {
     eos: []const u32 = &.{},
     think_close: []const u32 = &.{},
     think_close_end: ?u32 = null,
+    close_id: ?u32 = null, // the think close marker's own token, when the marker is one token
     metrics: metrics.Metrics,
     store: responses.Store,
     next_id: std.atomic.Value(u64) = .init(1),
@@ -185,6 +186,7 @@ pub const Server = struct {
         const a = srv.arena.allocator();
         srv.eos = try a.dupe(u32, text.eosIds());
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
+        srv.close_id = text.tokenId(srv.markers.close);
         const source = text.templateSource();
         if (srv.info.efforts.len > 0) {
             // a family whose template takes numbers: every name it gives one passes as asked, rendered as that number

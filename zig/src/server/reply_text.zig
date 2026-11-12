@@ -178,19 +178,60 @@ fn trimNewlines(s: []const u8) []const u8 {
 
 pub const Split = struct { reasoning: []const u8, answer: []const u8 };
 
-/// (reasoning, answer) of a thinking reply; while it streams, a tail that could begin a marker is held back.
-pub fn splitThinking(a: Allocator, full: []const u8, finished: bool, m: Markers) Allocator.Error!Split {
-    return splitThinkingMarked(a, full, finished, m, null);
+/// Where a reply's reasoning ends: the model's own close token, or the text's first spelling of the marker.
+pub const Close = union(enum) {
+    /// The close marker is not one token in this tokenizer: the first spelling of it in the text ends the reasoning.
+    spelled,
+    /// The close token's bytes begin here: the reasoning ends there, and a marker the reply quotes stays text.
+    token: usize,
+    /// The close marker is one token and the reply has not written it yet: all of the text so far is reasoning.
+    pending,
+};
+
+/// Where the reply's reasoning ends, from its tokens: the close token's bytes, the text's spelling, or all of it.
+pub fn closeWhere(a: Allocator, decode: anytype, ctx: anytype, tokens: []const u32, close_id: ?u32) !Close {
+    const id = close_id orelse return .spelled;
+    const at = std.mem.indexOfScalar(u32, tokens, id) orelse return .pending;
+    return closeAt(a, decode, ctx, tokens, at);
 }
 
-/// ``splitThinking`` with the reply's marks: a marker spelled in ordinary tokens neither opens nor closes the block.
-pub fn splitThinkingMarked(a: Allocator, full: []const u8, finished: bool, m: Markers, marks: ?*const Marks) Allocator.Error!Split {
+/// The byte where token `at` (the close token) begins in the decoded reply.
+fn closeAt(a: Allocator, decode: anytype, ctx: anytype, tokens: []const u32, at: usize) !Close {
+    if (at == 0) return .{ .token = 0 };
+    const through = try decode(ctx, a, tokens[0 .. at + 1]);
+    defer a.free(through);
+    const marker = try decode(ctx, a, tokens[at .. at + 1]);
+    defer a.free(marker);
+    // (decoded through the token, less its own bytes: separators a decoder writes before it stay in front of it)
+    return .{ .token = through.len -| marker.len };
+}
+
+/// (reasoning, answer) of a thinking reply; while it streams, a tail that could begin a marker is held back.
+pub fn splitThinking(a: Allocator, full: []const u8, finished: bool, m: Markers) Allocator.Error!Split {
+    return splitThinkingAt(a, full, finished, m, .spelled);
+}
+
+/// As `splitThinkingAt`, the close found in the reply's tokens: the close token's own bytes end the reasoning.
+pub fn splitThinkingTokens(a: Allocator, decode: anytype, ctx: anytype, full: []const u8, finished: bool, m: Markers, tokens: []const u32, close_id: ?u32) !Split {
+    return splitThinkingAt(a, full, finished, m, try closeWhere(a, decode, ctx, tokens, close_id));
+}
+
+/// As `splitThinking`, but where `close` says the reasoning ends: at the model's close token, so a marker the reply
+/// quotes while it reasons stays reasoning.
+pub fn splitThinkingAt(a: Allocator, full: []const u8, finished: bool, m: Markers, close: Close) Allocator.Error!Split {
     var text = full;
-    if (m.open.len > 0 and !startsMarkup(text, m.open, marks)) {
-        if (findMarkup(text, 0, m.open, marks)) |start| if (start > 0) {
+    var at: ?usize = switch (close) {
+        .spelled, .pending => null,
+        .token => |v| v,
+    };
+    if (m.open.len > 0 and !std.mem.startsWith(u8, text, m.open)) {
+        if (find(text, m.open)) |start| if (start > 0) {
             var prefix = text[0..start];
             prefix = prefix[0 .. prefix.len - partialTag(prefix, m.open)]; // a stray partial opener
-            const inner = try splitThinkingMarked(a, text[start..], finished, m, marks);
+            const inner = try splitThinkingAt(a, text[start..], finished, m, switch (close) {
+                .spelled, .pending => close,
+                .token => |v| .{ .token = if (v >= start) v - start else 0 },
+            });
             return .{ .reasoning = inner.reasoning, .answer = try std.mem.concat(a, u8, &.{ prefix, inner.answer }) };
         };
         if (!finished) {
@@ -200,23 +241,40 @@ pub fn splitThinkingMarked(a: Allocator, full: []const u8, finished: bool, m: Ma
         }
         return .{ .reasoning = "", .answer = text };
     }
+    var shift: usize = 0; // the bytes the opener and its newlines took off the front
     if (m.open.len > 0) {
-        text = trimNewlines(text[m.open.len..]);
-    } else if (startsMarkup(text, think_open, marks)) {
-        text = trimNewlines(text[think_open.len..]);
+        const rest = text[m.open.len..];
+        const trimmed = trimNewlines(rest);
+        shift = m.open.len + (rest.len - trimmed.len);
+        text = trimmed;
+    } else if (std.mem.startsWith(u8, text, think_open)) {
+        const rest = text[think_open.len..];
+        const trimmed = trimNewlines(rest);
+        shift = think_open.len + (rest.len - trimmed.len);
+        text = trimmed;
     } else if (!finished and std.mem.startsWith(u8, think_open, text)) {
         return .{ .reasoning = "", .answer = "" }; // held while the reply may still be writing that opener
     }
-    if (findMarkup(text, 0, m.close, marks)) |end| return .{ .reasoning = text[0..end], .answer = trimNewlines(text[end + m.close.len ..]) };
-    var call: ?usize = null;
-    for (calls) |c| if (findMarkup(text, 0, c[0], marks)) |at| {
-        if (call == null or at < call.?) call = at;
+    if (at) |v| at = if (v >= shift) v - shift else null;
+    const end: ?usize = switch (close) {
+        .spelled => find(text, m.close),
+        .pending => null,
+        .token => at,
     };
-    if (call) |at| {
+    if (end) |e| {
+        if (e + m.close.len <= text.len and std.mem.startsWith(u8, text[e..], m.close))
+            return .{ .reasoning = text[0..e], .answer = trimNewlines(text[e + m.close.len ..]) };
+        // (the close token's bytes are not where the text has them: all of the text is reasoning)
+    }
+    var call: ?usize = null;
+    for (calls) |c| if (find(text, c[0])) |at_call| {
+        if (call == null or at_call < call.?) call = at_call;
+    };
+    if (call) |at_call| {
         // a call written before the block closes: held while the block may still close, the answer if the reply ends
-        if (!finished) return .{ .reasoning = text[0..at], .answer = "" };
-        for (calls) |c| if (startsMarkup(text[at..], c[0], marks) and find(text[at..], c[1]) != null)
-            return .{ .reasoning = text[0..at], .answer = text[at..] };
+        if (!finished) return .{ .reasoning = text[0..at_call], .answer = "" };
+        for (calls) |c| if (std.mem.startsWith(u8, text[at_call..], c[0]) and find(text[at_call..], c[1]) != null)
+            return .{ .reasoning = text[0..at_call], .answer = text[at_call..] };
         return .{ .reasoning = text, .answer = "" };
     }
     var held: usize = 0;
@@ -229,84 +287,43 @@ pub fn splitThinkingMarked(a: Allocator, full: []const u8, finished: bool, m: Ma
 
 /// Hides tool-call blocks and partial opening tags while streaming, so calls arrive as deltas instead.
 pub fn hideToolCalls(a: Allocator, text: []const u8, finished: bool) Allocator.Error![]const u8 {
-    return hideToolCallsMarked(a, text, finished, null);
-}
-
-/// ``hideToolCalls`` with the reply's marks: a block whose opener is spelled in ordinary tokens is prose.
-pub fn hideToolCallsMarked(a: Allocator, text: []const u8, finished: bool, marks: ?*const Marks) Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    return hideIntoMarked(a, &out, text, finished, marks);
+    return hideInto(a, &out, text, finished);
 }
 
 /// ``hideToolCalls`` into ``out`` (cleared first); text without a call block comes back as a slice of ``text``.
 pub fn hideInto(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finished: bool) Allocator.Error![]const u8 {
-    return hideIntoMarked(a, out, text, finished, null);
-}
-
-/// ``hideInto`` with the reply's marks (``hideToolCallsMarked``). DeepSeek-V4.1's blocks are found first (``open41``),
-/// and the other forms only in the text around them, as the parser reads a reply: a <tool_call> in the prose before a
-/// block, or in its argument, hides nothing past the block's bounds.
-pub fn hideIntoMarked(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finished: bool, marks: ?*const Marks) Allocator.Error![]const u8 {
     out.clearRetainingCapacity();
-    var gap: usize = 0;
-    while (open41(text, gap, marks)) |s| {
-        _ = try hideForms(a, out, text, gap, s, true, marks);
-        gap = (findTag(text, s + calls[3][0].len, calls[3][1]) orelse return out.items) + calls[3][1].len;
-    }
-    return hideForms(a, out, text, gap, text.len, finished, marks);
-}
-
-/// ``hideIntoMarked``'s other forms in ``text[from..to]``, appended to ``out``. A ``to`` short of the end is a
-/// DeepSeek-V4.1 block's start: an opener whose closer would lie past it is prose. ``text`` without a block comes back
-/// as a slice of itself.
-fn hideForms(a: Allocator, out: *std.ArrayList(u8), whole: []const u8, from: usize, to: usize, finished: bool, marks: ?*const Marks) Allocator.Error![]const u8 {
-    const text = whole[0..to];
-    var pos = from;
-    var next: [calls.len]?usize = undefined; // each opener at or after `pos`, searched again only once `pos` passes it
-    for (calls, &next) |c, *n| n.* = findMarkup(text, from, c[0], marks);
+    var pos: usize = 0;
     while (true) {
         var start: ?usize = null;
         var which: usize = 0;
-        for (calls, &next, 0..) |c, *n, i| {
-            if (n.* != null and n.*.? < pos) n.* = findMarkup(text, pos, c[0], marks);
-            if (n.*) |at| if (start == null or at < start.?) {
+        for (calls, 0..) |c, i| if (findTag(text, pos, c[0])) |at| {
+            if (start == null or at < start.?) {
                 start = at;
                 which = i;
-            };
-        }
+            }
+        };
         if (start == null) {
             const tail = text[pos..];
             var held: usize = 0;
             if (!finished) for (calls) |c| {
                 held = @max(held, partialTag(tail, c[0]));
             };
-            if (pos == 0 and to == whole.len) return text[0 .. text.len - held];
+            if (pos == 0) return text[0 .. text.len - held];
             try out.appendSlice(a, tail[0 .. tail.len - held]);
             return out.items;
         }
         try out.appendSlice(a, text[pos..start.?]);
         const opener = calls[which][0];
         const end = blockEnd(text, start.? + opener.len, opener, calls[which][1], finished) orelse {
+            // a DSML block the reply ended inside (max_tokens) never becomes a call (no DSML call streams before its
+            // block closes): it is the reply's text, as the whole reply's parse keeps it
+            if (finished and std.mem.indexOf(u8, opener, "DSML") != null) try out.appendSlice(a, text[start.?..]);
             return out.items;
         };
         pos = end + calls[which][1].len;
     }
-}
-
-/// With tools, a stream holds trailing whitespace back until more text comes: a reply with a call does not show it.
-pub fn heldBack(text: []const u8, tools: bool) []const u8 {
-    return if (tools) text[0..pyRstrip(text).len] else text; // a prefix, so the stream's pointer checks still hold
-}
-
-/// ``hideToolCalls`` of a finished reply; once a call is hidden, the prose's trailing whitespace stays unsent too.
-pub fn finishedProse(a: Allocator, text: []const u8) Allocator.Error![]const u8 {
-    return finishedProseMarked(a, text, null);
-}
-
-/// ``finishedProse`` with the reply's marks (``hideToolCallsMarked``).
-pub fn finishedProseMarked(a: Allocator, text: []const u8, marks: ?*const Marks) Allocator.Error![]const u8 {
-    const prose = try hideToolCallsMarked(a, text, true, marks);
-    return if (prose.len != text.len) prose[0..pyRstrip(prose).len] else prose;
 }
 
 const harmony_final = "<|channel|>final<|message|>";
@@ -461,7 +478,66 @@ pub const Stops = struct {
     }
 };
 
+/// Decodes only new tokens with the previous chunk as context, so characters split across tokens stay whole.
+pub const Incremental = struct {
+    tokens: std.ArrayList(u32) = .empty,
+    text: std.ArrayList(u8) = .empty,
+    prefix: usize = 0,
+    read: usize = 0,
+    close: ?Close = null, // where the reasoning ends, once the close token has arrived
+    scanned: usize = 0, // tokens already searched for the close token
+
+    /// Where the reply's reasoning ends: the close token's bytes once it has arrived (each call searches only the
+    /// tokens since the last), or the text's spelling when the marker is not one token.
+    pub fn closeOf(inc: *Incremental, a: Allocator, decode: anytype, ctx: anytype, close_id: ?u32) !Close {
+        if (inc.close) |c| return c;
+        const id = close_id orelse return .spelled;
+        const at = std.mem.indexOfScalarPos(u32, inc.tokens.items, inc.scanned, id) orelse {
+            inc.scanned = inc.tokens.items.len;
+            return .pending;
+        };
+        const c = try closeAt(a, decode, ctx, inc.tokens.items, at);
+        inc.close = c;
+        return c;
+    }
+
+    pub fn extend(inc: *Incremental, a: Allocator, ctx: anytype, decode: anytype, more: []const u32) ![]const u8 {
+        try inc.tokens.appendSlice(a, more);
+        const before = try decode(ctx, a, inc.tokens.items[inc.prefix..inc.read]);
+        const after = try decode(ctx, a, inc.tokens.items[inc.prefix..]);
+        const nb = charCount(before);
+        if (charCount(after) > nb and !std.mem.endsWith(u8, after, "\u{fffd}")) {
+            try inc.text.appendSlice(a, afterChars(after, nb));
+            inc.prefix = inc.read;
+            inc.read = inc.tokens.items.len;
+        }
+        return inc.text.items;
+    }
+
+    /// A character is still split across tokens, so streaming waits for the rest.
+    pub fn pending(inc: *const Incremental) bool {
+        return inc.tokens.items.len > 0 and inc.read < inc.tokens.items.len;
+    }
+};
+
+// -- TENSORFOLD_REPLY_IDS (BertholomusAI/ashhart): a reply's marker-token marks --------------------------------------------
 // The marks type and the call sites that pass it came in with the merge; this engine's readers above (DSML tags read as
+// their text, the close found in the tokens by splitThinkingTokens) do not consult them, so the marked entry points below
+// read as the unmarked ones: TENSORFOLD_REPLY_IDS parses and is inert until the readers take the marks.
+
+/// Where a reply's marker tokens decoded (TENSORFOLD_REPLY_IDS): a marker token's text in a tag is markup only at the
+/// offset its own token decoded to, so the same text spelled in ordinary tokens (a reply quoting a think end or a DSML
+/// call) stays words. Null marks read every tag as its text does.
+pub const Marks = struct {
+    base: [*]const u8, // the decoded reply the offsets count in
+    len: usize,
+    at: []const Mark, // in reply order
+    pieces: []const Piece, // the marker tokens (Server.reply_pieces)
+
+    pub const Mark = struct { offset: usize, id: u32 };
+    pub const Piece = struct { text: []const u8, id: u32 };
+
+    /// Whether `tag` at `text[i..]` is markup: each marker token's text in it lies where that token decoded. Text
     /// outside the decoded reply (a copy) reads as its text does.
     pub fn real(m: *const Marks, text: []const u8, i: usize, tag: []const u8) bool {
         const p = @intFromPtr(text.ptr);
@@ -477,6 +553,8 @@ pub const Stops = struct {
         return true;
     }
 
+    fn has(m: *const Marks, offset: usize, id: u32) bool {
+        for (m.at) |x| {
             if (x.offset == offset and x.id == id) return true;
             if (x.offset > offset) return false;
         }
@@ -513,12 +591,7 @@ pub const Shown = struct {
     }
 };
 
-/// Decodes only new tokens with the previous chunk as context, so characters split across tokens stay whole.
-pub const Incremental = struct {
-    tokens: std.ArrayList(u32) = .empty,
-    text: std.ArrayList(u8) = .empty,
-    prefix: usize = 0,
-    read: usize = 0,
+/// `findTag`; the marks are not consulted (see above).
 pub fn findMarkup(text: []const u8, from: usize, tag: []const u8, marks: ?*const Marks) ?usize {
     _ = marks;
     return findTag(text, from, tag);
@@ -530,15 +603,24 @@ pub fn hideIntoMarked(a: Allocator, out: *std.ArrayList(u8), text: []const u8, f
     return hideInto(a, out, text, finished);
 }
 
-    /// A character is still split across tokens, so streaming waits for the rest.
-    pub fn pending(inc: *const Incremental) bool {
-        return inc.tokens.items.len > 0 and inc.read < inc.tokens.items.len;
+/// `hideToolCalls` of a finished reply; the marks are not consulted.
+pub fn finishedProseMarked(a: Allocator, text: []const u8, marks: ?*const Marks) Allocator.Error![]const u8 {
+    _ = marks;
     return hideToolCalls(a, text, true);
 }
 
+/// Appends where `tokens[from..]`'s marker tokens decoded: each one's text ends the decode of the tokens through it
+/// (`text`: the model's tokenizer; each decode is `scratch`'s and freed at once).
+pub fn markTokens(a: Allocator, scratch: Allocator, text: anytype, pieces: []const Marks.Piece, tokens: []const u32, from: usize, out: *std.ArrayList(Marks.Mark)) Allocator.Error!void {
+    for (tokens[from..], from..) |t, j| {
+        const piece = for (pieces) |p| {
+            if (p.id == t) break p;
         } else continue;
+        const through = try text.decode(scratch, tokens[0 .. j + 1]);
+        defer scratch.free(through);
+        if (std.mem.endsWith(u8, through, piece.text)) try out.append(a, .{ .offset = through.len - piece.text.len, .id = t });
     }
-};
+}
 
 test "splits and holds" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);

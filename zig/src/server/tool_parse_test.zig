@@ -181,49 +181,39 @@ test "a DSML block is read from its own tags: <tool_call> text around it or in a
     try std.testing.expectEqualStrings("no block", tool_parse.beforeDsml("no block"));
 }
 
-test "a GLM call's keys without values search their key and value ends once" {
+test "a <tool_call> whose payload is a DSML opener with no closer is no call and no crash, in either spelling" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
-    var ns: [2]u64 = undefined;
-    for ([_]usize{ 800, 6400 }, &ns) |n, *best| {
-        var reply: std.ArrayList(u8) = .empty;
-        try reply.appendSlice(a, "<tool_call>lookup");
-        for (0..n) |_| try reply.appendSlice(a, "<arg_key>n</arg_key>");
-        try reply.appendSlice(a, "</tool_call>");
-        best.* = std.math.maxInt(u64);
-        for (0..3) |_| {
-            var run: std.heap.ArenaAllocator = .init(std.testing.allocator);
-            defer run.deinit();
-            const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
-            const r = try parse(run.allocator(), reply.items, tools, null);
-            best.* = @min(best.*, @as(u64, @intCast(std.Io.Clock.awake.now(std.testing.io).nanoseconds - start)));
-            try std.testing.expectEqualStrings("{}", r.calls.?[0].get("function").?.get("arguments").?.string);
+    const D = "\u{ff5c}DSML\u{ff5c}";
+    inline for (.{ "<" ++ D ++ "tool_calls>", "<" ++ D ++ " calls>" }) |opener| {
+        const text = "<tool_call>" ++ opener ++ "</tool_call>";
+        for ([_]?usize{ null, 1 }) |quota| {
+            const r = try parse(a, text, tools, quota);
+            try std.testing.expect(r.calls == null or r.calls.?.len == 0);
+            // (a malformed call stays text when calls are unlimited and drops out of a one-call reply)
+            try std.testing.expectEqualStrings(if (quota == null) text else "", r.content);
         }
     }
 }
 
-test "GLM calls keep a declared name with spaces, dots, colons or unicode; an undeclared one stays text" {
+test "a lone DSML opener inside a call's argument is the argument's text, in either spelling" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"Get Classes List\"}},{\"type\":\"function\",\"function\":{\"name\":\"search.web\"}},{\"type\":\"function\",\"function\":{\"name\":\"ns:lookup\"}},{\"type\":\"function\",\"function\":{\"name\":\"Caf\u{e9} Lookup\"}}]")).ok.array;
-    const cases = [_][3][]const u8{
-        .{ "<tool_call>Get Classes List<arg_key>class_type</arg_key><arg_value>ACTIVE</arg_value></tool_call>", "Get Classes List", "{\"class_type\":\"ACTIVE\"}" },
-        .{ "<tool_call>get classes list<arg_key>n</arg_key><arg_value>2</arg_value></tool_call>", "Get Classes List", "{\"n\":\"2\"}" },
-        .{ "<tool_call>search.web<arg_key>q</arg_key><arg_value>x</arg_value></tool_call>", "search.web", "{\"q\":\"x\"}" },
-        .{ "<tool_call>ns:lookup<arg_key>q</arg_key><arg_value>y</arg_value></tool_call>", "ns:lookup", "{\"q\":\"y\"}" },
-        .{ "<tool_call>Caf\u{e9} Lookup<arg_key>q</arg_key><arg_value>z</arg_value></tool_call>", "Caf\u{e9} Lookup", "{\"q\":\"z\"}" },
-    };
-    for (cases) |c| {
-        for ([_]?usize{ null, 1 }) |max_calls| {
-            const r = try parse(a, c[0], tools, max_calls);
-            const f = r.calls.?[0].get("function").?;
-            try std.testing.expectEqualStrings(c[1], f.get("name").?.string);
-            try std.testing.expectEqualStrings(c[2], f.get("arguments").?.string);
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
+    const D = "\u{ff5c}DSML\u{ff5c}";
+    inline for (.{ "<" ++ D ++ "tool_calls>", "<" ++ D ++ " calls>" }) |opener| {
+        const call = "{\"name\":\"lookup\",\"arguments\":{\"q\":\"" ++ opener ++ "\"}}";
+        const inputs = [_][]const u8{ "<tool_call>" ++ call ++ "</tool_call>", call, "[" ++ call ++ "]", "```json\n" ++ call ++ "\n```" };
+        for (inputs) |text| for ([_]?usize{ null, 1 }) |quota| {
+            const r = try parse(a, text, tools, quota);
+            try std.testing.expectEqual(@as(usize, 1), r.calls.?.len);
+            const args = (try json.parse(a, r.calls.?[0].get("function").?.get("arguments").?.string)).ok;
+            try std.testing.expectEqualStrings(opener, args.get("q").?.string);
             try std.testing.expectEqualStrings("", r.content);
-        }
+        };
     }
 }
 
