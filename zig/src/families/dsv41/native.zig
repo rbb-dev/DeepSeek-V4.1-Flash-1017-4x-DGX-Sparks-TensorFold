@@ -16,13 +16,10 @@
 //!   TF_DS_WINDOW                                the streams' shared pool of positions (unset: --context; the
 //!                                               four-node lane's 2,097,152 with requests of up to --context)
 //!   TF_DS_ROUND_ROWS, TF_DS_STREAMS             a round's rows at most (16; the four-node lane's 48) and the pool's
-//!                                               streams (4; its 32): --parallel at most the streams. Every rank
+//!                                               streams (4; its 16): --parallel at most the streams. Every rank
 //!                                               the same (the followers: --round-rows, --streams, or these variables):
-//!                                               a rank that differs from rank 0 stops at the start
-//!   TF_RDMA_DEVICES                             the decode gathers over the RDMA ring on these devices (else NCCL)
-//!   TF_DS_IDX_SPLIT=1                           the keyed indexer layers' rows of 32,768 columns or more split by
-//!                                               columns over the nodes (a larger number: from that many columns);
-//!                                               the same selections. Every rank the same, as TF_DS_ROUND_ROWS
+//!                                               a rank that differs from rank 0 stops at the start, as one with
+//!                                               other graphs, graph cap, RDMA devices or drafter does
 //!   TF_DS_GRAPHS=1                              the rounds' stretches as CUDA graphs
 //!   TF_DS_HC_SIDE=1                             the mixes' side work on a stream of its own
 //!   TF_DS_L2_PREFETCH=1                         the paced L2 prefetch of the next kernels' weights
@@ -240,6 +237,7 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "--streams") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "--graph-cap") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
 }
 

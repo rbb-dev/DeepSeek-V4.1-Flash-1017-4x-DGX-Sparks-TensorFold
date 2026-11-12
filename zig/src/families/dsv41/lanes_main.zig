@@ -8,6 +8,10 @@
 //! the served server's) against the served reply's: the drafted, concurrent reply must be the served one. One JSON
 //! line a request, then the summary. FILE: zrec_lanereq.py's requests (prompt ids, max_tokens, sampling, expect_sha).
 //! KIT_DIR: a gate dir's aot/, cubins/, RoPE tables (as many rows as the pool) and engram.json.
+//! A follower serving `tensorfold serve` takes TF_DS_STREAMS, TF_DS_ROUND_ROWS and TF_DS_GRAPH_CAP from its environment
+//! when it has no --streams / --round-rows / --graph-cap; every rank checks its settings against rank 0's at the start
+//! and stops on a difference (prompt2d.Settings), so a follower of fewer streams than the server says so instead of
+//! hanging at the first stream past its own.
 //! A follower serving `tensorfold serve` takes TF_DS_STREAMS and TF_DS_ROUND_ROWS from its environment when it has no
 //! --streams / --round-rows; every rank checks its settings against rank 0's at the start and stops on a difference
 //! (prompt2d.Settings), so a follower of fewer streams than the server says so instead of hanging at the first stream
@@ -63,9 +67,12 @@ pub fn main(init: std.process.Init) !u8 {
     };
     // the served lane's round table (native.zig reads the same variable; --round-ms overrides it)
     if (std.c.getenv("TF_DS_ROUND_MS")) |v| o.round_ms = try dsv41.lanes.parseMs(a, std.mem.span(v));
+    // a follower takes rank 0's TF_DS_STREAMS, TF_DS_ROUND_ROWS and TF_DS_GRAPH_CAP from its environment (its flags
+    // still win); every rank checks its settings against rank 0's at the start (prompt2d.Settings)
     if (o.rank != 0) {
         if (std.c.getenv("TF_DS_STREAMS")) |v| o.streams = try std.fmt.parseInt(usize, std.mem.span(v), 10);
         if (std.c.getenv("TF_DS_ROUND_ROWS")) |v| o.round_rows = try std.fmt.parseInt(usize, std.mem.span(v), 10);
+        if (std.c.getenv("TF_DS_GRAPH_CAP")) |v| o.graph_cap = try std.fmt.parseInt(usize, std.mem.span(v), 10);
     }
     var requests_file: ?[]const u8 = null;
     var parallel: ?usize = null; // default: every stream of the pool

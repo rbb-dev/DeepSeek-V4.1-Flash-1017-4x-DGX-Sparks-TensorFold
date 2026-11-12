@@ -146,6 +146,8 @@ pub const Fan = struct {
 };
 
 /// What the ranks of a run must agree on, checked at the start (Fan.commChecked) from Model.open's options.
+    };
+
 pub const Settings = extern struct {
     magic: u32 = tag,
     world: u32,
@@ -153,6 +155,9 @@ pub const Settings = extern struct {
     round_rows: u32, // TF_DS_ROUND_ROWS (--round-rows): the same (it picks the decode kernels)
     rails: u32, // TF_RDMA_DEVICES (--rdma): as many devices (0: NCCL)
     drafts: u32, // the drafter (--drafts): the same
+    graphs: u32, // TF_DS_GRAPHS (--graphs): the same (a rank with graphs votes on each capture, one without never does)
+    graph_cap: u32, // TF_DS_GRAPH_CAP (--graph-cap), with graphs: the same (every rank keeps and drops the same graphs)
+    pool: u64, // rank 0's window (--context, or TF_DS_WINDOW; a follower's --pool): a follower's holds rank 0's
     replay_floor: u32, // TF_DS_REPLAY_FLOOR: the same
     idx_split: u32 = 0, // TF_DS_IDX_SPLIT (prompt.split_from): the same (the keyed indexer layers all-gather inside)
     neighbor_rdma: u32 = 0, // TF_DS_NEIGHBOR_RDMA: the same exchange path on every rank
@@ -177,6 +182,10 @@ pub const Settings = extern struct {
             w.print("{s}rank {d} has {d} RDMA devices and rank 0 {d} (TF_RDMA_DEVICES): give rank {d} as many with --rdma", .{ sepIf(&w, sep), rank, mine.rails, lead.rails, rank }) catch {};
         if (mine.drafts != lead.drafts)
             w.print("{s}rank {d} {s} the drafter and rank 0 {s}: start rank {d} with --drafts {d}", .{ sepIf(&w, sep), rank, if (mine.drafts != 0) "loads" else "does not load", if (lead.drafts != 0) "does" else "does not", rank, lead.drafts }) catch {};
+        if (mine.graphs != lead.graphs)
+            w.print("{s}rank {d} runs {s} CUDA graphs and rank 0 {s}: start rank {d} with --graphs {d}", .{ sepIf(&w, sep), rank, if (mine.graphs != 0) "with" else "without", if (lead.graphs != 0) "with them" else "without them", rank, lead.graphs }) catch {}
+        else if (mine.graphs != 0 and mine.graph_cap != lead.graph_cap)
+            w.print("{s}rank {d} keeps {d} CUDA graphs at most and rank 0 {d} (0: all): start rank {d} with --graph-cap {d} (or TF_DS_GRAPH_CAP={d})", .{ sepIf(&w, sep), rank, mine.graph_cap, lead.graph_cap, rank, lead.graph_cap, lead.graph_cap }) catch {};
         if (mine.replay_floor != lead.replay_floor)
             w.print("{s}rank {d} has TF_DS_REPLAY_FLOOR={d} and rank 0 {d}: set the same on every rank", .{ sepIf(&w, sep), rank, mine.replay_floor, lead.replay_floor }) catch {};
         if (mine.idx_split != lead.idx_split)
@@ -531,27 +540,37 @@ test "a node's split: TP over two, the 2D split over four" {
     try std.testing.expectError(error.UnsupportedWorld, split(0, 3));
 }
 
-test "a follower holds rank 0's streams and pool and runs its round rows, or says what to change" {
-    const served: Settings = .{ .world = 2, .streams = 8, .round_rows = 16, .rails = 2, .drafts = 1, .replay_floor = 1, .pool = 524288 };
+test "a follower holds rank 0's streams and pool and runs its round rows and graphs, or says what to change" {
     var buf: [1024]u8 = undefined;
     try std.testing.expectEqualStrings("", served.differ(served, 1, &buf));
     var more = served; // a follower may hold more streams and positions than rank 0 uses
     more.streams = 16;
-    more.pool = 1 << 20;
+    more.pool = 1 << 25;
     try std.testing.expectEqualStrings("", more.differ(served, 1, &buf));
     var four = served;
     four.streams = 4;
-    try std.testing.expectEqualStrings("rank 1 holds 4 streams and rank 0 serves 8: start rank 1 with --streams 8 (or TF_DS_STREAMS=8)", four.differ(served, 1, &buf));
+    try std.testing.expectEqualStrings("rank 1 holds 4 streams and rank 0 serves 16: start rank 1 with --streams 16 (or TF_DS_STREAMS=16)", four.differ(served, 1, &buf));
     var other = served;
-    other.round_rows = 48;
-    other.replay_floor = 0;
+    other.round_rows = 16;
     other.pool = 262144;
     other.rails = 0;
     other.drafts = 0;
+    other.graph_cap = 64;
     const words = other.differ(served, 3, &buf);
-    for ([_][]const u8{ "--pool 524288", "--round-rows 16", "--rdma", "--drafts 1", "TF_DS_REPLAY_FLOOR=0 and rank 0 1" }) |s|
-        try std.testing.expect(std.mem.indexOf(u8, words, s) != null);
+    for ([_][]const u8{ "--pool 16777216", "--round-rows 48", "--rdma", "--drafts 1", "--graph-cap 128" }) |w|
+        try std.testing.expect(std.mem.indexOf(u8, words, w) != null);
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, words, "; "));
+    // graphs on one rank only: it would vote on captures the others never make
+    var eager = served;
+    eager.graphs = 0;
+    eager.graph_cap = 0;
+    try std.testing.expectEqualStrings("rank 2 runs without CUDA graphs and rank 0 with them: start rank 2 with --graphs 1", eager.differ(served, 2, &buf));
+    // without graphs anywhere, the caps do not matter
+    var off = served;
+    off.graphs = 0;
+    var off2 = off;
+    off2.graph_cap = 7;
+    try std.testing.expectEqualStrings("", off2.differ(off, 1, &buf));
 }
 
 test "a follower splits the keyed indexer rows as rank 0 does, or says to set the same" {
@@ -610,6 +629,8 @@ test "rank 0's settings go with NCCL's id: the follower answers, and an older ra
         };
         var id: [128]u8 = undefined;
         for (&id, 0..) |*b, i| b.* = @intCast(i);
+    }
+}
         var why: [1024]u8 = undefined;
         const heard = f.lead(&id, cs.lead, &why);
         t.join();
@@ -634,4 +655,5 @@ test "startup settings reject mixed neighbor modes before communicator creation"
     try std.testing.expectEqualStrings("", on.differ(on, 1, &buf));
     try std.testing.expectEqualStrings("rank 1 has TF_DS_NEIGHBOR_RDMA=0 and rank 0 1: set the same on every rank", off.differ(on, 1, &buf));
     try std.testing.expectEqualStrings("rank 1 has TF_DS_NEIGHBOR_RDMA=1 and rank 0 0: set the same on every rank", on.differ(off, 1, &buf));
+}
 }
