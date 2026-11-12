@@ -1510,6 +1510,7 @@ pub fn decodeZFloats(lay: weights.Layer, hidden: usize, n_experts: usize, ih: us
         if (l.fmt == .bf16) need = @max(need, bfSplits(l.k, l.n) * rows * l.n);
     }
     // the decode tensor-core kernels' cross-CTA partials (every decode linear, the router, the indexer's weights_proj)
+    for ([_]?weights.Linear{ lay.wq_a, lay.wkv, lay.wq_b, lay.wo_b, lay.wo_bk, lay.comp_wkv, lay.comp_wgate, lay.idx_wq_b, lay.idx_wk, lay.engram_wkv, lay.wo_a8 }) |ol| {
         const l = ol orelse continue;
         const f: u2 = switch (l.fmt) {
             .fp8 => 0,

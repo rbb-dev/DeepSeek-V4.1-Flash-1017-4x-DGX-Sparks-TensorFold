@@ -21,6 +21,10 @@ pub const Split = struct {
     /// first) and the odd block left over (the ninth) of the experts whose parity is its own (restPair); else
     /// "first": whole blocks, pair 0 the larger part.
     parity: bool = false,
+    /// TF_DS_DECODE_KSPLIT: this node also keeps wo_b's K-half over every output column (woBKRows), the decode rounds'
+    /// attention exchange (round.zig); the prompt path keeps wo_b's pair columns. A 2D node's only (the drafter's TP2 blocks
+    /// never carry it), native checkpoints' only.
+    ksplit: bool = false,
 
     pub fn heads(s: Split, c: Config) usize {
         return c.heads / s.world;
@@ -71,6 +75,14 @@ pub const Split = struct {
     /// wo_b's output columns (null: all of them; its input rows are the rank's groups either way).
     pub fn woBCols(s: Split, c: Config) ?[2]usize {
         return if (s.pair != null) s.cut(.{ 0, c.hidden }, null) else null;
+    }
+    /// TF_DS_DECODE_KSPLIT: wo_b's input rows of this node's own wo_a groups (the pair's half of the rank's), the K-half its
+    /// decode partial is taken over: every output column of them.
+    pub fn woBKRows(s: Split, c: Config) [2]usize {
+        const r = s.range(s.groups(c) * c.o_lora);
+        const half = (r[1] - r[0]) / 2;
+        const at = r[0] + (s.pair orelse 0) * half;
+        return .{ at, at + half };
     }
     /// The experts' parts: the rank's intermediate half, gate / up's columns of it here (TF_DS_2D_GU=first: whole
     /// 128-blocks, pair 0 the larger part), down's output columns (null: all; TF_DS_2D_DOWN = down0 blocks for pair 0).
@@ -315,6 +327,15 @@ pub fn wants(a: std.mem.Allocator, c: Config, s: Split, dspark: bool) ![]Want {
     return b.out.items;
 }
 
+/// TF_DS_DECODE_KSPLIT's file: every main layer's wo_b K-half over all columns (w8 and s8), a 2D node's, in layer order. The
+/// rank's own file (wants) does not carry them, so its index and name are the same with the switch on or off.
+pub fn wantsKsplit(a: std.mem.Allocator, c: Config, s: Split) ![]Want {
+    var b: Builder = .{ .a = a };
+    if (c.format != .native or s.pair == null) return b.out.items;
+    for (0..c.layers) |i| try b.native(try b.fmt("layers.{d}.attn.wo_b", .{i}), .{ 0, c.hidden }, s.woBKRows(c), .fp8);
+    return b.out.items;
+}
+
 /// wants for Format.native: the same order, native parts.
 fn wantsNative(a: std.mem.Allocator, c: Config, s: Split, dspark: bool) ![]Want {
     var b: Builder = .{ .a = a };
@@ -499,6 +520,33 @@ test "every four-way drafter part lies inside its TP2 part" {
         if (xs.rest) |rc| try Inside.check(rc, xt.gu);
         try Inside.check(xs.dcols.?, xt.dcols orelse .{ 0, c.hidden });
     };
+}
+
+test "TF_DS_DECODE_KSPLIT: the K-half file holds each main layer's wo_b K-half (w8, s8) of a 2D node; the rank's own list is untouched" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = @import("config.zig");
+    var why: cfg.Why = .{};
+    var c = try cfg.parse(a, cfg.test_config, &why);
+    c.format = .native;
+    const n3: Split = .{ .rank = 1, .world = 2, .pair = 1, .parity = true };
+    try std.testing.expectEqual([2]usize{ 6144, 8192 }, n3.woBKRows(c));
+    try std.testing.expectEqual([2]usize{ 4096, 6144 }, n3.atPair(0).woBKRows(c));
+    try std.testing.expectEqual([2]usize{ 0, 2048 }, (Split{ .rank = 0, .world = 2, .pair = 0 }).woBKRows(c));
+    const k = try wantsKsplit(a, c, n3);
+    try std.testing.expectEqual(2 * c.layers, k.len);
+    try std.testing.expectEqualStrings("layers.0.attn.wo_b|(0, 5120)|(6144, 8192)|w8", k[0].key);
+    try std.testing.expectEqualStrings("layers.0.attn.wo_b|(0, 5120)|(6144, 8192)|s8", k[1].key);
+    // the rank's list carries none of them, whatever ksplit says
+    var on = n3;
+    on.ksplit = true;
+    const base = try wants(a, c, n3, true);
+    const with = try wants(a, c, on, true);
+    try std.testing.expectEqual(base.len, with.len);
+    for (base, with) |x, y| try std.testing.expectEqualStrings(x.key, y.key);
+    // a TP2 split, or a non-native checkpoint: none
+    try std.testing.expectEqual(@as(usize, 0), (try wantsKsplit(a, c, .{ .rank = 1, .world = 2 })).len);
 }
 
 test "the weight-file index of nodes 0-3 is unchanged" {

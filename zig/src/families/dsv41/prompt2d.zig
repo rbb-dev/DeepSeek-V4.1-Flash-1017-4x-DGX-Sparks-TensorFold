@@ -470,6 +470,7 @@ pub const kern_mma_sf_exact: u32 = 1 << 22;
 pub const kern_pass_tail: u32 = 1 << 23;
 pub const kern_head_cand: u32 = 1 << 24;
 pub const kern_head_key: u32 = 1 << 25;
+pub const kern_decode_ksplit: u32 = 1 << 26;
 pub const kern_gemm_w16: u32 = 1 << 28;
 pub const kern_hc_fused: u32 = 1 << 21;
 pub const kern_attn_epi_fused: u32 = 1 << 27;
@@ -598,6 +599,11 @@ pub var pf_t64_asked: bool = false;
 /// TF_DS_GEMM_R2 as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useGemmR2).
 pub var gemm_r2_asked: bool = false;
 
+/// TF_DS_DECODE_KSPLIT as Model.open read it (switchAsked), once (Settings.kern, plan.Split.ksplit, round.zig's attention):
+/// a decode round's wo_b takes this node's own wo_a groups' outputs alone (no column-ring exchange) over every output column,
+/// and the four partials are gathered and summed. Not the same bits as the baseline (the fp32 additions' order), a decode-only switch.
+pub var decode_ksplit_asked: bool = false;
+
 /// TF_DS_RING_WC as Model.open read it (switchAsked), once (Settings.exch, rdma.Settings.wc): the RDMA rings' send and
 /// landing slots from cudaHostAlloc(Mapped | WriteCombined).
 pub var ring_wc_asked: bool = false;
@@ -700,6 +706,7 @@ pub fn kernAsked() u32 {
     if (hc_fused_asked) x |= kern_hc_fused;
     if (attn_epi_fused_asked) x |= kern_attn_epi_fused;
     if (gemm_r2_asked) x |= kern_gemm_r2;
+    if (decode_ksplit_asked) x |= kern_decode_ksplit;
 
     if (gemm_halves_asked) x |= kern_gemm_halves;
     if (qgate_canary_asked != .off) x |= kern_qgate_canary;
@@ -1091,6 +1098,12 @@ pub const Two = struct {
     pub fn quarters(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, w: [2]usize, esize: usize) !void {
         const rs = t.rings orelse return error.DecodeNeedsRings;
         if (!try ringed(rs.quarters(e.s, src, dst, n, w, esize))) return error.RingRefused;
+    }
+
+    /// TF_DS_DECODE_KSPLIT: this node's full-width partial `src` [rows, row_bytes] to the four nodes' planes of `dst` [4, rows, row_bytes].
+    pub fn planes4(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, rows: usize, row_bytes: usize) !void {
+        const rs = t.rings orelse return error.DecodeNeedsRings;
+        if (!try ringed(rs.planes4(e.s, src, dst, rows, row_bytes))) return error.RingRefused;
     }
 
     pub fn quartersDecode(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, w: [2]usize, esize: usize) !void {

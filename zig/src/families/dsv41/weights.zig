@@ -134,6 +134,9 @@ pub const Layer = struct {
     // groups' shapes alone, fmt bf16, no bytes) and the prompt path reads wo_a8 (mx.woA8Prefill)
     wo_a_rows: bool = true,
     wo_b: Linear = undefined, // this rank's groups' input rows (a 2D node: its pair's output columns of them)
+    // TF_DS_DECODE_KSPLIT: this node's own wo_a groups' rows of wo_b over every output column (plan.Split.woBKRows), the decode
+    // rounds' wo_b (the prompt path keeps wo_b); null where the switch is off (and on every drafter block)
+    wo_bk: ?Linear = null,
     comp_wkv: ?Linear = null,
     comp_wgate: ?Linear = null,
     comp_norm: u64 = 0,
@@ -428,6 +431,30 @@ pub const Weights = struct {
         w.* = undefined;
     }
 };
+
+/// TF_DS_DECODE_KSPLIT: the device bytes of every layer's wo_b K-half (Layer.wo_bk): FP8 codes [n, k] and their UE8M0 scales
+/// on 32 x 32 blocks.
+pub fn ksplitBytes(w: *const Weights) u64 {
+    var total: u64 = 0;
+    for (w.layers) |lay| {
+        const l = lay.wo_bk orelse continue;
+        total += @as(u64, l.n) * l.k + @as(u64, l.n / 32) * (l.k / 32);
+    }
+    return total;
+}
+
+/// TF_DS_DECODE_KSPLIT: whether the K-half file was cut from the same checkpoint as the rank file. The two hold some of the
+/// same values of wo_b: this node's pair columns of its K-half rows. `rank` is the rank file's entry [rows, rk] and `side` the
+/// K-half entry [2 * rows (pair 0's columns, then pair 1's), sk] of the same kind (the codes, or the scales on 32 x 32 blocks):
+/// row i of the rank's entry, columns pair * sk .. +sk, must be row pair * rows + i of the K-half's. An abliteration overlay
+/// rewrites wo_b, so a K-half cut from the stock checkpoint beside a rank file cut from the overlay differs here.
+pub fn ksplitSame(rank: []const u8, rows: usize, rk: usize, side: []const u8, sk: usize, pair: usize) bool {
+    if (rank.len != rows * rk or side.len != 2 * rows * sk or pair > 1) return false;
+    for (0..rows) |i| {
+        if (!std.mem.eql(u8, rank[i * rk + pair * sk ..][0..sk], side[(pair * rows + i) * sk ..][0..sk])) return false;
+    }
+    return true;
+}
 
 /// Where entries come from: the lane's rank cache file, or the checkpoint read by the split.
 pub const Source = union(enum) {
@@ -1288,6 +1315,12 @@ const Loader = struct {
 
 /// Every tensor of rank `s` on device `d`, from `src` (weights.py _load, in its order).
 pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, src: Source, c: Config, s: plan.Split, dspark: bool) !Weights {
+    return loadWith(gpa, d, src, null, c, s, dspark);
+}
+
+/// load, and with `side` (TF_DS_DECODE_KSPLIT: the K-half file, plan.wantsKsplit's entries) every main layer's wo_b K-half
+/// from it; the rank's own file is the same file with or without the switch.
+pub fn loadWith(gpa: std.mem.Allocator, d: *const cuda.Driver, src: Source, side: ?Source, c: Config, s: plan.Split, dspark: bool) !Weights {
     var w: Weights = .{ .gpa = gpa };
     errdefer w.deinit();
     var L: Loader = .{ .gpa = gpa, .d = d, .src = src, .w = &w };
@@ -1343,7 +1376,15 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, src: Source, c: Confi
         };
         if (c.format == .native and draftHeadFp8()) w.dspark.?.head8 = try L.headFp8(vr);
     }
-    if (L.span_bytes > 0) std.log.info("rank cache: {d:.1} GiB of expert entries read whole in {d:.1} s", .{ @as(f64, @floatFromInt(L.span_bytes)) / (1 << 30), @as(f64, @floatFromInt(L.span_ns)) / 1e9 });
+    if (side) |sd| {
+        if (!(s.ksplit and s.pair != null)) return error.KsplitNeedsTheSplit;
+        L.src = sd;
+        for (w.layers[0..c.layers], 0..) |*lay, i| {
+            var pb: [96]u8 = undefined;
+            lay.wo_bk = try L.native(try std.fmt.bufPrint(&pb, "layers.{d}.attn.wo_b", .{i}), .{ 0, c.hidden }, s.woBKRows(c), .fp8);
+        }
+        L.src = src;
+    }
     if (L.direct_reads > 0) std.log.info("dsv41: weights read past the page cache: {d} reads, {d:.1} GiB", .{ L.direct_reads, @as(f64, @floatFromInt(L.direct_bytes)) / (1 << 30) });
     if (woa_w8) std.log.info("TF_DS_WOA_W8=1: wo_a from its FP8 rows on {d} of {d} layers ({d:.1} MB of bf16 rows not loaded){s}{s}", .{ L.w8_layers, L.w8_layers + L.w8_kept, @as(f64, @floatFromInt(L.w8_saved)) / 1e6, if (L.w8_why != null) "; the others keep their rows: " else "", L.w8_why orelse "" });
     return w;
@@ -1754,6 +1795,7 @@ test "an expert's pack reads its entries in the rank cache's order: each byte on
 test "the drafter's stages load four ways only as decided, on a 2D node with the checkpoint's own weights" {
     // (TF_DS_DRAFT_4WAY: Model.open sets draft_4way before the load; plan.zig's listing, the rank files, unchanged)
     const src = @embedFile("weights.zig");
+    const at = std.mem.indexOf(u8, src, "pub fn loadWith(").?;
     const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n}\n").?];
     for ([_][]const u8{
         "const ds_split: plan.Split = if (draft_4way and s.pair != null and c.format == .native) s else tp2;",
@@ -1938,6 +1980,36 @@ test "a four-way drafter part is its TP2 entry's rows" {
     try std.testing.expectError(error.MissingEntry, L.entry("mtp.0.attn.wq_b|(8192, 16384)|None|w8"));
 }
 
+test "TF_DS_DECODE_KSPLIT: the K-halves' bytes are the FP8 weight and its 32 x 32 UE8M0 scales, only of the layers that hold one" {
+    var lays: [3]Layer = undefined;
+    for (&lays) |*l| l.wo_bk = null;
+    lays[0].wo_bk = .{ .words = 1, .w = 1, .s = 1, .k = 2048, .n = 5120, .fmt = .fp8 };
+    lays[2].wo_bk = lays[0].wo_bk;
+    var w: Weights = .{ .gpa = std.testing.allocator };
+    w.layers = &lays;
+    // 5120 x 2048 codes + 160 x 64 scales, twice
+    try std.testing.expectEqual(@as(u64, 2 * (5120 * 2048 + 160 * 64)), ksplitBytes(&w));
+    w.layers = lays[1..2];
+    try std.testing.expectEqual(@as(u64, 0), ksplitBytes(&w));
+    w.layers = &.{};
+}
+
+test "TF_DS_DECODE_KSPLIT: the K-half file is checked against the rank file's overlapping values, and a differing source is found" {
+    // 4 rows of the rank's entry (k 6) and the K-half's 8 rows (k 3): pair 1 shares the rank's columns 3..5 with side rows 4..7
+    var rank: [24]u8 = undefined;
+    var side: [24]u8 = undefined;
+    for (&rank, 0..) |*b, i| b.* = @intCast(i * 7 + 1);
+    for (0..4) |i| for (0..3) |j| {
+        side[(1 * 4 + i) * 3 + j] = rank[i * 6 + 3 + j]; // pair 1
+        side[(0 * 4 + i) * 3 + j] = rank[i * 6 + j]; // pair 0
+    };
+    try std.testing.expect(ksplitSame(&rank, 4, 6, &side, 3, 1));
+    try std.testing.expect(ksplitSame(&rank, 4, 6, &side, 3, 0));
+    side[(4 + 2) * 3 + 1] ^= 0x10; // one value of pair 1's block cut from another checkpoint
+    try std.testing.expect(!ksplitSame(&rank, 4, 6, &side, 3, 1));
+    try std.testing.expect(ksplitSame(&rank, 4, 6, &side, 3, 0)); // pair 0's block is untouched: the check is per pair
+    try std.testing.expect(!ksplitSame(&rank, 4, 6, side[0..23], 3, 1)); // a wrong size is no match
+}
 
 test "the loader's expert scale tensors against the kernels' lengths: every expert's gate, up and down bytes, the rest rows where owned" {
     var ex = std.mem.zeroes(Experts);

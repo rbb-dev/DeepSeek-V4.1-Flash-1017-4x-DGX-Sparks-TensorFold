@@ -66,3 +66,65 @@ test "wo_b's rotated input: each pair's half of the rank's suh" {
     t.p = 1;
     try std.testing.expectEqual(exl3_linear.RotOut{ .suh = 0x10000 + 2048 * 2, .xh = 0x7000, .ldr = 2048, .off = 0 }, woRot(&t, lay, 0));
 }
+
+test "TF_DS_DECODE_KSPLIT: wo_b's K-halves summed per TP2 rank equal the whole-K partial within the fp32 bound; the planes pair as r and 2 + r" {
+    // a stand-in for wo_b on a small shape: K = 4 * 16 inputs (rank r's two pairs' halves are K/2 each), N = 6 outputs, the
+    // activations and weights deterministic fp32 values of mixed sign and size
+    const K = 64;
+    const N = 6;
+    var state: u32 = 0x9e3779b9;
+    const Rng = struct {
+        fn next(st: *u32) f32 {
+            st.* = st.* *% 1664525 +% 1013904223;
+            const m: f32 = @floatFromInt(@as(i32, @intCast(st.* >> 8)) - (1 << 23));
+            return m / @as(f32, 1 << 23) * @as(f32, @floatFromInt(@as(u32, 1) << @intCast((st.* >> 3) % 6)));
+        }
+    };
+    var x: [2][K]f32 = undefined; // TP2 rank r's wo_b input row
+    var wt: [2][N][K]f32 = undefined;
+    for (0..2) |r| {
+        for (&x[r]) |*v| v.* = Rng.next(&state);
+        for (&wt[r]) |*row| for (row) |*v| {
+            v.* = Rng.next(&state);
+        };
+    }
+    // baseline: a node's partial of rank r over the whole K (its N columns), the consumer adds rank 0 and rank 1
+    // the K-split: node (pair p, rank r) over its half, the planes in node order 2 p + r, summed as plane r + plane 2 + r
+    var planes: [4][N]f32 = undefined;
+    for (0..2) |p| for (0..2) |r| for (0..N) |n| {
+        var acc: f32 = 0;
+        for (p * K / 2..(p + 1) * K / 2) |k| acc += x[r][k] * wt[r][n][k];
+        planes[2 * p + r][n] = acc;
+    };
+    for (0..N) |n| {
+        var whole: [2]f32 = undefined;
+        var mag: [2]f32 = undefined; // sum |term|: the bound's scale
+        for (0..2) |r| {
+            var acc: f32 = 0;
+            var m: f32 = 0;
+            for (0..K) |k| {
+                acc += x[r][k] * wt[r][n][k];
+                m += @abs(x[r][k] * wt[r][n][k]);
+            }
+            whole[r] = acc;
+            mag[r] = m;
+        }
+        for (0..2) |r| {
+            const ks = planes[r][n] + planes[2 + r][n]; // the kernel's add: out[r] = in[r] + in[2 + r]
+            // the standard bound of a K-term fp32 dot against any other order: 2 K u sum|term|, u = 2^-24
+            const bound = 2.0 * @as(f32, K) * @as(f32, 1.0 / 16777216.0) * mag[r];
+            try std.testing.expect(@abs(ks - whole[r]) <= bound);
+        }
+        // the consumer's rank-order sum of the two ranks' K-split sums stays within twice the bound of the baseline
+        const got = (planes[0][n] + planes[2][n]) + (planes[1][n] + planes[3][n]);
+        const want = whole[0] + whole[1];
+        try std.testing.expect(@abs(got - want) <= 2.0 * 2.0 * @as(f32, K) * @as(f32, 1.0 / 16777216.0) * (mag[0] + mag[1]));
+    }
+    // control: the bound can fail: a sum that drops one half is off by far more than it
+    const n0 = planes[0][0] + planes[0][0];
+    var m0: f32 = 0;
+    for (0..K) |k| m0 += @abs(x[0][k] * wt[0][0][k]);
+    var w0: f32 = 0;
+    for (0..K) |k| w0 += x[0][k] * wt[0][0][k];
+    try std.testing.expect(@abs(n0 - w0) > 2.0 * @as(f32, K) * @as(f32, 1.0 / 16777216.0) * m0);
+}

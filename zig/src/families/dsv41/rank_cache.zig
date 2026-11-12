@@ -143,8 +143,13 @@ pub fn open(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, name: []const u8) !Inde
 /// The file in `dir` for rank `rank` of `world` (rank{r}of{w}-<key>.bin, the Python loader keeps one a split);
 /// the name is `gpa`'s.
 pub fn find(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, rank: u32, world: u32) ![]u8 {
-    var prefix_buf: [32]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&prefix_buf, "rank{d}of{d}-", .{ rank, world });
+    return findStem(gpa, io, dir, "rank", rank, world);
+}
+
+/// find for the files of another stem ("ksplit": TF_DS_DECODE_KSPLIT's wo_b K-halves, ksplit{r}of{w}-<key>.bin).
+pub fn findStem(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, stem: []const u8, rank: u32, world: u32) ![]u8 {
+    var prefix_buf: [48]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&prefix_buf, "{s}{d}of{d}-", .{ stem, rank, world });
     var found: ?[]u8 = null;
     errdefer if (found) |f| gpa.free(f);
     var it = dir.iterate();

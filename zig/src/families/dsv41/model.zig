@@ -169,6 +169,48 @@ pub fn parityGU() bool {
     return std.mem.eql(u8, std.mem.span(v), "parity");
 }
 
+/// TF_DS_DECODE_KSPLIT asked: why this start cannot take it (null: it can). It needs the 2D split over four nodes (each node's
+/// own wo_a groups are the K-half it multiplies) and the checkpoint's own FP8 wo_b; asked for outright, a start that cannot
+/// refuses by name rather than serving something else.
+pub fn decodeKsplitRefusal(two: bool, native: bool) ?[]const u8 {
+    if (!two) return "it splits the decode rounds' attention over the four nodes of the 2D split (TF_DS_DECODE_KSPLIT=1 needs four nodes)";
+    if (!native) return "it takes the checkpoint's own FP8 wo_b (the native format)";
+    return null;
+}
+
+/// TF_DS_DECODE_KSPLIT: the K-half file is cut from the checkpoint the rank file was (stock or the abliteration overlay, which
+/// rewrites wo_b of layers 10-35): the values the two files share, at a layer the overlay changes and one it leaves, must be
+/// equal (weights.ksplitSame). A K-half of another source refuses the start by name.
+fn ksplitSourceCheck(gpa: std.mem.Allocator, io: std.Io, rank_file: std.Io.File, rank_ix: *const rank_cache.Index, side_file: std.Io.File, side_ix: *const rank_cache.Index, c: Config, sp: plan.Split, side_name: []const u8) !void {
+    const pair: usize = sp.pair orelse return error.KsplitNeedsTheSplit;
+    const rows = c.hidden / 2;
+    const kh = sp.woBKRows(c)[1] - sp.woBKRows(c)[0];
+    const krank = sp.range(sp.groups(c) * c.o_lora)[1] - sp.range(sp.groups(c) * c.o_lora)[0];
+    for ([_]usize{ 9, 10, 35 }) |layer| {
+        if (layer >= c.layers) continue;
+        for ([_][]const u8{ "w8", "s8" }) |part| {
+            const div: usize = if (part[0] == 's') 32 else 1;
+            var pb: [96]u8 = undefined;
+            var kb1: [256]u8 = undefined;
+            var kb2: [256]u8 = undefined;
+            const name = try std.fmt.bufPrint(&pb, "layers.{d}.attn.wo_b", .{layer});
+            const rk = plan.partKey(&kb1, name, sp.woBCols(c), sp.range(sp.groups(c) * c.o_lora), part) catch unreachable;
+            const sk = plan.partKey(&kb2, name, .{ 0, c.hidden }, sp.woBKRows(c), part) catch unreachable;
+            const re = rank_ix.get(rk) orelse return error.MissingEntry;
+            const se = side_ix.get(sk) orelse return error.MissingEntry;
+            const rbuf = try gpa.alloc(u8, @intCast(re.bytes));
+            defer gpa.free(rbuf);
+            const sbuf = try gpa.alloc(u8, @intCast(se.bytes));
+            defer gpa.free(sbuf);
+            if (try rank_file.readPositionalAll(io, rbuf, re.offset) != rbuf.len or try side_file.readPositionalAll(io, sbuf, se.offset) != sbuf.len) return error.ShortRead;
+            if (!weights.ksplitSame(rbuf, rows / div, krank / div, sbuf, kh / div, pair)) {
+                std.log.err("TF_DS_DECODE_KSPLIT=1: {s} was cut from another checkpoint than this rank's weight file: its wo_b {s} of layer {d} differs from the rank file's where they overlap (stock against the abliteration overlay?); write it again from the checkpoint the rank file came from (tf-dsv41-rank-cache --ksplit --source TAG on the same checkpoint path)", .{ side_name, part, layer });
+                return error.KsplitSourceDiffers;
+            }
+        }
+    }
+}
+
 /// The parity split's decode gate / up in one launch (experts_par.cu, the same bits); TF_DS_PAR_ONE=0: the served
 /// build's launches (main, then the rest's grouping and gate / up, beside it on a stream of its own with --side).
 pub fn parOne() bool {
@@ -2156,6 +2198,7 @@ pub const Model = struct {
         prompt2d.split64n_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_SPLIT64N")) |v| std.mem.span(v) else null); // this rank's launches alone: its bytes are the 128-column tile's
         prompt2d.pf_t64_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_PF_T64")) |v| std.mem.span(v) else null); // this rank's launches alone: its bytes are the 128 x 128 tile's
         prompt2d.gemm_r2_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_GEMM_R2")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.decode_ksplit_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_DECODE_KSPLIT")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.draft_4way_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_DRAFT_4WAY")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.draft_main_4way_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_DRAFT_MAIN_4WAY")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.hc_late_fork_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_HC_LATE_FORK")) |v| std.mem.span(v) else null); // every rank alike (Settings)
@@ -2487,6 +2530,15 @@ pub const Model = struct {
             if (std.c.getenv("TF_DS_DRAFT_DUMP_PASS")) |dp| draft.ddump_pass = std.fmt.parseInt(usize, std.mem.span(dp), 10) catch 2;
         }
         sp.parity = sp.pair != null and parityGU(); // TF_DS_2D_GU=parity: the balanced experts split
+        // TF_DS_DECODE_KSPLIT: every rank asked alike (Settings); the rank file must hold the K-halves (prepare with --ksplit)
+        sp.ksplit = false;
+        if (prompt2d.decode_ksplit_asked) {
+            if (decodeKsplitRefusal(sp.pair != null, c.format == .native)) |why| {
+                std.log.err("TF_DS_DECODE_KSPLIT=1: refused on rank {d}: {s}", .{ o.rank, why });
+                return error.DecodeKsplitUnavailable;
+            }
+            sp.ksplit = true;
+        }
         // TF_DS_WOA_W8: the main layers' wo_a from its FP8 rows alone where the prompt path's kernel takes them; the
         // bits are the bf16 rows' either way, so each rank decides on its own
         weights.woa_w8 = false;
@@ -2505,7 +2557,26 @@ pub const Model = struct {
             if (draftMainFourWayOff(c, sp, o.drafts, mx.decOnEnv())) |why| std.log.info("TF_DS_DRAFT_MAIN_4WAY=1: off on rank {d}: {s}", .{ o.rank, why }) else weights.draft_main_4way = true;
         }
         const free_before_weights = freeNow(ctx);
+        const rank_src: weights.Source = .{ .cache = .{ .file = m.cache_file, .index = &m.ix, .io = io, .direct = direct } };
+        if (sp.ksplit) {
+            // TF_DS_DECODE_KSPLIT: the wo_b K-halves are their own file beside the rank's (tf-dsv41-rank-cache --ksplit): the rank's
+            // file is the same with the switch on or off
+            const side_name = rank_cache.findStem(a, io, m.cache_dir, "ksplit", role, o.world) catch |err| {
+                std.log.err("TF_DS_DECODE_KSPLIT=1: no ksplit{d}of{d}-*.bin in {s}: write it with tf-dsv41-rank-cache --ksplit (prepare.sh with the switch); the rank file stays as it is ({t})", .{ role, o.world, o.cache_dir, err });
+                return error.MissingEntry;
+            };
+            var side_ix = try rank_cache.open(gpa, io, m.cache_dir, side_name);
+            defer side_ix.deinit();
+            var side_file = try m.cache_dir.openFile(io, side_name, .{});
+            defer side_file.close(io);
+            try ksplitSourceCheck(gpa, io, m.cache_file, &m.ix, side_file, &side_ix, c.*, sp, side_name);
+            m.w = try weights.loadWith(gpa, d, rank_src, .{ .cache = .{ .file = side_file, .index = &side_ix, .io = io } }, c.*, sp, o.drafts);
+        } else m.w = try weights.load(gpa, d, rank_src, c.*, sp, o.drafts);
         m.ledger.record(@src(), .weights, free_before_weights -| freeNow(ctx), 0);
+        if (sp.ksplit) std.log.info("TF_DS_DECODE_KSPLIT=1: decode rounds' attention on one exchange a layer: wo_b's K-half over every column, {d:.1} MiB more weights on this node (the prompt path keeps wo_b); not the bits of the baseline rounds (the fp32 sums' order)", .{@as(f64, @floatFromInt(weights.ksplitBytes(&m.w))) / (1024.0 * 1024.0)});
+        errdefer m.w.deinit();
+        if (o.drafts and m.w.dspark == null) return error.NoDrafter;
+
         // the ranks' links (rank 0 takes its followers in order; a follower retries its connect for TF_DS_CONNECT_S)
 
         try m.fan.join(io, o.master, o.port, o.rank, o.world, prompt2d.connectSeconds());
@@ -4896,6 +4967,11 @@ test "the start-up settings carry TF_DS_PF_SPLIT and the kernel switches as Mode
     prompt2d.head_key_asked = true;
     try std.testing.expectEqual(prompt2d.kern_head_key, startSettings(o).kern);
     prompt2d.head_key_asked = false;
+    const was_ks = prompt2d.decode_ksplit_asked;
+    defer prompt2d.decode_ksplit_asked = was_ks;
+    prompt2d.decode_ksplit_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_decode_ksplit, startSettings(o).kern);
+    prompt2d.decode_ksplit_asked = false;
     for ([_]prompt2d.Qgate{ .head, .body_fp8, .body_ulp }) |q| {
         prompt2d.qgate_canary_asked = q;
     }
@@ -6642,6 +6718,12 @@ test "TF_DS_RING_WORD is on unless set to something but 1; a start without an RD
     try std.testing.expect(!Model.ringNoRingNote(false, false));
     // the explicit flag follows the environment's presence
     try std.testing.expect(std.mem.indexOf(u8, src, "prompt2d.ring_word_explicit = ring_word_text != null;") != null);
+}
+
+test "TF_DS_DECODE_KSPLIT: asked, it needs the 2D split on the checkpoint's own FP8 weights, and refuses by name otherwise" {
+    try std.testing.expect(decodeKsplitRefusal(true, true) == null);
+    try std.testing.expect(std.mem.indexOf(u8, decodeKsplitRefusal(false, true).?, "four nodes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, decodeKsplitRefusal(true, false).?, "FP8") != null);
 }
 
 test "TF_DS_RING_WORD_SIGNAL's decision: unset is the atomic where the cards can, else the word with a warning; atomic set outright refuses there; word is always the word" {

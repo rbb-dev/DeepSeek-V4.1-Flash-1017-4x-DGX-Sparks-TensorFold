@@ -121,6 +121,13 @@ pub const Rings = struct {
         try rs.all4.gatherInto(stream, src, @intCast(rows), try float4s(w[rs.p] * esize), &dsts);
     }
 
+    /// TF_DS_DECODE_KSPLIT's gather: `src` [rows, row_bytes] (this node's full-width partial) -> `dst` [4, rows, row_bytes], node q's
+    /// part in plane q (node = 2 pair + TP2 rank), the four nodes' ring: no copy after it.
+    pub fn planes4(rs: *const Rings, stream: cuda.Stream, src: u64, dst: u64, rows: usize, row_bytes: usize) !void {
+        const dsts = try planesDsts(dst, rows, row_bytes);
+        try rs.all4.gatherInto(stream, src, @intCast(rows), try float4s(row_bytes), &dsts);
+    }
+
     /// One part of `rows` rows of 16 bytes (four fp32) from every node into `dst` [4, rows, 16 bytes], the parts in
     /// `slot_of[node]` order (the communicator's rank order, which Markov's pick reads): the four nodes' ring, no copy after
     /// it.
@@ -159,6 +166,14 @@ pub fn quartersDsts(dst: u64, n_total: usize, r0: usize, w: [2]usize, esize: usi
     const row = (w[0] + w[1]) * esize;
     var dsts: [4]rdma.Ring.Dst = undefined;
     for (0..4) |q| dsts[q] = .{ .ptr = dst + (q % 2) * n_total * row + r0 * row + (q / 2) * w[0] * esize, .row4 = try Rings.float4s(w[q / 2] * esize), .stride4 = try Rings.float4s(row) };
+    return dsts;
+}
+
+/// Where each node's part of planes4 lands: node q's `rows` whole rows of `row_bytes` as plane q of `dst`, rows contiguous.
+pub fn planesDsts(dst: u64, rows: usize, row_bytes: usize) ![4]rdma.Ring.Dst {
+    const row4 = try Rings.float4s(row_bytes);
+    var dsts: [4]rdma.Ring.Dst = undefined;
+    for (0..4) |q| dsts[q] = .{ .ptr = dst + q * rows * row_bytes, .row4 = row4, .stride4 = row4 };
     return dsts;
 }
 
@@ -214,6 +229,30 @@ test "quartersRows lands rows [r0, r0 + n) where one quarters call lands them" {
     // a rank's plane holds both pairs' columns: rank 1, pair 1 starts its row past pair 0's columns of rank 1's plane
     const d3 = (try quartersDsts(dst, 48, 34, .{ 32384, 32256 }, 4))[3];
     try std.testing.expectEqual(dst + 48 * (32384 + 32256) * 4 + 34 * (32384 + 32256) * 4 + 32384 * 4, d3.ptr);
+}
+
+test "planesDsts: node q's whole rows land in plane q of [4, rows, row], the planes the sum kernel pairs as r and 2 + r" {
+    const dst: u64 = 1 << 32;
+    const d = try planesDsts(dst, 7, 5120 * 4);
+    for (0..4) |q| {
+        try std.testing.expectEqual(dst + q * 7 * 5120 * 4, d[q].ptr);
+        try std.testing.expectEqual(@as(u32, 1280), d[q].row4);
+        try std.testing.expectEqual(@as(u32, 1280), d[q].stride4); // rows follow each other: no gap
+    }
+    // node q = 2 pair + TP2 rank: plane 0 and 2 are rank 0's two K-halves (pairs 0 and 1), planes 1 and 3 rank 1's
+    try std.testing.expectEqual(@as(u32, 0), owner(0)[0]);
+    try std.testing.expectEqual(@as(u32, 0), owner(2)[0]);
+    try std.testing.expectEqual(@as(u32, 1), owner(1)[0]);
+    try std.testing.expectEqual(@as(u32, 1), owner(3)[0]);
+    try std.testing.expectError(error.NotFloat4, planesDsts(dst, 7, 5124));
+}
+
+test "planes4 is one all-four gather of whole rows into planesDsts" {
+    const src = @embedFile("ring2d.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn planes4(").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "const dsts = try planesDsts(dst, rows, row_bytes);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "try rs.all4.gatherInto(stream, src, @intCast(rows), try float4s(row_bytes), &dsts);"));
 }
 
 test "a decode gather's rows per slot" {

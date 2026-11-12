@@ -167,6 +167,7 @@ pub const Round = struct {
     u: u64, // bf16 [R, groups * o_lora]
     pa: u64, // fp32 [R, D]
     ga: u64, // fp32 [world, R, D]
+    ga4: u64, // TF_DS_DECODE_KSPLIT: the four nodes' full-width partials, fp32 [4, R, D] (0: no layer has a K-half)
     // MoE
     gl: u64, // fp32 [R, D / 256, experts]: the gate's chunk sums
     pick: u64, // int32 [R, slots]
@@ -308,6 +309,7 @@ pub const Round = struct {
         // its own as before (and the gather stages it).
         rd.pa = (try e.ringSendSlot(e.s, R * d * 4)) orelse try a.take(R * d * 4);
         rd.ga = try a.take(e.world * R * d * 4);
+        rd.ga4 = if (l0.wo_bk != null) try a.take(4 * R * d * 4) else 0;
         rd.gl = try a.take(R * (d / 256) * c.experts * 4);
         rd.pick = try a.take(R * e.slots() * 4);
         rd.mw = try a.take(R * e.slots() * 4);
@@ -710,6 +712,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         var r: [5][2]u64 = @splat(.{ 0, 0 });
         const w8: ?weights.Linear = if (e.mx) |mk| (if (mk.dec_on) lay.wo_a8 else null) else null;
         if (w8) |x| r[0] = linearBytes(x) else for (lay.wo_a[0..lay.groups], 0..) |wo, j| r[j] = linearBytes(wo);
+        r[4] = linearBytes(lay.wo_bk orelse lay.wo_b);
         if (l2_skip & 1 == 0) try rd.prefetch(e, &r, l2_mb[0] << 20);
     }
     try rd.mark(e, .a_q);
@@ -853,6 +856,12 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
             try mx.woA8(k, e.s, ch.mxs, w8, lay.groups, rd.o, hl * hd, R, rd.u, uw, ch.mxe.z);
         } else try mx.woA(k, e.s, ch.mxs, lay.wo_a[0..lay.groups], rd.o, hl * hd, R, rd.u, uw, ch.mxe.z);
         try rd.mark(e, .a_woa);
+        if (lay.wo_bk) |wk| {
+            // TF_DS_DECODE_KSPLIT: this node's own wo_a groups' outputs are the K-half wo_bk takes, over every output column: no
+            // cat before it, a full-width partial after it (the layer's gather sums the four)
+            try rd.mark(e, .a_x);
+            try prompt.groupedDecode(e, ch, R, &.{wk}, &.{rd.u}, &.{uw}, &.{rd.pa}, &.{wk.n}, &.{.f32});
+        } else {
             var u = rd.u;
             var uk: usize = uw;
             if (e.two) |tw| {
@@ -862,6 +871,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
             }
             try rd.mark(e, .a_x);
             try prompt.groupedDecode(e, ch, R, &.{lay.wo_b}, &.{u}, &.{uk}, &.{rd.pa}, &.{lay.wo_b.n}, &.{.f32});
+        }
         // (the decode tensor-core kernels: the shared expert's gate / up too, read first by gate / up, during the
         // attention's gather)
         if (k.dec_on) {
@@ -1319,7 +1329,12 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
         try attention(e, rd, ch, cs, rings, &sh, l);
         try rd.mark(e, .attn);
         try Probe.check(probe, .attn_out, l, rd.pa);
-        if (e.two) |tw| try tw.quarters(e, rd.pa, rd.ga, R, tw.ow, 4) else try e.gatherF32(rd.pa, rd.ga, R * d);
+        if (e.two) |tw| {
+            if (lay.wo_bk != null) {
+                try tw.planes4(e, rd.pa, rd.ga4, R, d * 4);
+                try e.ops.sumPairsF32(e.s, rd.ga4, rd.ga, R * d);
+            } else try tw.quarters(e, rd.pa, rd.ga, R, tw.ow, 4);
+        } else try e.gatherF32(rd.pa, rd.ga, R * d);
         try rd.mark(e, .gather_a);
         try Probe.check(probe, .attn_gather, l, rd.ga);
         pending = rd.ga;
@@ -1589,6 +1604,28 @@ test "TF_DS_HC_LATE_FORK: a mix leaves its side work, the router and the input p
     try S.before(src, "    fn joinSide(rd: *Round, e: *const Engine) !void {\n        try rd.flushSide(e);", "        if (!rd.side_out) return;");
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, S.method(src, "    fn abortCapture("), "rd.side_work = null;"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, S.method(src, "    fn flushSide("), "try rd.join.?.record(rd.side.?);"));
+}
+
+test "TF_DS_DECODE_KSPLIT: a layer with a K-half takes no column-ring cat before wo_b, one gather of four full-width partials, summed in rank pairs; without it, the baseline two exchanges" {
+    const src = @embedFile("round.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    const at = std.mem.indexOf(u8, code, "fn attention(").?;
+    const att = code[at .. at + std.mem.indexOf(u8, code[at..], "\n}\n").?];
+    // wo_b: the K-half branch multiplies this node's own wo_a outputs, the else branch is the baseline cat then wo_b
+    const br = std.mem.indexOf(u8, att, "if (lay.wo_bk) |wk| {") orelse return error.TestUnexpectedResult;
+    const el = std.mem.indexOfPos(u8, att, br, "} else {") orelse return error.TestUnexpectedResult;
+    const yes = att[br..el];
+    const no = att[el..];
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, yes, "catRank"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, yes, "try prompt.groupedDecode(e, ch, R, &.{wk}, &.{rd.u}, &.{uw}, &.{rd.pa}, &.{wk.n}, &.{.f32});"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, no, "try tw.catRank(e, rd.u, tw.u_full, R, tw.uw, 2);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, no, "try prompt.groupedDecode(e, ch, R, &.{lay.wo_b}, &.{u}, &.{uk}, &.{rd.pa}, &.{lay.wo_b.n}, &.{.f32});"));
+    // the layer's gather: the four partials into ga4 and the pairs summed into ga, or the baseline quarters into ga
+    const st = std.mem.indexOf(u8, code, "fn stretch(").?;
+    const body = code[st .. st + std.mem.indexOf(u8, code[st..], "\n}\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "        if (e.two) |tw| {\n            if (lay.wo_bk != null) {\n                try tw.planes4(e, rd.pa, rd.ga4, R, d * 4);\n                try e.ops.sumPairsF32(e.s, rd.ga4, rd.ga, R * d);\n            } else try tw.quarters(e, rd.pa, rd.ga, R, tw.ow, 4);\n        } else try e.gatherF32(rd.pa, rd.ga, R * d);"));
+    // (the MoE's gather and the others stay the baseline)
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "if (e.two) |tw| try tw.quarters(e, rd.pm, rd.gm, R, tw.dw, 4) else try e.gatherF32(rd.pm, rd.gm, R * d);"));
 }
 
 test "TF_DS_DECODE_FUSE: a 2D round's parity assembly writes down's codes and down takes them; unset, assembleParity and down's own quant" {

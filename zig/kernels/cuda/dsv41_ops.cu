@@ -36,6 +36,17 @@ extern "C" __global__ void tf_ds_add2_bf16_v4_kernel(const float4* g0, const flo
     }
 }
 
+// TF_DS_DECODE_KSPLIT: the four nodes' full-width fp32 partials of one sublayer, planes in node order (node = 2 pair + TP2 rank),
+// summed per TP2 rank over its two pairs' K-halves: out[r] = in[r] + in[2 + r], r = grid.y, one fp32 add (round to nearest) a
+// value. The consumers (_hc_post, _hc_mix_part) then add the two ranks' planes as they always do.
+extern "C" __global__ void tf_ds_sum_pairs_f32_kernel(const float* input, float* output, uint64_t count) {
+    const float* a = input + uint64_t(blockIdx.y) * count;
+    const float* b = input + (2 + uint64_t(blockIdx.y)) * count;
+    float* o = output + uint64_t(blockIdx.y) * count;
+    for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * blockDim.x) o[i] = __fadd_rn(a[i], b[i]);
+}
+
 // The owner sums' widen: dst fp32 [q, 2 w] row r = (float(p0 row r) | float(p1 row r)), p0 and p1 bf16 [q, w]; exact
 // (a bf16 is an fp32 with 16 more zero bits). Grid (ceil(w / blockDim), q): a row a grid row, a column pair a thread.
 extern "C" __global__ void tf_ds_widen_pairs_kernel(const __nv_bfloat16* p0, const __nv_bfloat16* p1, float* dst,

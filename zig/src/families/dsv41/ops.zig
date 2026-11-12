@@ -70,6 +70,7 @@ pub const Ops = struct {
     to_f32: cuda.Function,
     f16_to_f32: cuda.Function,
     add2_bf16: cuda.Function,
+    sum_pairs_f32: cuda.Function,
     widen_pairs: cuda.Function,
     collect2_fn: cuda.Function,
     ywiden: cuda.Function,
@@ -121,6 +122,7 @@ pub const Ops = struct {
             .to_f32 = try pw.function("tf_bf16_to_f32_kernel"),
             .f16_to_f32 = try fm.function("tf_ds_f16_to_f32_kernel"),
             .add2_bf16 = try fm.function("tf_ds_add2_bf16_kernel"),
+            .sum_pairs_f32 = try fm.function("tf_ds_sum_pairs_f32_kernel"),
             .widen_pairs = try fm.function("tf_ds_widen_pairs_kernel"),
             .collect2_fn = try fm.function("tf_ds_collect2_kernel"),
             .ywiden = try fm.function("tf_ds_ywiden_kernel"),
@@ -196,6 +198,17 @@ pub const Ops = struct {
         }
         a.add(@as(u64, count));
         try go(o.add2_bf16, s, blocks(count, 256), 256, &a);
+    }
+
+    /// TF_DS_DECODE_KSPLIT: `in` four fp32 planes of `count` values (the nodes' partials, node order) -> `out` two planes,
+    /// out[r] = in[r] + in[2 + r] (the two pairs' K-halves of TP2 rank r), one launch.
+    pub fn sumPairsF32(o: *const Ops, s: cuda.Stream, in: u64, out: u64, count: usize) !void {
+        if (count == 0) return;
+        var a: cuda.Args = .{};
+        a.add(in);
+        a.add(out);
+        a.add(@as(u64, count));
+        try cuda.launch.launch(o.sum_pairs_f32, .{ .grid = .{ .x = @intCast(blocks(count, 256)), .y = 2 }, .block = .{ .x = 256 } }, s, &a);
     }
 
     /// TF_DS_ROCI_COLLECT: two parts of `bytes` each (a multiple of 16, 16-byte aligned) copied from s0, s1 to d0, d1 in one launch,

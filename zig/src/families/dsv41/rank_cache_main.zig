@@ -1,7 +1,8 @@
-//! tf-dsv41-rank-cache MODEL_DIR OUT_DIR RANK WORLD [--parity] [--no-dspark] [--index-only]: one rank's weight file
+//! tf-dsv41-rank-cache MODEL_DIR OUT_DIR RANK WORLD [--parity] [--ksplit [--source TAG]] [--no-dspark] [--index-only]: one rank's weight file
 //! (the lane's rank cache, TF_DS_RANK_CACHE) from the checkpoint alone, no GPU and no Python. The entries are
 //! plan.wants' (the Python loader's keys and order for the split: TP over 1 or 2 nodes, the exact 2D split over 4;
-//! --parity: the balanced experts split, TF_DS_2D_GU=parity), each sliced by the checkpoint reader from its source
+//! --parity: the balanced experts split, TF_DS_2D_GU=parity; --ksplit: TF_DS_DECODE_KSPLIT's extra wo_b K-half of every
+//! main layer, written as a separate file ksplit{RANK}of{WORLD}-<hash>[-TAG].bin (--source TAG: which checkpoint it was cut from, e.g. stock or keys@de412d22) beside the rank file, which it does not touch; implies --no-dspark), each sliced by the checkpoint reader from its source
 //! tensor read whole (checkpoint.readFrom: the bytes the loader keeps); then the index as weights.py RankCache writes it
 //! (rank_cache.writeRow), its offset (u64 little-endian) and the magic. The file is OUT_DIR/rank{RANK}of{WORLD}-<the
 //! index's sha256, 20 hex digits>.bin, written as a dot file and renamed when whole; OUT_DIR must not hold another file
@@ -10,7 +11,7 @@
 const std = @import("std");
 const dsv41 = @import("dsv41");
 
-const usage = "usage: tf-dsv41-rank-cache MODEL_DIR OUT_DIR RANK WORLD [--parity] [--no-dspark] [--index-only]\n";
+const usage = "usage: tf-dsv41-rank-cache MODEL_DIR OUT_DIR RANK WORLD [--parity] [--ksplit [--source TAG]] [--no-dspark] [--index-only]\n";
 
 fn dim(s: dsv41.checkpoint.Slice, i: usize) usize {
     return if (i < s.rank) s.shape[i] else 1;
@@ -29,12 +30,21 @@ pub fn main(init: std.process.Init) !u8 {
     const world = try std.fmt.parseInt(u32, args[4], 10);
     var dspark = true;
     var parity = false;
+    var ksplit = false;
+    var source: []const u8 = "";
     var index_only = false;
-    for (args[5..]) |x| {
+    var ai: usize = 5;
+    while (ai < args.len) : (ai += 1) {
+        const x = args[ai];
         if (std.mem.eql(u8, x, "--no-dspark")) {
             dspark = false;
         } else if (std.mem.eql(u8, x, "--parity")) {
             parity = true;
+        } else if (std.mem.eql(u8, x, "--ksplit")) {
+            ksplit = true;
+        } else if (std.mem.eql(u8, x, "--source") and ai + 1 < args.len) {
+            ai += 1;
+            source = args[ai];
         } else if (std.mem.eql(u8, x, "--index-only")) {
             index_only = true;
         } else {
@@ -42,14 +52,27 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         }
     }
-    if (!(world == 1 or world == 2 or world == 4) or rank >= world or (parity and world != 4)) {
-        std.debug.print("WORLD is 1, 2 or 4, RANK below it; --parity needs WORLD 4\n{s}", .{usage});
+    if (!(world == 1 or world == 2 or world == 4) or rank >= world or ((parity or ksplit) and world != 4)) {
+        std.debug.print("WORLD is 1, 2 or 4, RANK below it; --parity and --ksplit need WORLD 4\n{s}", .{usage});
         return 2;
     }
     // four ranks: the exact 2D split (node g = TP2 rank g % 2 of pair g / 2); the file is still rank g of 4
-    const split: dsv41.plan.Split = if (world == 4) .{ .rank = rank % 2, .world = 2, .pair = rank / 2, .parity = parity } else .{ .rank = rank, .world = world };
+    for (source) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '@' or ch == '.' or ch == '_')) {
+        std.debug.print("--source TAG: letters, digits and @ . _ only\n", .{});
+        return 2;
+    };
+    if (source.len > 0 and !ksplit) {
+        std.debug.print("--source goes with --ksplit\n", .{});
+        return 2;
+    }
+    const split: dsv41.plan.Split = if (world == 4) .{ .rank = rank % 2, .world = 2, .pair = rank / 2, .parity = parity, .ksplit = ksplit } else .{ .rank = rank, .world = world };
     const cfg = try dsv41.Config.read(a, io, args[1]);
-    const want = try dsv41.plan.wants(a, cfg, split, dspark);
+    const want = if (ksplit) try dsv41.plan.wantsKsplit(a, cfg, split) else try dsv41.plan.wants(a, cfg, split, dspark);
+    const stem: []const u8 = if (ksplit) "ksplit" else "rank";
+    if (ksplit and want.len == 0) {
+        std.debug.print("--ksplit: this split and checkpoint have no wo_b K-half (needs WORLD 4 and the native format)\n", .{});
+        return 2;
+    }
     var sh = try dsv41.checkpoint.Shards.open(gpa, io, args[1]);
     defer sh.close(io);
 
@@ -90,11 +113,11 @@ pub fn main(init: std.process.Init) !u8 {
 
     var dir = try std.Io.Dir.cwd().createDirPathOpen(io, args[2], .{ .open_options = .{ .iterate = true } });
     defer dir.close(io);
-    if (dsv41.rank_cache.find(a, io, dir, rank, world)) |old| {
+    if (dsv41.rank_cache.findStem(a, io, dir, stem, rank, world)) |old| {
         std.debug.print("{s} already holds {s}: remove it or name an empty OUT_DIR\n", .{ args[2], old });
         return 1;
     } else |err| if (err != error.NoRankCache) return err;
-    const partial = try std.fmt.allocPrint(a, ".rank{d}of{d}.partial", .{ rank, world });
+    const partial = try std.fmt.allocPrint(a, ".{s}{d}of{d}.partial", .{ stem, rank, world });
     var file = try dir.createFile(io, partial, .{});
     var file_open = true;
     defer if (file_open) file.close(io);
@@ -141,7 +164,7 @@ pub fn main(init: std.process.Init) !u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    const name = try std.fmt.allocPrint(a, "rank{d}of{d}-{s}.bin", .{ rank, world, hex[0..20] });
+    const name = try std.fmt.allocPrint(a, "{s}{d}of{d}-{s}{s}{s}.bin", .{ stem, rank, world, hex[0..20], if (source.len > 0) "-" else "", source });
     try dir.rename(partial, dir, name, io);
     try out.interface.print("{{\"file\": \"{s}\", \"entries\": {d}, \"data_bytes\": {d}, \"index_bytes\": {d}, \"rank\": {d}, \"world\": {d}, \"parity\": {}, \"dspark\": {}}}\n", .{ name, want.len, at, body.len, rank, world, parity, dspark });
     try out.interface.flush();

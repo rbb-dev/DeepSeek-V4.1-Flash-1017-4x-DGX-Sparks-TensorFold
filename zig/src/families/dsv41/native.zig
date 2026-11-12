@@ -216,6 +216,19 @@
 //!                                               replies' bits without it; needs TF_DS_MMA_SF_EXACT=1 in effect and an
 //!                                               image with the kernels; one line says whether it runs; every rank the
 //!                                               same; the SSD tier's math names it
+//!   TF_DS_DECODE_KSPLIT=1                       a decode round's attention on one exchange a layer instead of two:
+//!                                               wo_b takes this node's own wo_a groups' outputs (its K-half of the
+//!                                               rank's rows) over every output column, so the column-ring cat before
+//!                                               it is gone, and the four nodes' full-width fp32 partials are gathered
+//!                                               and added per TP2 rank in pairs. The order of the fp32 additions
+//!                                               changes, so the last bits of some values differ from the baseline: a
+//!                                               reply is as good, but may take another equally valid path after some
+//!                                               tokens (byte-equality tests do not apply; the quality gate does).
+//!                                               Needs the 2D split on four nodes, the native FP8 checkpoint and a
+//!                                               small file beside the rank's, ksplit{R}of4-<hash>.bin, written with
+//!                                               tf-dsv41-rank-cache --ksplit (wo_b's K-half of every main layer, ~0.39
+//!                                               GiB a node; the rank file and the prompt path are untouched); refuses
+//!                                               to start without it; every rank the same; not in the SSD tier's math
 //!   TF_DS_GEMM_HALVES=1                         a prompt pass of more than 4,096 rows runs its dense FP8, bf16 and pf
 //!                                               GEMMs as row blocks of at most 4,096, each block the launch a
 //!                                               4,096-row pass makes for its rows (the same kernel, split, variant
@@ -1129,6 +1142,7 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_GEMM_R2") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_HEAD_CAND") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_HEAD_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_DECODE_KSPLIT") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_HC_FUSED") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_RING_WORD") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_RING_WORD_SIGNAL") != null);

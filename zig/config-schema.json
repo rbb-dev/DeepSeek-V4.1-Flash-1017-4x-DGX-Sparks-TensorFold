@@ -6850,6 +6850,29 @@
    "secret": false
   },
   {
+   "id": 938,
+   "name": "tf_ds_decode_ksplit",
+   "env": "TF_DS_DECODE_KSPLIT",
+   "group": "other",
+   "tab": "Advanced",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "0",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Decode attention: one exchange a layer",
+   "doc": "Each decoding step normally exchanges data between the Sparks twice in every layer's attention. With this on it exchanges once, which removes 40 of the 169 exchanges a step. The output projection is cut along its input instead of its output, so each node multiplies only its own half and the four full-width partial results are added in pairs. Adding the same numbers in a different order changes the last bits of some values, so replies are as good but can take a different, equally valid path after some tokens; tests that need byte-identical replies do not apply, and the quality gate is the check. It needs the four-node split, the native FP8 checkpoint and a small extra weight file written with tf-dsv41-rank-cache --ksplit (about 0.39 GiB a node); the engine refuses to start without it. Every node must agree.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:1946",
+   "secret": false
+  },
+  {
    "id": 939,
    "name": "tf_ds_hybrid_wait",
    "env": "TF_DS_HYBRID_WAIT",
