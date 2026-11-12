@@ -1436,8 +1436,44 @@ extern "C" __global__ void tf_dsn_pf_tiles_kernel(const int* __restrict__ off, c
     if (threadIdx.x == 0 && blockIdx.x == 0) pf::tiles_of(off, act, nact, pf::kBm, tiles, ntiles);
 }
 
+// A dense GEMM tile's fp32 result into y as whole coalesced lines (the _st kernels: y lies in host-mapped
+// write-combined memory, where the MMA fragment's own stores - a warp's 8 rows of 32 bytes - are partial lines): the tile
+// goes through shared memory in row chunks, then consecutive threads write 16 bytes each along a row. The values are the
+// accumulators', stored as they are.
+template <class C>
+__device__ __forceinline__ void stage_store(const MxArgs& a, int m0, int n0, const float (&acc)[1][C::MT][C::NT][4]) {
+    constexpr int LD = C::BN + 8;  // floats a staged row
+    constexpr int RB = (64 * LD * 4 <= C::SMEM && C::BM % 64 == 0) ? 64 : 32;
+    static_assert(RB * LD * 4 <= C::SMEM && C::BM % RB == 0 && C::BN % 4 == 0, "a staged chunk fits the tile's shared memory");
+    float* tile = reinterpret_cast<float*>(pf::smem);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int wm = warp / C::WGN, wn = warp % C::WGN;
+    asm volatile("cp.async.wait_all;" ::: "memory");
+    for (int c = 0; c < C::BM / RB; c++) {
+        __syncthreads();  // the pipeline's stages (first chunk) and the last chunk's lines are read
+#pragma unroll
+        for (int i = 0; i < C::MT; i++)
+#pragma unroll
+            for (int j = 0; j < C::NT; j++)
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    const int rl = wm * C::WM + i * 16 + g + h * 8;
+                    if (rl / RB != c) continue;
+                    *reinterpret_cast<float2*>(tile + (rl % RB) * LD + wn * C::WN + j * 8 + 2 * t) = make_float2(acc[0][i][j][2 * h], acc[0][i][j][2 * h + 1]);
+                }
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < RB * (C::BN / 4); idx += pf::kThreads) {
+            const int r = idx / (C::BN / 4), c4 = idx % (C::BN / 4);
+            const int m = m0 + c * RB + r;
+            if (m >= a.M) continue;
+            *reinterpret_cast<float4*>(reinterpret_cast<float*>(a.y) + size_t(m) * a.ldy + n0 + c4 * 4) = *reinterpret_cast<const float4*>(tile + r * LD + c4 * 4);
+        }
+    }
+}
+
 // The dense MX GEMM of a prompt chunk (MxArgs as tf_dsn_mx_gemm, FP8 weights, N a multiple of 128, K of 64): grid
 // (N / 128, ceil(M / 128)), 256 threads, kPfGemmSmem dynamic bytes. Splits > 1 fold in the CTA (no partials buffer).
+template <class C, bool FOLD, bool SPLIT = false, bool STAGE = false>
 __device__ __forceinline__ void pf_gemm(const MxArgs& a) {
     __shared__ int srow[C::BM];
     __shared__ uint8_t wss[pf::kWss];
@@ -1451,6 +1487,7 @@ __device__ __forceinline__ void pf_gemm(const MxArgs& a) {
     pf::fp8_scales<C>(wss, o, nkb);
     __syncthreads();
     float acc[1][C::MT][C::NT][4];
+    if constexpr (STAGE) return stage_store<C>(a, m0, o.n0, acc);  // y in write-combined host memory
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int wm = warp / C::WGN, wn = warp % C::WGN;
 #pragma unroll
@@ -1481,6 +1518,15 @@ __device__ __forceinline__ void pf_gemm(const MxArgs& a) {
 // CTA, no partials buffer): tf_dsn_pf_gemm_fold, grid (ceil(M / 64), N / 128).
 extern "C" __global__ void __launch_bounds__(256, PF_MINB) tf_dsn_pf_gemm_kernel(MxArgs a) { pf_gemm<pf::GemmCfg, false>(a); }
 extern "C" __global__ void __launch_bounds__(256, PF_MINB) tf_dsn_pf_gemm_fold_kernel(MxArgs a) { pf_gemm<pf::GemmFoldCfg, true>(a); }
+extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_pf_gemm5_st_kernel(MxArgs a) { pf_gemm<pf::GemmFiveCfg, false, false, true>(a); }
+// The same kernels storing their fp32 tile as whole lines (stage_store), for a y in write-combined host memory (the
+// transport's arena); y fp32, 16-byte aligned, ldy a multiple of 4, no accumulate. Their values are the kernels'.
+extern "C" __global__ void __launch_bounds__(256, PF_MINB) tf_dsn_pf_gemm_st_kernel(MxArgs a) { pf_gemm<pf::GemmCfg, false, false, true>(a); }
+extern "C" __global__ void __launch_bounds__(256, PF_MINB) tf_dsn_pf_gemm_fold_st_kernel(MxArgs a) { pf_gemm<pf::GemmFoldCfg, true, false, true>(a); }
+extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_pf_gemm_splitA_st_kernel(MxArgs a) { pf_gemm<pf::GemmSplitACfg, true, true, true>(a); }
+extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_pf_gemm_splitB_st_kernel(MxArgs a) { pf_gemm<pf::GemmSplitBCfg, true, true, true>(a); }
+extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_pf_gemm_splitC6_st_kernel(MxArgs a) { pf_gemm<pf::GemmSplitC6Cfg, true, true, true>(a); }
+extern "C" __global__ void __launch_bounds__(256, 1) tf_dsn_pf_gemm_splitC7_st_kernel(MxArgs a) { pf_gemm<pf::GemmSplitC7Cfg, true, true, true>(a); }
 
     if (int(blockIdx.y) >= ntiles[0]) return;
     const int2 tl = tiles[blockIdx.y];
@@ -2324,6 +2370,38 @@ extern "C" __global__ void __launch_bounds__(1024) tf_dsn_dec_group_kernel(const
         const int at = so[e] + before;
         ent[at] = i;
         erow[at] = i / S;
+    }
+}
+
+// TF_DS_NACT_LOG (log only; launched by mx.nactLog, never when the log is off): one record a decode launch's grouping, what the weight bytes of
+// the launch's gate / up and down depend on: the rows, the active experts (nact, distinct across the rows), how many of the routed ones this node
+// owns (an unowned expert's rest tiles are not read) and whether the shared expert is among them (sh: 1 active and unowned, 2 active and owned).
+// ring: word 0 the call counter, 8 words of header, then 4 words a record {call + 1, rows << 32 | nact, sh << 32 | owned, 0}.
+extern "C" __global__ void __launch_bounds__(256) tf_dsn_nact_log_kernel(const int* __restrict__ act, const int* __restrict__ nact_p,
+                                                                       const int* __restrict__ owner, int shared, int rows,
+                                                                       unsigned long long* ring) {
+    __shared__ int owned, sh;
+    const int n = nact_p[0];
+    if (threadIdx.x == 0) {
+        owned = 0;
+        sh = 0;
+    }
+    __syncthreads();
+    int mine = 0;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        const int e = act[j];
+        if (e == shared) atomicAdd(&sh, owner == nullptr || owner[e] != 0 ? 2 : 1);
+        else if (owner == nullptr || owner[e] != 0) mine++;
+    }
+    atomicAdd(&owned, mine);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned long long i = atomicAdd(ring, 1ull);
+        unsigned long long* r = ring + 8 + (i & 4095) * 4;
+        r[0] = i + 1;
+        r[1] = ((unsigned long long)rows << 32) | (unsigned)n;
+        r[2] = ((unsigned long long)sh << 32) | (unsigned)owned;
+        r[3] = 0;
     }
 }
 

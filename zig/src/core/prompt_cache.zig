@@ -65,6 +65,7 @@ pub const Snapshots = struct {
 
 /// What a paged store asks of the backend's pages: who holds each, and how many are free.
 pub const Pages = struct {
+// rank 0 lands on every rank inside `poll` (frame kind snap_land and a broadcast of its pieces), so a job is
     ptr: *anyopaque,
     vtable: *const VTable,
     /// Bytes of one page, over every layer.

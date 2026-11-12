@@ -35,6 +35,12 @@ pub fn hcPostRs(t: Tri, gathered: u64, rs: usize, h: u64, post: u64, comb: u64, 
     try t.run("_hc_post", .{ u(rows), u(d / 1024), 1 }, &.{ p("G", "*fp32", gathered), aot.int("RS", @intCast(rs)), p("X", "*bf16", h), p("XOUT", "*bf16", out), p("POST", "*fp32", post), p("COMB", "*fp32", comb) }, &.{ ci("D", d), ci("WORLD", world), ci("BLOCK", 1024), t.pdlConst() });
 }
 
+/// hcPost with the sums from the two bf16 blocks the transport landed (the kit's extra set's _hc_post_2b): block p holds
+/// pair p's D / 2 columns, `rs` elements between the blocks.
+pub fn hcPost2b(t: Tri, blk: u64, rs: usize, h: u64, post: u64, comb: u64, out: u64, rows: usize, d: usize) !void {
+    try t.runExtra("_hc_post_2b", .{ u(rows), u(d / 1024), 1 }, &.{ p("G", "*bf16", blk), aot.int("RS", @intCast(rs)), p("X", "*bf16", h), p("XOUT", "*bf16", out), p("POST", "*fp32", post), p("COMB", "*fp32", comb) }, &.{ ci("D", d), ci("WORLD", 2), ci("BLOCK", 1024), t.pdlConst() });
+}
+
 /// rmsnorm: x [R, D] (row stride xs) bf16 -> out [R, D] (row stride os) bf16.
 pub fn rmsnorm(t: Tri, x: u64, xs: usize, w: u64, out: u64, os: usize, eps: f32, rows: usize, d: usize) !void {
     try t.run("_rmsnorm", .{ u(rows), 1, 1 }, &.{ p("X", "*bf16", x), aot.int("xs", @intCast(xs)), p("W", "*bf16", w), p("OUT", "*bf16", out), aot.int("os_", @intCast(os)), aot.float("eps", eps) }, &.{ ci("D", d), ci("BLOCK", tri.pow2(d)), t.pdlConst() });
@@ -63,6 +69,12 @@ pub fn collapse(t: Tri, h: u64, pre: u64, out: u64, rows: usize, d: usize) !void
 /// engram_gate: h [R, 4, D] bf16, kv [R, 5 D] bf16 (4 keys, the value), qk [4, D] fp32 -> out [R, 4, D].
 pub fn engramGate(t: Tri, h: u64, kv: u64, qk: u64, out: u64, eps: f32, rows: usize, d: usize) !void {
     try t.run("_engram_gate", .{ u(rows), 4, 1 }, &.{ p("H", "*bf16", h), p("KV", "*bf16", kv), p("QK", "*fp32", qk), p("OUT", "*bf16", out), aot.float("eps", eps) }, &.{ ci("D", d), ci("BLOCK", 1024), t.pdlConst() });
+}
+
+/// engramGate with the key and value row from the two bf16 blocks the transport landed (_engram_gate_2b): block p holds the
+/// row's columns [p * 5 D / 2, (p + 1) * 5 D / 2), `rs` elements between the blocks.
+pub fn engramGate2b(t: Tri, h: u64, blk: u64, rs: usize, qk: u64, out: u64, eps: f32, rows: usize, d: usize) !void {
+    try t.runExtra("_engram_gate_2b", .{ u(rows), 4, 1 }, &.{ p("H", "*bf16", h), p("KV", "*bf16", blk), p("QK", "*fp32", qk), p("OUT", "*bf16", out), aot.float("eps", eps), aot.int("RS", @intCast(rs)) }, &.{ ci("D", d), ci("BLOCK", 1024), t.pdlConst() });
 }
 
 // -- conformance with the recorded launches ----------------------------------------------------------------------

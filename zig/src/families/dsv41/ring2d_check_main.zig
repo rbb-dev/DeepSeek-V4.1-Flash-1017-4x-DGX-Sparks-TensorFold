@@ -35,8 +35,11 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("{s}", .{usage});
         return 2;
     }
-    const g = try std.fmt.parseInt(u32, args[1], 10);
+    // RANK: the rank (rank 0 listens); the node it checks is TF_DS_2D_ORDER's (unset: the rank)
+    const rank = try std.fmt.parseInt(u32, args[1], 10);
+    if (rank >= 4) return error.BadRank;
     const ord = try dsv41.prompt2d.order();
+    const g = ord[rank];
     const ip = try dsv41.link.parseIp(args[2]);
     const port = try std.fmt.parseInt(u16, args[3], 10);
     var rows_text: []const u8 = "1,6,16,32,48";
@@ -67,9 +70,14 @@ pub fn main(init: std.process.Init) !u8 {
     var module = try cuda.Module.load(&driver, image);
     defer module.unload();
 
-    var fan = try dsv41.prompt2d.Fan.open(io, ip, port, g, 4);
+    var fan = try dsv41.prompt2d.Fan.open(io, ip, port, rank, 4);
     defer fan.close();
-    var comm = try fan.comm(g, 4);
+    // the rings' queue-pair tables go round over the host links (their own second set of links, as the engine's start makes them)
+    var vfan = try dsv41.prompt2d.Fan.open(io, ip, port + dsv41.prompt2d.host_links_port_offset, rank, 4);
+    defer vfan.close();
+    var star_busy: std.atomic.Value(bool) = .init(false);
+    var comm = dsv41.comm.Comm.init(rank, 4);
+    comm.host = .{ .star = .{ .links = &vfan.links, .rank = rank, .world = 4, .busy = &star_busy } };
     defer comm.deinit();
     if (std.c.getenv("TF_DS_TWO_HOP")) |v| dsv41.comm.two_hop = std.mem.eql(u8, std.mem.span(v), "1"); // a ring of four
     var rings = try ring2d.Rings.open(gpa, io, &driver, try rdma.Kernels.load(module), devices.items, g, .{ .max_bytes = 4456448, .gid_index = gid }, &comm, stream);

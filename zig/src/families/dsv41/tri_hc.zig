@@ -74,6 +74,17 @@ fn runRows(t: Tri, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts
     return t.run(name, grid, a[0 .. args.len + 1], consts);
 }
 
+/// runRows on the kit's extra set (the two-block readers): no base variant is searched.
+fn runRowsExtra(t: Tri, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const, rows: usize) !void {
+    var a: [16]aot.Arg = undefined;
+    @memcpy(a[0..args.len], args);
+    a[args.len] = aot.int("rows", @intCast(rows));
+    // NZ: the -0.0 that plane 1 held, added to each sum as the base function adds it (a value the compiler cannot fold,
+    // so the twin's arithmetic is the base function's instruction for instruction)
+    a[args.len + 1] = aot.float("NZ", -0.0);
+    return t.runExtra(name, grid, a[0 .. args.len + 2], consts);
+}
+
 /// The arguments _hc_finish, _hc_finish_u and _hc_finish_s share: the streams x [R, 4, D] bf16 to collapse and norm.
 fn finishArgs(x: u64, part: u64, base: u64, scale: u64, pre_in: u64, norm_w: u64, out: u64, pre_out: u64, post: u64, comb: u64, eps: f32, hc_eps: f32) [12]aot.Arg {
     return .{
@@ -152,6 +163,14 @@ pub fn hcMixPf(t: Tri, h: u64, fn_w: u64, part: u64, posted: ?Posted, post: u64,
     const consts = [_]aot.Const{ ci("WIDE", 4 * d), ci("D", d), ci("NB", hc_blocks), ci("SUB", 128), ci("MB", 8), ci("RB", rb) };
     if (posted) |ps| {
         std.debug.assert(ps.h_out != h);
+        if (ps.blk_rs != 0) {
+            std.debug.assert(ps.world == 2);
+            try runRowsExtra(t, "_hc_mix_pf_2b", grid, &.{
+                p("X", "*bf16", h),       p("XO", "*bf16", ps.h_out), p("G", "*bf16", ps.gathered), aot.int("RS", @intCast(ps.blk_rs)),
+                p("POST", "*fp32", post), p("COMB", "*fp32", comb),   p("FN", "*fp32", fn_w),       p("PART", "*fp32", part),
+            }, &(consts ++ [_]aot.Const{ ci("WORLD", ps.world), ci("POSTED", 1) }), rows);
+            return ps.h_out;
+        }
         try runRows(t, "_hc_mix_pf", grid, &.{
             p("X", "*bf16", h),       p("XO", "*bf16", ps.h_out), p("G", "*fp32", ps.gathered), aot.int("RS", @intCast(if (ps.rs != 0) ps.rs else rows * d)),
             p("POST", "*fp32", post), p("COMB", "*fp32", comb),   p("FN", "*fp32", fn_w),       p("PART", "*fp32", part),

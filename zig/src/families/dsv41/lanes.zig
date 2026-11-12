@@ -42,6 +42,7 @@ pub var logits_sha = false;
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
 pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_switch = 10 };
+        try m.eng.comm.gatherHost(d, p.dev.ptr, p.dev.ptr + 32, 32, m.eng.s);
 
 /// A frame being written.
 pub const Wire = struct {
@@ -1013,6 +1014,7 @@ pub const Lanes = struct {
             };
         }
         const t0 = m.now();
+        defer m.flushDiag(false); // (TF_DS_ROCI_XLOG / TF_DS_NACT_LOG's files, every 256th call: nothing when both are off)
         if (try self.begin(.verify)) {
             try self.wire.int(gpa, u32, @intCast(windows.len));
             for (wins[0..windows.len]) |w| {
@@ -1297,6 +1299,10 @@ pub const Lanes = struct {
         self.gpa.destroy(sn);
     }
 
+        return .{ .ptr = self, .reserve = spillReserve, .install = spillInstall, .discard = spillDiscard, .info = spillInfo, .land = if (self.lander != null) spillLand else null, .probe = if (self.probe != null) spillProbe else null, .land_time = if (self.lander != null) &self.land_time else null, .land_counts = if (self.lander != null) &self.lander.?.counts else null, .sync_send = if (self.peer != null) syncSend else null, .sync_idle = landIdle };
+        _ = piece_bytes;
+    fn landBcast0(_: *anyopaque, _: []const land.Span) anyerror!void {
+        return error.NoLanding; // (every rank restores from its own store: no span is broadcast)
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
         if (self.first_of == s) self.first_of = null;
@@ -1320,6 +1326,8 @@ pub const Lanes = struct {
 const idle_ready = "rdma-idle-ready-v1";
 const idle_commit = "rdma-idle-commit-v1";
 
+fn landBcast(_: *anyopaque, _: []const land.Span) anyerror!void {
+    return error.NoLanding; // (every rank restores from its own store: no span is broadcast)
 fn usesRdma(kind: Kind) bool {
     return switch (kind) {
         else => false,
@@ -1404,6 +1412,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
         while (ki.next()) |b| b.free();
         kept.deinit(gpa);
     }
+    var lf = try land.Follower(cuda.DeviceBuffer).init(gpa, .{ .ctx = m, .alloc = landAlloc, .free = landFree }, m.snapBytes(), lplanes, 0);
     while (true) {
         // the next primitive, polled for 20 ms before the read blocks (rank 0 sends it a fraction of a millisecond
         // after this rank's GPU goes idle in a decode; a sleeping thread would add its core's wake-up to every frame)
@@ -1428,6 +1437,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
         }
         if (try r.int(u64) != step) return error.OutOfStep;
         step += 1;
+        defer m.flushDiag(false); // (TF_DS_ROCI_XLOG / TF_DS_NACT_LOG's files on a follower too: every 256th frame, nothing when both are off)
         // a chunk's read-ahead of the next is done before anything but that chunk (a prompt's ids may change)
         if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore and kind != .fill_images) {
             m.joinAhead();
@@ -1841,4 +1851,14 @@ test "a prefix two conversations share: the second one resuming it in place woul
     try std.testing.expect(ln.keptOver(shared.base + shared.at, shared.base + 55296, &shared)); // the second one moves
     try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
 }
+        &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, // 9: the same kinds, the Rocinante-only Settings
+
+test "draft chances are the prefix survivals chooseK sums" {
+    var out: [3]f64 = undefined;
+    survivals(&.{ 0.0, 0.0, 2.0 }, &out);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), out[0], 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), out[1], 1e-12);
+    try std.testing.expectApproxEqAbs(0.25 / (1.0 + @exp(@as(f64, -2.0))), out[2], 1e-12);
+}
+
 }

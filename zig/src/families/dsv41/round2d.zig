@@ -8,7 +8,7 @@
 //! which the mixes and Engram's sum then take as on TP2), the head's vocabulary quarters (TP2's [2, R, half]), and two
 //! cat_rank fills of a TP2 rank's whole input from the two pairs' parts: wo_b's rotated input rows (wo_a's epilogue
 //! writes this node's half, wo_b's suh at that half) and the experts' intermediate (between gate / up and down). Here
-//! they go over NCCL (prompt2d.Two's quarters and catRank: the bytes the lane's RDMA rings put there), as round.zig's TP2
+//! they go over the lane's RDMA rings (prompt2d.Two's quarters and catRank), as round.zig's TP2
 //! gathers do; the rings (ring2d.zig) come with the graphs.
 const std = @import("std");
 const prompt = @import("prompt.zig");

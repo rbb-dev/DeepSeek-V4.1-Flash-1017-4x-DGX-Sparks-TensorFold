@@ -22,6 +22,22 @@ pub const stream_non_blocking: c_uint = 1;
 pub const event_disable_timing: c_uint = 2;
 pub const host_alloc_portable: c_uint = 1;
 pub const host_alloc_devicemap: c_uint = 2;
+/// A 64-bit stream wait's condition: the word is at least the value, compared cyclically ((int64)(word - value) >= 0).
+pub const stream_wait_value_geq: c_uint = 0;
+pub const stream_mem_op_wait_value_64: c_uint = 4;
+pub const stream_mem_op_write_value_64: c_uint = 5;
+
+/// One CUstreamBatchMemOpParams (a 48-byte union): the wait or write of one 64-bit word.
+pub const BatchMemOp = extern struct {
+    operation: c_uint,
+    pad0: c_uint = 0,
+    address: DevicePtr,
+    value64: u64,
+    flags: c_uint = 0,
+    pad1: c_uint = 0,
+    alias: DevicePtr = 0,
+    pad2: u64 = 0,
+};
 pub const host_register_devicemap: c_uint = 2;
 pub const host_register_iomemory: c_uint = 4; // the range is device or I/O memory, not RAM
 
@@ -197,6 +213,8 @@ pub const Api = struct {
     cuStreamSynchronize: *const fn (Stream) callconv(.c) R,
     cuStreamWaitEvent: *const fn (Stream, Event, c_uint) callconv(.c) R,
     cuStreamQuery: *const fn (Stream) callconv(.c) R,
+    cuStreamWriteValue64_v2: *const fn (Stream, DevicePtr, u64, c_uint) callconv(.c) R,
+    cuStreamBatchMemOp_v2: *const fn (Stream, c_uint, [*]const BatchMemOp, c_uint) callconv(.c) R,
     cuEventCreate: *const fn (*Event, c_uint) callconv(.c) R,
     cuEventDestroy_v2: *const fn (Event) callconv(.c) R,
     cuEventRecord: *const fn (Event, Stream) callconv(.c) R,
@@ -240,4 +258,5 @@ comptime {
     std.debug.assert(@sizeOf(LaunchConfig) == 56 and @offsetOf(LaunchConfig, "stream") == 32);
     std.debug.assert(@sizeOf(KernelNodeParams) == 72 and @offsetOf(KernelNodeParams, "params") == 40);
     std.debug.assert(@sizeOf(ExecUpdateResultInfo) == 24);
+    std.debug.assert(@sizeOf(BatchMemOp) == 48 and @offsetOf(BatchMemOp, "address") == 8 and @offsetOf(BatchMemOp, "value64") == 16 and @offsetOf(BatchMemOp, "flags") == 24 and @offsetOf(BatchMemOp, "alias") == 32);
 }

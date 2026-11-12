@@ -19,6 +19,14 @@ extern "C" __global__ void tf_ds_add2_bf16_kernel(const float* g0, const float* 
          i += uint64_t(gridDim.x) * blockDim.x) output[i] = __float2bfloat16_rn(__fadd_rn(g0[i], g1[i]));
 }
 
+// Two equal parts of n16 16-byte words copied from s0, s1 to d0, d1 (grid.y picks the part, consecutive threads consecutive
+// words: whole lines): the owner sums' send blocks from device memory into the transport's arena.
+extern "C" __global__ void tf_ds_collect2_kernel(const uint4* s0, uint4* d0, const uint4* s1, uint4* d1, unsigned long long n16) {
+    const uint4* s = blockIdx.y == 0 ? s0 : s1;
+    uint4* d = blockIdx.y == 0 ? d0 : d1;
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += (unsigned long long)gridDim.x * blockDim.x) d[i] = s[i];
+}
+
 // prompt2d ySums (TF_DS_2D_YX): the four nodes' bf16 sums, pieces [4, half, w] (node g = r + 2 p holds rows
 // r * half.. of pair p's columns), widened into dst fp32 [n, 2 w] (exact): a TP2 rank's [n, D] sum in place.
 extern "C" __global__ void tf_ds_ywiden_kernel(const __nv_bfloat16* pieces, float* dst, uint64_t n, uint64_t half,

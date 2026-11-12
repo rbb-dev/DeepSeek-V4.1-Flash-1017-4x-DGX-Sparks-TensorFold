@@ -8,7 +8,7 @@
 //! rotating wo_b's rows; the MoE at top 3 of the routed experts and the shared one), the Markov loop (markov.py: the
 //! vocabulary split over the ranks, the bias rows of 256 frequent tokens cached, each step's bests gathered) and the
 //! confidence head (one fp32 GEMV as torch issues it). The served L2 prefetch forks move no bytes and are left out; the
-//! RDMA gathers are NCCL all-gathers (the same bytes).
+//! RDMA gathers are the rings' gathers (the same bytes).
 const std = @import("std");
 const cuda = @import("cuda");
 const prompt = @import("prompt.zig");
@@ -234,7 +234,10 @@ pub fn printProf() void {
 /// window's first position.
 pub const Item = struct { slot: usize, taps: u64, n: usize, start: usize };
 
+/// The drafter's sublayer gather: fp32 [R, width] partials -> dst [world, R, width] in TP2 rank order (a 2D node: its pair's two,
+/// over the row pair's ring).
 fn pairGather(e: *const Engine, src: u64, dst: u64, R: usize, width: usize) !void {
+    const tw = e.two orelse return error.DecodeNeedsRings;
     return tw.pairGather(e, src, dst, R, width, 4);
 }
 
@@ -245,15 +248,8 @@ const MarkovGather = struct {
 
     fn run(ctx: *anyopaque, send: u64, rows: usize) anyerror!u64 {
         const g: *MarkovGather = @ptrCast(@alignCast(ctx));
-        if (g.e.two) |tw| if (tw.neighbor_gather) |ng| {
-            const neighbor = @import("neighbor.zig");
-            const bytes = try std.math.mul(usize, rows, 16);
-            if (neighbor.eligible(bytes)) {
-                try ng.gather(g.e.s, send, g.dst, bytes);
-                return g.dst;
-            }
-        };
-        try g.e.gatherF32(send, g.dst, rows * 4);
+        // the four nodes' ring carries the bests (rows x 16 bytes a node), in the communicator's rank order
+        const tw = g.e.two orelse return error.DecodeNeedsRings;
         return g.dst;
     }
 };
@@ -348,6 +344,10 @@ pub const PassGraphs = struct {
 
         pub fn failed(s: *Site, err: ?anyerror) void {
             if (err) |x| {
+                std.log.err("drafter pass graph of {d} streams, {d} steps failed on rank {d} while it was recorded: {s}; the pass fails on every rank (restart the engine if replies stop: the ranks' graph state may differ)", .{ s.N, s.steps, s.e.comm.rank, @errorName(x) });
+            } else std.log.err("drafter pass graph of {d} streams, {d} steps failed on another rank while it was recorded; the pass fails on every rank (restart the engine if replies stop: the ranks' graph state may differ)", .{ s.N, s.steps });
+        }
+    };
 };
 
 pub const Drafter = struct {

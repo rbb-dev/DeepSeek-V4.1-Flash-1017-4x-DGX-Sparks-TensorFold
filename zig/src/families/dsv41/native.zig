@@ -1,8 +1,8 @@
 //! DeepSeek-V4.1-Flash behind the native CUDA family interface, tensor parallel over two GPUs: the server's process is
 //! rank 0 (the lane core over lanes.zig's Backend on model.zig), rank 1 is `tf-dsv41-lanes` following it on the other
-//! node (the same model directory, rank cache, kit, pool and port). The ranks link over TCP and NCCL; the inputs
+//! node (the same model directory, rank cache, kit, pool and port). The ranks link over TCP and Rocinante; the inputs
 //! beyond the checkpoint come from the environment:
-//!   TF_TP_WORLD (2), TF_TP_MASTER, TF_TP_PORT   the ranks: rank 0's fabric address and port (rank 1 connects)
+//!   TF_TP_WORLD (4, the only world), TF_TP_MASTER, TF_TP_PORT   the ranks: rank 0's fabric address and port (the followers connect)
 //!   TF_TP_LISTEN                                world 4: rank 0's address for each follower, "a,b,c" (ranks 1-3: the
 //!                                               address each was given; unset: TF_TP_MASTER for all)
 //!   TF_DS_RANK_CACHE                            the lane's per-rank weight files (the Python lane's TF_DS_RANK_CACHE)
@@ -20,6 +20,7 @@
 //!                                               the same (the followers: --round-rows, --streams, or these variables):
 //!                                               a rank that differs from rank 0 stops at the start, as one with
 //!                                               other graphs, graph cap, RDMA devices or drafter does
+//!   TF_RDMA_DEVICES                             the decode gathers over the RDMA ring on these devices (the rings are required)
 //!   TF_DS_GRAPHS=1                              the rounds' stretches as CUDA graphs
 //!   TF_DS_GRAPH_CAP=N                           (with TF_DS_GRAPHS) the captured stretches kept at most, the least
 //!                                               recently replayed destroyed first (0 or unset: all); rank 1's
@@ -139,6 +140,10 @@ pub fn weightBytes(io: std.Io, dir: []const u8) u64 {
 /// Loads rank 0 and links rank 1 (which must start against TF_TP_MASTER:TF_TP_PORT); the pool holds TF_DS_WINDOW
 /// positions (else `o.context`), a stream at most `o.context`. Needs `ctx` current.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
+    api.speed_defaults.applyFamily();
+}
+
+pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !Loaded {
     const world = std.fmt.parseInt(u32, getenv("TF_TP_WORLD") orelse "2", 10) catch return error.BadWorld;
     if (world != 2 and world != 4) return error.NotPortedYet; // TP2, or the four-node 2D split
     const master = link.parseIp(getenv("TF_TP_MASTER") orelse return error.NoMaster) catch return error.BadMaster;
@@ -208,6 +213,27 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     // a follower that stops stops this server too, with a line that names it, instead of a wait on it for good
     st.m.watchPeers() catch |err| std.log.warn("dsv41: rank 0 cannot watch its followers: {s}", .{@errorName(err)});
     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .lane_vision = if (st.vision) |v| v.hook() else null, .fill_rounds = if (st.lanes.fill_chunks > 0) fill_rounds else 0 };
+        // the switches that no longer exist keep the values the shipped settings gave them, so a store written before the NCCL
+        // removal keeps its name (the numerics are the same bytes): pair sums off, quarter-HC and the owner gather on
+        .pair_sum = false,
+        .qhc = two != null,
+        .owner_gather = two != null,
+        .negzero = false,
+        .owner_yx = two != null,
+        .cat_partner = two != null,
+        .front_owned = two != null,
+        .ffn_codes = two != null,
+        .pack_codes = two != null,
+        .engram_owner_sum = two != null,
+        .boundary_owned = two != null,
+        .cat_codes = two != null,
+        .roci = two != null,
+        .roci_collect = false,
+    if (world > 1 and !reconciled) abstainBare(st.gpa, st.m);
+    if (world > 1) {
+    if (world > 1)
+        std.log.info("dsv41 spill: the SSD tier is on: a store on every rank under {s} ({d} GiB, staging {d} MiB; a restore is read by each rank from its own disk, no landing); TF_DS_SSD_FAULT {s}", .{ s.dir, s.gib, s.stagingBytes() >> 20, prompt2d.ssd_fault.text(&fault_buf) });
+    if (m.world < 2 or m.lead.land_slots == 0) return null;
 /// The work this engine ran eagerly after a CUDA graph capture failed on a rank (every rank runs it so, and counts
 /// alike; /metrics shows rank 0's); null without graphs.
 pub fn graphFallbacks(ctx: *anyopaque) ?*const std.atomic.Value(u64) {
@@ -248,6 +274,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     };
 }
 
+    @setEvalBranchQuota(20000);
 test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
@@ -268,6 +295,25 @@ test "an engine with graphs counts its work run eagerly after failed captures; o
     defer m.graphs.?.deinit();
     try std.testing.expect(graphFallbacks(&st).? == &m.graph_fallbacks);
 }
+
+test "the tier's math keeps the values the shipped settings gave the switches that no longer exist, so a store written before keeps its name; all off without a 2D node" {
+    const off = tierMath(null, null);
+    try std.testing.expect(!off.owner_yx and !off.qhc and !off.owner_gather and !off.pair_sum and !off.cat_partner and !off.front_owned and !off.ffn_codes);
+    try std.testing.expect(!off.pack_codes and !off.engram_owner_sum and !off.boundary_owned and !off.cat_codes and !off.roci and !off.negzero);
+    var t: prompt2d.Two = undefined;
+    t.idx_proj_owned = false;
+    t.idx_shard = false;
+    const on = tierMath(&t, null);
+    try std.testing.expect(on.qhc and on.owner_gather and on.owner_yx and on.cat_partner and on.front_owned and on.ffn_codes);
+    try std.testing.expect(on.pack_codes and on.engram_owner_sum and on.boundary_owned and on.cat_codes and on.roci);
+    try std.testing.expect(!on.pair_sum and !on.negzero and !on.roci_collect and !on.idx_shard);
+    // the name's text, as it was written when these were agreed flags
+    var buf: [768]u8 = undefined;
+    const text = try spill_start.mathText(&buf, on);
+    try std.testing.expect(std.mem.startsWith(u8, text, "pair_sum=0 qhc=1 owner_gather=1 idx_shard=0 idx_rb="));
+    try std.testing.expect(std.mem.indexOf(u8, text, " negzero=0 replay_floor=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, " owner_yx=1 cat_partner=1 front_owned=1 ffn_codes=1 pack_codes=1 engram_owner_sum=1 boundary_owned=1 cat_codes=1 pf_split=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, " roci=1") != null and std.mem.indexOf(u8, text, "roci_collect") == null);
 }
 
 test "passRows takes multiples of the resume grid up to the pass rows" {

@@ -428,7 +428,7 @@ def meta() -> dict:
 
     out = {"torch": torch.__version__, "triton": triton.__version__, "cuda": torch.version.cuda,
            "python": sys.version.split()[0], "argv": sys.argv, "pid": os.getpid(),
-           "env": {k: v for k, v in os.environ.items() if k.startswith(("TF_", "TRITON_", "CUBLAS", "NCCL_", "TORCH_"))}}
+           "env": {k: v for k, v in os.environ.items() if k.startswith(("TF_", "TRITON_", "CUBLAS", "TORCH_"))}}
     try:
         import tensorfold
 

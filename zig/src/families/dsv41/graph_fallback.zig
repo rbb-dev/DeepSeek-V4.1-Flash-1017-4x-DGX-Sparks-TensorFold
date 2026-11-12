@@ -68,6 +68,8 @@ pub const Outcome = enum { keep, eager, fail };
 
 pub const ballot_len = 11;
 
+/// A rank's ballot: [failed after the recording, failed during it, captured, the collective calls it recorded as 4 bytes, the
+/// complements of those bytes]. The ranks' byte-wise largest (Engine.agreeCapture: max over bytes) tells whether any
 /// rank failed each way, whether any captured, and whether every rank recorded as many calls: max(b) + max(255 - b)
 /// is 255 only when every rank has the same byte b.
 pub fn ballot(stage: Stage, calls: u32) [ballot_len]u8 {
@@ -86,7 +88,9 @@ pub fn ballot(stage: Stage, calls: u32) [ballot_len]u8 {
 /// The ranks' choice from their ballots' byte-wise largest, the same on every rank:
 ///   none failed: keep;
 ///   every failure came once the work was recorded whole: every rank recorded the same exchanges, so eager;
+///   every rank failed during the recording after as many collective calls (one launch failing alike everywhere: a kit
 ///   without its variant): eager, which meets the same failure on every rank and fails the round cleanly;
+///   else (a rank cut short alone, ranks that recorded different collective calls): fail, since the collectives' state on one
 ///   rank may now differ from the others' (an RDMA ring's sequence lives on the device, untouched by a recording).
 pub fn decide(m: [ballot_len]u8) Outcome {
     const after = m[0] != 0;
@@ -145,9 +149,11 @@ pub fn Lazy(comptime G: type, comptime Key: type) type {
         /// and kept (store.keep), run eagerly with the key held (site.undo first), or failed (site.failed). `site`: the
         /// work (body), its host state put back (undo), its forks closed after a capture cut short (abort), the kept
         /// value (value), the log lines (fellBack, failed); `store`: room for the key (reserve) and the keeping (keep);
+        /// `ranks`: the votes (agreeAll, agreeCapture), this rank's collective calls so far (calls), a test's injected failure
         /// (injected).
         pub fn run(l: *Self, gpa: std.mem.Allocator, s: G.Stream, key: Key, site: anytype, store: anytype, ranks: anytype) anyerror!void {
             if (l.holds.eager(key)) return site.body();
+            // room for the key in the store and among the holds, made and agreed before anyone records: a collective needs
             // every rank to capture the same collectives (a rank that skipped the capture would leave the others'
             // recorded exchanges unmatched), and nothing after the vote below may fail on one rank alone. No room
             // anywhere: nothing is recorded anywhere, and every rank runs the work as it is.
@@ -286,9 +292,11 @@ const TestKey = struct { rows: u32, bucket: u64 };
 const Kept = struct { exec: Fake.Exec, state: u32 };
 
 /// This rank's peers in the votes: their ballots (the same for every vote), whether they found room, and this rank's
+/// collective calls (the site's body makes them).
 const FakeRanks = struct {
     others: []const struct { Stage, u32 } = &.{ .{ .ok, 0 }, .{ .ok, 0 }, .{ .ok, 0 } },
     others_room: bool = true,
+    collectives: u32 = 0,
     inject_at: ?u64 = null,
     votes: u32 = 0, // agreeAll's and agreeCapture's
     vote_fails: ?anyerror = null,
@@ -312,6 +320,7 @@ const FakeRanks = struct {
     }
 
     pub fn calls(r: *FakeRanks) u32 {
+        return r.collectives;
     }
 
     pub fn injected(r: *FakeRanks, nth: u64) bool {
@@ -319,6 +328,7 @@ const FakeRanks = struct {
     }
 };
 
+/// A fake site: its host state (a counter its body bumps), its collective calls (3 a body, 1 when it fails in its work), its
 /// runs captured and eager, its undos and aborts, its log lines, injected failures.
 const FakeSite = struct {
     f: *Fake,
@@ -336,12 +346,14 @@ const FakeSite = struct {
         s.state += 1;
         if (s.f.capturing) {
             if (s.body_fails) |e| {
+                s.r.collectives +%= 1;
                 return e;
             }
         } else {
             s.eager_runs += 1;
             if (s.eager_fails) |e| return e;
         }
+        s.r.collectives +%= 3;
     }
 
     pub fn undo(s: *FakeSite) void {
@@ -462,15 +474,18 @@ test "the ranks keep their graphs when none failed, and run eagerly when every f
     try std.testing.expectEqual(Outcome.eager, outcomeOf(&.{.{ .after, 7 }}));
 }
 
+test "a failure during the recording runs eagerly only when every rank failed after as many collective calls" {
     // a launch no rank can make (a kit without its variant): every rank stops at it
     try std.testing.expectEqual(Outcome.eager, outcomeOf(&.{ .{ .during, 12 }, .{ .during, 12 }, .{ .during, 12 }, .{ .during, 12 } }));
     try std.testing.expectEqual(Outcome.eager, outcomeOf(&.{ .{ .during, 12 }, .{ .after, 12 }, .{ .during, 12 }, .{ .after, 12 } }));
+    // one rank cut short alone: the others recorded on, so the collectives' state may differ (G0.3's answer: the round fails)
     try std.testing.expectEqual(Outcome.fail, outcomeOf(&.{ .{ .ok, 40 }, .{ .during, 12 }, .{ .ok, 40 }, .{ .ok, 40 } }));
     try std.testing.expectEqual(Outcome.fail, outcomeOf(&.{ .{ .ok, 12 }, .{ .during, 12 }, .{ .ok, 12 }, .{ .ok, 12 } }));
     // every rank cut short, at different calls
     try std.testing.expectEqual(Outcome.fail, outcomeOf(&.{ .{ .during, 12 }, .{ .during, 13 }, .{ .during, 12 }, .{ .during, 12 } }));
 }
 
+test "the ranks' collective calls compare in every byte: counts that differ by 256 or by the top byte are not the same" {
     try std.testing.expectEqual(Outcome.fail, outcomeOf(&.{ .{ .during, 5 }, .{ .during, 5 + 256 } }));
     try std.testing.expectEqual(Outcome.fail, outcomeOf(&.{ .{ .during, 0 }, .{ .during, 1 << 24 } }));
     try std.testing.expectEqual(Outcome.fail, outcomeOf(&.{ .{ .during, 0x01020304 }, .{ .during, 0x04030201 } }));
@@ -527,6 +542,7 @@ test "this rank's failure at begin, in its work, at the capture's end or its ins
         var w: World = .{};
         defer w.deinit();
         w.f.fail_at = c.at;
+        // the others as this rank: the same stage, and as many collective calls when they failed in their work (none at begin)
         const theirs: u32 = if (c.at == .begin) 0 else if (c.in_body) 1 else 3;
         const others = [_]struct { Stage, u32 }{ .{ c.others, theirs }, .{ c.others, theirs }, .{ c.others, theirs } };
         w.r.others = &others;
@@ -695,7 +711,9 @@ test "a failed launch of a graph every rank kept is returned, and nothing is kep
 test "a vote that fails is returned, this rank's graph dropped" {
     var w: World = .{};
     defer w.deinit();
+    w.r.vote_fails = error.VoteFailed;
     var s = w.site();
+    try std.testing.expectError(error.VoteFailed, w.run(.{ .rows = 4, .bucket = 1024 }, &s));
     try std.testing.expectEqual(@as(i32, 0), w.f.execs);
     try std.testing.expectEqual(@as(u32, 0), w.f.calls.get(.launch));
     try std.testing.expectEqual(@as(usize, 0), w.st.map.count());

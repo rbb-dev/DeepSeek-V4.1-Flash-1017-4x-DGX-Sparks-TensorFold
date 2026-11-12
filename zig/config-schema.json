@@ -1,0 +1,254 @@
+   "name": "tf_ds_bf16_rows",
+   "env": "TF_DS_BF16_ROWS",
+   "unit": "rows",
+   "first_use": "families/dsv41/model.zig:1685",
+  },
+  {
+   "id": 981,
+   "name": "tf_ds_roci_xlog",
+   "env": "TF_DS_ROCI_XLOG",
+   "group": "transport",
+   "tab": "Transport",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "0",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Exchange log (capture matching)",
+   "doc": "Diagnostics, log only: the decode ring's peers kernel records, for each exchange and peer, the sequence and, on the GPU's own clock, when the kernel started, when that peer's words were all in and when the copy-out ended (a ring of 8,192 records in device memory, 256 KiB); each rank writes roci-xlog-rank<R>.txt when its ring closes. Per rank, wait and copy-out are then exact (one clock), and captures from the four ranks pair on the sequence instead of by time. Costs a few stores, two clock reads and one block barrier on each exchange's copy-out when on, nothing when off. Replies unchanged.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:2280",
+   "secret": false
+  },
+  {
+   "id": 982,
+   "name": "tf_ds_roci_xlog_dir",
+   "env": "TF_DS_ROCI_XLOG_DIR",
+   "group": "transport",
+   "tab": "Transport",
+   "kind": "text",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "",
+   "default_text": "the folder's log directory ($HOME/.cache/dsv41-tensorfold/logs)",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Exchange log folder",
+   "doc": "Where TF_DS_ROCI_XLOG writes each rank's roci-xlog-rank<R>.txt when the ring closes; unset: the folder's log directory ($HOME/.cache/dsv41-tensorfold/logs). Created if missing. Only read with TF_DS_ROCI_XLOG=1.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/rdma.zig:1550",
+   "secret": false
+  },
+  {
+   "id": 984,
+   "name": "tf_ds_nact_log",
+   "env": "TF_DS_NACT_LOG",
+   "group": "decode",
+   "tab": "Generation",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "0",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Expert count log",
+   "doc": "Diagnostics, log only: every decode launch's grouping appends a record (rows, distinct experts, how many this node owns, whether the shared expert is active) to a 4,096-record device ring, written to nact-rank<R>.txt every 256th call and at close: what a launch's gate/up and down weight bytes are, which no other counter keeps. Off: no launch and no copy. Replies unchanged.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:2674",
+   "secret": false
+  },
+  {
+   "id": 985,
+   "name": "tf_ds_nact_dir",
+   "env": "TF_DS_NACT_DIR",
+   "group": "decode",
+   "tab": "Generation",
+   "kind": "text",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "",
+   "default_text": "the folder's log directory ($HOME/.cache/dsv41-tensorfold/logs)",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Expert count log folder",
+   "doc": "Where TF_DS_NACT_LOG writes nact-rank<R>.txt; unset: the folder's log directory ($HOME/.cache/dsv41-tensorfold/logs). Created if missing. Only read with TF_DS_NACT_LOG=1.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:974",
+   "secret": false
+ ],
+ "retired": [
+  {
+   "env": "TF_DS_ROCI",
+   "when": "set",
+   "why": "Rocinante is the only transport"
+  },
+  {
+   "env": "TF_DS_ROCI_CODES",
+   "when": "set",
+   "why": "Rocinante is the only transport"
+  },
+  {
+   "env": "TF_DS_ROCI_GATHERS",
+   "when": "set",
+   "why": "Rocinante is the only transport"
+  },
+  {
+   "env": "TF_DS_ROCI_ANY",
+   "when": "set",
+   "why": "Rocinante is the only transport"
+  },
+  {
+   "env": "TF_DS_ROCI_DEC",
+   "when": "set",
+   "why": "Rocinante is the only transport"
+  },
+  {
+   "env": "TF_DS_ROCI_DECODE",
+   "when": "set",
+   "why": "Rocinante is the only transport"
+  },
+  {
+   "env": "TF_DS_ROCI_STARTUP",
+   "when": "set",
+   "why": "Rocinante is the only transport"
+  },
+  {
+   "env": "TF_DS_ROCI_SSD",
+   "when": "set",
+   "why": "Rocinante is the only transport"
+  },
+  {
+   "env": "TF_DS_SSD_EVERY_RANK",
+   "when": "set",
+   "why": "Rocinante is the only transport"
+  },
+  {
+   "env": "TF_DS_OWNER_YX",
+   "when": "set",
+   "why": "the exchange it selected is always on: Rocinante is the only transport"
+  },
+  {
+   "env": "TF_DS_QUARTER_HC",
+   "when": "set",
+   "why": "the exchange it selected is always on: Rocinante is the only transport"
+  },
+  {
+   "env": "TF_DS_CAT_PARTNER",
+   "when": "set",
+   "why": "the exchange it selected is always on: Rocinante is the only transport"
+  },
+  {
+   "env": "TF_DS_CAT_CODES",
+   "when": "set",
+   "why": "the exchange it selected is always on: Rocinante is the only transport"
+  },
+  {
+   "env": "TF_DS_PACK_CODES",
+   "when": "set",
+   "why": "the exchange it selected is always on: Rocinante is the only transport"
+  },
+  {
+   "env": "TF_DS_FRONT_OWNED",
+   "when": "set",
+   "why": "the exchange it selected is always on: Rocinante is the only transport"
+  },
+  {
+   "env": "TF_DS_FFN_CODES",
+   "when": "set",
+   "why": "the exchange it selected is always on: Rocinante is the only transport"
+  },
+  {
+   "env": "TF_DS_BOUNDARY_OWNED",
+   "when": "set",
+   "why": "the exchange it selected is always on: Rocinante is the only transport"
+  },
+  {
+   "env": "TF_DS_ENGRAM_OWNER_SUM",
+   "when": "set",
+   "why": "the exchange it selected is always on: Rocinante is the only transport"
+  },
+  {
+   "env": "TF_DS_ROCI_COLLECT",
+   "when": "set",
+   "why": "the owner sums' copy-out variant was removed with the NCCL paths; the owner sums go over Rocinante straight from the arena"
+  },
+  {
+   "env": "TF_DS_ROCI_COMBINE_FIRST",
+   "when": "set",
+   "why": "the four-launch routed sum was removed; TF_DS_ROCI_COMBINE_DOOR is the fused send"
+  },
+  {
+   "env": "TF_DS_ROCI_PAGES",
+   "when": "set",
+   "why": "Rocinante's arena is always locked anonymous pages registered with cuMemHostRegister"
+  },
+  {
+   "env": "TF_DS_ENGRAM_OWNED",
+   "when": "on",
+   "why": "the owned Engram records were combined by an NCCL all-reduce; every Spark reads whole tables (TF_DS_ENGRAM_OWNED=0 is the only state)"
+  },
+  {
+   "env": "TF_DS_LINK_GRAPHS",
+   "when": "set",
+   "why": "the ring-link topology ran on NCCL's two-rank communicators; the engine has no NCCL"
+  },
+  {
+   "env": "TF_DS_PAIR_SUM",
+   "when": "set",
+   "why": "pair sums ran over NCCL's ring links; the engine has no NCCL"
+  },
+  {
+   "env": "TF_DS_PAIR_SUM_NEGZERO",
+   "when": "set",
+   "why": "pair sums ran over NCCL's ring links; the engine has no NCCL"
+  },
+  {
+   "env": "TF_DS_OWNER_GATHER",
+   "when": "set",
+   "why": "it only served the pair sums over NCCL's ring links; the engine has no NCCL"
+  },
+  {
+   "env": "TF_DS_NCCL_CPUS",
+   "when": "set",
+   "why": "the engine has no NCCL threads to pin"
+  },
+  {
+   "env": "NCCL_GRAPH_FILE",
+   "when": "set",
+   "why": "the engine has no NCCL"
+  },
+  {
+   "env": "TF_DS_DRAFT_LINK",
+   "when": "set",
+   "why": "the drafter's pair gather over NCCL's ring links is gone; the pair's gather rides the row pair's ring"
+  },
+  {
+   "when": "on",
+   "when": "set",
+   "when": "set",
+   "when": "on",
+   "when": "on",
+   "when": "set",
+   "when": "set",
+  }

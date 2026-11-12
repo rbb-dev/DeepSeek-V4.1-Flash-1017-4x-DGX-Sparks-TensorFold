@@ -26,6 +26,7 @@ pub const Ops = struct {
     to_f32: cuda.Function,
     f16_to_f32: cuda.Function,
     add2_bf16: cuda.Function,
+    collect2_fn: cuda.Function,
     ywiden: cuda.Function,
     topk_i64: cuda.Function,
     topk_indices: cuda.Function,
@@ -63,6 +64,7 @@ pub const Ops = struct {
             .to_f32 = try pw.function("tf_bf16_to_f32_kernel"),
             .f16_to_f32 = try fm.function("tf_ds_f16_to_f32_kernel"),
             .add2_bf16 = try fm.function("tf_ds_add2_bf16_kernel"),
+            .collect2_fn = try fm.function("tf_ds_collect2_kernel"),
             .ywiden = try fm.function("tf_ds_ywiden_kernel"),
             .topk_i64 = try fm.function("tf_ds_topk_i64_kernel"),
             .topk_indices = try fm.function("tf_ds_topk_indices_kernel"),
@@ -127,6 +129,22 @@ pub const Ops = struct {
         a.add(out);
         a.add(@as(u64, count));
         try go(o.add2_bf16, s, blocks(count, 256), 256, &a);
+    }
+
+    /// TF_DS_ROCI_COLLECT: two parts of `bytes` each (a multiple of 16, 16-byte aligned) copied from s0, s1 to d0, d1 in one launch,
+    /// 16 bytes a thread along each part: the owner sums' send blocks from device memory into the transport's arena as whole lines.
+    pub fn collect2(o: *const Ops, s: cuda.Stream, s0: u64, d0: u64, s1: u64, d1: u64, bytes: usize) !void {
+        if (bytes == 0) return;
+        if (bytes % 16 != 0 or (s0 | d0 | s1 | d1) % 16 != 0) return error.Unaligned;
+        const n16: u64 = bytes / 16;
+        var a: cuda.Args = .{};
+        a.add(s0);
+        a.add(d0);
+        a.add(s1);
+        a.add(d1);
+        a.add(n16);
+        const bx: u32 = @intCast(@min((n16 + 255) / 256, 384));
+        try cuda.launch.launch(o.collect2_fn, .{ .grid = .{ .x = bx, .y = 2 }, .block = .{ .x = 256 } }, s, &a);
     }
 
     /// prompt2d ySums: pieces bf16 [4, half, w] -> dst fp32 [n, 2 w], widened exactly (tf_ds_ywiden_kernel).

@@ -1,5 +1,6 @@
 //! Streams and events: ordering, waits and GPU-side timing.
 
+const std = @import("std");
 const abi = @import("abi.zig");
 const Driver = @import("driver.zig").Driver;
 const Error = @import("driver.zig").Error;
@@ -31,6 +32,20 @@ pub const Stream = struct {
             else => return e,
         };
         return true;
+    }
+
+    /// A write of the 64-bit `value` to the mapped word `addr` (a device address of host memory), after the work queued
+    /// before it; the driver fences the earlier work's stores first. It holds no SM.
+    pub fn writeValue64(self: Stream, addr: abi.DevicePtr, value: u64) Error!void {
+        try self.d.check(self.d.api.cuStreamWriteValue64_v2(self.handle, addr, value, 0), "cuStreamWriteValue64");
+    }
+
+    /// Waits for every (word, value) pair in one batch: all at least their values.
+    pub fn waitValues64(self: Stream, words: []const abi.DevicePtr, values: []const u64) Error!void {
+        std.debug.assert(words.len == values.len and words.len <= 8);
+        var ops: [8]abi.BatchMemOp = undefined;
+        for (words, values, 0..) |w, v, i| ops[i] = .{ .operation = abi.stream_mem_op_wait_value_64, .address = w, .value64 = v, .flags = abi.stream_wait_value_geq };
+        try self.d.check(self.d.api.cuStreamBatchMemOp_v2(self.handle, @intCast(words.len), &ops, 0), "cuStreamBatchMemOp");
     }
 
     pub fn wait(self: Stream, event: Event) Error!void {

@@ -78,12 +78,129 @@ pub const Kernels = struct {
     stage: cuda.Function,
     collect: cuda.Function,
     collect_into: cuda.Function,
+    // TF_DS_ROCI_XLOG's variants of the three kernels that log (rdma_gather.cu, after the originals; null in an older fatbin). The host launches them
+    // ONLY with the log on: the originals above carry no logging code, so with the log off the exchange runs the instructions it ran before the log.
+    stage_wait_x: ?cuda.Function = null,
+    publish_wait_x: ?cuda.Function = null,
+    collect_peers_roci_x: ?cuda.Function = null,
 
     pub fn load(m: cuda.Module) cuda.Error!Kernels {
-        return .{ .stage = try m.function("dsv41_rdma_stage"), .collect = try m.function("dsv41_rdma_collect"), .collect_into = try m.function("dsv41_rdma_collect_into") };
+        return .{ .stage = try m.function("dsv41_rdma_stage"), .collect = try m.function("dsv41_rdma_collect"), .collect_into = try m.function("dsv41_rdma_collect_into"), .collect_peers = m.function("dsv41_rdma_collect_peers") catch null, .collect_roci = m.function("dsv41_rdma_collect_roci") catch null, .collect_into_roci = m.function("dsv41_rdma_collect_into_roci") catch null, .collect_peers_roci = m.function("dsv41_rdma_collect_peers_roci") catch null, .publish = m.function("dsv41_rdma_publish") catch null, .await_send = m.function("dsv41_rdma_await_send") catch null, .stage_wait = m.function("dsv41_rdma_stage_wait") catch null, .publish_wait = m.function("dsv41_rdma_publish_wait") catch null, .await_send_wait = m.function("dsv41_rdma_await_send_wait") catch null, .stage_wait_x = m.function("dsv41_rdma_stage_wait_x") catch null, .publish_wait_x = m.function("dsv41_rdma_publish_wait_x") catch null, .collect_peers_roci_x = m.function("dsv41_rdma_collect_peers_roci_x") catch null };
+    /// The kernel to launch for a plain one and its logging variant: the variant when TF_DS_ROCI_XLOG is on and the fatbin has it, else the plain one.
+    fn pick(plain: ?cuda.Function, x: ?cuda.Function) struct { f: ?cuda.Function, logging: bool } {
+        if (xlog) if (x) |xf| return .{ .f = xf, .logging = true };
+        return .{ .f = plain, .logging = false };
+    }
+
     }
 };
 
+/// A diagnostic log's file (TF_DS_ROCI_XLOG, TF_DS_NACT_LOG): `text` to <dir named by the environment variable `dir_env`, else the folder's log
+/// directory $HOME/.cache/dsv41-tensorfold/logs>/<name>, the directory and its parents made if missing. True when written; a failure is a log
+/// line, never an error: these are measurement aids.
+pub fn diagWriteFile(dir_env: [:0]const u8, name: []const u8, text: []const u8) bool {
+    var dirbuf: [512]u8 = undefined;
+    const dir: []const u8 = if (std.c.getenv(dir_env.ptr)) |v| std.mem.span(v) else blk: {
+        const home = std.c.getenv("HOME") orelse "/tmp";
+        break :blk std.fmt.bufPrint(&dirbuf, "{s}/.cache/dsv41-tensorfold/logs", .{std.mem.span(home)}) catch "/tmp";
+    };
+    var pathbuf: [640:0]u8 = undefined;
+    var i: usize = 1;
+    while (i <= dir.len) : (i += 1) {
+        if (i == dir.len or dir[i] == '/') {
+            const part = std.fmt.bufPrintSentinel(&pathbuf, "{s}", .{dir[0..i]}, 0) catch return false;
+            _ = std.c.mkdir(part.ptr, 0o755);
+        }
+    }
+    const path = std.fmt.bufPrintSentinel(&pathbuf, "{s}/{s}", .{ dir, name }, 0) catch return false;
+    const f = std.c.fopen(path.ptr, "w") orelse {
+        std.log.warn("{s}: cannot write {s}", .{ dir_env, path });
+        return false;
+    };
+    defer _ = std.c.fclose(f);
+    _ = std.c.fwrite(text.ptr, 1, text.len, f);
+    return true;
+}
+
+/// The exchange log's file name for a ring: `roci-xlog-rank<R>.txt` for the four nodes' ring (the decode exchanges' and the report's default), a suffix for
+/// the column and row rings (their sequences are their own, and three rings writing one name overwrote one another).
+pub fn xlogFileName(buf: []u8, rank: u32, ring_name: []const u8) ?[]const u8 {
+    const sfx: []const u8 = if (std.mem.indexOf(u8, ring_name, "four") != null) "" else if (std.mem.indexOf(u8, ring_name, "column") != null) "-col" else if (std.mem.indexOf(u8, ring_name, "row") != null) "-row" else "-other";
+    return std.fmt.bufPrint(buf, "roci-xlog-rank{d}{s}.txt", .{ rank, sfx }) catch null;
+}
+
+/// TF_DS_ROCI_XLOG=1 (read at Model.open; log only, off by default): the peers kernel logs, in a ring of `xlog_records`, the sequence and the
+/// time (its GPU's globaltimer) at which each peer's words were all in. A capture then matches every exchange across ranks by sequence
+/// instead of by time; read it with Ring.xlogRead after the stream is synchronized.
+pub var xlog: bool = false;
+pub const xlog_records = 8192; // the doorbell log's records: one a sequence, 8,192 sequences (~48 decode rounds)
+/// The receive log's records, four words each: indexed (sequence * 8 + peer) & (xlog_recv_records - 1), so it holds the last xlog_recv_records / 8 = 8,192 SEQUENCES (~48 decode
+/// rounds at 169 exchanges), as many as the doorbell log. 1,024 (the first size: 8,192 records) left the ranks' files without a common sequence: each rank's file is written at
+/// its own time (every 256th call or 3 s), rank 0's ~1,330 exchanges before the followers', so the receive windows of 1,024 sequences did not overlap and the report matched none (#398).
+pub const xlog_recv_records = 65536; // 2 MiB of the fault buffer
+/// This rank's own doorbells (the sender side, one per exchange): the sequence and this GPU's clock just after the doorbell store, a ring of
+/// `xlog_records` in the fault buffer behind the receive records (xlog_recv_records); written by the card-WAIT staging / publishing kernels (their `probe` argument,
+/// tagged with bit 0, points at it). A peer's words-in time minus this, once the two GPUs' clocks are fitted, is the wire.
+pub const XlogPub = struct { seq: u64, at_ns: u64 };
+
+pub fn xlogPubDecode(words: []const u64, out: []XlogPub) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i + 1 < words.len and n < out.len) : (i += 2) {
+        if (words[i + 1] == 0) continue;
+        out[n] = .{ .seq = words[i], .at_ns = words[i + 1] };
+        n += 1;
+    }
+    return n;
+}
+
+pub const XlogRec = struct { seq: u64, peer: u32, at_ns: u64, start_ns: u64 = 0, end_ns: u64 = 0 };
+
+/// The log's records from the device words (four a record: sequence << 3 | peer, the clock when the peer's words were all in, the kernel's
+/// start, and the end of the last block's copy-out; a slot never written has clock 0), in ring
+/// order, up to out.len. The kernel's layout is the only reader of this: rdma_gather.cu (collect_peers_roci).
+pub fn xlogDecode(words: []const u64, out: []XlogRec) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i + 3 < words.len and n < out.len) : (i += 4) {
+        if (words[i + 1] == 0) continue;
+        out[n] = .{ .seq = words[i] >> 3, .peer = @truncate(words[i] & 7), .at_ns = words[i + 1], .start_ns = words[i + 2], .end_ns = words[i + 3] };
+        n += 1;
+    }
+    return n;
+}
+
+/// One rank's log file: a header line naming the rank, the world, the ring and its slot count (so four files pair on the sequence with no other
+/// context), then one line a record sorted by sequence and peer: `seq peer words_in_ns start_ns end_ns` (this rank's GPU globaltimer, a clock of its own; end_ns 0: not written).
+pub fn xlogRender(gpa: std.mem.Allocator, rank: u32, world: u32, ring: []const u8, slots: u32, recs: []XlogRec) ![]u8 {
+    return xlogRenderPub(gpa, rank, world, ring, slots, recs, &.{});
+}
+
+/// xlogRender with this rank's doorbell records after the receive records, one `P seq at_ns` line each, sorted by sequence (the header says how many).
+pub fn xlogRenderPub(gpa: std.mem.Allocator, rank: u32, world: u32, ring: []const u8, slots: u32, recs: []XlogRec, pubs: []XlogPub) ![]u8 {
+    std.mem.sort(XlogPub, pubs, {}, struct {
+        fn less(_: void, a: XlogPub, b: XlogPub) bool {
+            return a.seq < b.seq;
+        }
+    }.less);
+    std.mem.sort(XlogRec, recs, {}, struct {
+        fn less(_: void, a: XlogRec, b: XlogRec) bool {
+            return if (a.seq != b.seq) a.seq < b.seq else a.peer < b.peer;
+        }
+    }.less);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    if (pubs.len == 0) {
+        try out.print(gpa, "# TF_DS_ROCI_XLOG v1 rank={d} world={d} ring=\"{s}\" slots={d} records={d} clock=globaltimer_ns\n", .{ rank, world, ring, slots, recs.len });
+    } else try out.print(gpa, "# TF_DS_ROCI_XLOG v1 rank={d} world={d} ring=\"{s}\" slots={d} records={d} pubs={d} clock=globaltimer_ns\n", .{ rank, world, ring, slots, recs.len, pubs.len });
+    for (recs) |q| try out.print(gpa, "{d} {d} {d} {d} {d}\n", .{ q.seq, q.peer, q.at_ns, q.start_ns, q.end_ns });
+    for (pubs) |q| try out.print(gpa, "P {d} {d}\n", .{ q.seq, q.at_ns });
+    return out.toOwnedSlice(gpa);
+}
+
+        const pr = Kernels.pick(k.collect_peers_roci, k.collect_peers_roci_x);
+        if (s.collect_peers) if (pr.f) |f| {
+            b.add(w.fault | @intFromBool(pr.logging)); // (the logging variant takes the address tagged with bit 0 and strips it)
 /// cuMemHostRegister / cuMemHostUnregister, which the runtime's driver table does not hold.
 const HostReg = struct {
     lib: std.DynLib,
@@ -288,6 +405,7 @@ pub const Ring = struct {
         errdefer scalars.free();
         try scalars.fill8(0, null);
         r.* = .{ .d = d, .verbs = verbs, .k = k, .s = s, .rank = rank, .world = world, .hr = hr, .send = send, .recv = recv, .meta = meta, .scalars = scalars };
+            fault = try cuda.DeviceBuffer.alloc(d, 64 + xlog_recv_records * 32 + xlog_records * 16);
         r.v = &r.verbs;
         errdefer for (r.nics[0..r.nd]) |*n| r.closeNic(n);
         for (devices) |name| {
@@ -364,6 +482,7 @@ pub const Ring = struct {
     }
 
     pub fn destroy(r: *Ring, gpa: std.mem.Allocator) void {
+        r.xlogWriteFile();
         r.stop();
         for (r.nics[0..r.nd]) |*n| r.closeNic(n);
         r.scalars.free();
@@ -503,19 +622,46 @@ pub const Ring = struct {
     fn fail(r: *Ring, why: []const u8) void {
         r.failLocal(why);
         if (r.failure_peer) |peer| peer.failLocal(why);
+    /// The exchange log (TF_DS_ROCI_XLOG): the records written so far, in ring order, empty slots left out; call after the stream is
+    /// synchronized. Returns the count.
+    pub fn xlogRead(r: *Ring, out: []XlogRec) usize {
+        const b = r.fault orelse return 0;
+        if (!xlog) return 0;
+        const words = std.heap.page_allocator.alloc(u64, xlog_recv_records * 4) catch return 0;
+        defer std.heap.page_allocator.free(words);
+        b.download(64, std.mem.sliceAsBytes(words)) catch return 0;
+        return xlogDecode(words, out);
     }
 
-    fn failLocal(r: *Ring, why: []const u8) void {
-        if (!r.failed.swap(true, .acq_rel)) {
-            const n = @min(why.len, r.why.len - 1);
-            @memcpy(r.why[0..n], why[0..n]);
-        }
-        @atomicStore(u64, r.abortWord(), 1, .release);
+    /// This rank's doorbell records (TF_DS_ROCI_XLOG), as xlogRead.
+    pub fn xlogPubRead(r: *Ring, out: []XlogPub) usize {
+        const b = r.fault orelse return 0;
+        if (!xlog) return 0;
+        const words = std.heap.page_allocator.alloc(u64, xlog_records * 2) catch return 0;
+        defer std.heap.page_allocator.free(words);
+        b.download(64 + xlog_recv_records * 32, std.mem.sliceAsBytes(words)) catch return 0;
+        return xlogPubDecode(words, out);
     }
 
-    fn proxyLoop(r: *Ring) void {
-        const nd = r.nd;
-        const need: u32 = (r.world - 1) * nd;
+    /// TF_DS_ROCI_XLOG: this rank's log to `<dir>/roci-xlog-rank<R>.txt` (dir: TF_DS_ROCI_XLOG_DIR, else the folder's log dir
+    /// $HOME/.cache/dsv41-tensorfold/logs; created if missing). Called once, from destroy, when the GPU side is quiescent: never inside a round.
+    /// A failure is a log line, never an error: this is a measurement aid.
+    pub fn xlogWriteFile(r: *Ring) void {
+        if (!xlog or r.fault == null) return;
+        const gpa = std.heap.page_allocator;
+        const recs = gpa.alloc(XlogRec, xlog_recv_records) catch return;
+        defer gpa.free(recs);
+        const n = r.xlogRead(recs);
+        const pubs = gpa.alloc(XlogPub, xlog_records) catch return;
+        defer gpa.free(pubs);
+        const np = r.xlogPubRead(pubs);
+        const text = xlogRenderPub(gpa, @intCast(r.rank), @intCast(r.world), r.s.name, @intCast(r.s.slots), recs[0..n], pubs[0..np]) catch return;
+        defer gpa.free(text);
+        var namebuf: [64]u8 = undefined;
+        const name = xlogFileName(&namebuf, @intCast(r.rank), r.s.name) orelse return;
+        if (diagWriteFile("TF_DS_ROCI_XLOG_DIR", name, text)) std.log.info("TF_DS_ROCI_XLOG: {d} exchange records written ({s})", .{ n, name });
+    }
+
             r.idle_gate.wake(); // a parked proxy must wake before join
             if (r.proxy) |t| t.join();
         }
@@ -695,6 +841,9 @@ pub const Ring = struct {
         try r.stage(stream, send, n4, own, n4, n4);
         var a: cuda.Args = .{};
         a.add(send);
+        const pw = Kernels.pick(r.k.publish_wait, r.k.publish_wait_x);
+        const f = (if (waiting) pw.f else r.k.publish) orelse return error.BadInfo;
+        a.add(if (waiting) r.probeOrPubLog(pw.logging) else r.probe());
         a.add(recv);
         a.add(@as(c_int, @intCast(n4)));
         a.add(r.recv.dev);
@@ -753,6 +902,11 @@ pub const Ring = struct {
         const per = collect_threads * r.s.collect_grain;
         const blocks = std.math.clamp((copy4 + per - 1) / per, 1, r.s.collect_blocks);
         try cuda.launch.launch(r.k.collect_into, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
+    /// `probe` for the card-WAIT staging / publishing kernels: with TF_DS_ROCI_XLOG on and no probe running, the doorbell log's address tagged with
+    /// bit 0 (the kernels strip it and log each doorbell); else the probe as it is.
+    fn probeOrPubLog(r: *const Ring, logging: bool) DevicePtr {
+        if (logging and !r.s.probing and r.fault != null) return (r.fault.?.ptr + 64 + xlog_recv_records * 32) | 1;
+        return r.probe();
     }
 
     fn probe(r: *const Ring) DevicePtr {
@@ -782,6 +936,9 @@ pub const Ring = struct {
         try cuda.launch.launch(r.k.stage, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = stage_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
     }
 
+        const sw = Kernels.pick(r.k.stage_wait, r.k.stage_wait_x);
+        a.add(r.probeOrPubLog(sw.logging));
+        try cuda.launch.launch(sw.f.?, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = stage_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
     /// (stage, doorbell to every flag, copy-out) mean ns over the probed gathers and their count; resets the sums.
     pub fn probes(r: *Ring) Error![4]f64 {
         var host: [8]u64 = undefined;
@@ -840,25 +997,54 @@ test "lanes pair each subnet's devices in list order; a peer across the ring has
     const ll = [_][16]u8{.{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8 }};
     try std.testing.expectEqual(@as(?u32, null), pairLanes(&ll, &s2, 24, &out));
 }
+    const kern_at = std.mem.indexOf(u8, swbody, "cuda.launch.launch(sw.f.?") orelse return error.TestUnexpectedResult;
+
+test "the exchange log: device words decode to records in ring order, empty slots left out, and out.len bounds them" {
+    // a fake log buffer as the kernel writes it: slot ((q * 8 + peer) & 32767), words {q << 3 | peer, clock}
+    var words: [32]u64 = @splat(0); // 8 slots of 4 words
+    words[4 * 1] = (5 << 3) | 1;
+    words[4 * 1 + 1] = 1000;
+    words[4 * 1 + 2] = 400;
+    words[4 * 1 + 3] = 1900;
+    words[4 * 4] = (6 << 3) | 2;
+    words[4 * 4 + 1] = 2500;
+    words[4 * 6] = (7 << 3) | 3;
+    words[4 * 6 + 1] = 0; // a slot whose clock is 0 was never written
+    var out: [4]XlogRec = undefined;
+    try std.testing.expectEqual(@as(usize, 2), xlogDecode(&words, &out));
+    try std.testing.expectEqual(XlogRec{ .seq = 5, .peer = 1, .at_ns = 1000, .start_ns = 400, .end_ns = 1900 }, out[0]);
+    try std.testing.expectEqual(XlogRec{ .seq = 6, .peer = 2, .at_ns = 2500 }, out[1]);
+    var one: [1]XlogRec = undefined;
+    try std.testing.expectEqual(@as(usize, 1), xlogDecode(&words, &one));
 }
 
-test "a failed neighbor stage releases both local stages' device waits" {
-    var first: Ring = undefined;
-    var second: Ring = undefined;
-    var first_meta: [32]u64 align(std.heap.page_size_min) = @splat(0);
-    var second_meta: [32]u64 align(std.heap.page_size_min) = @splat(0);
-    for ([_]*Ring{ &first, &second }, [_][]u64{ &first_meta, &second_meta }) |r, meta| {
-        r.s.slots = 4;
-        r.world = 2;
-        r.meta.mem = @alignCast(std.mem.sliceAsBytes(meta));
-        r.failed = .init(false);
-        r.why = @splat(0);
-    }
-    first.failure_peer = &second;
-    second.failure_peer = &first;
-    first.abort("peer failed");
-    try std.testing.expectEqualStrings("peer failed", first.failure().?);
-    try std.testing.expectEqualStrings("peer failed", second.failure().?);
-    try std.testing.expectEqual(@as(u64, 1), first.abortWord().*);
-    try std.testing.expectEqual(@as(u64, 1), second.abortWord().*);
+test "the doorbell log: device words {sequence, clock} decode in ring order, empty slots out" {
+    var words: [16]u64 = @splat(0); // 8 slots
+    words[2 * 3] = 12;
+    words[2 * 3 + 1] = 5000;
+    words[2 * 5] = 13; // a slot with a sequence and no clock: never written
+    var out: [4]XlogPub = undefined;
+    try std.testing.expectEqual(@as(usize, 1), xlogPubDecode(&words, &out));
+    try std.testing.expectEqual(XlogPub{ .seq = 12, .at_ns = 5000 }, out[0]);
+}
+
+test "the exchange log file: a header naming rank, world and ring, then the records sorted by sequence and peer" {
+    const gpa = std.testing.allocator;
+    var recs = [_]XlogRec{ .{ .seq = 9, .peer = 2, .at_ns = 30, .start_ns = 5, .end_ns = 40 }, .{ .seq = 8, .peer = 3, .at_ns = 20, .start_ns = 4, .end_ns = 33 }, .{ .seq = 8, .peer = 1, .at_ns = 10, .start_ns = 4, .end_ns = 29 } };
+    const text = try xlogRender(gpa, 1, 4, "the decode ring", 8, &recs);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("# TF_DS_ROCI_XLOG v1 rank=1 world=4 ring=\"the decode ring\" slots=8 records=3 clock=globaltimer_ns\n8 1 10 4 29\n8 3 20 4 33\n9 2 30 5 40\n", text);
+    // with doorbell records (this rank's own publishes): a second block, sorted by sequence, after a line naming it
+    var pubs = [_]XlogPub{ .{ .seq = 9, .at_ns = 77 }, .{ .seq = 8, .at_ns = 66 } };
+    const text2 = try xlogRenderPub(gpa, 1, 4, "the decode ring", 8, &recs, &pubs);
+    defer gpa.free(text2);
+    try std.testing.expectEqualStrings("# TF_DS_ROCI_XLOG v1 rank=1 world=4 ring=\"the decode ring\" slots=8 records=3 pubs=2 clock=globaltimer_ns\n8 1 10 4 29\n8 3 20 4 33\n9 2 30 5 40\nP 8 66\nP 9 77\n", text2);
+}
+
+test "the exchange log's file for a ring: the four nodes' ring keeps roci-xlog-rank<R>.txt, the column and row rings' files are told apart (one name for all three would overwrite the first)" {
+    var b: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("roci-xlog-rank2.txt", xlogFileName(&b, 2, "the four nodes' ring").?);
+    try std.testing.expectEqualStrings("roci-xlog-rank0-col.txt", xlogFileName(&b, 0, "the column pair's ring").?);
+    try std.testing.expectEqualStrings("roci-xlog-rank3-row.txt", xlogFileName(&b, 3, "the row pair's ring").?);
+    try std.testing.expectEqualStrings("roci-xlog-rank1-other.txt", xlogFileName(&b, 1, "a ring nobody named").?);
 }

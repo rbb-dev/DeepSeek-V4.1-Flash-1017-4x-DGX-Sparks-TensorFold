@@ -3,16 +3,13 @@
 //! holds whole, over its TP2 slice's K in TP2's order, and every exchange only moves bytes, so after an exchange a
 //! node holds TP2 rank r's bytes: `quarters` assembles TP2's [2, n, N] gather of the two ranks' partials (which the
 //! mixes then add in rank order, as on TP2), `catRank` the rank's whole wo_a output or expert intermediate from the
-//! two pairs' parts. Prompt chunks exchange over NCCL across the four (the RDMA rings drop prompt-size bursts on the
-//! switch: slots P6, P7b), each as one all-gather of every node's part then copies into place: the bytes Comm2D's
-//! NCCL paths (gather4, _p2p) put there. With RDMA rings (Two.rings, ring2d.zig) the exchanges the lane sends over
-//! them take them, written straight into place: quarters of fewer than 64 rows (decode windows; TF_DS_2D_PROMPT_NCCL
-//! keeps prompt chunks on NCCL) and every cat_rank its column pair's ring takes; the same bytes either way.
+//! two pairs' parts. A prompt chunk's exchanges are Rocinante's (rocinante.zig, roci_engine.zig: owner sums, codes and gathers
+//! written into the peers' arenas); decode windows' and the drafter's ride the RDMA rings (Two.rings, ring2d.zig), written straight
+//! into place, and a ring that cannot take an exchange ends it by name: no other transport exists.
 //!
 //! prompt.zig takes it through thin hooks behind Engine.two; a TP2 engine has none and runs as before. The decode
 //! rounds' part is round2d.zig's, on this node state.
 const std = @import("std");
-const neighbor = @import("neighbor.zig");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
 const plan = @import("plan.zig");
@@ -28,6 +25,8 @@ const round_rows = @import("round.zig").max_rows;
 const Link = @import("link.zig").Link;
 const Ports = @import("link.zig").Ports;
 const Comm = @import("comm.zig").Comm;
+const roci_engine = @import("roci_engine.zig");
+const rocinante = @import("rocinante.zig");
 
 const nccl = cuda.nccl;
 
@@ -51,6 +50,8 @@ pub fn connectSeconds() u32 {
     return std.fmt.parseInt(u32, std.mem.span(v), 10) catch 300;
 }
 
+/// The links of a run: rank 0 listens on PORT + g - 1 for follower g, all the followers' ports at once, and takes them in
+/// order (a follower that is ready early waits in its port's backlog).
 pub const Fan = struct {
     links: [3]?Link = .{ null, null, null },
     ports: ?Ports = null, // rank 0's, from listenAt until join has taken every follower
@@ -106,25 +107,15 @@ pub const Fan = struct {
         }
     }
 
-    /// Comm.init over every link: rank 0 makes the id and sends it to each follower. Needs the CUDA context current.
-    pub fn comm(f: *const Fan, rank: u32, world: u32) !Comm {
-        return f.commChecked(rank, world, null);
-    }
-
-    /// comm, with this rank's Settings (Model.open's): rank 0 sends its own after the id and waits for each follower's
-    /// answer, a follower checks rank 0's against its own and answers. A difference ends both with SettingsDiffer, its
-    /// words on stderr, before NCCL starts (a follower of fewer streams than rank 0 serves otherwise refuses the first
-    /// step of a stream past its own and rank 0 waits for it in an exchange for good).
-    pub fn commChecked(f: *const Fan, rank: u32, world: u32, mine: ?Settings) !Comm {
-        var lib = try nccl.Library.open();
-        errdefer lib.close();
-        var id: nccl.UniqueId = undefined;
+    /// The start-up exchange over every link, with this rank's Settings (Model.open's): rank 0 sends its own and waits for each
+    /// follower's answer, a follower checks rank 0's against its own and answers. A difference ends every rank with
+    /// SettingsDiffer, its words on stderr (a follower of fewer streams than rank 0 serves otherwise refuses the first step
+    /// of a stream past its own and rank 0 waits for it in an exchange for good). Each answer carries the follower's weight
+    /// digest (`digest`: this rank's); `heard` gets rank 0's Settings and the digests. The Comm it returns holds the rank and
+    /// the world; its host links are the caller's to set.
         if (world > 1) {
             var why: [1024]u8 = undefined;
-            const differ = if (rank == 0) blk: {
-                try lib.check(lib.api.ncclGetUniqueId(&id), "ncclGetUniqueId");
-                break :blk try f.lead(std.mem.asBytes(&id), mine, &why);
-            } else try f.follow(rank, std.mem.asBytes(&id), mine, &why);
+            const differ = try f.exchange(rank, mine, digest, &why, h);
             if (differ.len > 0) {
                 std.debug.print("tf-dsv41: the ranks' settings differ: {s}\n", .{differ});
                 return error.SettingsDiffer;
@@ -142,9 +133,21 @@ pub const Fan = struct {
         if (id.len > id_max) return error.BadUniqueId;
         @memcpy(frame[0..id.len], id);
         var n = id.len;
+        return Comm.init(rank, world);
+    /// The links' part of settingsChecked: rank 0 sends `mine` down every link and hears every answer (lead), a follower reads
+    /// it, checks and answers (follow). `heard` starts over with this rank's own digest at its rank. "" when every rank can
+    /// follow, else the first follower's words (in `why`).
+    fn exchange(f: *const Fan, rank: u32, mine: ?Settings, digest: Digest, why: []u8, heard: *Heard) ![]const u8 {
+        return if (rank == 0) f.lead(mine, why, heard) else f.follow(rank, mine, digest, why, heard);
+    /// Rank 0: `mine`, when given, down every link; then every follower's answer: its weight digest (the follower on link g - 1,
+    /// rank g, into heard.weights[g]) and its words. "" when each one can follow, else the first one's words (in `why`).
+    /// heard.lead = `mine`.
+    fn lead(f: *const Fan, mine: ?Settings, why: []u8, heard: *Heard) ![]const u8 {
+        var frame: [@sizeOf(Settings)]u8 = undefined;
+        var n: usize = 0;
         if (mine) |s| {
-            @memcpy(frame[n..][0..@sizeOf(Settings)], std.mem.asBytes(&s));
-            n += @sizeOf(Settings);
+            @memcpy(frame[0..@sizeOf(Settings)], std.mem.asBytes(&s));
+            n = @sizeOf(Settings);
         }
         for (f.links) |l| if (l) |x| try x.send(frame[0..n]);
         if (mine == null) return "";
@@ -157,34 +160,38 @@ pub const Fan = struct {
         return first;
     }
 
-    /// A follower: rank 0's id into `id`, and the Settings after it (an older rank 0 sends none: nothing to check)
-    /// checked against `mine`, the answer sent back. "" when this rank can follow, else its words (in `why`).
-    fn follow(f: *const Fan, rank: u32, id: []u8, mine: ?Settings, why: []u8) ![]const u8 {
+    /// A follower: rank 0's Settings (a rank 0 with nothing to check sends none) checked against `mine` and kept (heard.lead); the
+    /// answer sent back: this rank's weight digest, then its words. "" when this rank can follow, else its words (in `why`).
+    fn follow(f: *const Fan, rank: u32, mine: ?Settings, digest: Digest, why: []u8, heard: *Heard) ![]const u8 {
         const l = f.links[0].?;
-        var frame: [id_max + @sizeOf(Settings)]u8 = undefined;
+        var frame: [@sizeOf(Settings)]u8 = undefined;
         const got = try l.recv(&frame);
-        if (got.len != id.len and got.len != id.len + @sizeOf(Settings)) return error.BadUniqueId;
-        @memcpy(id, got[0..id.len]);
-        if (got.len == id.len) return "";
-        const theirs = std.mem.bytesToValue(Settings, got[id.len..]);
-        if (theirs.magic != Settings.tag) return error.BadUniqueId;
+        if (got.len == 0) return "";
+        if (got.len != @sizeOf(Settings)) return error.BadAnswer;
+        const theirs = std.mem.bytesToValue(Settings, got);
+        if (theirs.magic != Settings.tag) return error.BadAnswer;
         const text = if (mine) |s| s.differ(theirs, rank, why) else "";
         try l.send(text);
         return text;
     }
 
-    const id_max = 256; // NCCL's id is 128 bytes
+    const answer_max = @sizeOf(Digest) + 1024; // a follower's answer: its weight digest, then its words (settingsChecked's why)
 };
 
 /// What the ranks of a run must agree on, checked at the start (Fan.commChecked) from Model.open's options.
+/// What the start-up exchange gives a rank (Fan.settingsChecked).
+    /// rank 0's Settings (rank 0: its own); null when rank 0 sent none
+    /// the ranks' weight digests by rank: rank 0 holds every rank's, a follower its own (no_digest: none sent, or
     };
 
+/// head_whole 13, TF_DS_HEAD_CAND's whole head after a round's candidates fell back); 7 = 1-14 (and fill_pair 14, TF_DS_ROCI_STAGGER's two passes); 8 = 1-15 (and snap_sync 15, the SSD tier's stores on every rank); 9 = the same kinds, a Settings of the Rocinante-only layout (no
+/// What the ranks of a run must agree on, checked at the start (Fan.settingsChecked) from Model.open's options.
 pub const Settings = extern struct {
     magic: u32 = tag,
     world: u32,
     streams: u32, // TF_DS_STREAMS (a follower's --streams): a follower holds every stream rank 0 serves
     round_rows: u32, // TF_DS_ROUND_ROWS (--round-rows): the same (it picks the decode kernels)
-    rails: u32, // TF_RDMA_DEVICES (--rdma): as many devices (0: NCCL)
+    rails: u32, // TF_RDMA_DEVICES (--rdma): as many devices
     drafts: u32, // the drafter (--drafts): the same
     graphs: u32, // TF_DS_GRAPHS (--graphs): the same (a rank with graphs votes on each capture, one without never does)
     graph_cap: u32, // TF_DS_GRAPH_CAP (--graph-cap), with graphs: the same (every rank keeps and drops the same graphs)
@@ -229,9 +236,16 @@ pub const Settings = extern struct {
     fn sepIf(w: *const std.Io.Writer, sep: []const u8) []const u8 {
         return if (w.end > 0) sep else "";
     }
+/// TF_DS_ROCI_P2_FIRST as Model.open read it (switchAsked), once (Settings.exch; Two.p2First): an owner sum's
+/// TF_DS_ROCI_ENGRAM_AHEAD as Model.open read it (switchAsked), once (Settings.exch; Two.engramAhead): an
+/// TF_DS_ROCI_SENT_FIRST as Model.open read it (switchAsked), once (Settings.exch; Two.sentFirst): wo_b runs in
+/// TF_DS_ROCI_COMBINE_DOOR as Model.open read it (switchAsked), once (Settings.exch; Two.combineDoor): the MoE's
 };
 
+
+/// TF_DS_2D_ORDER: the 2D node (role) each rank serves, "g0,g1,g2,g3" (rank 0 must serve node 0: it serves the
 /// API); unset, rank g serves node g. On four GB10s cabled as a ring 0-1-2-3-0 without a switch, "0,1,3,2" makes every
+/// node's row partner (g ^ 1) and column partner (g ^ 2) its cabled neighbours, and the transport's plans run over
 /// the cables in rank order.
 pub fn order() ![4]u32 {
     const v = std.c.getenv("TF_DS_2D_ORDER") orelse return .{ 0, 1, 2, 3 };
@@ -252,6 +266,8 @@ pub fn parseOrder(text: []const u8) ![4]u32 {
     return out;
 }
 
+/// The rank of each node g under `ord` (the inverse permutation).
+pub fn rankOf(ord: [4]u32) [4]u32 {
     var inv: [4]u32 = undefined;
     for (ord, 0..) |g, i| inv[g] = @intCast(i);
     return inv;
@@ -260,6 +276,8 @@ pub fn parseOrder(text: []const u8) ![4]u32 {
 test "TF_DS_2D_ORDER: a ring's order and its inverse" {
     const o = try parseOrder("0,1,3,2");
     try std.testing.expectEqual([4]u32{ 0, 1, 3, 2 }, o);
+    try std.testing.expectEqual([4]u32{ 0, 1, 3, 2 }, rankOf(o));
+    try std.testing.expectEqual([4]u32{ 0, 2, 3, 1 }, rankOf(try parseOrder("0,3,1,2")));
     try std.testing.expectError(error.BadOrder, parseOrder("1,0,2,3"));
     try std.testing.expectError(error.BadOrder, parseOrder("0,1,1,2"));
     try std.testing.expectError(error.BadOrder, parseOrder("0,1,2"));
@@ -272,8 +290,8 @@ fn len(r: ?[2]usize) usize {
 
 /// A 2D node's part of the prompt path and the decode rounds: the pairs' widths of each split output and the exchange
 /// buffers.
+/// Why a node's decode exchanges cannot all ride the RDMA rings (null: every one can): each
 pub const Two = struct {
-    neighbor_gather: ?*const neighbor.Gather,
     r: usize,
     p: usize,
     heads: usize, // the heads here (its pair's half of the rank's)
@@ -283,9 +301,6 @@ pub const Two = struct {
     dw: [2]usize, // down's output columns a pair
     ew: [2]usize, // Engram wkv's output columns a pair (0 without an Engram layer)
     hw: [2]usize, // the head's vocabulary columns a pair (253 / 252 blocks of a TP2 half)
-    parts: u64, // [4, rows, widest] where the all-gathers land
-    pad: u64, // this node's part at the wider pair's width (when the pairs' widths differ)
-    part_bytes: usize, // the largest part a node sends
     u_full: u64, // bf16 [cap, uw0 + uw1]: the rank's wo_a output, pair 0's groups then pair 1's
     xd_full: u64, // fp16 [cap * slots, gu0 + gu1]: the rank's expert intermediate, pair 0's blocks then pair 1's
     own: u64, // fp16 [round rows, uw[p]]: a round's half of wo_b's rotated input rows (wo_a's epilogue, round2d.woRot)
@@ -297,9 +312,12 @@ pub const Two = struct {
     rest_dec: ?exl3_experts2d.RestScratch = null,
     rest_chunk: ?exl3_experts2d.RestScratch = null,
     peer: u64 = 0,
+    // the rank of each 2D node g (TF_DS_2D_ORDER, model.zig): the transport's slots and the partners' ranks (the identity by default)
+    rank_of: [4]u32 = .{ 0, 1, 2, 3 },
     // WP6(b) (docs/prefill-plan.md, indexer row-sharding): agreed at startup (agreeIdxShard), independent of qhc:
     // the indexer's own scoring kernels, not the quarter-HC path's mix and gather.
     idx_shard: bool = false,
+    rc: ?*roci_engine.Roci = null,
 
     /// The widths from the split (both pairs'), and the buffers for chunks of up to `cap` rows (and rounds) from `a`.
     pub fn init(c: *const Config, w: *const weights.Weights, a: *prompt.Arena, s: plan.Split, cap: usize) !Two {
@@ -310,6 +328,7 @@ pub const Two = struct {
         const x1 = s1.expertParts(c.*);
         var t: Two = undefined;
         t.neighbor_gather = null;
+        t.rc = null;
         t.r = s.rank;
         t.p = pp;
         t.heads = s.headSpan(c.*)[1];
@@ -328,10 +347,6 @@ pub const Two = struct {
         // prompt.gather assembles either sublayer's partials: both splits must give the same widths
         if (t.ow[0] != t.dw[0] or t.ow[1] != t.dw[1]) return error.UnequalPartialSplits;
         const slots = c.top_k + 1;
-        const biggest = @max(@max(@max(cap * @max(t.ow[0], t.ow[1]) * 4, cap * @max(t.ew[0], t.ew[1]) * 4), @max(cap * @max(t.uw[0], t.uw[1]) * 2, cap * slots * @max(t.gu[0], t.gu[1]) * 2)), @max(t.hw[0], t.hw[1]) * 4);
-        t.part_bytes = biggest;
-        t.parts = try a.take(4 * biggest);
-        t.pad = try a.take(biggest);
         t.u_full = try a.take(cap * (t.uw[0] + t.uw[1]) * 2);
         // parity: the rest block after both pairs' main blocks in the assembled intermediate
         const ex0 = l0.experts;
@@ -352,9 +367,12 @@ pub const Two = struct {
         }
         t.own = try a.take(round_rows * t.uw[pp] * 2);
         t.rings = null;
+        t.rank_of = .{ 0, 1, 2, 3 };
         return t;
     }
 
+        const own = .{ t.u_full, t.xd_full, t.peer, t.own, t.rest_dec, t.rest_chunk, t.rest_rows };
+        t.u_full, t.xd_full, t.peer, t.own, t.rest_dec, t.rest_chunk, t.rest_rows = own;
     fn restScratch(a: *prompt.Arena, ex: weights.Experts, rows: usize, slots: usize, chunk: bool) !exl3_experts2d.RestScratch {
         const sz = try exl3_experts2d.RestScratch.sizes(rows, slots, ex, chunk);
         var rs: exl3_experts2d.RestScratch = undefined;
@@ -373,30 +391,13 @@ pub const Two = struct {
         }
     }
 
-    /// The column partner's pack (a parity split's main rows, then its rest rows: `bytes` each way) into t.peer: over
-    /// the column ring when the caller opened the rings and it fits, else NCCL send / recv with the partner.
+    /// The column partner's pack (a parity split's main rows, then its rest rows: `bytes` each way) into t.peer, over the
+    /// column ring.
     pub fn packExchange(t: *const Two, e: *const prompt.Engine, mine: u64, rows: usize, width: usize) !void {
-        if (t.rings) |rs| {
-            var dsts: [2]rdma_mod.Ring.Dst = .{ .{}, .{} };
-            dsts[1 - t.p] = .{ .ptr = t.peer, .row4 = @intCast(width * 2 / 16), .stride4 = width * 2 / 16 };
-            if (rs.col.gatherInto(e.s, mine, @intCast(rows), @intCast(width * 2 / 16), &dsts)) |_| return else |err| switch (err) {
-                error.TooLarge => {},
-                else => return err,
-            }
-        }
-        const count = try std.math.mul(usize, rows, width);
-        if (t.neighbor_gather) |ng| {
-            const bytes = try std.math.mul(usize, count, 2);
-            if (neighbor.eligible(bytes)) {
-                if (bytes > t.part_bytes) return error.PartTooBig;
-                try ng.relay(e.s, mine, t.peer, bytes);
-            } else {
-                try neighbor.forward(e.comm, mine, t.peer, @splat(count), .f16, t.pad, t.part_bytes, e.s);
-            }
-            return;
-        }
-        const g: u32 = @intCast(t.r + 2 * t.p);
-        try e.comm.exchange(mine, count, t.peer, count, .f16, g ^ 2, e.s);
+        const rs = t.rings orelse return error.DecodeNeedsRings;
+        var dsts: [2]rdma_mod.Ring.Dst = .{ .{}, .{} };
+        dsts[1 - t.p] = .{ .ptr = t.peer, .row4 = @intCast(width * 2 / 16), .stride4 = width * 2 / 16 };
+        try rs.col.gatherInto(e.s, mine, @intCast(rows), @intCast(width * 2 / 16), &dsts);
     }
 
     /// moe_2d's parity experts after the main gate / up and the rest's: the packs exchanged with the column partner,
@@ -440,58 +441,15 @@ pub const Two = struct {
         return true;
     }
 
-    /// quarters (Comm2D.quarters): `src` [n, w[p]] (this node's columns of its TP2 rank's partial) -> `dst`
-    /// [2, n, w0 + w1]: rank r's partial, pair 0's columns then pair 1's, for every r.
     pub fn quarters(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, w: [2]usize, esize: usize) !void {
-        if (t.rings) |rs| if (n < 64 and try ringed(rs.quarters(e.s, src, dst, n, w, esize))) return;
-        if (t.neighbor_gather) |ng| {
-            const width = try std.math.mul(usize, w[0], esize);
-            const bytes = try std.math.mul(usize, n, width);
-            if (w[0] == w[1] and width % 16 == 0 and neighbor.eligible(bytes)) {
-                try ng.quarters(e.s, src, dst, n, width);
-                return;
-            }
-        }
-        const wmax = try t.allParts(e, src, n, w, esize);
-        const row = (w[0] + w[1]) * esize;
-        for (0..4) |g| {
-            const rr = g % 2;
-            const pg = g / 2;
-            try e.ops.copyRows(e.s, t.parts + g * n * wmax * esize, wmax * esize, dst + rr * n * row + pg * w[0] * esize, row, w[pg] * esize, n);
-        }
+        const rs = t.rings orelse return error.DecodeNeedsRings;
+        if (!try ringed(rs.quarters(e.s, src, dst, n, w, esize))) return error.RingRefused;
     }
 
-    /// TF_DS_2D_YX's prompt.gather, when y_sums is on and the chunk takes NCCL (no ring) with equal pair widths: the
-    /// pair partners swap their fp32 partials of each other's half of the rows (src [n, w]), each sums its half in TP2
-    /// rank order and rounds it to bf16 (add2Bf16: hc_mix_pf's and hc_post's y), the four nodes all-gather those halves
-    /// (bf16 [half, w] each), and dst[0] gets them widened to fp32 [n, 2 w]. dst[1] (at cap * 2 w, in every buffer of
-    /// `negs`) holds -0.0, written once (x + -0.0 == x for every x): the posting kernels' y is bit for bit the
-    /// quarters'. Bytes a node receives: 5 n w against 12 n w. False: not taken (nothing sent).
-    pub fn ySums(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, cap: usize, neg_done: *bool, negs: []const u64) !bool {
-        if (!y_sums or n == 0 or t.ow[0] != t.ow[1]) return false;
-        if (t.rings != null and n < 64) return false;
-        const w = t.ow[0];
-        if (2 * w != e.c.hidden) return false;
-        const half = (n + 1) / 2;
-        if (half * w * 6 > t.part_bytes) return error.PartTooBig;
-        if (!neg_done.*) {
-            for (negs) |g| try prompt.fill32(e, g + cap * 2 * w * 4, 0x80000000, cap * 2 * w);
-            neg_done.* = true;
+        const rs = t.rings orelse return error.DecodeNeedsRings;
+        const blocks = try decodeBlocks(n, @max(w[0], w[1]) * esize, rs.slotBytes(), &bb);
+            if (!sent) return if (i == 0) error.RingRefused else error.RingRefusedBlock;
         }
-        const mine = t.r * half;
-        const mine_n = if (t.r == 0) half else n - half;
-        const theirs = (1 - t.r) * half;
-        const theirs_n = n - mine_n;
-        const g: u32 = @intCast(t.r + 2 * t.p);
-        const recv = t.pad;
-        const own = t.pad + half * w * 4;
-        try e.comm.exchange(src + theirs * w * 4, theirs_n * w, recv, mine_n * w, .f32, g ^ 1, e.s);
-        const p0 = if (t.r == 0) src + mine * w * 4 else recv;
-        const p1 = if (t.r == 0) recv else src + mine * w * 4;
-        try e.ops.add2Bf16(e.s, p0, p1, own, mine_n * w);
-        try e.comm.allGather(own, t.parts, half * w * 2, .u8, e.s);
-        try e.ops.yWiden(e.s, t.parts, dst, n, half, w);
-        return true;
     }
 
     /// WP6(b) (docs/prefill-plan.md, indexer row-sharding): agreed at startup like qhc, but independent of
@@ -504,6 +462,7 @@ pub const Two = struct {
         var dev = try cuda.DeviceBuffer.alloc(d, (1 + w) * 4);
         defer dev.free();
         const mine: u32 = @intFromBool(want);
+        try comm.gatherHost(d, dev.ptr, dev.ptr + 4, 4, stream);
         try stream.synchronize();
         var all: [8]u32 = undefined;
         if (w > all.len) return error.WorldTooLarge;
@@ -528,10 +487,72 @@ pub const Two = struct {
             if (neighbor.eligible(bytes)) {
                 try ng.pair(e.s, src, dst, bytes);
                 return;
+    /// TF_DS_ROCI in effect: `asked` (the start-up Settings made it the same on every rank) and rociOff's conditions on every
+    /// rank (`why`: this rank's reason it cannot, null when it can), one world all-gather. A rank that cannot ends the start
+    /// on every rank, naming which: Rocinante has no other transport to fall back to.
+    /// TF_DS_ROCI_P2_FIRST in effect: asked (the start-up Settings made it the same on every rank).
+    pub fn p2First(_: *const Two) bool {
+        return roci_p2_first_asked;
+    /// TF_DS_ROCI_ENGRAM_AHEAD in effect: asked (the start-up Settings made it the same on every rank).
+    pub fn engramAhead(_: *const Two) bool {
+        return roci_engram_ahead_asked;
+    /// TF_DS_ROCI_SENT_FIRST in effect: asked (the start-up Settings made it the same on every rank).
+    pub fn sentFirst(_: *const Two) bool {
+        return roci_sent_first_asked;
+    /// TF_DS_ROCI_COMBINE_DOOR in effect: asked (the start-up Settings made it the same on every rank).
+    pub fn combineDoor(_: *const Two) bool {
+        return roci_combine_door_asked;
+    /// This node's decode exchanges (decodeOff's input) for rounds of `rows` rows, rings of `slot` bytes, and a head
+    /// candidate part of `cand_bytes`.
+    pub fn decodeShape(t: *const Two, hidden: usize, rows: usize, slots: usize, slot: usize, cand_bytes: usize) DecodeShape {
+        return .{ .ow = t.ow, .dw = t.dw, .hw = t.hw, .ew = t.ew, .uw = t.uw, .gu = t.gu, .ir = t.ir, .hidden = hidden, .rows = rows, .slots = slots, .slot = slot, .cand_bytes = cand_bytes, .pair_ring = t.rings != null and t.rings.?.pair != null };
+    }
+
+    /// One start check of a family of Rocinante's exchanges, on every rank together: `why` is null where this rank can run it. A rank
+    /// that cannot ends the start, naming itself and its reason (there is no other transport to fall back to). One gather over the
+    /// host links.
+    pub fn require(d: *const cuda.Driver, comm: *const Comm, stream: cuda.Stream, name: []const u8, why: ?[]const u8) !void {
+        const cannot = try ranksThatCannot(d, comm, stream, why == null);
+        if (cannot == 0) return;
+        var buf: [64]u8 = undefined;
+        std.log.err("{s}: {s} cannot run it (this rank: {s}); not started", .{ name, rankList(cannot, &buf), why orelse "can" });
+        return error.RociCannot;
+    }
+    /// Every rank's node order (TF_DS_2D_ORDER, `rank_of`) and gather widths (`ow`) gathered over the host links and checked against
+    /// this rank's own: a rank alone on a different permutation would address different partners under the same role numbers (the
+    /// transport's plans, the rings and the node's weights all follow it), so the start ends by name. Before any prompt.
+    pub fn agreeTopology(t: *const Two, d: *const cuda.Driver, comm: *const Comm, stream: cuda.Stream) !void {
+        const w = comm.world;
+        const Cfg = extern struct { rank_of: [4]u32, ow: [2]u32 };
+        const mine: Cfg = .{ .rank_of = t.rank_of, .ow = .{ @intCast(t.ow[0]), @intCast(t.ow[1]) } };
+        var dev = try cuda.DeviceBuffer.alloc(d, (1 + w) * @sizeOf(Cfg));
+        defer dev.free();
+        try comm.gatherHost(d, dev.ptr, dev.ptr + @sizeOf(Cfg), @sizeOf(Cfg), stream);
+        try stream.synchronize();
+        var all: [8]Cfg = undefined;
+        if (w > all.len) return error.WorldTooLarge;
+        try dev.download(@sizeOf(Cfg), std.mem.sliceAsBytes(all[0..w]));
+        for (all[0..w], 0..) |x, i| {
+            if (!std.mem.eql(u32, &x.rank_of, &mine.rank_of)) {
+                std.log.err("rank {d}'s node order {any} differs from this rank's {any} (TF_DS_2D_ORDER mismatch): refusing to start", .{ i, x.rank_of, mine.rank_of });
+                return error.TopologyMismatch;
+            }
+            if (x.ow[0] != mine.ow[0] or x.ow[1] != mine.ow[1]) {
+                std.log.err("rank {d}'s gather widths {any} differ from this rank's {any}: refusing to start", .{ i, x.ow, mine.ow });
+                return error.TopologyMismatch;
             }
         }
         const wmax = try t.allParts(e, src, n, .{ width, width }, esize);
         try e.ops.copyRows(e.s, t.parts + 2 * t.p * n * wmax * esize, wmax * esize, dst, width * esize, width * esize, 2 * n);
+        try rs.nodesGather(e.s, src, dst, rows, t.rank_of);
+    pub fn node(t: *const Two) u32 {
+        const rs = t.rings orelse return error.DecodeNeedsRings;
+        if (!try ringed(rs.catRank(e.s, src, dst, n, w, esize))) return error.RingRefused;
+    }
+
+    pub fn pairGather(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, width: usize, esize: usize) !void {
+        const rs = t.rings orelse return error.DecodeNeedsRings;
+        if (!try ringed(rs.pairGather(e.s, src, dst, n, width, esize))) return error.RingRefused;
     }
 
     /// wo_2d after wo_a: the rank's four groups (this node's two in ch.u [n, uw[p]], the partner's two), then wo_b
@@ -539,6 +560,16 @@ pub const Two = struct {
     pub fn woB(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer) !void {
         try t.catRank(e, ch.u, t.u_full, ch.n, t.uw, 2);
         try prompt.mm(e, ch, lay.wo_b, t.u_full, t.uw[0] + t.uw[1], ch.pa, .fp32, lay.wo_b.n);
+        return t.woBCodes(e, ch, lay, sent_first);
+    /// into its land region, and the copies read the partner's part there (the exchange is the transport's).
+        const shape = prompt.codesShape(e, ch) orelse return error.RociNoShape;
+        const rc = t.rc.?;
+        const send = rc.addr(.wob_send);
+        const land = rc.addr(.wob_land);
+        const pl = catCodesPlan(t.node(), t.rank_of, ch.n, t.uw, ch.u, send, land, ch.wob_q, ch.wob_s);
+        try rc.send(e.s, .wob, shape);
+        try rc.wait(e.s, .wob);
+        if (sent_first) {
     }
 
     /// moe_2d's experts after the routing: this node's gate / up blocks, the rank's whole intermediate assembled, down
@@ -547,6 +578,8 @@ pub const Two = struct {
     pub fn experts(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer) !void {
         const c = e.c;
         const n = ch.n;
+            // the pack as codes over the transport (the decode rounds' experts are expertsNative's, through the rings)
+            return t.expertsCodes(e, ch, lay.experts, ch.x, c.hidden, ch.pick, ch.wts, ch.xs.xd, ch.pm, n, x_codes, cf);
         if (n < exl3_experts.exact_rows) return round2d.experts(t, e, lay.experts, ch.xsd, ch.x, c.hidden, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
         try exl3_experts2d.gateUp(e.ex, e.s, lay.experts, ch.xs, ch.x, c.hidden, ch.pick, n, c.swiglu_limit);
         if (t.ir != 0) {
@@ -571,6 +604,10 @@ pub const Two = struct {
         try mx.down(k, e.s, ex, ch.mxe, t.xd_full, ex.down_k, pick, rows, out, t.dw[t.p], false, split_k);
     }
 
+        const mine = t.rc.?.addr(.pack_send);
+        const theirs = t.rc.?.addr(.pack_land);
+        try t.rc.?.send(e.s, .pack, shape);
+        if (t.gu[0] == t.gu[1] and mx.threeTakes(k, ex, ch.mxe, t.gu[t.p], t.ir)) {
     }
 
     /// Engram's projection summed over the ranks from its column quarters (model.py esum): the gathered width.
@@ -579,6 +616,45 @@ pub const Two = struct {
     }
 };
 
+/// The ranks of `comm` whose `can` is false, a bit each (bit k: rank k), from one gather of every rank's word over the
+/// host links on `stream`: a start-up agreement, called by every rank together.
+    try comm.gatherHost(d, dev.ptr, dev.ptr + 4, 4, stream);
+/// Why the owner sums over Rocinante cannot run on this rank (null: it can): attention, MoE and Engram all at owned rows,
+pub fn rociOff(ow: [2]usize, pass_rows: usize, readers: bool) ?[]const u8 {
+    if (ownerYxOff(ow)) |why| return why;
+    if (!readers) return "the kit's extra set has no _hc_mix_pf_2b / _hc_post_2b / _engram_gate_2b variant";
+    return null;
+}
+
+/// Why TF_DS_ROCI_DEC cannot run on this rank before its kernel check (null: it can): the decoder front on owned rows runs .once's kernels
+/// (act_quant, wq_a and wkv on one quant), the baseline front over the decoder rows only with TF_DS_QUANT_ONCE (`quant_once`); the taps region
+/// holds three taps of 5,120 values a row (`taps` the DSpark taps, none without a drafter; `hidden` the model's).
+pub fn rociDecOff(quant_once: bool, taps: usize, hidden: usize) ?[]const u8 {
+    if (!quant_once) return "needs TF_DS_QUANT_ONCE=1 (the decoder half's front on owned rows runs its kernels)";
+    if (taps != 0 and taps * hidden * 2 != rocinante.taps_row) return "the arena's taps region holds three taps of 5,120 values a row";
+    if (hidden * 2 != rocinante.head_row) return "the arena's head row holds 5,120 values";
+    return null;
+}
+
+pub fn rociCodesOff(uw: [2]usize, gu: [2]usize, ir: usize, slots: usize) ?[]const u8 {
+pub fn rociGathersOff(native: bool, hidden: usize, qw: usize, hd: usize, index_topk: usize, id: usize, dims: usize, slots: usize) ?[]const u8 {
+pub fn catCodesOff(native: bool, layers: []const weights.Layer, uw: [2]usize) ?[]const u8 {
+/// woBCodes of node g (2 p + r) under ranks `rank_of`, n rows: this node's u [n, uw[p]] bf16 quantized into
+pub fn catCodesPlan(g: u32, rank_of: [4]u32, n: usize, uw: [2]usize, u: u64, codes: u64, stage: u64, wob_q: u64, wob_s: u64) CatCodes {
+        .peer = rank_of[g ^ 2],
+/// Why the owner sums cannot run (null: they can): widening the two pairs' sums into one row needs equal pair widths.
+pub fn ownerYxOff(ow: [2]usize) ?[]const u8 {
+/// Owner sums of node g under ranks `rank_of` (Two.rank_of), for owned blocks of q rows: rank k owns rows R(k) =
+    row_peer: u32, // the row partner's rank (node g ^ 1: the other TP2 rank of this pair)
+    col_peer: u32, // the column partner's rank (node g ^ 2: this TP2 rank of the other pair)
+pub fn ownerPlan(g: u32, rank_of: [4]u32, q: usize) OwnerPlan {
+        .row_peer = rank_of[g ^ 1],
+        .col_peer = rank_of[g ^ 2],
+        .send1 = .{ at(rank_of[g ^ 1], q), at(rank_of[g ^ 3], q) },
+        .recv1 = .{ at(rank_of[g], q), at(rank_of[g ^ 2], q) },
+        .send2 = at(rank_of[g ^ 2], q),
+        .recv2 = at(rank_of[g], q),
+const Span = @import("land.zig").Span;
 test "a node's split: TP over two, the 2D split over four" {
     try std.testing.expectEqual(plan.Split{ .rank = 1, .world = 2 }, try split(1, 2));
     try std.testing.expectEqual(plan.Split{ .rank = 0, .world = 2, .pair = 1 }, try split(2, 4));
@@ -587,6 +663,7 @@ test "a node's split: TP over two, the 2D split over four" {
 }
 
 test "a follower holds rank 0's streams and pool and runs its round rows and graphs, or says what to change" {
+    const served: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 0, .idx_rb = 1 };
     var buf: [1024]u8 = undefined;
     try std.testing.expectEqualStrings("", served.differ(served, 1, &buf));
     var more = served; // a follower may hold more streams and positions than rank 0 uses
@@ -620,6 +697,7 @@ test "a follower holds rank 0's streams and pool and runs its round rows and gra
 }
 
 test "a follower runs rank 0's replay floor, or says to set the same on every rank" {
+    const on: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 1 };
     var buf: [1024]u8 = undefined;
     try std.testing.expectEqualStrings("", on.differ(on, 2, &buf));
     var off = on;
@@ -679,11 +757,213 @@ test "rank 0's settings go with NCCL's id: the follower answers, and an older ra
         };
         var id: [128]u8 = undefined;
         for (&id, 0..) |*b, i| b.* = @intCast(i);
+        const pl = catCodesPlan(@intCast(g), rankOf(orders[0]), 2048, .{ 2048, 2048 }, u, codes, stage, wq, ws);
+        const nc = rankOf(ord);
+        // one exchange a pair of column partners: each names the other's rank, and what one sends the other takes
+/// The node that rank `k` serves under `rank_of`.
+fn nodeOfRank(rank_of: [4]u32, k: u32) usize {
+    return std.mem.indexOfScalar(u32, &rank_of, k).?;
+        const nc = rankOf(ord);
+            // the partners: node g ^ 1 and node g ^ 2, by their ranks, and mutual
+test "TF_DS_PASS_ROWS takes any whole number of resume units up to the engine's largest pass (unset: one); TF_DS_PASS_FROM any multiple of the unit, 0 included (unset: four)" {
+    const top = prompt.max_pass_rows;
+    try std.testing.expectEqual(@as(u32, 16384), top);
+    try std.testing.expectEqual(@as(?u32, 2048), passRowsSetting(null, 2048, top));
+    var units: u32 = 1;
+    while (units <= 8) : (units += 1) {
+        var buf: [8]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{d}", .{units * 2048}) catch unreachable;
+        try std.testing.expectEqual(@as(?u32, units * 2048), passRowsSetting(text, 2048, top));
     }
+    // not a whole number of units, none at all, or above the largest pass: no setting, and the words name the setting, the unit and the largest
+    for ([_][]const u8{ "", "0", "1024", "3000", "6143", "4096 ", "x", "-2048", "18432", "32768", "16385", "99999999999" }) |t| {
+        try std.testing.expectEqual(@as(?u32, null), passRowsSetting(t, 2048, top));
+        var wb: [320]u8 = undefined;
+        const w = passRowsRefusal(&wb, t, 2048, top);
+        try std.testing.expect(std.mem.indexOf(u8, w, "TF_DS_PASS_ROWS=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, w, "whole number of 2048-row resume units") != null);
+        try std.testing.expect(std.mem.indexOf(u8, w, "16384") != null);
+    // a smaller ceiling (a build for fewer rows) holds the same rule
+    try std.testing.expectEqual(@as(?u32, 8192), passRowsSetting("8192", 2048, 8192));
+    try std.testing.expectEqual(@as(?u32, null), passRowsSetting("10240", 2048, 8192));
+    try std.testing.expectEqual(@as(?u32, 8192), passFromSetting(null, 2048));
+    try std.testing.expectEqual(@as(?u32, 0), passFromSetting("0", 2048));
+    try std.testing.expectEqual(@as(?u32, 2048), passFromSetting("2048", 2048));
+    try std.testing.expectEqual(@as(?u32, 4096), passFromSetting("4096", 2048));
+    try std.testing.expectEqual(@as(?u32, 6144), passFromSetting("6144", 2048));
+    try std.testing.expectEqual(@as(?u32, 8192), passFromSetting("8192", 2048));
+    try std.testing.expectEqual(@as(?u32, 16384), passFromSetting("16384", 2048));
+    for ([_][]const u8{ "", "1", "3000", "9000", "-8192", "4096 ", "x" }) |t| try std.testing.expectEqual(@as(?u32, null), passFromSetting(t, 2048));
+test "TF_DS_PASS_BESIDE: unset is the resume rows; any whole number of units up to the booted pass rows is a setting; anything else none" {
+    try std.testing.expectEqual(@as(?u32, 2048), passBesideSetting(null, 2048, 2048));
+    try std.testing.expectEqual(@as(?u32, 2048), passBesideSetting(null, 2048, 4096));
+    try std.testing.expectEqual(@as(?u32, 2048), passBesideSetting("2048", 2048, 2048));
+    try std.testing.expectEqual(@as(?u32, 2048), passBesideSetting("2048", 2048, 4096));
+    try std.testing.expectEqual(@as(?u32, 4096), passBesideSetting("4096", 2048, 4096));
+    try std.testing.expectEqual(@as(?u32, 4096), passBesideSetting("4096", 2048, 8192));
+    try std.testing.expectEqual(@as(?u32, 6144), passBesideSetting("6144", 2048, 8192));
+    try std.testing.expectEqual(@as(?u32, 8192), passBesideSetting("8192", 2048, 8192));
+    // above the booted pass rows: refused
+    try std.testing.expectEqual(@as(?u32, null), passBesideSetting("4096", 2048, 2048));
+    try std.testing.expectEqual(@as(?u32, null), passBesideSetting("8192", 2048, 4096));
+    for ([_][]const u8{ "", "0", "1024", "3000", "16384", "4096 ", "-4096", "x" }) |t| try std.testing.expectEqual(@as(?u32, null), passBesideSetting(t, 2048, 8192));
 }
+test "TF_DS_PASS_FILLING: the environment sets the switch and prints its start line when on" {
+    const env = struct { // the process environment, as Model.open reads it
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const name = "TF_DS_PASS_FILLING";
+    if (std.c.getenv(name) != null) return error.SkipZigTest; // the caller's own setting: left alone
+    defer pass_filling_asked = false;
+    _ = env.unsetenv(name);
+    readPassFillingEnv();
+    try std.testing.expect(!pass_filling_asked);
+    _ = env.setenv(name, "1", 1);
+    readPassFillingEnv();
+    try std.testing.expect(pass_filling_asked);
+    try std.testing.expect(std.mem.startsWith(u8, pass_filling_line, "TF_DS_PASS_FILLING=1: "));
+    _ = env.setenv(name, "0", 1); // any text but "1": off, as every switch asked this way
+    readPassFillingEnv();
+    try std.testing.expect(!pass_filling_asked);
+    _ = env.unsetenv(name);
+    readPassFillingEnv();
+    try std.testing.expect(!pass_filling_asked);
+}
+
+test "TF_DS_PROMPT_ORDER, TF_DS_PROMPT_QOS and TF_DS_PROMPT_MAX_WAIT_S: the environment sets the prompt-step order" {
+    const env = struct { // the process environment, as Model.open reads it
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const order_name = "TF_DS_PROMPT_ORDER";
+    const qos_name = "TF_DS_PROMPT_QOS";
+    const wait_name = "TF_DS_PROMPT_MAX_WAIT_S";
+    if (std.c.getenv(order_name) != null or std.c.getenv(qos_name) != null or std.c.getenv(wait_name) != null) return error.SkipZigTest; // the caller's own settings: left alone
+    defer {
+        _ = env.unsetenv(order_name);
+        _ = env.unsetenv(qos_name);
+        _ = env.unsetenv(wait_name);
+        prompt_order = .{};
+    }
+    _ = env.unsetenv(order_name);
+    _ = env.unsetenv(qos_name);
+    try readPromptOrderEnv();
+    try std.testing.expect(!prompt_order.on);
+    _ = env.setenv(order_name, "turns", 1);
+    try readPromptOrderEnv();
+    try std.testing.expect(prompt_order.on and prompt_order.order == .turns and prompt_order.count_all);
+    _ = env.setenv(qos_name, "4k:1:0,*:2:inf", 1);
+    try readPromptOrderEnv();
+    try std.testing.expect(prompt_order.on and !prompt_order.count_all and prompt_order.len == 2);
+    _ = env.setenv(wait_name, "12", 1);
+    try readPromptOrderEnv();
+    try std.testing.expectEqual(@as(u32, 12), prompt_order.max_wait_s);
+    _ = env.setenv(wait_name, "0", 1); // refused by name: the start stops, the policy before it stands
+    try std.testing.expectError(error.BadPromptOrder, readPromptOrderEnv());
+    try std.testing.expectEqual(@as(u32, 12), prompt_order.max_wait_s);
+    _ = env.unsetenv(wait_name);
+    _ = env.unsetenv(order_name);
+    _ = env.setenv(qos_name, "garbage", 1); // refused by name, never the rotation unseen
+    try std.testing.expectError(error.BadPromptOrder, readPromptOrderEnv());
+    _ = env.unsetenv(qos_name);
+    _ = env.setenv(order_name, "seriel", 1); // a typo of serial: refused
+    try std.testing.expectError(error.BadPromptOrder, readPromptOrderEnv());
+}
+
+test "the coded parity assembly is assembleParity's with the assembly and down's quant in one launch" {
+    const src = @embedFile("prompt2d.zig");
+    const Body = struct {
+        fn of(text: []const u8, name: []const u8) []const u8 {
+            const at = std.mem.indexOf(u8, text, name).?;
+            return text[at .. at + std.mem.indexOf(u8, text[at..], "\n    }\n").?];
+        }
+    };
+    const plain = Body.of(src, "pub fn assembleParity(");
+    const coded = Body.of(src, "pub fn assembleParityCodes(");
+    // the exchange and the parts as assembleParity takes them, then the one launch in place of assembleRest
+    for ([_][]const u8{ "const rest = ex.rest orelse return error.NoRest;", "const ig = t.gu[t.p];", "try t.packExchange(e, xd, p, ig + t.ir);", "const part0 = if (t.p == 0) xd else t.peer;", "const part1 = if (t.p == 1) xd else t.peer;" }) |line| {
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, plain, line));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, coded, line));
+    }
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, plain, "try e.ops.assembleRest(e.s, part0, part1, pick, rest.owner, t.xd_full, p, ig, t.ir);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, coded, "try mx.assembleQuant(k, e.s, part0, part1, pick, rest.owner, t.xd_full, p, ig, t.ir, sc);"));
+}
+
+test "a decode gather's row blocks fit a slot" {
+    _ = &Two.quartersDecode;
+    var bb: [max_decode_blocks][2]usize = undefined;
+    const head = 129536; // a pair-0 row of the head's quarters (32,384 fp32), 34 to a 4,456,448-byte slot
+    const slot = 4456448;
+    try std.testing.expectEqualSlices([2]usize, &.{.{ 0, 34 }}, try decodeBlocks(34, head, slot, &bb));
+    try std.testing.expectEqualSlices([2]usize, &.{ .{ 0, 34 }, .{ 34, 1 } }, try decodeBlocks(35, head, slot, &bb));
+    try std.testing.expectEqualSlices([2]usize, &.{ .{ 0, 34 }, .{ 34, 14 } }, try decodeBlocks(48, head, slot, &bb));
+    // a drafter pass's partials: 80 rows of 10,240 bytes in one block
+    try std.testing.expectEqualSlices([2]usize, &.{.{ 0, 80 }}, try decodeBlocks(80, 10240, slot, &bb));
+    try std.testing.expectError(error.TooLarge, decodeBlocks(1, slot + 16, slot, &bb));
+    // more blocks than a gather takes
+    try std.testing.expectError(error.TooLarge, decodeBlocks(9 * 34, head, slot, &bb));
+    try std.testing.expectEqual(@as(usize, 0), (try decodeBlocks(0, head, slot, &bb)).len);
+}
+
+test "a ring that cannot take an exchange says so: too large, not whole float4s, no row pair ring" {
+    for ([_]anyerror{ error.TooLarge, error.NotFloat4, error.NoPairRing }) |err| try std.testing.expect(!try Two.ringed(err));
+    try std.testing.expect(try Two.ringed({}));
+    try std.testing.expectError(error.RingFailed, Two.ringed(error.RingFailed));
+}
+
+test "TF_DS_PF_RASTER: unset is off, 2 4 8 16 are the groups, any other text is no setting; a rank that differs is named" {
+    try std.testing.expectEqual(@as(?u32, 0), rasterSetting(null));
+    for ([_]u32{ 2, 4, 8, 16 }) |g| {
+        var b: [4]u8 = undefined;
+        try std.testing.expectEqual(@as(?u32, g), rasterSetting(try std.fmt.bufPrint(&b, "{d}", .{g})));
+    }
+    for ([_][]const u8{ "", "0", "1", "3", "32", "08", "8 ", "-8", "eight", "true" }) |t| try std.testing.expectEqual(@as(?u32, null), rasterSetting(t));
+    const lead: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 0, .pool = 1 << 24, .replay_floor = 0, .idx_rb = 1, .pf_raster = 8 };
+    var same = lead;
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings("", same.differ(lead, 2, &buf));
+    same.pf_raster = 0;
+    try std.testing.expectEqualStrings("rank 2 has TF_DS_PF_RASTER=0 and rank 0 8 (0: unset): set the same on every rank", same.differ(lead, 2, &buf));
+    same.pf_raster = 4;
+    try std.testing.expectEqualStrings("rank 1 has TF_DS_PF_RASTER=4 and rank 0 8 (0: unset): set the same on every rank", same.differ(lead, 1, &buf));
+    try std.testing.expectEqual(@as(usize, 0), @sizeOf(Settings) % 8);
+}
+
+test "an answer too short for a weight digest is refused" {
+    const Peer = struct {
+        fn run(end: Link) void {
+            var l = end;
+            defer l.close();
+            var frame: [@sizeOf(Settings)]u8 = undefined;
+            _ = l.recv(&frame) catch return;
+            l.send("rank 1 holds 4 streams") catch return; // words alone: no digest before them
+        }
+    };
+    const ends = try testLinks();
+    var f: Fan = .{};
+    defer f.close();
+    f.links[0] = ends[0];
+    const t = try std.Thread.spawn(.{}, Peer.run, .{ends[1]});
+    var why: [1024]u8 = undefined;
+    var heard: Heard = .{};
+    const served: Settings = .{ .world = 2, .streams = 8, .round_rows = 16, .rails = 0, .drafts = 1, .graphs = 0, .graph_cap = 0, .pool = 1 << 19, .replay_floor = 0, .idx_rb = 1 };
+    const said = f.exchange(0, served, no_digest, &why, &heard);
+    f.close();
+    t.join();
+    try std.testing.expectError(error.BadAnswer, said);
+}
+
+test "four ranks, digests not shared: rank 0 hears every follower's weight digest in link order, and the first follower's words" {
+    const served: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 1 };
+            p.said = f.exchange(rank, mine, digest, &p.why, &p.heard) catch |e| {
+    const said = f.exchange(0, served, @splat(0xd0), &why, &heard);
+    const served: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 1 };
+            p.said = f.exchange(rank, mine, digest, &p.why, &p.heard) catch |e| {
         var why: [1024]u8 = undefined;
         const heard = f.lead(&id, cs.lead, &why);
         t.join();
+        const said = f.exchange(0, served, @splat(0xd0), &why, &heard);
         f.close();
         try std.testing.expect(peer.err == null);
         try std.testing.expectEqualSlices(u8, &id, &peer.id);
@@ -692,18 +972,107 @@ test "rank 0's settings go with NCCL's id: the follower answers, and an older ra
         if (cs.differs) {
             const setting = if (cs.follower.?.streams != cs.lead.?.streams) "--streams 8" else "TF_DS_NEIGHBOR_RDMA";
             try std.testing.expect(std.mem.indexOf(u8, peer.said, setting) != null);
+    const served: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 1 };
+            _ = f.exchange(rank, served, @splat(@intCast(0x10 * rank + rank)), &p.why, &p.heard) catch |e| {
         }
     }
+    _ = try f.exchange(0, served, @splat(0xd0), &why, &heard);
+test "a follower runs rank 0's TF_DS_CUDA_SCHED, or says what differs" {
+    const lead: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 1, .sched = cuda.context.sched_blocking };
 }
 
-test "startup settings reject mixed neighbor modes before communicator creation" {
-    const off: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 0, .drafts = 1, .replay_floor = 0, .pool = 1 << 21 };
-    var on = off;
-    on.neighbor_rdma = 1;
+test "a follower runs rank 0's indexer score rows, or says to set the same on every rank" {
+    const lead: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 2 };
     var buf: [1024]u8 = undefined;
-    try std.testing.expectEqualStrings("", off.differ(off, 1, &buf));
-    try std.testing.expectEqualStrings("", on.differ(on, 1, &buf));
-    try std.testing.expectEqualStrings("rank 1 has TF_DS_NEIGHBOR_RDMA=0 and rank 0 1: set the same on every rank", off.differ(on, 1, &buf));
-    try std.testing.expectEqualStrings("rank 1 has TF_DS_NEIGHBOR_RDMA=1 and rank 0 0: set the same on every rank", on.differ(off, 1, &buf));
+    try std.testing.expectEqualStrings("", lead.differ(lead, 1, &buf));
+    var rb = lead;
+    rb.idx_rb = 1;
+    try std.testing.expectEqualStrings("", rb.differ(rb, 1, &buf));
+    try std.testing.expectEqualStrings("rank 1 has TF_DS_IDX_RB=1 and rank 0 2: set the same on every rank", rb.differ(lead, 1, &buf));
+    try std.testing.expectEqualStrings("rank 3 has TF_DS_IDX_RB=2 and rank 0 1: set the same on every rank", lead.differ(rb, 3, &buf));
+    var all = rb;
+    all.replay_floor = 0;
+    try std.testing.expectEqualStrings("rank 3 has TF_DS_REPLAY_FLOOR=0 and rank 0 1: set the same on every rank; rank 3 has TF_DS_IDX_RB=1 and rank 0 2: set the same on every rank", all.differ(lead, 3, &buf));
+    comptime var sum: usize = 0;
+    inline for (@typeInfo(Settings).@"struct".field_names) |name| sum += @sizeOf(@FieldType(Settings, name));
+    try std.testing.expectEqual(sum, @sizeOf(Settings));
+test "a follower runs rank 0's TF_DS_PASS_ROWS, or says to set the same on every rank; rank 0's TF_DS_PASS_FROM travels and is never compared" {
+    const lead: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 1, .pass_rows = 4096, .pass_from = 8192 };
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("", lead.differ(lead, 1, &buf));
+    var mine = lead;
+    mine.pass_from = 0; // a follower's own: rank 0's alone is used
+    try std.testing.expectEqualStrings("", mine.differ(lead, 1, &buf));
+    mine.pass_rows = 2048;
+    try std.testing.expectEqualStrings("rank 1 has TF_DS_PASS_ROWS=2048 and rank 0 4096: set the same on every rank", mine.differ(lead, 1, &buf));
+    try std.testing.expectEqualStrings("rank 3 has TF_DS_PASS_ROWS=4096 and rank 0 2048: set the same on every rank", lead.differ(mine, 3, &buf));
+    // every field whole 4- or 8-byte words: no padding travels
+    const lead: Settings = .{ .world = 4, .streams = 8, .round_rows = 16, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 20, .replay_floor = 0, .idx_rb = 1, .land_slots = 2 };
 }
+test "the expert pack as codes needs the checkpoint's own weights, the parity rest blocks and whole 128-value blocks" {
+    try std.testing.expectEqual(@as(?[]const u8, null), packCodesOff(true, 512, 128));
+    try std.testing.expectEqualStrings("needs the checkpoint's own FP8 / MXFP4 weights", packCodesOff(false, 512, 128).?);
+    try std.testing.expectEqualStrings("needs TF_DS_2D_GU=parity (each slot's rest block in the pack)", packCodesOff(true, 512, 0).?);
+    try std.testing.expectEqualStrings("needs a pack of whole 128-value blocks (its scales move in 16-byte units)", packCodesOff(true, 576, 128).?);
+    try std.testing.expectEqualStrings("needs a pack of whole 128-value blocks (its scales move in 16-byte units)", packCodesOff(true, 512, 96).?);
+test "wo_b's input as codes needs the checkpoint's own weights and an FP8 wo_b of both pairs' whole 32-value groups" {
+    var lays: [40]weights.Layer = undefined;
+    woBLayers(&lays);
+    const uw = [2]usize{ 2048, 2048 };
+    try std.testing.expectEqual(@as(?[]const u8, null), catCodesOff(true, &lays, uw));
+    try std.testing.expectEqualStrings("needs the checkpoint's own FP8 / MXFP4 weights", catCodesOff(false, &lays, uw).?);
+    const fp8 = "needs an FP8 wo_b on every layer (the checkpoint's own)";
+    var odd = lays;
+    odd[39].wo_b.fmt = .fp4;
+    try std.testing.expectEqualStrings(fp8, catCodesOff(true, &odd, uw).?);
+    odd = lays;
+    odd[7].wo_b.fmt = .bf16;
+    try std.testing.expectEqualStrings(fp8, catCodesOff(true, &odd, uw).?);
+    const groups = "needs wo_b's input as both pairs' parts, each of whole 32-value groups";
+    try std.testing.expectEqualStrings(groups, catCodesOff(true, &lays, .{ 2040, 2056 }).?);
+    odd = lays;
+    odd[20].wo_b.k = 4064;
+    try std.testing.expectEqualStrings(groups, catCodesOff(true, &odd, uw).?);
+    // unequal pair widths of whole groups run
+    try std.testing.expectEqual(@as(?[]const u8, null), catCodesOff(true, &lays, .{ 2016, 2080 }));
+test "quartersDecode sends each block's own rows of src at its place in the whole exchange, over the ring alone" {
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "const blocks = try decodeBlocks(n, @max(w[0], w[1]) * esize, rs.slotBytes(), &bb);"));
+    // no fallback: a refused block ends the exchange by name
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "error.RingRefusedBlock"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, qbody, "error.RingRefused"));
+    try std.testing.expect(std.mem.indexOf(u8, qbody, "t.parts") == null);
+}
+    try std.testing.expect(seen >= 6);
+test "the exchange switches that remain: a named bit each in Settings.exch, asked as \"1\" only; the retired bits are reserved and a rank that sets one is named as one this build has no name for" {
+    const kept = [_]struct { name: []const u8, bit: u32, var_ptr: *bool }{
+        .{ .name = "TF_DS_ROCI_P2_FIRST", .bit = exch_roci_p2_first, .var_ptr = &roci_p2_first_asked },
+        .{ .name = "TF_DS_ROCI_ENGRAM_AHEAD", .bit = exch_roci_engram_ahead, .var_ptr = &roci_engram_ahead_asked },
+        .{ .name = "TF_DS_ROCI_SENT_FIRST", .bit = exch_roci_sent_first, .var_ptr = &roci_sent_first_asked },
+        .{ .name = "TF_DS_ROCI_COMBINE_DOOR", .bit = exch_roci_combine_door, .var_ptr = &roci_combine_door_asked },
+        .{ .name = "TF_DS_ROCI_STAGGER", .bit = exch_roci_stagger, .var_ptr = &roci_stagger_asked },
+        .{ .name = "TF_DS_ENGRAM_PARTNER", .bit = exch_engram_partner, .var_ptr = &engram_partner_asked },
+    };
+    var buf: [1024]u8 = undefined;
+    for (kept) |k| {
+        try std.testing.expectEqualStrings(k.name, exch_names[@ctz(k.bit)]);
+        const was = k.var_ptr.*;
+        defer k.var_ptr.* = was;
+        k.var_ptr.* = false;
+        try std.testing.expectEqual(@as(u32, 0), exchAsked() & k.bit);
+        k.var_ptr.* = true;
+        try std.testing.expectEqual(k.bit, exchAsked() & k.bit);
+        // a follower that differs is named
+        const lead: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 1, .exch = k.bit };
+        var mine = lead;
+        mine.exch = 0;
+        var want: [160]u8 = undefined;
+        const w = try std.fmt.bufPrint(&want, "rank 2 has {s}=0 and rank 0 1: set the same on every rank", .{k.name});
+        try std.testing.expectEqualStrings(w, mine.differ(lead, 2, &buf));
+    }
+    // the retired switches' bits have no name: an image of the old layout is refused at the protocol before its bits are read, and a bit set by a
+    // rank of this layout's number is named as one this build cannot name
+    const lead: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 1 };
+    var odd = lead;
+    odd.exch = 1 << 0; // the old TF_DS_OWNER_YX bit
+    try std.testing.expect(std.mem.indexOf(u8, odd.differ(lead, 1, &buf), "switches this build has no name for") != null);
 }

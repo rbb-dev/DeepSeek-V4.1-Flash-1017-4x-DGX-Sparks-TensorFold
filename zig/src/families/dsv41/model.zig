@@ -9,6 +9,25 @@ const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
 const rank_cache = @import("rank_cache.zig");
+
+/// The words of the start's refusal when a retired name is set in the environment (null: none is): "TF_DS_ROCI_DECODE no longer exists:
+/// Rocinante is the only transport".
+pub fn retiredSwitch(buf: []u8) ?[]const u8 {
+    return engine_api.settings.firstRetired(ProcessEnv{}, buf);
+}
+
+/// The process environment as a lookup (`get(name) ?[]const u8`), what settings.firstRetired reads.
+const ProcessEnv = struct {
+    pub fn get(_: ProcessEnv, name: []const u8) ?[]const u8 {
+        var buf: [128:0]u8 = undefined;
+        if (name.len >= buf.len) return null;
+        @memcpy(buf[0..name.len], name);
+        buf[name.len] = 0;
+        const v = std.c.getenv(&buf) orelse return null;
+        return std.mem.span(v);
+    }
+};
+
 const weights = @import("weights.zig");
 const prompt = @import("prompt.zig");
 const prompt2d = @import("prompt2d.zig");
@@ -29,6 +48,8 @@ const cublas = @import("cublas.zig");
 const comm_mod = @import("comm.zig");
 const link = @import("link.zig");
 const ring2d = @import("ring2d.zig");
+const roci_engine = @import("roci_engine.zig");
+const pair_spans = @import("pair_spans.zig");
 const rdma = @import("rdma.zig");
 const tri_index = @import("tri_index.zig");
 
@@ -60,7 +81,7 @@ pub const Options = struct {
     pool: usize = 1 << 18, // positions of the streams' shared plane (their extents together)
     context: usize = 0, // a stream's extent at most (its prompt, budget and a round's rows; 0: the pool)
     drafts: bool = true, // load the DSpark drafter
-    rdma_devices: ?[]const u8 = null, // the decode gathers over RDMA on these devices (comma separated), else NCCL: TP2's
+    rdma_devices: ?[]const u8 = null, // the decode gathers over RDMA on these devices (comma separated): TP2's
     // ring (rdma.zig), or at world 4 the 2D split's decode-size exchanges over its rings (ring2d.zig)
     rdma_kernels: ?[]const u8 = null, // world 4: the rings' kernels' image (rdma_gather.cu's fatbin; null: the embedded one)
     graphs: bool = false, // the rounds' stretches as CUDA graphs (round.Graphs)
@@ -246,73 +267,31 @@ pub const Model = struct {
         m.stream = try cuda.Stream.init(d, true);
         errdefer m.stream.deinit();
 
-        // the weights (and the DSpark blocks) from the lane's rank cache
-        m.cache_dir = try std.Io.Dir.cwd().openDir(io, o.cache_dir, .{ .iterate = true });
-        errdefer m.cache_dir.close(io);
-        const cache_name = try rank_cache.find(a, io, m.cache_dir, o.rank, o.world);
-        m.ix = try rank_cache.open(gpa, io, m.cache_dir, cache_name);
-        errdefer m.ix.deinit();
-        m.cache_file = try m.cache_dir.openFile(io, cache_name, .{});
-        errdefer m.cache_file.close(io);
-        var sp = try prompt2d.split(o.rank, o.world);
-        sp.parity = sp.pair != null and parityGU(); // TF_DS_2D_GU=parity: the balanced experts split
-        m.w = try weights.load(gpa, d, .{ .cache = .{ .file = m.cache_file, .index = &m.ix, .io = io } }, c.*, sp, o.drafts);
-        errdefer m.w.deinit();
-        if (o.drafts and m.w.dspark == null) return error.NoDrafter;
+    /// The base set alone: the extra set's launches (the two-block readers) are not looked up by the checks that take this lookup.
+    pub fn hasExtra(f: SetFinds, name: []const u8, args: []const cuda.aot.Arg, consts: []const cuda.aot.Const) bool {
+        _ = f;
+        _ = name;
+        _ = args;
+        _ = consts;
+        return true;
+    }
+};
 
-        const neighbor_rdma = try neighbor.configured();
-        if (neighbor_rdma and o.world != 4) return error.NotFourNodes;
-        if (neighbor_rdma and o.rdma_devices != null) return error.NeighborDisallowsStockRdma;
-        const neighbor_gid = if (neighbor_rdma) try neighbor.gidIndex() else 0;
+/// SetFinds with the kit's extra set as well: a launch of the extra set (the two-block readers, runExtra) is looked up there, as it runs;
+/// without an extra set it has no variant.
+const KitFinds = struct {
+    set: *const cuda.aot.Set,
+    extra: ?*const cuda.aot.Set,
 
-        // the ranks' link and NCCL (rank 0 listens: rank 1 retries its connect while rank 0 loads)
-        m.fan = try prompt2d.Fan.open(io, o.master, o.port, o.rank, o.world);
-        errdefer m.fan.close();
-        // every rank's streams, pool, round rows, rails, drafter, replay floor and indexer split checked against rank 0's
-        m.comm = try m.fan.commChecked(o.rank, o.world, .{
-            .world = o.world,
-            .streams = @intCast(o.streams),
-            .round_rows = @intCast(o.round_rows),
-            .rails = if (o.rdma_devices) |list| @intCast(std.mem.count(u8, list, ",") + 1) else 0,
-            .drafts = @intFromBool(o.drafts),
-            .replay_floor = @intFromBool(prompt.replay_floor),
-            .idx_split = @intCast(prompt.split_from),
-            .neighbor_rdma = @intFromBool(neighbor_rdma),
-            .pool = o.pool,
-        });
-        errdefer m.comm.deinit();
-        // TF_DS_WAVES: the gathers' communicator (every rank opens it here, in the same order)
-        if (m.waves) m.comm2 = try m.fan.comm(o.rank, o.world);
-        errdefer if (m.comm2) |*x| x.deinit();
-        // TP2: the decode gathers' RDMA ring (both ranks connect before either returns)
-        if (sp.pair == null and o.rdma_devices != null) {
-            const list = o.rdma_devices.?;
-            if (!cuda.kernels.available) return error.NoKernelImages;
-            m.rdma_mod = try cuda.Module.load(d, cuda.kernels.dsv41_rdma);
-            var devices: std.ArrayList([]const u8) = .empty;
-            var it = std.mem.splitScalar(u8, list, ',');
-            while (it.next()) |dev| try devices.append(a, dev);
-            m.ring = try openRing(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, &m.comm, m.stream);
-        }
-        errdefer if (m.ring) |r| r.destroy(gpa);
-        errdefer if (m.rdma_mod) |*x| x.unload();
+    pub fn has(f: KitFinds, name: []const u8, args: []const cuda.aot.Arg, consts: []const cuda.aot.Const) bool {
+        _ = f.set.find(name, args, consts) catch return false;
+        return true;
+    }
 
-        // kernels: the recorded Triton set, the served extension cubins, the torch-op images
-        m.set = try cuda.aot.Set.load(gpa, io, d, ctx.device, o.aot_dir orelse try std.fs.path.join(a, &.{ o.kit_dir, "aot" }));
-        errdefer m.set.deinit();
-        m.pf = try exl3_prefill.Kernels.load(d, try readKit(a, io, o.kit_dir, "linear.cubin"));
-        errdefer m.pf.unload();
-        m.lg = try exl3_linear.Kernels.load(d, try readKit(a, io, o.kit_dir, "linear_grouped.cubin"));
-        errdefer m.lg.unload();
-        m.exk = try exl3_experts.Kernels.load(d, try readKit(a, io, o.kit_dir, "experts.cubin"), try readKit(a, io, o.kit_dir, "experts_cb.cubin"), exl3_linear.codebook_mul1);
-        errdefer m.exk.unload();
-        if (!cuda.kernels.available) return error.NoKernelImages;
-        m.ops = try ops_mod.Ops.load(d, cuda.kernels.torch_pointwise, cuda.kernels.torch_movement, cuda.kernels.dsv41_ops);
-        errdefer m.ops.unload();
-        m.ex = try exact.Exact.load(d, cuda.kernels.dsv41_torch);
-        errdefer m.ex.unload();
-        m.par = if (sp.parity and parOne()) try exl3_experts2d.ParKernels.load(d, cuda.kernels.dsv41_experts_par) else null;
-        errdefer if (m.par) |*x| x.unload();
+    pub fn hasExtra(f: KitFinds, name: []const u8, args: []const cuda.aot.Arg, consts: []const cuda.aot.Const) bool {
+        const x = f.extra orelse return false;
+        return x.lookup(name, args, consts) != null;
+    }
 
         // the RoPE tables (the served build's bits: torch CPU pow and polar), every position a stream reaches
         const half = c.rope_dim / 2;
@@ -710,6 +689,41 @@ pub const Model = struct {
         if (n == 0 or n > chunk_rows or seq.len != start + n) return error.BadChunk;
         if (m.waves and n > wave_rows) return m.fillPair(seq, start, n, replay);
         const e = &m.eng;
+/// TF_DS_NACT_LOG=1 (log only, off by default): the device ring the decode groupings append to (mx.nact_ring; none when off: no launch, no copy),
+/// written by flushDiag to nact-rank<R>.txt in TF_DS_NACT_DIR (default the folder's log directory): per decode launch, the rows, the distinct
+/// experts, how many of them this node owns and whether the shared expert is among them: what a launch's gate / up and down weight bytes are.
+var nact_buf: ?cuda.DeviceBuffer = null;
+var diag_calls: u32 = 0;
+var diag_last_ns: u64 = 0;
+fn nactOpen(d: *const cuda.Driver) void {
+    if (nact_buf != null) return;
+    const b = cuda.DeviceBuffer.alloc(d, 64 + mx.nact_records * 32) catch |e| return std.log.warn("TF_DS_NACT_LOG=1: off: no device memory for the log ({s})", .{@errorName(e)});
+    b.fill8(0, null) catch {};
+    nact_buf = b;
+    mx.nact_ring = b.ptr;
+    std.log.info("TF_DS_NACT_LOG=1: each decode launch's rows, distinct experts and owned experts are logged ({d} records) to nact-rank<R>.txt", .{mx.nact_records});
+}
+
+fn nactWrite(m: *Model, b: cuda.DeviceBuffer) void {
+    const gpa = std.heap.page_allocator;
+    const words = gpa.alloc(u64, 8 + mx.nact_records * 4) catch return;
+    defer gpa.free(words);
+    b.download(0, std.mem.sliceAsBytes(words)) catch return;
+    const recs = gpa.alloc(mx.NactRec, mx.nact_records) catch return;
+    defer gpa.free(recs);
+    const n = mx.nactDecode(words, recs);
+    const text = mx.nactRender(gpa, m.rank, m.world, recs[0..n]) catch return;
+    defer gpa.free(text);
+    var name: [48]u8 = undefined;
+    const file = std.fmt.bufPrint(&name, "nact-rank{d}.txt", .{m.rank}) catch return;
+    if (rdma.diagWriteFile("TF_DS_NACT_DIR", file, text)) std.log.info("TF_DS_NACT_LOG: {d} launches written ({s})", .{ n, file });
+}
+
+/// Why the decode exchanges cannot all ride the rings on this rank (null: they can): the rings are open and every decode exchange fits
+/// them (prompt2d.decodeOff).
+pub fn decodeOff(rings: bool, shape: prompt2d.DecodeShape) ?[]const u8 {
+    return std.fmt.bufPrint(&S.buf, "Rocinante decode: every decode round and drafter pass exchange rides the RDMA rings (the drafter's per-step bests over the four nodes' ring in rank order {s}); a ring that cannot take an exchange ends it by name; on every rank (this one: {d})", .{ order, rank }) catch S.buf[0..0];
+fn rankOrderText(order: *const [4]u32) []const u8 {
 pub fn startSettings(o: Options) prompt2d.Settings {
     return .{
         .world = o.world,
@@ -724,6 +738,19 @@ pub fn startSettings(o: Options) prompt2d.Settings {
     };
 }
 
+        why = "needs the four-node 2D split with Rocinante";
+    const rc = try roci_engine.Roci.openLane(gpa, d, m.comm.rank, node, m.comm.world, m.two.?.rank_of, &m.fan, rails, Model.rdmaGid() orelse 3, 1, m.two.?.rc.?, .host);
+    m.two_b = try prompt2d.Two.init(c, &m.w, &m.arena, sp, m.pass_rows);
+    m.two_b.?.rc = try roci_engine.Roci.openLane(gpa, d, m.comm.rank, @intCast(m.two.?.node()), m.comm.world, m.two.?.rank_of, &m.fan, rails, Model.rdmaGid() orelse 3, 2, m.two.?.rc.?, .prompt);
+    if (m.pair_log) {
+        // the span log's events: a pair of timing events per outstanding pair (pair_spans.cap of them), made here and only here
+        m.span_t0 = try m.gpa.alloc(cuda.Event, pair_spans.cap);
+        m.span_join = try m.gpa.alloc(cuda.Event, pair_spans.cap);
+        for (0..pair_spans.cap) |i| {
+            m.span_t0[i] = try cuda.Event.init(d, true);
+            m.span_join[i] = try cuda.Event.init(d, true);
+        }
+    }
     mxk: ?mx.Kernels = null, // Format.native: DeepSeek's own FP8 / MXFP4 checkpoint's kernels (mx.zig)
     rope_buf: cuda.DeviceBuffer,
     arena: prompt.Arena,
@@ -734,19 +761,53 @@ pub fn startSettings(o: Options) prompt2d.Settings {
     cand_vals: [round.max_rows * sampling.max_candidates]f32 = undefined,
     cand_ids: [round.max_rows * sampling.max_candidates]i64 = undefined,
     cand_flags: [round.max_rows]i32 = undefined,
+    span_ring: pair_spans.Ring = .{}, // TF_DS_ROCI_PAIR_LOG: the pairs whose span is not printed yet
+    span_t0: []cuda.Event = &.{},
+    span_join: []cuda.Event = &.{},
+    span_slot: ?usize = null, // the slot of the pair being issued
+    // digests by rank (rank 0 holds every rank's, a follower its own; prompt2d.no_digest: none)
+    /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port)
+    /// and sets up every buffer. Needs `ctx` current on this thread.
+    pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, o: Options) !*Model {
         readWorkerEnv();
+        {
+            // a name that no longer exists, in the environment, ends the start by name (every rank reads the same environment: every rank refuses alike)
+            var why: [512]u8 = undefined;
+            if (retiredSwitch(&why)) |text| {
+                std.log.err("{s}", .{text});
+                return error.RetiredSwitch;
+            }
+        }
+        if (o.world != 4) {
+            std.log.err("WORLD {d}: the engine runs on the four-node 2D split only (Rocinante carries every exchange between the Sparks; the two-Spark TP2 split needed NCCL)", .{o.world});
+            return error.NotPortedYet;
+        }
+        const m = try gpa.create(Model);
+        errdefer gpa.destroy(m);
+        m.* = undefined;
+        m.gpa = gpa;
+        m.spans = .empty;
+        m.img_buf = null;
         // WP6 (docs/prefill-plan.md): TF_DS_IDX_RB=2 batches the indexer's prompt-chunk scoring kernel to the
         // kit's own captured RB=2 variant (dequantizing a 64-key tile once for 2 rows instead of 1); the kit
         // never captured RB above 2. Off (RB=1, today's behavior) unless set; validate on your own ring first.
         if (std.c.getenv("TF_DS_IDX_RB")) |v| tri_index.idx_rb = std.fmt.parseInt(usize, std.mem.span(v), 10) catch tri_index.idx_rb;
         if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
+        if (std.c.getenv("TF_DS_ROCI_XLOG")) |v| rdma.xlog = std.mem.eql(u8, std.mem.span(v), "1");
         if (std.c.getenv("TF_DS_L2_DN_MB")) |v| round.l2_dn_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dn_mb;
         if (std.c.getenv("TF_DS_L2_DEC_MB")) |v| round.l2_dec_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dec_mb;
         m.graph_fallbacks = .init(0);
+        m.span_ring = .{};
+        m.span_t0 = &.{};
+        m.span_join = &.{};
+        m.span_slot = null;
         // rank 0's ports for its followers listen before its weights load: a follower that loads first connects and
         // waits in its port's backlog instead of retrying until rank 0 and the followers before it are in
         m.fan = try prompt2d.Fan.listenAt(o.master, o.listen, o.port, o.rank, o.world);
+        m.fan.share_digests = o.world > 1; // a rank's store is named from all four weight files
         errdefer m.fan.close();
+        m.vfan = try prompt2d.Fan.listenAt(o.master, o.listen, o.port + prompt2d.host_links_port_offset, o.rank, o.world);
+        // world 4: the 2D node this rank serves (TF_DS_2D_ORDER; its weight file is that node's)
         const ord = if (o.world == 4) try prompt2d.order() else [4]u32{ 0, 1, 2, 3 };
         const role: u32 = if (o.world == 4) ord[o.rank] else o.rank;
         const cache_name = try rank_cache.find(a, io, m.cache_dir, role, o.world);
@@ -787,13 +848,63 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         }
         sp.parity = sp.pair != null and parityGU(); // TF_DS_2D_GU=parity: the balanced experts split
         // the ranks' links (rank 0 takes its followers in order; a follower retries its connect for TF_DS_CONNECT_S)
+
         try m.fan.join(io, o.master, o.port, o.rank, o.world, prompt2d.connectSeconds());
+        try m.vfan.join(io, o.master, o.port + prompt2d.host_links_port_offset, o.rank, o.world, prompt2d.connectSeconds());
+        m.comm = try m.fan.settingsChecked(o.rank, o.world, mine, rankDigest(), &heard);
+        errdefer m.comm.deinit();
+        m.comm.host = .{ .star = .{ .links = &m.vfan.links, .rank = o.rank, .world = o.world, .busy = &m.star_busy } };
         m.par = if (sp.parity and parOne() and c.format == .exl3) try exl3_experts2d.ParKernels.load(d, cuda.kernels.dsv41_experts_par) else null;
         errdefer if (m.par) |*x| x.unload();
         m.mxk = if (c.format == .native) try mx.Kernels.load(d, cuda.kernels.dsv41_native) else null;
+        if (std.c.getenv("TF_DS_NACT_LOG")) |v| if (std.mem.eql(u8, std.mem.span(v), "1")) nactOpen(d);
         errdefer if (m.mxk) |*x| x.unload();
+        // round over the host links)
+        errdefer if (m.rdma_rings) |*x| x.close(gpa);
+            m.two = try prompt2d.Two.init(c, &m.w, &m.arena, sp, m.pass_rows);
+            m.two.?.rank_of = prompt2d.rankOf(ord);
+            try m.two.?.agreeTopology(d, &m.comm, m.stream);
             try m.two.?.agreeIdxShard(d, &m.comm, m.stream);
+            // Rocinante carries every exchange between the Sparks. Each family's start check is every rank's own (its kernel set included),
+            // then on every rank or the start ends naming the rank and its reason: there is no other transport to fall back to.
+            const Two = prompt2d.Two;
+            const rows4 = [_]usize{ 256, 512, 1024, m.pass_rows / m.comm.world };
+            try Two.require(d, &m.comm, m.stream, "the front on owned rows (qr and y gathered)", try prompt.frontOwnedOff(gpa, SetFinds{ .set = &m.set }, m.mxk != null, m.w.layers, c.layers / 2, c.eps, &rows4, m.comm.world));
+            try Two.require(d, &m.comm, m.stream, "the routing on owned rows (codes, picks and weights gathered)", try prompt.ffnCodesOff(gpa, SetFinds{ .set = &m.set }, m.mxk != null, m.w.layers, c.layers / 2, c.experts, c.top_k, c.routed_scaling, c.top_k + 1, &rows4, m.comm.world));
+            try Two.require(d, &m.comm, m.stream, "the expert pack as codes", prompt2d.packCodesOff(m.mxk != null, m.two.?.gu[m.two.?.p], m.two.?.ir));
+            try Two.require(d, &m.comm, m.stream, "the Engram sums at owned rows", try prompt.engramOwnerSumOff(gpa, SetFinds{ .set = &m.set }, m.two.?.ew, m.w.layers, c.layers / 2, c.eps, c.hidden, c.hc, &rows4, m.comm.world));
+            try Two.require(d, &m.comm, m.stream, "the boundary layer on owned rows", prompt.boundaryOwnedOff(m.w.layers[c.layers / 2]));
+            try Two.require(d, &m.comm, m.stream, "wo_b's input as codes", prompt2d.catCodesOff(m.mxk != null, m.w.layers, m.two.?.uw));
+            {
+                // the owner sums over the transport: each rank's start check (the kit's two-block readers included)
+                const readers: bool = if (m.extra) |*x| try prompt.rociReadersOff(gpa, SetLookups{ .set = x }, &[_]usize{m.pass_rows / m.comm.world}, c.hidden, m.two.?.ew[m.two.?.p], c.eps, c.hc_eps, c.hc_iters) == null else false;
+                const why = prompt2d.rociOff(m.two.?.ow, m.pass_rows, readers) orelse if (o.rdma_devices == null) @as(?[]const u8, "needs the rails' devices (TF_DS_RDMA_DEVICES)") else null;
+                try Two.require(d, &m.comm, m.stream, "the owner sums over Rocinante", why);
+                if (m.two.?.sentFirst()) std.log.info("TF_DS_ROCI_SENT_FIRST=1: wo_b runs in one launch whose first CTAs are the row quarters an owner sum's first part sends, and the last of those CTAs rings the part's doorbell itself (needs TF_DS_MMA_SF_EXACT), on every rank", .{});
+                const devs = o.rdma_devices.?;
+                var pit = std.mem.splitScalar(u8, devs, ',');
+                const rails: [2][]const u8 = .{ pit.next() orelse return error.RociRails, pit.next() orelse return error.RociRails };
+                // the producers that write the arena (the dense GEMMs) store whole lines there
+                if (m.mxk) |*x| try x.useStaged(m.two.?.rc.?.range()[0], m.two.?.rc.?.range()[1]);
+            }
+            try Two.require(d, &m.comm, m.stream, "wo_b's and the expert pack's codes over Rocinante", prompt2d.rociCodesOff(m.two.?.uw, m.two.?.gu, m.two.?.ir, c.top_k + 1));
+            std.log.info("Rocinante carries wo_b's and the expert pack's codes and scales: quantized into the transport's arena, moved to the column partner as RDMA WRITEs, on every rank", .{});
+            try Two.require(d, &m.comm, m.stream, "the gathers over Rocinante", prompt2d.rociGathersOff(m.mxk != null, c.hidden, m.w.layers[0].wq_a.n, c.head_dim, c.index_topk, c.index_head_dim, m.w.layers[0].experts.dims, c.top_k + 1));
+            std.log.info("Rocinante carries the gathers (qr and y, x, the routing's codes and picks, the indexer's top-k, the boundary's cache rows): their tensors are in the transport's arena and move as RDMA WRITEs to the three other nodes, on every rank", .{});
+            // each rank's start check of every launch of every slab (its kernel sets, the two-block readers in the extra set)
+            try Two.require(d, &m.comm, m.stream, "chunks of any row count over Rocinante", try any_check.anyOwnedOff(gpa, a, KitFinds{ .set = &m.set, .extra = if (m.extra) |*x| x else null }, c.*, m.w.layers, c.layers / 2, true, m.pass_rows));
+            std.log.info("Rocinante carries the owned path and its exchanges for a chunk of any row count (a quarter of the rows, rounded up to 16, a rank), the decoder rows' boundary and handoff, on every rank", .{});
+            // each rank's start check (its settings, then every launch of every layer at every slab of a decoder window in its kernel sets)
+            try Two.require(d, &m.comm, m.stream, "the decoder half over Rocinante", prompt2d.rociDecOff(prompt.quant_once, c.dspark_taps.slice().len, c.hidden) orelse try any_check.decoderOff(gpa, a, KitFinds{ .set = &m.set, .extra = if (m.extra) |*x| x else null }, c.*, m.w.layers));
+            std.log.info("Rocinante carries the decoder half (layers {d} to {d}) on owned rows of the decoder rows, its sums and gathers, the DSpark taps and the head's row, on every rank", .{ c.layers / 2, c.layers - 1 });
+            const proj_why: ?[]const u8 = if (prompt2d.idx_proj_owned_asked) try prompt.idxProjOwnedOff(gpa, SetFinds{ .set = &m.set }, m.mxk != null, m.two.?.idx_shard, m.w.layers, c.candidate_source, c.rope_dim, c.index_heads, c.index_head_dim, &rows4, m.comm.world) else null;
+            // the decode exchanges: each rank's start check (the rings, the shapes), then on every rank or the start ends
+            {
+                try Two.require(d, &m.comm, m.stream, "the decode exchanges on the rings", decodeOff(m.two.?.rings != null, shape));
+                std.log.info("{s}", .{decodeLine(o.rank, rankOrderText(&m.two.?.rank_of))});
+        prompt.hc_stride = prompt2d.hc_stride_asked and m.two != null;
         logPdlControls(m.comm.rank);
+        std.log.info("transport: Rocinante carries every exchange between the Sparks; no NCCL is loaded or made (rank {d})", .{o.rank});
         if (m.mxk) |*x| m.eng.mx = x;
         m.cand = try m.arena.take(round.max_rows * (sampling.max_candidates * 12 + 4));
         m.eng.agree_flag = try m.arena.take(64); // G0.3: the graph captures' agreement bytes (agreeAll, agreeCapture)
@@ -806,11 +917,34 @@ pub fn startSettings(o: Options) prompt2d.Settings {
                 m.dr.?.graphs = &m.pgraphs.?;
             }
         }
+                const owned = false; // (TF_DS_ENGRAM_OWNED is a retired name: the whole tables are on every node)
         if (c.vision and c.format == .exl3) { // (Format.native: the checkpoint's own gate.bias_vl, loaded with the weights)
             const path = o.vision_bias orelse try std.fs.path.join(a, &.{ o.kit_dir, "vision", "gate_bias_vl.safetensors" });
             m.loadVisionBias(path) catch |err| if (o.vision_bias != null or err != error.FileNotFound) return err;
         }
 
+        for (m.span_t0) |*ev| ev.deinit();
+        for (m.span_join) |*ev| ev.deinit();
+        if (m.span_t0.len != 0) m.gpa.free(m.span_t0);
+        if (m.span_join.len != 0) m.gpa.free(m.span_join);
+        m.span_t0 = &.{};
+        m.span_join = &.{};
+    /// The diagnostic logs (TF_DS_ROCI_XLOG, TF_DS_NACT_LOG) to their files: every 256th call and, forced, at close. Called after a round's work, with
+    /// the stream synchronized here: never inside a round. Nothing runs when both logs are off.
+    pub fn flushDiag(m: *Model, force: bool) void {
+        if (!rdma.xlog and nact_buf == null) return;
+        diag_calls +%= 1;
+        // every 256th call, or 3 s after the last write (a phase of a few hundred rounds then lands in the file whole but for its last seconds)
+        const t_now = m.now();
+        if (!force and diag_calls % 256 != 0 and t_now -% diag_last_ns < 3 * std.time.ns_per_s) return;
+        diag_last_ns = t_now;
+        m.stream.synchronize() catch return;
+        if (m.ring) |r| r.xlogWriteFile();
+        if (m.rdma_rings) |rs| for ([_]?*rdma.Ring{ rs.all4, rs.col, rs.pair }) |y| if (y) |r| r.xlogWriteFile(); // (a TP4 run's rings: m.ring is its single-ring twin)
+        if (nact_buf) |b| nactWrite(m, b);
+    }
+
+        m.flushDiag(true);
         if (m.dr) |*dr| dr.deinit();
         if (m.timer) |t| {
             t.deinit();
@@ -830,6 +964,8 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         m.lg.unload();
         m.pf.unload();
         m.set.deinit();
+        if (m.two) |*t| if (t.rc) |rc| rc.close();
+        m.comm.deinit();
     /// The decode plan's G0.2 controls (TF_DS_DEC_PDL, TF_DS_RDMA_PDL, TF_DS_TRITON_PDL_ATTR, TF_DS_PDL), one line on each
     /// rank when any is off, so a run can show that every rank has the same ones.
     fn logPdlControls(rank: usize) void {
@@ -968,6 +1104,22 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         if (ch.n >= 64) prompt.dump_done = prompt.dump_dir != null;
         if (pt) |t| try t.mark(e.s, .head);
         if (m.dr) |*dr| {
+            // its taps (the tap layers side by side) into the slot's drafter rings; with TF_DS_ROCI_DEC the arena's taps region holds them
+            // side by side already: one copy once the other ranks' rows have landed
+            try prompt.tapsLanded(e);
+            try e.ops.copyRows(e.s, ch.taps, dr.taps_w * 2, dr.at, dr.taps_w * 2, dr.taps_w * 2, ch.n);
+            try dr.absorb(e, ch, &m.dpool.?, m.fill_slot, dr.at, ch.n, ch.start);
+        }
+        // no synchronize: the next chunk's host steps (its first Engram layer's hashing, table reads and decode, ~0.14 s
+        // at 2,048 rows) run while this chunk's kernels do; readers of the results (the prompt's logits) synchronize.
+        // The profile (--profile 2) times a chunk to its end, so it alone waits.
+        if (pt) |t| {
+            try e.s.synchronize();
+            try t.finish();
+        }
+        return true;
+    }
+
                 }
                 if (eh.ahead_err) |err| return err;
                 try prompt.engramApply(e, ch, eh, li, seq);
@@ -984,6 +1136,31 @@ pub fn startSettings(o: Options) prompt2d.Settings {
                     eh.ahead_ready = .{ false, false };
                     eh.ahead_err = null;
                     m.ahead = std.Thread.spawn(.{}, prompt.engramReadAheadAll, .{ eh, c, m.fill_seq[0 .. start + n + nn], start + n, nn }) catch null;
+    /// Prints, in issue order, every outstanding pair's GPU span whose events are done (TF_DS_ROCI_PAIR_LOG; rank 0 prints, every rank keeps the ring).
+    fn sweepSpans(m: *Model) void {
+        const Ctx = struct {
+            m: *Model,
+            pub fn done(c: @This(), slot: usize) bool {
+                return c.m.span_join[slot].done() catch true;
+            }
+            pub fn elapsed(c: @This(), slot: usize) f32 {
+                return cuda.Event.elapsedMs(c.m.span_t0[slot], c.m.span_join[slot]) catch -1;
+            }
+            pub fn emit(c: @This(), pair: u64, ms: f32) void {
+                if (c.m.comm.rank == 0) pairLog("ROCI pair {d}: GPU span {d:.1} ms", .{ pair, ms });
+            }
+        };
+        _ = m.span_ring.sweep(Ctx{ .m = m });
+    }
+
+        if (m.pair_log) m.sweepSpans();
+        _ = t;
+        // every finished pair's GPU span (its first queued work to its second pass's last), in order
+        if (m.pair_log) m.sweepSpans();
+        m.span_slot = if (m.pair_log) m.span_ring.push(m.pair_count + 1) else null;
+        if (m.span_slot) |sl| try m.span_t0[sl].record(m.stream);
+        if (m.span_slot) |sl| try m.span_join[sl].record(m.passStreamOf(last));
+        m.span_slot = null;
                 }
                 if (pt) |t| try t.mark(m.stream, .engram);
             }
@@ -1021,6 +1198,16 @@ pub fn startSettings(o: Options) prompt2d.Settings {
     /// device's logits: vals and ids [R, count], flags [R] (non-zero: that row must be read whole, roundLogits).
     }
 
+        if (m.two) |t| if (t.rc) |rc| {
+            try rc.t.check(); // a failed transport stops the pass before its tokens are used
+            rc.passLine();
+        }; // a synchronisation point: every proxy has posted what the stream sent
+        return m.logits[0..m.vocab];
+    }
+
+    /// The drafter's batched pass for N streams: each one's pending token at position q0 in its slot (its rings hold
+    /// its positions below q0), `steps` drafts each (the drafter's drafts and confidences on the host).
+    pub fn pass(m: *Model, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize) !void {
 
         }
         return true;
@@ -1234,17 +1421,60 @@ pub fn startSettings(o: Options) prompt2d.Settings {
     /// The monotonic clock (ns).
     pub fn now(m: *const Model) u64 {
         return @intCast(std.Io.Timestamp.now(m.io, .awake).nanoseconds);
-    }
 
-    /// The round's logits, R rows of the vocabulary, on the host (after verify).
-    /// The round's greedy tokens, R rows (the device's argmax of the round's logits, as sampling.argmax), on the host.
-    pub fn roundArgmax(m: *Model, R: usize) ![]const u32 {
-        const d = m.ctx.d;
-        try m.ops.argmaxRows(m.stream, m.rd.logits, m.vocab, m.vocab, R, m.amax);
-        try m.synchronize();
-        try d.check(d.api.cuMemcpyDtoH_v2(&m.amax_host, m.amax, R * 4), "cuMemcpyDtoH");
-        return m.amax_host[0..R];
+test "this rank's weight digest comes from TF_DS_RANK_CACHE_SHA; unset, empty or not a digest, none (and the start goes on)" {
+    const env = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const name = "TF_DS_RANK_CACHE_SHA";
+    if (std.c.getenv(name) != null) return error.SkipZigTest; // the caller's own setting: left alone
+    defer _ = env.unsetenv(name);
+    try std.testing.expectEqual(prompt2d.no_digest, rankDigest());
+    const hex = "c0ffee00" ++ "11223344" ++ "55667788" ++ "99aabbcc" ++ "ddeeff00" ++ "01234567" ++ "89abcdef" ++ "fedcba98";
+    var want: prompt2d.Digest = undefined;
+    _ = try std.fmt.hexToBytes(&want, hex);
+    for ([_][:0]const u8{ hex, "sha256:" ++ hex }) |v| {
+        _ = env.setenv(name, v, 1);
+        try std.testing.expectEqual(want, rankDigest());
     }
+    for ([_][:0]const u8{ "", hex[1..], "x" ++ hex, "sha1:" ++ hex[24..] }) |v| {
+        _ = env.setenv(name, v, 1);
+        try std.testing.expectEqual(prompt2d.no_digest, rankDigest());
+    }
+}
+
+test "the start-up settings carry this rank's options and the math switches it runs" {
+    const o: Options = .{ .model_dir = "", .cache_dir = "", .kit_dir = "", .rank = 2, .world = 4, .master = .{ 10, 255, 0, 33 }, .port = 29600, .pool = 1 << 24, .drafts = true, .rdma_devices = "mlx5_0,mlx5_2", .graphs = true, .graph_cap = 1 << 40, .round_rows = 48, .streams = 16 };
+    const was = .{ prompt.replay_floor, tri_index.idx_rb };
+    defer {
+        prompt.replay_floor = was[0];
+        tri_index.idx_rb = was[1];
+    }
+    prompt.replay_floor = false;
+    tri_index.idx_rb = 1;
+    const off = startSettings(o);
+    try std.testing.expectEqual(prompt2d.Settings{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = std.math.maxInt(u32), .pool = 1 << 24, .replay_floor = 0, .idx_rb = 1, .pass_rows = 2048, .pass_from = 8192 }, off);
+    // the pass settings as Model.open read them
+    const passes = .{ prompt2d.pass_rows_asked, prompt2d.pass_from_asked };
+    defer {
+        prompt2d.pass_rows_asked = passes[0];
+        prompt2d.pass_from_asked = passes[1];
+    }
+    prompt2d.pass_rows_asked = 4096;
+    prompt2d.pass_from_asked = 16384;
+    try std.testing.expectEqual(@as(u32, 4096), startSettings(o).pass_rows);
+    try std.testing.expectEqual(@as(u32, 16384), startSettings(o).pass_from);
+    prompt2d.pass_rows_asked = 2048;
+    prompt2d.pass_from_asked = 8192;
+    prompt.replay_floor = true;
+    tri_index.idx_rb = 2;
+    const on = startSettings(o);
+    try std.testing.expectEqual(@as(u32, 1), on.replay_floor);
+    try std.testing.expectEqual(@as(u32, 2), on.idx_rb);
+    tri_index.idx_rb = 1 << 40; // a count past u32: the largest u32, never a wrap to an agreeing value
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), startSettings(o).idx_rb);
+}
 
     pub fn roundLogits(m: *Model, R: usize) ![]const f32 {
         const d = m.ctx.d;
@@ -1259,6 +1489,18 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         try m.synchronize();
         try d.check(d.api.cuMemcpyDtoH_v2(m.logits.ptr, m.ch.head_g, m.vocab * 4), "cuMemcpyDtoH");
         return m.logits[0..m.vocab];
+
+test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings' (Model.rdma_rings), not only the single ring a TP4 run never has; and by a follower between its frames" {
+    const code = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, code, "pub fn flushDiag(").?;
+    const body = code[at..std.mem.indexOfPos(u8, code, at, "\n    }\n").?];
+    try std.testing.expect(std.mem.indexOf(u8, body, "m.rdma_rings") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "rs.all4, rs.col, rs.pair") != null);
+    const lanes = @embedFile("lanes.zig");
+    const f = std.mem.indexOf(u8, lanes, "pub fn follow(gpa").?;
+    const loop = lanes[f..std.mem.indexOfPos(u8, lanes, f, "\n}\n").?];
+    try std.testing.expect(std.mem.indexOf(u8, loop, "defer m.flushDiag(false);") != null);
+}
     }
 
     /// The drafter's batched pass for N streams: each one's pending token at position q0 in its slot (its rings hold

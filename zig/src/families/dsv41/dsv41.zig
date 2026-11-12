@@ -1,6 +1,7 @@
 //! DeepSeek-V4.1-Flash on CUDA in Zig, tensor parallel over two GB10s: the served Python family's kernels, host first.
 
 pub const Config = @import("config.zig").Config;
+pub const config = @import("config.zig");
 pub const native = @import("native.zig");
 pub const rank_cache = @import("rank_cache.zig");
 pub const plan = @import("plan.zig");
@@ -51,6 +52,15 @@ pub const draft = @import("draft.zig");
 pub const sampling = @import("sampling.zig");
 pub const model = @import("model.zig");
 pub const lanes = @import("lanes.zig");
+pub const any_check = @import("any_check.zig");
+pub const replay_runner = @import("replay_runner.zig");
+/// Rocinante: the zero-copy two-rail transport.
+pub const rocinante = @import("rocinante.zig");
+/// Rocinante on ibverbs.
+pub const rocinante_verbs = @import("rocinante_verbs.zig");
+/// Rocinante inside the engine.
+pub const roci_engine = @import("roci_engine.zig");
+
 
 test {
     // every declaration of every file, so functions no test calls are still compiled
@@ -90,7 +100,6 @@ test {
     refAll(exl3_experts2d_rec);
     refAll(prompt2d);
     refAll(ring2d);
-    refAll(neighbor);
     refAll(text);
     refAll(round);
     refAll(@import("graph_cache.zig"));
@@ -102,4 +111,10 @@ test {
     refAll(sampling);
     refAll(model);
     refAll(lanes);
+    refAll(rocinante);
+    refAll(rocinante_verbs);
+    refAll(roci_engine);
+    _ = @import("pair_spans.zig");
+    _ = @import("rocinante_test.zig");
+    refAll(replay_runner);
 }

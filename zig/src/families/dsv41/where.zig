@@ -1,0 +1,2 @@
+    capture_vote, // inside a CUDA graph capture's agreement across the ranks (a = graph_fallback.Stage, b = the collectives recorded)
+        .capture_vote => std.fmt.bufPrint(buf, "in a graph capture's vote across the ranks (stage {d}, {d} collectives recorded), for {d} ms", .{ m.a, m.b, ms }),

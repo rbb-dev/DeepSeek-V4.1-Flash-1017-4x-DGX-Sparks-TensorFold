@@ -1,4 +1,4 @@
-//! Rank 0 to rank 1 over TCP (the fabric addresses): length-prefixed frames for each round's step and NCCL's id, as
+//! Rank 0 to rank 1 over TCP (the fabric addresses): length-prefixed frames for each round's step and the start-up settings, as
 //! multi.py's Link sends them. One connection, TCP_NODELAY, SO_BUSY_POLL, blocking reads (recvSpin polls first).
 const std = @import("std");
 const c = std.c;

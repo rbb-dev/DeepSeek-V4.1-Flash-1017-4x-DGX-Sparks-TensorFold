@@ -1,0 +1,691 @@
+//! Rocinante (Roci), the engine's own RDMA transport between the four nodes'
+//! registered host memory. The tensors that cross the
+//! wire live in one arena of registered pages, the producer kernels write them there and the consumer kernels read
+//! them there. A part moves as two contiguous halves, one RDMA WRITE per rail straight to its final offset in the
+//! peer's arena, each followed on the same queue pair by an 8-byte generation word. The sender needs one stream write
+//! (the doorbell) after the producer, the receiver one stream wait on the words, and a proxy thread a rail posts
+//! pre-built chains between them. Nothing is copied between a producer and its consumer.
+//!
+//! This file holds the pieces that need no device: the arena's layout, the events' chains, the control block, the
+//! proxies, the watchdog and the abort. The NIC behind a post is an interface (`Nic`); the verbs implementation is in
+//! rocinante_verbs.zig, a loopback one in the tests.
+
+const std = @import("std");
+const nap = @import("rdma_nap.zig");
+
+pub const world: usize = 4;
+pub const rails: usize = 2;
+pub const line: usize = 64;
+pub const page: usize = 4096;
+/// The scheduling ring's entries: the host runs at least a pass ahead of the proxies, and a pass sends 168 times.
+pub const sched_len: usize = 8192;
+
+// -- the arena -------------------------------------------------------------------------------------------------------
+
+/// The tensors that cross the wire, in arena order.
+pub const Region = enum(u8) {
+    psum, // owner sums' fp32 partials [cap][2560]; serves attention and MoE
+    stage, // part 1 landing: fp32 [2][cap/4][2560]
+    send2, // part 2 source: bf16 [cap/4][2560]
+    blk, // part 2 landing and the own block: bf16 [2][cap/4][2560]
+    ek, // Engram's fp32 partials [cap][12800]
+    eng_stage,
+    eng_send2,
+    eng_blk,
+    wob_send, // wo_b's input as FP8 codes + scales: records of 2,304 bytes, one a row
+    wob_land,
+    pack_send, // the expert pack's codes + scales: records of 720 bytes, 7 slot rows a row
+    pack_land,
+    g_x, // gathered tensors: each rank's slab at its place
+    g_qr,
+    g_y,
+    g_cidx,
+    g_q,
+    g_s,
+    g_pick,
+    g_wts,
+    g_taps, // a decoder window's DSpark taps: bf16 [hand_rows][3][hidden], the three taps of a row side by side; each rank's slab at its rows
+    head_x, // the head's input row (bf16 [hidden]): the collapse of the window's last row, from the rank that owns it
+};
+
+/// One row of the decoder window's taps: the three tap layers' means side by side (the drafter's row: taps * hidden bf16).
+pub const taps_row: usize = 3 * 5120 * 2;
+/// The head's input row: hidden bf16 values.
+pub const head_row: usize = 5120 * 2;
+pub const n_regions = std.enums.values(Region).len;
+
+pub const pair_w: usize = 2560; // a pair's columns of the hidden state
+pub const eng_w: usize = 12800; // an Engram part's columns
+
+/// A region's bytes at `cap` rows (cap a multiple of 4): the row-shaped sizes the maps give, before page rounding.
+    const q = cap / world;
+    return switch (r) {
+        .psum => cap * pair_w * 4,
+        .stage => 2 * q * pair_w * 4,
+        .send2 => q * pair_w * 2,
+        .blk => 2 * q * pair_w * 2,
+        .ek => cap * eng_w * 4,
+        .eng_stage => 2 * q * eng_w * 4,
+        .eng_send2 => q * eng_w * 2,
+        .eng_blk => 2 * q * eng_w * 2,
+        .wob_send, .wob_land => cap * 2304,
+        .pack_send, .pack_land => 7 * cap * 720,
+        .g_x => cap * 5120 * 2,
+        .g_qr => cap * 1280 * 2,
+        .g_y => cap * 512 * 2,
+        .g_cidx => cap * 512 * 8,
+        .g_q => cap * 5120,
+        .g_s => cap * 160 * 4,
+        .g_pick, .g_wts => cap * 7 * 4,
+        .g_taps => hand_rows * taps_row,
+        .head_x => head_row,
+    };
+}
+
+/// The bytes of one row of a gathered region (the slab of rank k starts at k * q * row).
+pub fn rowBytes(r: Region) usize {
+    return switch (r) {
+        .g_x => 5120 * 2,
+        .g_qr => 1280 * 2,
+        .g_y => 512 * 2,
+        .g_cidx => 512 * 8,
+        .g_q => 5120,
+        .g_s => 160 * 4,
+        .g_pick, .g_wts => 7 * 4,
+        .g_taps => taps_row,
+        .head_x => head_row,
+        else => unreachable,
+    };
+}
+
+pub const Layout = struct {
+    off: [n_regions]u64,
+    len: [n_regions]u64, // the region's bytes (page-rounded in `size`)
+    total: u64,
+
+    pub fn at(l: Layout, r: Region) u64 {
+        return l.off[@backingInt(r)];
+    }
+    pub fn bytes(l: Layout, r: Region) u64 {
+        return l.len[@backingInt(r)];
+    }
+
+    /// A word that two ranks compare at connect: equal layouts, equal hash.
+    pub fn hash(l: Layout) u64 {
+        var h: u64 = 0xcbf29ce484222325;
+        for (l.off, l.len) |o, n| {
+            h = (h ^ o) *% 0x100000001b3;
+            h = (h ^ n) *% 0x100000001b3;
+        }
+        return h ^ l.total;
+    }
+};
+
+/// The arena's regions, each starting on a page and sized for `max_cap` rows (a pure function: every rank computes the
+/// same one).
+pub fn layout() Layout {
+    var l: Layout = undefined;
+    var at: u64 = 0;
+    for (0..n_regions) |i| {
+        l.off[i] = at;
+        l.len[i] = n;
+        at += std.mem.alignForward(u64, n, page);
+    }
+    l.total = at;
+    return l;
+}
+
+// -- events ----------------------------------------------------------------------------------------------------------
+
+/// What a send is: one word class a kind. Pairwise events go to one partner; a gather goes to the other three.
+pub const n_classes = std.enums.values(Class).len;
+
+/// One RDMA WRITE: `len` bytes from arena offset `src` to the peer's arena offset `dst`.
+pub const Piece = struct { src: u64, dst: u64, len: u64 };
+
+pub const max_pieces = 4;
+
+/// What one rail sends to one peer for one event: the pieces in order, then the generation word.
+pub const Chain = struct {
+    pieces: [max_pieces]Piece = undefined,
+    n: u8 = 0,
+
+    fn add(c: *Chain, p: Piece) void {
+        if (p.len == 0) return;
+        c.pieces[c.n] = p;
+        c.n += 1;
+    }
+
+    pub fn slice(c: *const Chain) []const Piece {
+        return c.pieces[0..c.n];
+    }
+    pub fn bytes(c: *const Chain) u64 {
+        var t: u64 = 0;
+        for (c.slice()) |p| t += p.len;
+        return t;
+    }
+};
+
+pub const max_peers = 3;
+
+/// An event for one node: its peers and, for each, a chain a rail.
+pub const Event = struct {
+    class: Class,
+    peers: [max_peers]u8 = undefined,
+    n_peers: u8 = 0,
+    chains: [max_peers][rails]Chain = @splat(.{ .{}, .{} }),
+
+    pub fn peerSlice(e: *const Event) []const u8 {
+        return e.peers[0..e.n_peers];
+    }
+};
+
+/// The two rails' halves of `len` bytes: the first the larger when odd, on a 64-byte boundary, which is a page
+/// boundary wherever the half is a page multiple (every region but the picks' and weights').
+pub fn halves(len: u64) [2]u64 {
+    const h = std.mem.alignForward(u64, len / 2, line);
+    const a = @min(h, len);
+    return .{ a, len - a };
+}
+
+/// A part of `len` bytes at `src` -> `dst` as the two rails' halves.
+fn split(src: u64, dst: u64, len: u64) [rails]Piece {
+    const h = halves(len);
+    return .{ .{ .src = src, .dst = dst, .len = h[0] }, .{ .src = src + h[0], .dst = dst + h[0], .len = h[1] } };
+}
+
+/// The rows of the node `order[g]`-th block: `Two.rank_of[node]` in the engine, the identity by default.
+pub const Order = [world]u8;
+pub const identity: Order = .{ 0, 1, 2, 3 };
+
+/// The event `class` of node `g` for a chunk of `cap` rows (cap a multiple of 4 up to max_cap).
+pub fn buildEvent(class: Class, cap: usize, g: usize, order: Order) Event {
+    const L = layout();
+    const q: u64 = cap / world;
+    var e: Event = .{ .class = class };
+    switch (class) {
+        .own1, .eng1 => {
+            // psum (or ek) rows of the row partner's block and of the diagonal's block, each whole on one rail
+            const w: u64 = if (class == .own1) pair_w else eng_w;
+            const src_r: Region = if (class == .own1) .psum else .ek;
+            const dst_r: Region = if (class == .own1) .stage else .eng_stage;
+            const blk = q * w * 4;
+            e.peers[0] = @intCast(g ^ 1);
+            e.n_peers = 1;
+            const rows = [rails]usize{ g ^ 1, g ^ 3 };
+            for (0..rails) |rail| {
+                e.chains[0][rail].add(.{ .src = L.at(src_r) + order[rows[rail]] * blk, .dst = L.at(dst_r) + rail * blk, .len = blk });
+            }
+        },
+        .own2, .eng2 => {
+            const w: u64 = if (class == .own2) pair_w else eng_w;
+            const src_r: Region = if (class == .own2) .send2 else .eng_send2;
+            const dst_r: Region = if (class == .own2) .blk else .eng_blk;
+            const blk = q * w * 2;
+            e.peers[0] = @intCast(g ^ 2);
+            e.n_peers = 1;
+            const pieces = split(L.at(src_r), L.at(dst_r) + (g >> 1) * blk, blk);
+            for (0..rails) |rail| e.chains[0][rail].add(pieces[rail]);
+        },
+        .wob, .pack => {
+            const s: Region = if (class == .wob) .wob_send else .pack_send;
+            const d: Region = if (class == .wob) .wob_land else .pack_land;
+            const n: u64 = if (class == .wob) cap * 2304 else 7 * cap * 720;
+            e.peers[0] = @intCast(g ^ 2);
+            e.n_peers = 1;
+            const pieces = split(L.at(s), L.at(d), n);
+            for (0..rails) |rail| e.chains[0][rail].add(pieces[rail]);
+        },
+        .gh, .gt, .hx => {}, // the handoff, the taps and the head's row have no full-cap plan: their rows are a decoder window's (buildEventX)
+            const regs: []const Region = switch (class) {
+                .gf => &.{ .g_qr, .g_y },
+                .ga => &.{.g_x},
+                .gm => &.{ .g_q, .g_s, .g_pick, .g_wts },
+            };
+            var k: u8 = 0;
+            for ([_]usize{ 1, 2, 3 }) |x| {
+                const peer = g ^ x;
+                e.peers[k] = @intCast(peer);
+                for (regs) |r| {
+                    const slab = order[g] * q * rowBytes(r);
+                    const pieces = split(L.at(r) + slab, L.at(r) + slab, q * rowBytes(r));
+                    for (0..rails) |rail| e.chains[k][rail].add(pieces[rail]);
+                }
+                k += 1;
+            }
+            e.n_peers = k;
+        },
+    }
+    return e;
+}
+
+/// For gt and hx, `n` is a decoder window's rows (1 to hand_rows): gt moves each rank's slab of the window's taps, its rows of the three
+/// taps side by side, to the other three; hx the head's row from the rank whose slab holds the window's last row (headOwner), the others
+/// sending their word alone.
+        .gt, .hx => {
+            std.debug.assert(n <= hand_rows);
+            const sl = slabs.slab(n, order[g]);
+            const at: u64 = if (class == .gt) L.at(.g_taps) + sl.start * taps_row else L.at(.head_x);
+            const len: u64 = if (class == .gt) sl.n * taps_row else if (order[g] == headOwner(n)) head_row else 0;
+            var j: u8 = 0;
+            for ([_]usize{ 1, 2, 3 }) |px| {
+                e.peers[j] = @intCast(g ^ px);
+                const pieces = split(at, at, len);
+                for (0..rails) |rail| e.chains[j][rail].add(pieces[rail]);
+                j += 1;
+            }
+            e.n_peers = j;
+        },
+/// The rank (slab plan index, as `order` gives a node's) whose slab holds the last row of a window of `n` rows: the head's row is its.
+pub fn headOwner(n: usize) usize {
+    return (n - 1) / slabs.q(n);
+}
+
+/// The word classes a rank receives on: from which sources an event of this class arrives.
+pub fn sourcesOf(class: Class, g: usize, out: *[world]u8) []const u8 {
+    var n: usize = 0;
+    switch (class) {
+        .own1, .eng1 => {
+            out[0] = @intCast(g ^ 1);
+            n = 1;
+        },
+            out[0] = @intCast(g ^ 2);
+            n = 1;
+        },
+        else => for ([_]usize{ 1, 2, 3 }) |x| {
+            out[n] = @intCast(g ^ x);
+            n += 1;
+        },
+    }
+    return out[0..n];
+}
+
+// -- the control block -----------------------------------------------------------------------------------------------
+
+/// A word alone on its cache line: the monitor of a nap, a stream write and a NIC write never share one.
+pub const Word = extern struct {
+    v: u64 align(line) = 0,
+    pad: [line - 8]u8 = @splat(0),
+};
+
+/// The abort value stored into every awaited word: above any generation, below 2^63 so the cyclic compare passes.
+pub const abort_value: u64 = 1 << 62;
+
+/// Ordinary mapped (not write-combined) memory: the CPU proxy loads it, the NICs and the GPU write it.
+pub const Control = extern struct {
+    doorbell: Word = .{},
+    abort: Word = .{},
+    done: [rails]Word = @splat(.{}),
+    sched: [sched_len]u64 align(line) = @splat(0),
+    recv: [n_classes][world][rails]Word = @splat(@splat(@splat(.{}))),
+};
+
+/// A scheduling entry: the send's ticket (so a reader can tell the entry is there) and its event.
+pub fn schedEntry(ticket: u64, class: Class, shape: u8) u64 {
+    return (ticket & 0xffff_ffff) | (@as(u64, @backingInt(class)) << 32) | (@as(u64, shape) << 40);
+}
+pub fn schedTicket(e: u64) u32 {
+    return @truncate(e);
+}
+pub fn schedClass(e: u64) Class {
+    return @fromBackingInt(@intCast(@as(u8, @truncate(e >> 32))));
+}
+pub fn schedShape(e: u64) u8 {
+    return @truncate(e >> 40);
+}
+
+// -- the NIC ---------------------------------------------------------------------------------------------------------
+
+pub const PostError = error{ PostFailed, QpError };
+
+/// What a proxy needs of the network: post one chain on a rail to a peer, ending in the generation word.
+pub const Nic = struct {
+    ctx: *anyopaque,
+    post_fn: *const fn (ctx: *anyopaque, rail: u8, peer: u8, class: Class, chain: *const Chain, word: u64) PostError!void,
+    fail_fn: *const fn (ctx: *anyopaque) void,
+    /// The proxy's chance to reap completions: an error completion fails the transport.
+    reap_fn: *const fn (ctx: *anyopaque, rail: u8) PostError!void,
+
+    fn post(n: Nic, rail: u8, peer: u8, class: Class, chain: *const Chain, word: u64) PostError!void {
+        return n.post_fn(n.ctx, rail, peer, class, chain, word);
+    }
+};
+
+// -- counters --------------------------------------------------------------------------------------------------------
+
+/// Plain counters, one writer each (the engine thread or one rail's proxy); read when the pass is quiet.
+pub const Counters = struct {
+    // engine thread
+    events: u64 = 0,
+    doorbells: u64 = 0,
+    stream_writes: u64 = 0,
+    wait_groups: u64 = 0,
+    // a rail's proxy
+    data_writes: u64 = 0,
+    words: u64 = 0,
+    posts: u64 = 0,
+    bytes_out: u64 = 0,
+    wakes: u64 = 0,
+    backstop_wakes: u64 = 0,
+    post_ns_max: u64 = 0,
+    watchdog_max_age_ms: u64 = 0,
+
+    pub fn add(a: *Counters, b: Counters) void {
+        inline for (@typeInfo(Counters).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "post_ns_max") or std.mem.eql(u8, name, "watchdog_max_age_ms")) {
+                @field(a, name) = @max(@field(a, name), @field(b, name));
+            } else @field(a, name) += @field(b, name);
+        }
+    }
+};
+
+// -- the transport ---------------------------------------------------------------------------------------------------
+
+/// The transport's name, as its start line prints it.
+pub const transport_name = "Rocinante transport";
+
+/// when the arena holds their regions.
+
+/// An owner pass (attention x20, MoE x20: two parts each; Engram x2: two parts each) sends this many events; the proxies print
+/// their rail's line every time they have posted that many.
+pub const events_per_pass: u64 = 84;
+
+/// The time from a proxy's post of an event to the last of its peers' words on that rail seen by the same proxy (it looks every
+/// wake: at most the backstop late). It holds the wire and the peers' lateness; per class.
+pub const Wire = struct { n: u64 = 0, sum_ns: u64 = 0, max_ns: u64 = 0 };
+
+const Pending = struct { class: u8, t_ns: u64, want: u64 };
+const pending_len = 512;
+
+/// The start line (once, on every rank): the name, the arena, the rails and the plan hash.
+    const l = layout();
+}
+
+pub const Settings = struct {
+    /// A nap's longest length: the backstop that catches a GPU write the nap missed.
+    backstop_us: u32 = 100,
+    /// No word from a peer for this long while one is owed: the pass stops, naming the peer and the class.
+    dead_ms: u64 = 5_000,
+    /// The two rails' proxies nap on the doorbell (TF_DS_RDMA_WFE's way) or poll.
+    nap: bool = true,
+};
+
+
+pub const Transport = struct {
+    gpa: std.mem.Allocator,
+    g: u8, // this node
+    order: Order,
+    ctl: *Control,
+    /// The device address of `ctl` (cuMemHostGetDevicePointer); the host tests use the host address.
+    ctl_dev: u64,
+    nic: Nic,
+    set: Settings,
+    events: [2][n_classes]Event, // [shape][class]; shape 0 = cap 4,096, 1 = cap 2,048
+    ticket: u64 = 0,
+    want: [n_classes]u64 = @splat(0),
+    sent: [rails][n_classes]u64 = @splat(@splat(0)),
+    host: Counters = .{},
+    rail_counters: [rails]Counters = @splat(.{}),
+    wire: [rails][n_classes]Wire = @splat(@splat(.{})),
+    pending: [rails][pending_len]Pending = undefined,
+    pend_head: [rails]u64 = @splat(0),
+    pend_tail: [rails]u64 = @splat(0),
+    rail_prev: [rails]Counters = @splat(.{}),
+    wire_prev: [rails][n_classes]Wire = @splat(@splat(.{})),
+    stop: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(u8) = .init(0),
+    fail_class: std.atomic.Value(u8) = .init(0),
+    fail_peer: std.atomic.Value(u8) = .init(0),
+    threads: [rails]?std.Thread = @splat(null),
+
+
+    pub fn init(gpa: std.mem.Allocator, g: u8, order: Order, ctl: *Control, ctl_dev: u64, nic: Nic, set: Settings) !*Transport {
+        const t = try gpa.create(Transport);
+        t.* = .{ .gpa = gpa, .g = g, .order = order, .ctl = ctl, .ctl_dev = ctl_dev, .nic = nic, .set = set, .events = undefined };
+        for (0..2) |s| for (0..n_classes) |c| {
+            t.events[s][c] = buildEvent(@fromBackingInt(@intCast(c)), shape_caps[s], g, order);
+        };
+        return t;
+    }
+
+    /// Starts the two proxy threads; `cpus` are the cores to pin them to (null: no pinning).
+    pub fn start(t: *Transport, cpus: ?[rails]u16) !void {
+    }
+
+    pub fn deinit(t: *Transport) void {
+        t.stop.store(true, .release);
+        for (&t.threads) |*th| if (th.*) |x| {
+            th.* = null;
+        };
+        t.gpa.destroy(t);
+    }
+
+    fn word(t: *Transport, class: Class, src: u8, rail: usize) *Word {
+        return &t.ctl.recv[@backingInt(class)][src][rail];
+    }
+
+    fn devAddr(t: *const Transport, p: *const anyopaque) u64 {
+        return t.ctl_dev + (@intFromPtr(p) - @intFromPtr(t.ctl));
+    }
+
+    /// The sender's side of an event, queued behind the producer on `stream`: the scheduling entry, then one stream
+    /// write of the ticket. `stream` has writeValue64(addr, value).
+    pub fn send(t: *Transport, stream: anytype, class: Class, shape: u8) !void {
+        try t.check();
+        // the host may run ahead of the proxies by half the ring: past that it waits for them (they advance as the stream
+        // reaches the doorbells), and a transport that does not advance in `dead_ms` has failed
+        if (t.ticket -% t.doneMin() >= sched_len / 2) {
+            const t0 = nowNs();
+            while (t.ticket -% t.doneMin() >= sched_len / 2) {
+                try t.check();
+                if (nowNs() - t0 > t.set.dead_ms * std.time.ns_per_ms) {
+                    t.fail(.host_wait, .own1, 0);
+                    return error.RociFailed;
+                }
+                const ts: std.c.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_us };
+                _ = std.c.nanosleep(&ts, null);
+            }
+        }
+        t.ticket += 1;
+        const slot = &t.ctl.sched[t.ticket % sched_len];
+        t.host.events += 1;
+        t.host.doorbells += 1;
+    }
+
+    /// The receiver's side: the next consumer on `stream` waits for every source's words on both rails.
+    pub fn wait(t: *Transport, stream: anytype, class: Class) !void {
+        try t.check();
+        t.want[@backingInt(class)] += 1;
+        const v = t.want[@backingInt(class)];
+        var srcs: [world]u8 = undefined;
+        var addrs: [world * rails]u64 = undefined;
+        var vals: [world * rails]u64 = undefined;
+        var n: usize = 0;
+        for (sourcesOf(class, t.g, &srcs)) |s| for (0..rails) |r| {
+            addrs[n] = t.devAddr(&t.word(class, s, r).v);
+            vals[n] = v;
+            n += 1;
+        };
+        try stream.waitValues64(addrs[0..n], vals[0..n]);
+        t.host.wait_groups += 1;
+    }
+
+    fn doneMin(t: *Transport) u64 {
+        return @min(@atomicLoad(u64, &t.ctl.done[0].v, .acquire), @atomicLoad(u64, &t.ctl.done[1].v, .acquire));
+    }
+
+    /// Whether the transport has failed (the host reads it at every enqueue and at its own synchronisation points).
+    pub fn check(t: *Transport) !void {
+        if (t.failed.load(.acquire) != 0 or @atomicLoad(u64, &t.ctl.abort.v, .acquire) != 0) return error.RociFailed;
+    }
+
+    pub fn failure(t: *const Transport) ?struct { reason: FailReason, class: Class, peer: u8 } {
+        const r = t.failed.load(.acquire);
+        if (r == 0) return null;
+        return .{ .reason = @fromBackingInt(@intCast(r)), .class = @fromBackingInt(@intCast(t.fail_class.load(.monotonic))), .peer = t.fail_peer.load(.monotonic) };
+    }
+
+    pub fn fail(t: *Transport, reason: FailReason, class: Class, peer: u8) void {
+        if (t.failed.cmpxchgStrong(0, @backingInt(reason), .acq_rel, .acquire) != null) return;
+        t.fail_class.store(@backingInt(class), .monotonic);
+        t.fail_peer.store(peer, .monotonic);
+        @atomicStore(u64, &t.ctl.abort.v, 1, .release);
+        t.nic.fail_fn(t.nic.ctx);
+        @atomicStore(u64, &t.ctl.doorbell.v, abort_value, .release);
+    }
+
+    /// The per-peer progress watchdog of one rail: for any class where this rail has posted more than a peer's words
+    /// received, if no word of that peer moved for `dead_ms`, the pass stops naming the peer and the class.
+    fn watch(t: *Transport, rail: u8, last: *u64, sum: *u64, ctr: *Counters) void {
+        var owed: ?struct { c: u8, p: u8 } = null;
+        var s: u64 = 0;
+        for (0..n_classes) |c| {
+            var srcs: [world]u8 = undefined;
+            for (sourcesOf(@fromBackingInt(@intCast(c)), t.g, &srcs)) |p| {
+                const v = @atomicLoad(u64, &t.word(@fromBackingInt(@intCast(c)), p, rail).v, .acquire);
+                s +%= v;
+                if (v < t.sent[rail][c] and owed == null) owed = .{ .c = @intCast(c), .p = p };
+            }
+        }
+        const now = nowNs();
+        if (s != sum.* or owed == null) {
+            sum.* = s;
+            last.* = now;
+            return;
+        }
+        const age_ms = (now - last.*) / std.time.ns_per_ms;
+        ctr.watchdog_max_age_ms = @max(ctr.watchdog_max_age_ms, age_ms);
+        if (age_ms >= t.set.dead_ms) t.fail(.watchdog, @fromBackingInt(@intCast(owed.?.c)), owed.?.p);
+    }
+
+    /// Events whose words from every source have all arrived on this rail: their post-to-last-word time into the class's Wire.
+    fn reapWire(t: *Transport, rail: u8) void {
+        while (t.pend_head[rail] < t.pend_tail[rail]) {
+            const p = t.pending[rail][t.pend_head[rail] % pending_len];
+            var srcs: [world]u8 = undefined;
+            for (sourcesOf(@fromBackingInt(@intCast(p.class)), t.g, &srcs)) |src| {
+                if (@atomicLoad(u64, &t.word(@fromBackingInt(@intCast(p.class)), src, rail).v, .acquire) < p.want) return;
+            }
+            const dt = nowNs() - p.t_ns;
+            const w = &t.wire[rail][p.class];
+            w.n += 1;
+            w.sum_ns += dt;
+            w.max_ns = @max(w.max_ns, dt);
+            t.pend_head[rail] += 1;
+        }
+    }
+
+    /// One line a pass and rail from its proxy: the posts, data WRITEs, words and bytes it made since its last line, and the
+    /// post-to-last-word time of each class it saw complete (mean / max, microseconds).
+    fn railLine(t: *Transport, rail: u8) void {
+        const now = t.rail_counters[rail];
+        const prev = t.rail_prev[rail];
+        t.rail_prev[rail] = now;
+        var w = std.Io.Writer.fixed(&buf);
+        for (0..n_classes) |c| {
+            const cur = t.wire[rail][c];
+            const pw = t.wire_prev[rail][c];
+            t.wire_prev[rail][c] = cur;
+            if (cur.n == pw.n) continue;
+            const n = cur.n - pw.n;
+            w.print(" {s} {d}/{d} {d}", .{ @tagName(@as(Class, @fromBackingInt(@intCast(c)))), (cur.sum_ns - pw.sum_ns) / n / 1000, cur.max_ns / 1000, n }) catch return;
+        }
+        std.log.info("{s}", .{w.buffered()});
+    }
+
+    pub fn counters(t: *const Transport) Counters {
+        var c = t.host;
+        for (t.rail_counters) |r| c.add(r);
+        return c;
+    }
+
+    /// The pass's counter line.
+    pub fn counterLine(t: *const Transport, w: *std.Io.Writer, label: []const u8) !void {
+        const c = t.counters();
+            label,            c.events,      c.doorbells,           c.stream_writes,                              c.wait_groups,
+            c.data_writes,    c.words,       c.posts,               c.bytes_out,                                  c.wakes,
+        });
+    }
+};
+
+fn pinCpu(c: u16) void {
+    if (c >= @bitSizeOf(std.os.linux.cpu_set_t)) return;
+    var set: std.os.linux.cpu_set_t = @splat(0);
+    const bits = @bitSizeOf(usize);
+    set[c / bits] |= @as(usize, 1) << @intCast(c % bits);
+    std.os.linux.sched_setaffinity(0, &set) catch {};
+}
+
+fn nowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+/// One rail's proxy: waits on the doorbell (a nap on its line, a backstop for a write the nap missed), posts the
+/// chains of every send the doorbell has passed, reaps its completions and watches its peers.
+    if (cpu) |c| pinCpu(c);
+    const ctr = &t.rail_counters[rail];
+    var done: u64 = 0;
+    var last_progress = nowNs();
+    var progress_sum: u64 = 0;
+    const ticks = nap.ticksPerUs();
+    const can_nap = t.set.nap and nap.available() and nap.clock() == .fine;
+    while (!t.stop.load(.acquire)) {
+        t.reapWire(rail);
+        const d = @atomicLoad(u64, &t.ctl.doorbell.v, .acquire);
+        if (d == abort_value or t.failed.load(.acquire) != 0) break;
+        if (d == done) {
+                const dl = nap.now() + ticks * t.set.backstop_us;
+            } else std.atomic.spinLoopHint();
+            ctr.wakes += 1;
+                t.watch(rail, &last_progress, &progress_sum, ctr);
+                t.nic.reap_fn(t.nic.ctx, rail) catch {
+                    t.fail(.qp, .own1, 0);
+                    break;
+                };
+            continue;
+        }
+        const t0 = nowNs();
+        while (done < d) {
+            const i = done + 1;
+            var e = @atomicLoad(u64, &t.ctl.sched[i % sched_len], .acquire);
+            var spins: u32 = 0;
+            while (schedTicket(e) != @as(u32, @truncate(i))) : (spins += 1) {
+                if (spins > 20_000) {
+                    t.fail(.stamp, .own1, 0);
+                    return;
+                }
+                std.atomic.spinLoopHint();
+                e = @atomicLoad(u64, &t.ctl.sched[i % sched_len], .acquire);
+            }
+            const cls = @backingInt(ev.class);
+            t.sent[rail][cls] += 1;
+            for (ev.peerSlice(), 0..) |peer, k| {
+                const ch = &ev.chains[k][rail];
+                t.nic.post(rail, peer, ev.class, ch, t.sent[rail][cls]) catch {
+                    t.fail(.post, ev.class, peer);
+                    return;
+                };
+                ctr.posts += 1;
+                ctr.data_writes += ch.n;
+                ctr.words += 1;
+                ctr.bytes_out += ch.bytes();
+            }
+            done = i;
+            @atomicStore(u64, &t.ctl.done[rail].v, done, .release);
+            if (t.pend_tail[rail] - t.pend_head[rail] < pending_len) {
+                t.pending[rail][t.pend_tail[rail] % pending_len] = .{ .class = @intCast(cls), .t_ns = nowNs(), .want = t.sent[rail][cls] };
+                t.pend_tail[rail] += 1;
+            }
+        }
+        ctr.post_ns_max = @max(ctr.post_ns_max, nowNs() - t0);
+        last_progress = nowNs();
+    }
+}
+
+comptime {
+    // the control block's lines: the doorbell and the abort never share one with a counter the NIC writes
+    std.debug.assert(@sizeOf(Word) == line and @alignOf(Word) == line);
+    std.debug.assert(@offsetOf(Control, "sched") % line == 0);
+}

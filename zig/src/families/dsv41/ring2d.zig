@@ -2,9 +2,9 @@
 //! TF_DS_2D_INTO and TF_DS_2D_GROUPS): quarters over the four nodes' ring, cat_rank over the column pair's (node g and
 //! g ^ 2, the same TP2 rank of each pair), the pair gather over the row pair's (g and g ^ 1, TP2 inside a pair), each
 //! part written straight into its place in the caller's layout (no [4, ...] buffer, no copies after it). The rings
-//! open on the fabric's verbs devices; their queue-pair infos go round the four nodes in one NCCL all-gather. Parts
+//! open on the fabric's verbs devices; their queue-pair infos go round the four nodes over the host links. Parts
 //! travel as fp32 words (16-bit parts reinterpreted), so a part's row must be a whole number of 16 bytes. A part
-//! larger than the rings take returns error.TooLarge, and the caller takes NCCL (prompt2d.zig), as the lane does.
+//! larger than the rings take returns error.TooLarge, and the caller ends the exchange by name (prompt2d.zig).
 const std = @import("std");
 const cuda = @import("cuda");
 const rdma = @import("rdma.zig");
@@ -79,6 +79,7 @@ pub const Rings = struct {
     /// started on every node before any returns.
     pub fn open(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, k: rdma.Kernels, devices: []const []const u8, g: u32, s: rdma.Settings, comm: *const Comm, stream: cuda.Stream) !Rings {
         if (g >= 4 or comm.world != 4) return error.NotFourNodes;
+    /// their infos exchanged over `comm` (world 4, rank i serving node ord[i]: TF_DS_2D_ORDER), connected and
         if (g >= 4 or comm.world != 4 or comm.rank >= 4) return error.NotFourNodes;
         var seen: [4]bool = @splat(false);
         for (ord) |x| {
@@ -88,26 +89,7 @@ pub const Rings = struct {
         if (ord[comm.rank] != g) return error.NotFourNodes;
         const r = g % 2;
         const p = g / 2;
-        // TF_DS_TWO_HOP: each partner's ring on the devices cabled to it (every node's subnets go round first)
-        var col_devs: []const []const u8 = devices;
-        var pair_devs: []const []const u8 = devices;
-        var col_buf: [4][]const u8 = undefined;
-        var pair_buf: [4][]const u8 = undefined;
-        var col_names: [4][24]u8 = undefined;
-        var pair_names: [4][24]u8 = undefined;
-        if (comm_mod.two_hop) {
-            const mine = try devs(io, devices, s.gid_index);
-            const tb = @sizeOf([4]Dev);
-            var tdev = try cuda.DeviceBuffer.alloc(d, 5 * tb);
-            defer tdev.free();
-            try tdev.upload(0, std.mem.asBytes(&mine));
-            try comm.allGather(tdev.ptr, tdev.ptr + tb, tb, .u8, stream);
-            try stream.synchronize();
-            var tables: [4][4]Dev = undefined;
-            try tdev.download(tb, std.mem.sliceAsBytes(&tables));
-            col_devs = col_buf[0..pick(mine, tables[g ^ 2], &col_buf, &col_names)];
-            pair_devs = pair_buf[0..pick(mine, tables[g ^ 1], &pair_buf, &pair_names)];
-            if (col_devs.len == 0 or pair_devs.len == 0) return error.NoCableToPartner;
+        var rank_of: [4]u32 = undefined; // node -> rank
         for (ord, 0..) |x, i| rank_of[x] = @intCast(i);
         // TF_DS_RDMA_CPUS=a,b,c: the three proxies' CPUs (the four nodes' ring's, the column pair's, the row pair's)
         var cpus: [3]?u16 = .{ null, null, null };
@@ -137,8 +119,9 @@ pub const Rings = struct {
         defer dev.free();
         try dev.upload(0, std.mem.sliceAsBytes(&mine));
         try comm.allGather(dev.ptr, dev.ptr + 8 * per, 8 * per, .u8, stream);
+        try comm.gatherHost(d, dev.ptr, dev.ptr + 8 * per, 8 * per, stream);
         try stream.synchronize();
-        var all: [4][8]rdma.Info = undefined;
+        var all: [4][8]rdma.Info = undefined; // by rank
         try dev.download(8 * per, std.mem.sliceAsBytes(&all));
         var remote4: [4]rdma.Info = undefined;
         for (0..4) |q| remote4[q] = all[rank_of[q]][g];
@@ -151,7 +134,7 @@ pub const Rings = struct {
         try pair.connect(&remote_pair);
             for (0..2) |rr| remote_pair[rr] = all[rank_of[2 * p + rr]][6 + r];
         // every queue pair ready on every node before any ring sends: one more all-gather as the barrier
-        try comm.allGather(dev.ptr, dev.ptr + 8 * per, 1, .u8, stream);
+        try comm.gatherHost(d, dev.ptr, dev.ptr + 8 * per, 1, stream);
         try stream.synchronize();
         if (all4) |x| try x.start();
         try col.start();

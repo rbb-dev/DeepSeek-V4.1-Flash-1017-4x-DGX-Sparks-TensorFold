@@ -6,7 +6,7 @@
 //! ring and the rotations folded in, q's RoPE in wq_b's epilogue, the compressor and the indexer, the sparse attention
 //! whose merge applies the inverse RoPE and rotates wo_a's inputs, wo_a's epilogue rotating wo_b's), its gather, the
 //! FFN mixes, the MoE and its gather; a stretch's last post alone; the head on every row. The served side streams (the
-//! Sinkhorn half, the L2 prefetches) run in this stream's order here, the RDMA gathers are NCCL all-gathers (the same
+//! Sinkhorn half, the L2 prefetches) run in this stream's order here, the RDMA gathers are the rings' all-gathers (the same
 //! bytes), and the round's index arithmetic (rounds.py _ix: integer ops on the positions and the stream's extent) is
 //! made on the host. A node of the four-node 2D split takes its column parts and their exchanges through round2d.zig's
 //! hooks (Engine.two).
@@ -1099,6 +1099,8 @@ pub const Graphs = struct {
         pub fn failed(s: *Site, err: ?anyerror) void {
             const k = s.key;
             if (err) |x| {
+                std.log.err("graph capture of rows {d} bucket {d} stretch {d} failed on rank {d} while it was recorded: {s}; the round fails on every rank (restart the engine if replies stop: the ranks' graph state may differ)", .{ k.rows, k.bucket, k.stretch, s.e.comm.rank, @errorName(x) });
+            } else std.log.err("graph capture of rows {d} bucket {d} stretch {d} failed on another rank while it was recorded; the round fails on every rank (restart the engine if replies stop: the ranks' graph state may differ)", .{ k.rows, k.bucket, k.stretch });
         }
     };
 };
@@ -1332,6 +1334,7 @@ fn engramAhead(e: *const Engine, eh: *prompt.EngramHost, seq: []const i32, rows:
 fn engramLand(e: *const Engine, rd: *Round, eh: *prompt.EngramHost, ah: *const Ahead, li: usize) !void {
     const c = e.c;
     const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)) orelse return error.NotAnEngramLayer;
+        try pr.roundLand(j, ah.R, e.s, rd.e_in);
     const tbl = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
     const k = eh.hi - eh.lo;
     const f0 = aheadRow(j) * k;

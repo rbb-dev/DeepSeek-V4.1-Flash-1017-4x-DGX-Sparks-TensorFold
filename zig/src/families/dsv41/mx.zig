@@ -217,6 +217,7 @@ pub const Kernels = struct {
     // up (GuArgs), down (DnArgs); the cross-CTA split's counters (int zeros, each launch leaves them zero)
     dec: [5][4]cuda.Function,
     dec_group: cuda.Function, // a decode launch's grouping in one CTA
+    nact_log: ?cuda.Function, // TF_DS_NACT_LOG's record kernel (a kit built before it: none)
     dec_quant: cuda.Function, // act_quant for decode launches (a programmatic dependent launch)
     dec_l2pf: cuda.Function, // the active experts' down weights into L2 (beside the 2D exchange)
     dec_on: bool, // TF_DS_DECODE_DEC=0: the GEMV kernels instead (the reference path, measured slower)
@@ -238,6 +239,13 @@ pub const Kernels = struct {
     pf_tiles: cuda.Function,
     pf_bf16: cuda.Function,
     pf_off: bool, // TF_DS_PF_TILES=0: prompt chunks on the tile kernels (the same bits)
+    // the transport's arena [wc[0], wc[1]) (useStaged): a dense GEMM whose fp32 y lies in it takes the _st kernels, which store
+    // whole lines (write-combined host memory takes partial lines slowly); the same values
+    wc: [2]u64 = .{ 0, 0 },
+    st_gemm: ?cuda.Function = null,
+    st_fold: ?cuda.Function = null,
+    st_gemm5: ?cuda.Function = null,
+    st_split: [4]?cuda.Function = @splat(null),
 
     pub fn load(d: *const cuda.Driver, image: []const u8) !Kernels {
         var m = try cuda.Module.load(d, image);
@@ -256,6 +264,7 @@ pub const Kernels = struct {
         return .{
             .dec = dec,
             .dec_group = try m.function("tf_dsn_dec_group_kernel"),
+            .nact_log = m.function("tf_dsn_nact_log_kernel") catch null,
             .dec_quant = try m.function("tf_dsn_dec_quant_kernel"),
             .dec_l2pf = try m.function("tf_dsn_dec_l2pf_kernel"),
             .dec_pdl = if (std.c.getenv("TF_DS_DEC_PDL")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true,
@@ -296,6 +305,17 @@ pub const Kernels = struct {
         const f = try m.function(name);
         try f.allowDynamicShared(smem);
         return f;
+    }
+
+    /// The dense GEMMs' whole-line twins for a y in [lo, hi) (the transport's arena): the _st kernels of the tile, fold, 5-stage
+    /// and split configurations, then the range. An error leaves the range empty.
+    pub fn useStaged(k: *Kernels, lo: u64, hi: u64) !void {
+        k.st_gemm = try pfFunction(k.module, "tf_dsn_pf_gemm_st_kernel", pf_gemm_smem);
+        k.st_fold = try pfFunction(k.module, "tf_dsn_pf_gemm_fold_st_kernel", pf_gemm_smem);
+        k.st_gemm5 = try pfFunction(k.module, "tf_dsn_pf_gemm5_st_kernel", pf_gemm5_smem);
+        for (&k.st_split, split_st_kernels, split_smem) |*f, name, smem| f.* = try pfFunction(k.module, name, smem);
+        if (k.sfk) |*sk| try sk.useStaged();
+        k.wc = .{ lo, hi };
     }
 
     pub fn unload(k: *Kernels) void {
@@ -363,6 +383,29 @@ pub fn splits(k: usize, n: usize) usize {
     return s;
 }
 
+        for (texts, 0..) |t, i| if (std.mem.eql(u8, v, t)) return @fromBackingInt(@intCast(i));
+const split_st_kernels = [4][:0]const u8{ "tf_dsn_pf_gemm_splitA_st_kernel", "tf_dsn_pf_gemm_splitB_st_kernel", "tf_dsn_pf_gemm_splitC6_st_kernel", "tf_dsn_pf_gemm_splitC7_st_kernel" };
+    const kbs = split_kbs[@backingInt(cfg)];
+    // the whole-line twins for a y in the transport's arena (Kernels.useStaged)
+    st_gemm: [2]?cuda.Function = @splat(null),
+    st_split64: [2]?cuda.Function = @splat(null),
+    st_split128: [2]?cuda.Function = @splat(null),
+
+    fn useStaged(sk: *SfKernels) !void {
+        const pf = Kernels.pfFunction;
+        sk.st_gemm = .{ try pf(sk.module, "tf_dsn_sf_gemm_st_kernel", sf_gemm_smem), try pf(sk.module, "tf_dsn_sf_gemm_exact_st_kernel", sf_gemm_smem) };
+        sk.st_split64 = .{ try pf(sk.module, "tf_dsn_sf_split64_st_kernel", sf_split64_smem), try pf(sk.module, "tf_dsn_sf_split64_exact_st_kernel", sf_split64_smem) };
+        sk.st_split128 = .{ try pf(sk.module, "tf_dsn_sf_split128_st_kernel", sf_split128_smem), try pf(sk.module, "tf_dsn_sf_split128_exact_st_kernel", sf_split128_smem) };
+    }
+/// Whether a dense GEMM's y takes the whole-line kernels: fp32, written (not added to), 16-byte aligned with whole float4 rows,
+/// and in the transport's arena (Kernels.useStaged).
+pub fn stagedY(k: *const Kernels, y: u64, ldy: usize, y_dtype: DType, accumulate: bool) bool {
+    return k.wc[1] != 0 and !accumulate and y_dtype == .f32 and y >= k.wc[0] and y < k.wc[1] and y % 16 == 0 and ldy % 4 == 0;
+}
+
+    const stage = stagedY(k, y, ldy, y_dtype, accumulate) and kind != .zsplit and sk.st_gemm[x] != null;
+        .gemm => try launchShared(if (stage) sk.st_gemm[x].? else sk.gemm[x], s, .{ cdiv(m, 128), l.n / 128, 1 }, sf_gemm_smem, &args),
+            ra.add(@as(c_int, @backingInt(y_dtype)));
 /// A decode-size bf16 linear's K splits (16-column steps), from its shape alone, as splits() for the MX GEMM.
 pub fn bfSplits(k: usize, n: usize) usize {
     const steps = k / 16;
@@ -440,6 +483,7 @@ fn decSlab(a: DecArgs, r0: usize, mm: usize) DecArgs {
         b.q = a.q + r0 * @as(usize, @intCast(a.ldq)) * qsz;
         if (a.s != 0) b.s = a.s + r0 * @as(usize, @intCast(a.lds)) * 4;
     }
+    const ysz: usize = if (a.accumulate != 0 or a.y_dtype == @backingInt(DType.f32)) 4 else 2;
     b.y = a.y + r0 * @as(usize, @intCast(a.ldy)) * ysz;
     return b;
 }
@@ -556,6 +600,7 @@ pub fn zFloats(l: weights.Linear, rows: usize) usize {
 pub fn quant(k: *const Kernels, s: cuda.Stream, x: u64, x_dtype: DType, ldx: usize, m: usize, kdim: usize, q: u64, ldq: usize, sc: u64, lds: usize) !void {
     var a: cuda.Args = .{};
     a.add(x);
+    a.add(@as(c_int, @backingInt(x_dtype)));
     a.add(@as(i64, @intCast(ldx)));
     a.add(@as(c_int, @intCast(m)));
     a.add(@as(c_int, @intCast(kdim)));
@@ -574,6 +619,7 @@ pub fn quantDec(k: *const Kernels, s: cuda.Stream, x: u64, x_dtype: DType, ldx: 
     if (!k.dec_on) return quant(k, s, x, x_dtype, ldx, m, kdim, q, ldq, sc, lds);
     var a: cuda.Args = .{};
     a.add(x);
+    a.add(@as(c_int, @backingInt(x_dtype)));
     a.add(@as(i64, @intCast(ldx)));
     a.add(@as(c_int, @intCast(m)));
     a.add(@as(c_int, @intCast(kdim)));
@@ -588,6 +634,7 @@ pub fn quantDec(k: *const Kernels, s: cuda.Stream, x: u64, x_dtype: DType, ldx: 
 pub fn fake(k: *const Kernels, s: cuda.Stream, x: u64, x_dtype: DType, ldx: usize, m: usize, kdim: usize, out: u64, ldo: usize) !void {
     var a: cuda.Args = .{};
     a.add(x);
+    a.add(@as(c_int, @backingInt(x_dtype)));
     a.add(@as(i64, @intCast(ldx)));
     a.add(@as(c_int, @intCast(m)));
     a.add(@as(c_int, @intCast(kdim)));
@@ -610,6 +657,11 @@ pub fn gemm(k: *const Kernels, s: cuda.Stream, l: weights.Linear, q: u64, ldq: u
         // the prefill tile GEMM: every row at once, a split folded in the CTA (the tile kernel's and reduce's bits)
         var args: cuda.Args = .{};
         args.add(a);
+        const stage = stagedY(k, y, ldy, y_dtype, accumulate);
+            .gemm => launchShared(if (stage) k.st_gemm.? else k.pf_gemm, s, .{ cdiv(m, 128), l.n / 128, 1 }, pf_gemm_smem, &args),
+            .gemm5 => launchShared((if (stage) k.st_gemm5 else k.pf_gemm5) orelse return error.NoGemm5Kernel, s, .{ cdiv(m, 128), l.n / 128, 1 }, pf_gemm5_smem, &args),
+            .fold => launchShared(if (stage) k.st_fold.? else k.pf_gemm_fold, s, .{ cdiv(m, 64), l.n / 128, 1 }, pf_gemm_smem, &args),
+            .split => |c| launchShared((if (stage) k.st_split[@backingInt(c)] else k.pf_split[@backingInt(c)]) orelse return error.NoSplitKernel, s, .{ cdiv(m, split_bm[@backingInt(c)]), l.n / 128, 1 }, split_smem[@backingInt(c)], &args),
     }
     var r0: usize = 0;
     while (r0 < m) : (r0 += slab_rows) {
@@ -633,6 +685,7 @@ pub fn gemm(k: *const Kernels, s: cuda.Stream, l: weights.Linear, q: u64, ldq: u
             .z = z,
             .y = y + r0 * ldy * esz,
             .ldy = @intCast(ldy),
+            .y_dtype = @backingInt(y_dtype),
             .accumulate = @intFromBool(accumulate),
         };
         var args: cuda.Args = .{};
@@ -647,6 +700,7 @@ pub fn gemm(k: *const Kernels, s: cuda.Stream, l: weights.Linear, q: u64, ldq: u
             ra.add(@as(c_int, @intCast(l.n)));
             ra.add(a.y);
             ra.add(@as(i64, @intCast(ldy)));
+            ra.add(@as(c_int, @backingInt(y_dtype)));
             ra.add(@as(c_int, @intFromBool(accumulate)));
             try launch(k.reduce, s, .{ cdiv(mm * l.n, 256), 1, 1 }, 256, &ra);
         }
@@ -673,6 +727,7 @@ pub fn gemv(k: *const Kernels, s: cuda.Stream, l: weights.Linear, q: u64, ldq: u
         .K = @intCast(l.k),
         .y = y,
         .ldy = @intCast(ldy),
+        .y_dtype = @backingInt(y_dtype),
         .accumulate = @intFromBool(accumulate),
     }, z);
     const a: MxArgs = .{
@@ -690,6 +745,7 @@ pub fn gemv(k: *const Kernels, s: cuda.Stream, l: weights.Linear, q: u64, ldq: u
         .K = @intCast(l.k),
         .y = y,
         .ldy = @intCast(ldy),
+        .y_dtype = @backingInt(y_dtype),
         .accumulate = @intFromBool(accumulate),
     };
     var args: cuda.Args = .{};
@@ -723,6 +779,7 @@ pub fn bf16Gemm(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: u64, l
         .K = @intCast(kdim),
         .y = y,
         .ldy = @intCast(ldy),
+        .y_dtype = @backingInt(y_dtype),
         .scale = scale,
         .round_first = @intFromBool(round_first),
     }, z);
@@ -795,6 +852,7 @@ fn decArgsOf(l: weights.Linear, q: u64, ldq: usize, sc: u64, lds: usize, m: usiz
         .K = @intCast(l.k),
         .y = y,
         .ldy = @intCast(ldy),
+        .y_dtype = @backingInt(y_dtype),
     };
 }
 
@@ -877,6 +935,7 @@ pub fn woA(k: *const Kernels, s: cuda.Stream, sc: Scratch, wo: []const weights.L
     }
 }
 
+                .y_dtype = @backingInt(DType.bf16),
 /// wo_a of a decode launch on its FP8 rows (weights.Layer.wo_a8, every group stacked): o [m, groups * gk] bf16 (row
 /// stride ldo) quantized once (act_quant: the codes and scales the reference's quant-dequant rows hold), every group's
 /// columns in one launch, group g's output columns reading its input columns, into u [m, groups * o_lora] bf16 (row
@@ -902,6 +961,7 @@ pub fn woA8(k: *const Kernels, s: cuda.Stream, sc: Scratch, w8: weights.Linear, 
         .K = @intCast(gk),
         .y = u,
         .ldy = @intCast(ldu),
+        .y_dtype = @backingInt(DType.bf16),
         .gn = @intCast(w8.n / groups),
         .gq = @intCast(gk),
         .gs = @intCast(gk / 32),
@@ -942,6 +1002,36 @@ pub const ExpertScratch = struct {
     }
 };
 
+/// TF_DS_NACT_LOG (log only, off by default): the device ring tf_dsn_nact_log_kernel appends to (0: off: no launch, no copy), its records, and the
+/// pure decode / render of them. See native.cu for the layout.
+pub var nact_ring: u64 = 0;
+pub const nact_records = 4096;
+pub const NactRec = struct { call: u64, rows: u32, active: u32, owned: u32, shared: u32 };
+
+pub fn nactDecode(words: []const u64, out: []NactRec) usize {
+    var n: usize = 0;
+    var i: usize = 8; // after the counter and its header
+    while (i + 3 < words.len and n < out.len) : (i += 4) {
+        if (words[i] == 0) continue;
+        out[n] = .{ .call = words[i] - 1, .rows = @truncate(words[i + 1] >> 32), .active = @truncate(words[i + 1]), .owned = @truncate(words[i + 2]), .shared = @truncate(words[i + 2] >> 32) };
+        n += 1;
+    }
+    return n;
+}
+
+pub fn nactRender(gpa: std.mem.Allocator, rank: u32, world: u32, recs: []NactRec) ![]u8 {
+    std.mem.sort(NactRec, recs, {}, struct {
+        fn less(_: void, a: NactRec, b: NactRec) bool {
+            return a.call < b.call;
+        }
+    }.less);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.print(gpa, "# TF_DS_NACT_LOG v1 rank={d} world={d} records={d} columns=call rows active owned shared (shared: 0 not active, 1 active and unowned, 2 active and owned)\n", .{ rank, world, recs.len });
+    for (recs) |q| try out.print(gpa, "{d} {d} {d} {d} {d}\n", .{ q.call, q.rows, q.active, q.owned, q.shared });
+    return out.toOwnedSlice(gpa);
+}
+
     var g: cuda.Args = .{};
     g.add(pick);
     g.add(@as(c_int, @intCast(sc.slots)));
@@ -951,6 +1041,20 @@ pub const ExpertScratch = struct {
     g.add(sc.nact);
     g.add(sc.ent);
     g.add(sc.erow);
+/// TF_DS_NACT_LOG: this decode launch's grouping into the log (after decodeGrouping, on the same stream); only called with the log on.
+fn nactLog(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScratch, r: usize) !void {
+    const f = k.nact_log orelse return;
+    var g: cuda.Args = .{};
+    g.add(sc.act);
+    g.add(sc.nact);
+    g.add(if (ex.native) |nx| nx.owner else @as(u64, 0));
+    g.add(@as(c_int, @intCast(ex.count - 1)));
+    g.add(@as(c_int, @intCast(r)));
+    g.add(nact_ring);
+    try cuda.launch.launch(f, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &g);
+}
+
+        if (nact_ring != 0) try nactLog(k, s, ex, sc, r);
         // x's codes last: gate / up (a programmatic dependent launch) reads the groups before it waits for them
         return quantDec(k, s, x, .bf16, ldx, r, ex.dims, sc.q, ex.dims, sc.s, ex.dims / 32);
     }
@@ -1164,4 +1268,30 @@ test "splits depend on the shape alone and fill the GPU" {
     try std.testing.expectEqual(@as(usize, 16), splits(5120, 640)); // a 2D node's expert gate / up pack
     try std.testing.expectEqual(@as(usize, 16), bfSplits(5120, 384)); // the router
     try std.testing.expectEqual(@as(usize, 16), bfSplits(4096, 1024)); // a wo_a group
+}
+    const d: Kernels = .{ .module = undefined, .act_quant = undefined, .attn_epilogue = undefined, .gemm = undefined, .reduce = undefined, .count = undefined, .scan = undefined, .place = undefined, .gu = undefined, .dn = undefined, .gu_finish = undefined, .dn_finish = undefined, .gu_gemv = undefined, .dn_gemv = undefined, .gemv = undefined, .mx_sab = undefined, .gu_sab = undefined, .dn_sab = undefined, .sab = false, .dec = undefined, .dec_group = undefined, .dec_group2 = undefined, .nact_log = null, .group2 = false, .dec_quant = undefined, .dec_l2pf = undefined, .dec_on = true, .dec_pdl = true, .expert_exit = false, .counters = undefined, .combine = undefined, .bf16 = undefined, .bf_reduce = undefined, .to_f16 = undefined, .pf_gemm = undefined, .pf_gemm_fold = undefined, .pf_gu = undefined, .pf_dn = undefined, .pf_tiles = undefined, .pf_bf16 = undefined, .pf_off = false };
+
+test "the expert-count log: device words decode to records in call order, empty slots left out, and out.len bounds them" {
+    // the kernel's ring: word 0 the call counter, 8 words of header, then four words a record {index + 1, rows << 32 | active, shared << 32 | owned, 0}
+    var words: [4 * 8]u64 = @splat(0);
+    words[4 * 2] = 3; // call index 2 (stored + 1)
+    words[4 * 2 + 1] = (3 << 32) | 14;
+    words[4 * 2 + 2] = (2 << 32) | 6;
+    words[4 * 5] = 6;
+    words[4 * 5 + 1] = (3 << 32) | 15;
+    words[4 * 5 + 2] = (1 << 32) | 7;
+    var out: [4]NactRec = undefined;
+    try std.testing.expectEqual(@as(usize, 2), nactDecode(&words, &out));
+    try std.testing.expectEqual(NactRec{ .call = 2, .rows = 3, .active = 14, .owned = 6, .shared = 2 }, out[0]);
+    try std.testing.expectEqual(NactRec{ .call = 5, .rows = 3, .active = 15, .owned = 7, .shared = 1 }, out[1]);
+    var one: [1]NactRec = undefined;
+    try std.testing.expectEqual(@as(usize, 1), nactDecode(&words, &one));
+}
+
+test "the expert-count log file: a header naming the rank and the layout, then the records in call order" {
+    const gpa = std.testing.allocator;
+    var recs = [_]NactRec{ .{ .call = 9, .rows = 2, .active = 11, .owned = 5, .shared = 2 }, .{ .call = 8, .rows = 2, .active = 10, .owned = 4, .shared = 0 } };
+    const text = try nactRender(gpa, 2, 4, &recs);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("# TF_DS_NACT_LOG v1 rank=2 world=4 records=2 columns=call rows active owned shared (shared: 0 not active, 1 active and unowned, 2 active and owned)\n8 2 10 4 0\n9 2 11 5 2\n", text);
 }

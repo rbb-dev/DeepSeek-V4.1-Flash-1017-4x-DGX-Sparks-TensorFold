@@ -226,3 +226,212 @@ extern "C" __global__ void __launch_bounds__(COLLECT_THREADS) dsv41_rdma_collect
     }
 }
 
+    const uint64_t t0 = probe ? now_ns() : 0;     // (the probe is null in a served engine)
+    if (threadIdx.x < 32) {                      // warp 0: its lanes read the queue pairs' completions together
+        const uint64_t q = *seq + 1;
+        if (q > (uint64_t)slots) cq_wait_warp(cq, q - slots - 1, abort_word);
+        if (threadIdx.x == 0) s_seq = q;
+    }
+    __syncthreads();
+    const uint64_t q = s_seq;
+    const int slot = (int)(q % slots);
+    float4* dst = reinterpret_cast<float4*>(send_ring + (size_t)slot * max_bytes);
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) dst[i] = src[i];
+    if (fence_mode) {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            s_last = atomicAdd(staged, 1u) == gridDim.x - 1;
+        }
+    } else {
+        __threadfence_system();
+        __syncthreads();
+        if (threadIdx.x == 0) s_last = atomicAdd(staged, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && s_last) {
+        __threadfence_system();
+        *staged = 0;
+        *seq = q;
+        if (fence_mode) {
+            store_relaxed_sys(doorbell, bswap64_dev(q));
+        } else {
+            store_sys(doorbell, bswap64_dev(q));
+        }
+        if (probe) {
+            probe[0] += now_ns() - t0;
+            probe[4] = now_ns();
+        }
+    }
+    if (own_dst) {
+        if (s_last) __syncthreads();
+        if (own_stride4 == own_row4) {
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) own_dst[i] = src[i];
+        } else {
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) {
+                const int r = i / own_row4;
+                own_dst[(size_t)r * own_stride4 + (i - r * own_row4)] = src[i];
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(STAGE_THREADS) dsv41_rdma_publish_wait(uint64_t* sizes, uint64_t* doorbell,
+        uint64_t* seq, uint64_t* send_q, uint64_t* send_slot, uint64_t* send_last, int slots, int user,
+        const CqTab cq, const uint64_t* abort_word, const float4* __restrict__ own_src,
+        float4* __restrict__ own_dst, int own_row4, long long own_stride4, uint64_t nbytes, uint64_t* probe, int pdl) {
+    pdl_enter(pdl);
+    const uint64_t t0 = probe ? now_ns() : 0;     // (the probe is null in a served engine)
+    const uint64_t q = *seq + 1;
+    if (blockIdx.x == 0 && threadIdx.x < 32) {   // warp 0 of block 0
+        if (q > (uint64_t)slots) cq_wait_warp(cq, q - slots - 1, abort_word);
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        // (sizes[], send_q[] and send_slot[] are the proxy path's words: with the queue pairs waiting in the card the chain carries the size
+        // and the slot, and nothing reads them; send_last is read by dsv41_rdma_await_send_wait)
+        store_relaxed_sys(send_last + user, q);
+        *seq = q;
+        __threadfence_system();
+        store_relaxed_sys(doorbell, bswap64_dev(q));
+        if (probe) {
+            probe[0] += now_ns() - t0;
+            probe[4] = now_ns();
+        }
+    }
+    if (own_dst) {
+        const int n4 = (int)(nbytes / 16);
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) {
+            if (own_stride4 == own_row4) {
+                own_dst[i] = own_src[i];
+            } else {
+                const int r = i / own_row4;
+                own_dst[(size_t)r * own_stride4 + (i - r * own_row4)] = own_src[i];
+            }
+        }
+    }
+}
+
+// The in-place send's wait in this mode: the previous send from the user's fixed slot is complete when its exchange's completion entry is.
+extern "C" __global__ void __launch_bounds__(32) dsv41_rdma_await_send_wait(const CqTab cq,
+        const uint64_t* send_last, int user, const uint64_t* abort_word, int pdl) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if (pdl) asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+    const uint64_t want = load_sys(send_last + user);   // the block is one warp
+    if (want > 0) cq_wait_warp(cq, want - 1, abort_word);
+}
+
+
+// ---- TF_DS_ROCI_XLOG: the same three kernels with the exchange log (log only; the host launches these ONLY with TF_DS_ROCI_XLOG=1) ----------------
+// Each is its kernel above with the lines that mention xlog added, and nothing else: the unsuffixed kernels carry no logging code at all, so with the log
+// off the decode exchange executes the instructions it executed before the log existed (ring_hotpath_test pins both: the unsuffixed bodies hold no
+// "xlog", and an _x body without its xlog lines is its original's body).
+extern "C" __global__ void __launch_bounds__(STAGE_THREADS) dsv41_rdma_stage_wait_x(const float4* __restrict__ src, int n4,
+        char* send_ring, uint64_t* sizes, uint64_t* doorbell, const CqTab cq, uint64_t* seq, int slots,
+        uint64_t max_bytes, uint64_t* probe, const uint64_t* abort_word, unsigned* staged, int fence_mode,
+        float4* __restrict__ own_dst, int own_row4, long long own_stride4, int pdl) {
+    __shared__ uint64_t s_seq;
+    __shared__ int s_last;
+    pdl_enter(pdl);
+    // TF_DS_ROCI_XLOG: the host tags `probe` with bit 0 and points it at the doorbell log (8,192 records of {sequence, this GPU's globaltimer after the
+    // doorbell}); no probe then (it is null in a served engine) (xlog)
+    uint64_t* xlog_pub = (reinterpret_cast<uintptr_t>(probe) & 1) ? reinterpret_cast<uint64_t*>(reinterpret_cast<uintptr_t>(probe) & ~uintptr_t(1)) : nullptr;
+    if (xlog_pub) probe = nullptr;
+        if (xlog_pub) {
+            xlog_pub[(q & 8191) * 2] = q;
+            xlog_pub[(q & 8191) * 2 + 1] = now_ns();
+        }  // xlog
+extern "C" __global__ void __launch_bounds__(STAGE_THREADS) dsv41_rdma_publish_wait_x(uint64_t* sizes, uint64_t* doorbell,
+    // TF_DS_ROCI_XLOG: the host tags `probe` with bit 0 and points it at the doorbell log (8,192 records of {sequence, this GPU's globaltimer after the
+    // doorbell}); no probe then (it is null in a served engine) (xlog)
+    uint64_t* xlog_pub = (reinterpret_cast<uintptr_t>(probe) & 1) ? reinterpret_cast<uint64_t*>(reinterpret_cast<uintptr_t>(probe) & ~uintptr_t(1)) : nullptr;
+    if (xlog_pub) probe = nullptr;
+        if (xlog_pub) {
+            xlog_pub[(q & 8191) * 2] = q;
+            xlog_pub[(q & 8191) * 2 + 1] = now_ns();
+        }  // xlog
+extern "C" __global__ void __launch_bounds__(COLLECT_THREADS) dsv41_rdma_collect_peers_roci_x(Dsts d, int rows,
+        const char* recv_ring, const uint64_t* gen, const unsigned* lanes, const uint64_t* seq, int rank, int world,
+        int slots, uint64_t max_bytes, uint64_t* abort_word, uint64_t deadline_ns, uint64_t* fault, int pdl,
+        const float4* __restrict__ own_src, float4* __restrict__ own_dst, int own_row4, long long own_stride4, int own_n4) {
+    pdl_enter(pdl);                              // the staging kernel's sequence and own slice are written
+    // TF_DS_ROCI_XLOG: the host tags the fault buffer's address with bit 0; the exchange log lives behind the record's 8 words
+    const bool xlog = (reinterpret_cast<uintptr_t>(fault) & 1) != 0;
+    fault = reinterpret_cast<uint64_t*>(reinterpret_cast<uintptr_t>(fault) & ~uintptr_t(1));  // xlog
+    const uint64_t t_enter = xlog ? now_ns() : 0;   // the kernel's start on this GPU's clock (after the PDL wait)
+    // This rank's own slice, copied here (the first row of blocks) while the peers' words are still on their way: the publishing kernel
+    // does not copy it, so its doorbell is not behind the copy. The same bytes to the same words; the consumer reads them after this kernel.
+    if (own_dst != nullptr && blockIdx.y == 0) {
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < own_n4; i += gridDim.x * blockDim.x) {
+            if (own_stride4 == own_row4) {
+                own_dst[i] = own_src[i];
+            } else {
+                const int r = i / own_row4;
+                own_dst[(size_t)r * own_stride4 + (i - r * own_row4)] = own_src[i];
+            }
+        }
+    }
+    int p = -1;
+    for (int k = 0, y = (int)blockIdx.y; k < world; ++k)
+        if (k != rank && d.ptr[k] != nullptr && d.row4[k] != 0 && y-- == 0) {
+            p = k;
+            break;
+        }
+    if (p < 0) return;                           // no peer for this row of blocks (a grid of one with none to copy)
+    const uint64_t q = *seq;
+    // everything that does not depend on the wait is computed before it (the 64-bit modulo and the row division are library routines of ~80
+    // and ~40 instructions): the wait then ends in the copy-out's loads
+    const int slot = (int)(q % slots);
+    const float4* in = reinterpret_cast<const float4*>(recv_ring + ((size_t)slot * world + p) * max_bytes);
+    float4* out = d.ptr[p];
+    const int r4 = d.row4[p];
+    const long long s4 = d.stride4[p];
+    const int per_row = (r4 + PEER_UNIT4 - 1) / PEER_UNIT4;
+    // a failed wait is the block's: the poison ends it (the vote below)
+    int failed = 0;
+    const int nl = (int)lanes[p];
+    if (threadIdx.x < nl) {                      // the peer's lanes are polled together, one thread a lane (the peer's words are independent)
+        const int k = (int)threadIdx.x;
+        uint64_t t0 = 0;
+        uint64_t seen = 0;
+        for (uint32_t i = 1; (seen = load_relaxed_sys(gen + (size_t)p * MAX_LANES + k)) < q; ++i) {
+            if (i == 1) t0 = now_ns();               // the word was not there yet: the wait's start
+            if ((i & 1023) == 0) {
+                if (load_sys(abort_word) != 0) {
+                    roci_record(fault, abort_word, q, rank, p, k, seen, now_ns() - t0, 1);
+                    failed = 1;
+                    break;
+                }
+                if (deadline_ns != 0 && now_ns() - t0 >= deadline_ns) {
+                    roci_record(fault, abort_word, q, rank, p, k, seen, now_ns() - t0, 2);
+                    failed = 1;
+                    break;
+                }
+            }
+        }
+        if (!failed) seen = load_sys(gen + (size_t)p * MAX_LANES + k);   // the acquire edge, once
+    }
+    if (__syncthreads_or(failed) != 0) return;     // a failed wait is the block's: the vote, not a load of the abort word by every thread
+    if (xlog && threadIdx.x == 0) {                // log only: exchange q's words from peer p were all in at this time (this GPU's globaltimer)
+        uint64_t* e = fault + 8 + ((q * 8 + (uint64_t)p) & 65535) * 4;   // 4 words a record: key, words in, kernel start, a block's copy-out end  // xlog
+        e[0] = (q << 3) | (uint64_t)p;  // xlog
+        e[1] = now_ns();  // xlog
+        e[2] = t_enter;  // xlog
+    }  // xlog
+    for (int u = blockIdx.x; u < rows * per_row; u += gridDim.x) {
+        const int r = per_row == 1 ? u : u / per_row;     // (a row of up to 1,024 float4 is one unit: every decode exchange; no division then)
+        const int c0 = (per_row == 1 ? 0 : (u - r * per_row) * PEER_UNIT4) + threadIdx.x;
+        const float4* src = in + (size_t)r * r4;
+        float4* dst = out + (size_t)r * s4;
+        float4 v[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+            if (c0 + k * COLLECT_THREADS < r4) v[k] = __ldcv(src + c0 + k * COLLECT_THREADS);
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+            if (c0 + k * COLLECT_THREADS < r4) dst[c0 + k * COLLECT_THREADS] = v[k];
+    }
+    if (xlog) {                                    // log only (a block-uniform branch): this block's copy-out has ended; the last block to write is the record's end
+        __syncthreads();  // xlog
+        if (threadIdx.x == 0) fault[8 + ((q * 8 + (uint64_t)p) & 65535) * 4 + 3] = now_ns();  // xlog
+    }  // xlog

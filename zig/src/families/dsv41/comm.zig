@@ -1,97 +1,43 @@
-//! The TP ranks' collectives: NCCL opened at run time, its unique id passed from rank 0 over the link. Every model
-//! reduction is an all-gather of fp32 partials that each rank then adds in rank order (DESIGN.md section 3), so the
-//! ranks hold the same bits without a broadcast.
+//! The ranks' host collectives: the start-up agreements, the queue-pair tables, the graph captures' votes and the SSD tier's
+//! digests, over the engine's own links (star.zig, a star from rank 0). Every exchange between the Sparks while serving is
+//! Rocinante's (rocinante.zig) or the decode rings'; there is no other transport.
 const std = @import("std");
 const cuda = @import("cuda");
 const Link = @import("link.zig").Link;
 
-const nccl = cuda.nccl;
+/// Where the ranks' host collectives go: `star` is the engine's own links, opened when the start-up joins them.
+/// One in-place all-gather part: every rank's `bytes` at `buf + rank * bytes`, gathered into `buf` rank after rank (the plan of a
+/// gather: the transport's own plans carry the same shape).
+pub const InPlace = struct { buf: u64, bytes: usize };
 
 /// TF_DS_TWO_HOP=1 (model.zig sets it, every rank alike; off by default): four nodes cabled as a ring, where node g
 /// reaches only its column partner g ^ 2 and its row partner g ^ 1 (no cross links between the two pairs). A world-4
-/// all-gather then goes as two hops of point-to-point exchanges between direct partners, never along NCCL's own ring:
-/// the column partner's slice first, then both slices with the row partner. The same bytes in the same places.
+/// exchange then goes between direct partners only (ring2d.zig's rings; this engine's all-gathers are the RDMA rings' and
 pub var two_hop: bool = false;
 
-/// One point-to-point step of a two-hop all-gather: the slots (rank indices) this rank sends to `peer`, then the
-/// slots it receives from it, in posting order (NCCL matches a pair's sends and receives in order).
-pub const Hop = struct { peer: u32, send: [2]u32, recv: [2]u32, n: usize };
-
-/// Rank g's two hops on four ranks (g ^ 2, then g ^ 1).
-pub fn hops(g: u32) [2]Hop {
-    return .{
-        .{ .peer = g ^ 2, .send = .{ g, 0 }, .recv = .{ g ^ 2, 0 }, .n = 1 },
-        .{ .peer = g ^ 1, .send = .{ g, g ^ 2 }, .recv = .{ g ^ 1, g ^ 3 }, .n = 2 },
-    };
-}
-
-fn size(t: nccl.DataType) usize {
-    return switch (t) {
-        .i8, .u8 => 1,
-        .f16, .bf16 => 2,
-        .i32, .u32 => 4,
-        .i64, .u64, .f64 => 8,
-        .f32 => 4,
-    };
-}
-
 pub const Comm = struct {
-    lib: nccl.Library,
-    comm: nccl.Comm,
     rank: u32,
     world: u32,
 
-    /// Rank 0 makes the id and sends it; the others take it from the link. Needs the CUDA context current.
-    pub fn init(link: Link, rank: u32, world: u32) !Comm {
-        var lib = try nccl.Library.open();
-        errdefer lib.close();
-        var id: nccl.UniqueId = undefined;
-        if (rank == 0) {
-            try lib.check(lib.api.ncclGetUniqueId(&id), "ncclGetUniqueId");
-            try link.send(std.mem.asBytes(&id));
-        } else {
-            var buf: [@sizeOf(nccl.UniqueId)]u8 = undefined;
-            const got = try link.recv(&buf);
-            if (got.len != buf.len) return error.BadUniqueId;
-            id = std.mem.bytesToValue(nccl.UniqueId, got);
-        }
-        var comm: nccl.Comm = null;
-        try lib.check(lib.api.ncclCommInitRank(&comm, @intCast(world), id, @intCast(rank)), "ncclCommInitRank");
-        return .{ .lib = lib, .comm = comm, .rank = rank, .world = world };
+    pub fn init(rank: u32, world: u32) Comm {
+        return .{ .rank = rank, .world = world };
     }
 
     pub fn deinit(c: *Comm) void {
-        _ = c.lib.api.ncclCommDestroy(c.comm);
-        c.lib.close();
         c.* = undefined;
     }
 
-    /// `count` elements of `dtype` from every rank into `recv`, rank after rank.
-    pub fn allGather(c: Comm, send: u64, recv: u64, count: usize, dtype: nccl.DataType, stream: cuda.Stream) !void {
-        if (two_hop and c.world == 4) return c.allGather2(send, recv, count, dtype, stream);
-        try c.lib.check(c.lib.api.ncclAllGather(send, recv, count, dtype, c.comm, stream.handle), "ncclAllGather");
+    /// `bytes` at device address `send` from every rank, gathered into `recv` rank after rank, over the links (the stream
+    /// drained, the device bytes read, every rank's gathered by rank 0, written into `recv`). Synchronous, for a caller that
+    /// synchronizes at once, as all of them do.
+    pub fn gatherHost(c: Comm, d: *const cuda.Driver, send: u64, recv: u64, bytes: usize, stream: cuda.Stream) !void {
+        return gatherVia(star, DriverMem{ .d = d, .stream = stream }, send, recv, bytes);
     }
 
-    /// allGather on a ring of four (two_hop): this rank's slice into its place, then the two hops.
-    fn allGather2(c: Comm, send: u64, recv: u64, count: usize, dtype: nccl.DataType, stream: cuda.Stream) !void {
-        const b = count * size(dtype);
-        const own = recv + c.rank * b;
-        if (send != own and b > 0) try stream.d.check(stream.d.api.cuMemcpyDtoDAsync_v2(own, send, b, stream.handle), "cuMemcpyDtoDAsync");
-        for (hops(c.rank)) |h| {
-            try c.lib.check(c.lib.api.ncclGroupStart(), "ncclGroupStart");
-            var rs: [4]nccl.Result = undefined;
-            var k: usize = 0;
-            for (h.send[0..h.n]) |q| {
-                rs[k] = c.lib.api.ncclSend(recv + q * b, count, dtype, @intCast(h.peer), c.comm, stream.handle);
-                k += 1;
-            }
-            for (h.recv[0..h.n]) |q| {
-                rs[k] = c.lib.api.ncclRecv(recv + q * b, count, dtype, @intCast(h.peer), c.comm, stream.handle);
-                k += 1;
-            }
-            try c.lib.check(c.lib.api.ncclGroupEnd(), "ncclGroupEnd");
-            for (rs[0..k]) |x| try c.lib.check(x, "ncclSend/ncclRecv");
-        }
+    /// `count` bytes at `buf` made, byte by byte, the largest of every rank's, in place, over the links (the stream drained
+    /// first): the graph captures' votes.
+    pub fn maxHost(c: Comm, d: *const cuda.Driver, buf: u64, count: usize, stream: cuda.Stream) !void {
+        return maxVia(star, DriverMem{ .d = d, .stream = stream }, buf, count);
     }
 
     /// `count` elements of `dtype` to rank `peer` and `rcount` from it, in one NCCL group (point to point).
@@ -122,9 +68,13 @@ test "two hops on a ring of four: every rank ends with every slice in rank order
                 try std.testing.expectEqual(h.recv[i], back.send[i]);
                 try std.testing.expect(have[h.peer][back.send[i]] != 0);
                 next[g][h.recv[i]] = have[h.peer][back.send[i]];
+// -- the host collectives ------------------------------------------------------------------------------------------------
+test "a host collective on a rank without links fails by name: nothing else could carry it" {
+    const c = Comm.init(1, 4);
+    try std.testing.expectError(error.NoHostLinks, c.gatherHost(d, 0x1000, 0x2000, 1, stream));
+    try std.testing.expectError(error.NoHostLinks, c.maxHost(d, 0x3000, 1, stream));
             }
         }
-        have = next;
     }
     for (0..4) |g| for (0..4) |q| try std.testing.expectEqual(@as(u8, @intCast(q + 1)), have[g][q]);
 }
