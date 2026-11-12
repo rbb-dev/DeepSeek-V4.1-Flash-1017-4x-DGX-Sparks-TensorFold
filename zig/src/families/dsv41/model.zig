@@ -56,6 +56,7 @@ const cublas = @import("cublas.zig");
 const comm_mod = @import("comm.zig");
 const api = @import("engine_api");
 const link = @import("link.zig");
+const peer_mem = @import("peer_mem.zig");
 const ring2d = @import("ring2d.zig");
 const roci_engine = @import("roci_engine.zig");
 const roci_pair = @import("roci_pair.zig");
@@ -1843,6 +1844,7 @@ pub const Model = struct {
     w: weights.Weights,
     fan: prompt2d.Fan,
     vfan: prompt2d.Fan, // the host collectives' links (prompt2d.hostLinksAsked), else none
+    pmem: peer_mem.Channel, // each follower's MemAvailable to rank 0 for the admin page (peer_mem.zig): a link of its own, never fatal
     watch: link.Watch, // watchPeers: a peer rank that stops stops this one too
     star_busy: std.atomic.Value(bool), // star.Star's guard against two threads in one collective
     comm: comm_mod.Comm,
@@ -2229,6 +2231,7 @@ pub const Model = struct {
         m.pair_bytes = 0;
         m.rdma_rings = null;
         m.vfan = .{};
+        m.pmem = .{};
         m.watch = .{};
         m.star_busy = .init(false);
         const d = ctx.d;
@@ -2273,6 +2276,13 @@ pub const Model = struct {
         // step frame, so a vote or a table can never be read in place of one
         m.vfan = try prompt2d.Fan.listenAt(o.master, o.listen, o.port + prompt2d.host_links_port_offset, o.rank, o.world);
         errdefer m.vfan.close();
+        // the memory reports' link: rank 0 listens here (a rank that cannot has no live memory on the page, nothing else changes)
+        m.pmem.prepare(o.master, o.listen, o.port + peer_mem.port_offset, o.rank, o.world);
+        errdefer m.pmem.close();
+
+        // the weights (and the DSpark blocks) from the lane's rank cache
+        m.cache_dir = try std.Io.Dir.cwd().openDir(io, o.cache_dir, .{ .iterate = true });
+        errdefer m.cache_dir.close(io);
         // world 4: the 2D node this rank serves (TF_DS_2D_ORDER; its weight file is that node's)
         const ord = if (o.world == 4) try prompt2d.order() else [4]u32{ 0, 1, 2, 3 };
         const role: u32 = if (o.world == 4) ord[o.rank] else o.rank;
@@ -2580,6 +2590,11 @@ pub const Model = struct {
                     std.log.info("{s}", .{ringInplaceLine(&lb, sw)});
                 }
                 const ring_wait_on = ringWaitOn(rk.hasWait(), devices.items);
+                engine_api.transport.facts.rings_known = true;
+                engine_api.transport.facts.rings_on = true;
+                engine_api.transport.facts.rings_wait = ring_wait_on;
+                engine_api.transport.facts.rings_word = prompt2d.ring_word_asked;
+                engine_api.transport.facts.rings_signal = if (!prompt2d.ring_word_asked) .unknown else if (prompt2d.ring_word_atomic_asked) .atomic else .write;
                 m.rdma_rings = try ring2d.Rings.open(gpa, d, rk, devices.items, role, ord, .{ .max_bytes = ring_bytes, .gid_index = rdmaGid(), .pdl = rdmaPdl(), .collect_peers = peers and rk.collect_peers != null, .wc = sw.wc, .inplace = sw.inplace, .roci = ringWordOf(), .roci_deadline_ns = ringWordDeadlineNs(), .wait = ring_wait_on, .wait_explicit = prompt2d.ring_wait_explicit }, &m.comm, m.stream, !weights.draft_4way);
                 m.two.?.rings = &m.rdma_rings.?;
             }
@@ -2592,6 +2607,7 @@ pub const Model = struct {
             }
         }
         if (o.rdma_devices == null) {
+            engine_api.transport.facts.rings_known = true; // (no ring: the page says so)
             // asked without an RDMA ring: say the switch changed nothing
             // (the switches are on by default: only one that was set says it changed nothing)
             if (ringNoRingNote(prompt2d.ring_word_asked, prompt2d.ring_word_explicit)) std.log.info("TF_DS_RING_WORD=1: off: no RDMA ring (TF_RDMA_DEVICES unset)", .{});
@@ -2926,6 +2942,7 @@ pub const Model = struct {
         if (m.two) |*t| if (t.rc) |rc| rc.close();
         m.comm.deinit();
         m.watch.stop(); // (still watching up to here: a wait above on a rank that went ends this process)
+        m.pmem.close();
         m.vfan.close();
         m.fan.close();
         m.w.deinit();
@@ -3098,6 +3115,9 @@ pub const Model = struct {
             for (m.followers(), 1..) |l, r| if (l) |x| try m.watch.add(x, @intCast(r));
         } else try m.watch.add(m.peer(), 0);
         try m.watch.start();
+        engine_api.transport.facts.watch_links = @intCast(m.watch.n);
+        if (m.rank == 0) m.pmem.expectFrom(m.followers()); // (a report is taken only from its follower's own address)
+        m.pmem.start(); // (never fails: the live memory on the admin page is a convenience)
     }
 
     /// The watch's hook, run on its thread once a peer has been gone for the grace: the Rocinante lanes fail with the rank that went
@@ -3118,6 +3138,7 @@ pub const Model = struct {
     /// Ends watchPeers' watch: this process ends its links itself now.
     pub fn unwatch(m: *Model) void {
         m.watch.stop();
+        m.pmem.stop();
     }
 
     /// Whether this rank's GPU context has failed for good: after a fault in a kernel (an illegal address, a trap) every

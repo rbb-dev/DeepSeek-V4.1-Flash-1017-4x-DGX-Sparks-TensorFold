@@ -1056,6 +1056,12 @@ pub const live_config = @import("live_config.zig");
 /// The KV pool sized from the free memory the operator leaves, and the ledger of a start (kv_pool.zig).
 pub const kv_pool = @import("kv_pool.zig");
 
+/// The memory each follower rank last reported to rank 0, for the admin surface (peer_mem.zig).
+pub const peer_mem = @import("peer_mem.zig");
+
+/// What the engine decided about its transports at the start (transport_facts.zig), for /status.
+pub const transport = @import("transport_facts.zig");
+
 /// A model folder's original files kept before --slide first teaches it, its hold and its rollback (originals.zig).
 pub const originals = @import("originals.zig");
 
@@ -1072,6 +1078,7 @@ test {
     _ = @import("prompt_imprint.zig");
     _ = @import("keepalive.zig");
     _ = @import("kv_pool.zig");
+    _ = @import("peer_mem.zig");
     _ = @import("kv_pool_test.zig");
     _ = @import("cfg_write.zig");
     _ = @import("cfg_write_test.zig");

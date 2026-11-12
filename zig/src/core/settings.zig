@@ -1,3 +1,6 @@
+    /// Never shown, listed or set through the admin surface: it answers a name that does not exist (a key file's path, the
+    /// debug rows, the options that only a test binary reads).
+    hidden: bool,
 
 /// A name that no longer exists. Naming it, in the environment or in engine.cfg, ends the start by name: an old
 /// configuration is caught, never ignored.

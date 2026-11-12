@@ -21,6 +21,8 @@ const tool_grammar = @import("tool_grammar.zig");
 const chunk_plan = @import("chunk_plan.zig");
 const log = @import("log.zig");
 const prepare_gate = @import("prepare_gate.zig");
+const admin_requests = @import("admin_requests.zig");
+const admin_series = @import("admin_series.zig");
 const live = @import("live.zig");
 const slide_graph = @import("slide_graph.zig");
 const slide_lesson = @import("slide_lesson.zig");
@@ -112,6 +114,12 @@ pub const Server = struct {
     text: model_text.Text,
     config: Config,
     keys: ?*auth.Store,
+    /// The admin surface's own keys (TENSORFOLD_ADMIN_KEY_FILE); null: the surface answers every request with the unknown-path 404.
+    admin_keys: ?*auth.Store = null,
+    /// The requests in flight and the last finished ones, for the admin surface (counts and labels only).
+    requests: admin_requests.Registry = .{},
+    /// The admin surface's once-a-second samples of the engine's status; null while its sampler is not running.
+    series: ?*admin_series.Sampler = null,
     late_system: []const u8 = "system",
     needs_user_after_tool: bool = false,
     markers: reply_text.Markers = reply_text.think_markers,
@@ -216,6 +224,7 @@ pub const Server = struct {
         srv.metrics.deinit();
         srv.arena.deinit();
         srv.store.deinit();
+        srv.requests.deinit(srv.gpa);
         srv.slide.deinit();
         srv.teacher.deinit();
         if (srv.cortheon) |c| c.deinit();

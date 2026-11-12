@@ -43,6 +43,9 @@ pub const Conn = struct {
     requestline: []const u8 = "",
     headers: []Header = &.{},
     key_label: ?[]const u8 = null,
+    /// The label the access line names when the request was let in by another key store than /v1's (the admin surface's):
+    /// it is not `key_label`, which /metrics counts replies under.
+    log_label: ?[]const u8 = null,
     auth_enabled: bool = false,
     counted: bool = false,
     hook: ?StatusHook = null,
@@ -182,6 +185,7 @@ pub const Conn = struct {
     /// connection waits for its next request (idle_ms), and the server's stop (`wake`) ends that wait as closed.
     pub fn readRequest(c: *Conn, a: Allocator, idle: bool) Allocator.Error!Outcome {
         c.key_label = null;
+        c.log_label = null;
         c.counted = false;
         const raw = c.readLine(a, max_line + 1, if (idle) c.timeouts.idle_ms else c.timeouts.read_ms) catch |e| switch (e) {
         const raw = c.readLineWoken(a, max_line + 1, if (idle) c.timeouts.idle_ms else c.timeouts.read_ms, if (idle) c.wake else null) catch |e| switch (e) {

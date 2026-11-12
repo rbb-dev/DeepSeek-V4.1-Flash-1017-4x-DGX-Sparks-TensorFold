@@ -2850,6 +2850,7 @@ test "a window's masks are none or every row's bits" {
 test "retained histories preserve their replay and output reservations (PR #10: eight 100K histories)" {
     var m: Model = undefined;
     m.watch = .{}; // (finish and deinit end the watch)
+    m.pmem = .{}; // (and the memory-report thread: finish stops it)
     m.pool_cap = 1 << 20;
     var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
     defer ln.snaps.deinit(std.testing.allocator);
@@ -2882,6 +2883,7 @@ test "retained histories preserve their replay and output reservations (PR #10: 
 test "a prefix two conversations share: the second one resuming it in place would stale the first one's later marks" {
     var m: Model = undefined;
     m.watch = .{}; // (finish and deinit end the watch)
+    m.pmem = .{}; // (and the memory-report thread: finish stops it)
     m.pool_cap = 1 << 20;
     var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
     defer ln.snaps.deinit(std.testing.allocator);
@@ -2902,6 +2904,7 @@ test "finish sends one done frame; nothing reaches a follower after it, and dein
     defer follower.close();
     var m: Model = undefined;
     m.watch = .{}; // (finish and deinit end the watch)
+    m.pmem = .{}; // (and the memory-report thread: finish stops it)
     m.world = 2;
     m.fan.links = .{ .{ .fd = fds[0] }, null, null };
     var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = m.peer() };
@@ -2942,6 +2945,7 @@ test "a restore's destination is held back from placement, never a victim and ne
     const c = model.chunk_rows;
     var m: Model = undefined;
     m.watch = .{}; // (finish and deinit end the watch)
+    m.pmem = .{}; // (and the memory-report thread: finish stops it)
     m.pool_cap = 16 * c;
     m.cfg.window = 128;
     const gpa = std.testing.allocator;
@@ -2997,6 +3001,7 @@ test "a restore's destination holds the waiting prompt's room past its rows whil
     const c = model.chunk_rows;
     var m: Model = undefined;
     m.watch = .{}; // (finish and deinit end the watch)
+    m.pmem = .{}; // (and the memory-report thread: finish stops it)
     m.pool_cap = 64 * c;
     m.cfg.window = 128;
     const gpa = std.testing.allocator;

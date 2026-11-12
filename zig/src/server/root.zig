@@ -60,6 +60,10 @@ test {
     _ = @import("server_init_test.zig");
     _ = @import("decisions.zig");
     _ = @import("decisions_test.zig");
+    _ = @import("admin.zig");
+    _ = @import("admin_test.zig");
+    _ = @import("admin_requests.zig");
+    _ = @import("admin_series.zig");
     _ = @import("prepare_gate.zig");
     _ = @import("prompt.zig");
     _ = @import("text_memo_test.zig");

@@ -1,0 +1,15 @@
+{
+  "measured": true,
+  "build": "the four Sparks",
+  "what": "a prompt pass of 8,192 rows with split matrix multiplies (TF_DS_PASS_ROWS=8192, TF_DS_GEMM_HALVES=1) against 4,096-row passes, the prompt cache and the SSD tier off, the KV pool sized to keep 12 GiB free on every Spark",
+  "long_speedup": 1.11,
+  "short_speedup": 1.056,
+  "beside_prompt_ratio": 0.965,
+  "beside_streams_ratio": 1.18,
+  "pool_normal_positions": 18350080,
+  "pool_turbo_positions": 10420224,
+  "pool_cost_positions": 7929856,
+  "pool_cost_pct": 43.2,
+  "replies_equal": true,
+  "source_run": "a cold ~152K-token prompt of real text, 7,468 against 6,729 tokens a second; free memory after the prompt unchanged on every Spark (the first Spark 13.0 against 13.1 GiB, the others 15.5 against 14.9 GiB); replies byte-equal"
+}

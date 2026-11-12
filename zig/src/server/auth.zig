@@ -8,6 +8,27 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const Key = struct { digest: [32]u8, label: []const u8 };
 
+/// What a key may do on the admin surface. The label is the whole policy: `admin` or `admin-<x>` is admin,
+/// `agent-<x>` is agent, `read-<x>` is read, and any other label is read as well (`known` false, so a load can say so).
+pub const Scope = enum { admin, agent, read };
+
+pub fn scopeOf(label: []const u8) struct { scope: Scope, known: bool } {
+    if (std.mem.eql(u8, label, "admin") or std.mem.startsWith(u8, label, "admin-")) return .{ .scope = .admin, .known = true };
+    if (std.mem.startsWith(u8, label, "agent-")) return .{ .scope = .agent, .known = true };
+    if (std.mem.startsWith(u8, label, "read-")) return .{ .scope = .read, .known = true };
+    return .{ .scope = .read, .known = false };
+}
+
+/// The admin store's rules at every load of its file: no key shorter than `min_key_bytes`, and no key the /v1 store also holds.
+/// A file that breaks either closes the whole store, naming the labels and never a key.
+pub const Rules = struct {
+    min_key_bytes: usize,
+    other: ?*Store,
+};
+
+/// The shortest admin key.
+pub const min_admin_key_bytes: usize = 32;
+
 pub var reload_requested: std.atomic.Value(bool) = .init(false);
 
 fn onHangup(_: posix.SIG) callconv(.c) void {
@@ -31,10 +52,36 @@ pub const Store = struct {
     valid: bool = true,
     stamp: [5]i128 = .{ 0, 0, 0, 0, 0 },
     checked_ns: ?i96 = null,
+    /// Set for the admin store only.
+    rules: ?Rules = null,
+    /// Why the newest load of the file was refused (labels, never keys); empty while the file loads.
+    refusal: []const u8 = "",
 
     /// ``keys`` from --api-key, ``environment`` from TENSORFOLD_API_KEY; errors carry Python's message.
     pub fn init(gpa: Allocator, keys: []const []const u8, environment: []const u8, path: ?[]const u8, metrics_open: bool, problem: *[]const u8) !Store {
-        var store: Store = .{ .gpa = gpa, .path = path, .metrics_open = metrics_open };
+        return initRules(gpa, keys, environment, path, metrics_open, null, problem);
+    }
+
+    /// The admin surface's store: the key file alone, under `rules`.
+    /// A file the rules or the filesystem refuse does not stop the start: the store comes back closed (it holds no key,
+    /// `refusal` says why), and a later reread of a repaired file opens it.
+    pub fn initAdmin(gpa: Allocator, path: []const u8, shared: ?*Store, problem: *[]const u8) !Store {
+        const rules: Rules = .{ .min_key_bytes = min_admin_key_bytes, .other = shared };
+        return initRules(gpa, &.{}, "", path, false, rules, problem) catch |e| switch (e) {
+            error.KeyFile => .{
+                .gpa = gpa,
+                .path = path,
+                .metrics_open = false,
+                .rules = rules,
+                .valid = false,
+                .refusal = try gpa.dupe(u8, if (problem.len > 0) problem.* else "the key file cannot be opened safely"),
+            },
+            else => e,
+        };
+    }
+
+    fn initRules(gpa: Allocator, keys: []const []const u8, environment: []const u8, path: ?[]const u8, metrics_open: bool, rules: ?Rules, problem: *[]const u8) !Store {
+        var store: Store = .{ .gpa = gpa, .path = path, .metrics_open = metrics_open, .rules = rules };
         errdefer store.deinit();
         for (keys, 1..) |key, i| {
             const d = digest(key) orelse return fail(problem, "API keys must be nonempty text without whitespace");
@@ -129,16 +176,73 @@ pub const Store = struct {
                 problem.* = "API keys must be nonempty text without whitespace";
                 return error.Invalid;
             };
+            if (s.rules) |r| if (key.len < r.min_key_bytes) return s.refuse(problem, "admin key labelled {s} is shorter than {d} bytes", .{ label, r.min_key_bytes });
             try keys.append(a, .{ .digest = d, .label = try a.dupe(u8, label) });
         }
         if (keys.items.len == 0) {
             problem.* = "API key file contains no keys";
             return error.Invalid;
         }
+        if (s.rules) |r| {
+            if (r.other) |other| if (other.describeShared(s.gpa, keys.items)) |named| {
+                defer s.gpa.free(named);
+                return s.refuse(problem, "{s}", .{named});
+            };
+            for (keys.items) |k| if (!scopeOf(k.label).known) log.line("admin key labelled {s} names no scope (admin, agent-, read-): it is read-only", .{k.label});
+        }
         if (s.file_arena) |*old| old.deinit();
         s.file_arena = arena;
         s.file = keys.items;
         s.stamp = .{ st.dev, st.ino, st.mtime_ns, st.size, st.mode };
+    }
+
+    /// Keeps why a load was refused (in `refusal`, which `problem` then points at) and says it is Invalid.
+    fn refuse(s: *Store, problem: *[]const u8, comptime fmt: []const u8, args: anytype) error{ Invalid, OutOfMemory } {
+        const text = try std.fmt.allocPrint(s.gpa, fmt, args);
+        if (s.refusal.len > 0) s.gpa.free(s.refusal);
+        s.refusal = text;
+        problem.* = text;
+        return error.Invalid;
+    }
+
+    /// Names the first key of `mine` that this store holds too: both labels, never the key. Null when none is shared.
+    fn describeShared(s: *Store, gpa: Allocator, mine: []const Key) ?[]u8 {
+        const m = log.io();
+        s.mutex.lockUncancelable(m);
+        defer s.mutex.unlock(m);
+        for (mine) |k| for ([_][]Key{ s.static.items, s.file }) |keys| for (keys) |other| {
+            if (std.crypto.timing_safe.eql([32]u8, k.digest, other.digest))
+                return std.fmt.allocPrint(gpa, "admin key labelled {s} is also the /v1 key labelled {s}", .{ k.label, other.label }) catch null;
+        };
+        return null;
+    }
+
+    /// Rereads the file now, whatever its stamp (the SIGHUP's twin), and says what the store holds.
+    pub fn reloadNow(s: *Store) Summary {
+        const m = log.io();
+        s.mutex.lockUncancelable(m);
+        defer s.mutex.unlock(m);
+        s.refreshAt(std.Io.Clock.awake.now(m).toNanoseconds(), true);
+        return s.summaryLocked();
+    }
+
+    /// How many keys the store holds and whether its file loaded; `refusal` names why not (labels, never keys).
+    pub const Summary = struct { keys: usize, valid: bool, refusal: []const u8 };
+
+    fn summaryLocked(s: *const Store) Summary {
+        return .{ .keys = if (s.valid) s.static.items.len + s.file.len else 0, .valid = s.valid, .refusal = s.refusal };
+    }
+
+    /// The labels the store holds now (the file looked at first, as a match would), copied into `a`, with the summary.
+    pub fn labels(s: *Store, a: Allocator, out: *[]const []const u8) !Summary {
+        const m = log.io();
+        s.mutex.lockUncancelable(m);
+        defer s.mutex.unlock(m);
+        s.refresh(std.Io.Clock.awake.now(m).toNanoseconds());
+        var list: std.ArrayList([]const u8) = .empty;
+        if (s.valid) for ([_][]Key{ s.static.items, s.file }) |keys| for (keys) |k| try list.append(a, try a.dupe(u8, k.label));
+        out.* = list.items;
+        return s.summaryLocked();
     }
 
     fn statStamp(s: *Store) ?[5]i128 {
@@ -150,8 +254,11 @@ pub const Store = struct {
 
     /// Rereads the key file when SIGHUP asked or, at most once a second, when its stamp changed.
     fn refresh(s: *Store, now_ns: i96) void {
+        s.refreshAt(now_ns, reload_requested.swap(false, .acq_rel));
+    }
+
+    fn refreshAt(s: *Store, now_ns: i96, forced: bool) void {
         if (s.path == null) return;
-        const forced = reload_requested.swap(false, .acq_rel);
         if (!forced) if (s.checked_ns) |last| if (now_ns - last < std.time.ns_per_s) return;
         s.checked_ns = now_ns;
         var problem: []const u8 = "";
@@ -160,8 +267,12 @@ pub const Store = struct {
             const ok = if (stamp == null) false else if (s.readFile(&problem)) |_| true else |_| false;
             if (ok) {
                 s.valid = true;
+                if (s.refusal.len > 0) s.gpa.free(s.refusal);
+                s.refusal = "";
             } else {
-                if (s.valid) log.line("API key file reload refused; authenticated routes remain closed", .{});
+                if (s.valid) {
+                    if (s.refusal.len > 0) log.line("API key file reload refused ({s}); authenticated routes remain closed", .{s.refusal}) else log.line("API key file reload refused; authenticated routes remain closed", .{});
+                }
                 if (s.file_arena) |*old| old.deinit();
                 s.file_arena = null;
                 s.file = &.{};
@@ -236,6 +347,8 @@ fn isSpace(cp: u21) bool {
 /// The paths only a key opens (``auth_http.gated``).
 pub fn gated(raw_path: []const u8, metrics_open: bool) bool {
     const path = routePath(raw_path);
+    // the admin surface has its own gate (admin.zig) and answers its refusals with the unknown-path 404
+    if (std.mem.eql(u8, path, "/admin") or std.mem.startsWith(u8, path, "/admin/")) return false;
     if (metrics_open and (std.mem.eql(u8, path, "/metrics") or std.mem.eql(u8, path, "/v1/metrics"))) return false;
     if (std.mem.eql(u8, path, "/v1") or std.mem.startsWith(u8, path, "/v1/")) return true;
     for ([_][]const u8{ "/metrics", "/dashboard", "/stats", "/memory", "/tokenize", "/detokenize", "/models", "/messages", "/messages/count_tokens", "/chat/completions", "/completions", "/decisions", "/responses" }) |p| if (std.mem.eql(u8, path, p)) return true;
@@ -267,6 +380,7 @@ test "gates and digests" {
     try std.testing.expect(gated("/v1/memory/", true));
     try std.testing.expect(!gated("/metrics/", true));
     try std.testing.expect(gated("/alternative/chat/completions", false));
+    try std.testing.expect(!gated("/admin/api/v1/config", false) and !gated("/admin/x/models", false)); // its own gate
     try std.testing.expect(digest("has space") == null);
     try std.testing.expect(loopback("127.0.0.1") and loopback("::1") and !loopback("0.0.0.0"));
 }

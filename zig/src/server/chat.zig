@@ -16,6 +16,7 @@ const clock = @import("clock.zig");
 const Server = @import("server.zig").Server;
 const chunk_plan = @import("chunk_plan.zig");
 const prepare_gate = @import("prepare_gate.zig");
+const admin_requests = @import("admin_requests.zig");
 const Mailbox = @import("mailbox.zig").Mailbox;
 const Value = json.Value;
 const Cx = errors.Cx;
@@ -221,6 +222,14 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     var box: Mailbox = .{ .io = io, .gpa = srv.gpa };
     defer box.deinit();
     const id = srv.next_id.fetchAdd(1, .monotonic);
+    const submitted = nowNs(io);
+    // the admin surface's record of this request: its label, endpoint and counts, from here to the end of its reply
+    const tracked = srv.requests.begin(srv.gpa, io, submitted, id, admin_requests.context, request.background, sink != null, prepared.prompt_len);
+    var done: admin_requests.Done = .{};
+    defer if (tracked) |t| {
+        done.end_unix_ms = @intCast(@divTrunc(std.Io.Clock.real.now(io).toNanoseconds(), std.time.ns_per_ms));
+        srv.requests.end(io, nowNs(io), t, done);
+    };
     if (srv.keepalive) |k| k.begin(); // the GPU is busy: the idle ticker holds its commits
     defer if (srv.keepalive) |k| k.end();
     srv.engine.submit(id, &request, .{ .ctx = &box, .event = Mailbox.onEvent }) catch |e| return switch (e) {
@@ -233,6 +242,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     preparing = false;
     var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = input.token_ids, .sent_ns = nowNs(io), .lp = if (request.logprobs != null) .{} else null };
     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, &box.stats.depths, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
+    if (tracked) |t| gen.live = &t.generated;
     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, &box.stats.depths, box.stats.rounds, box.stats.plans, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {
@@ -243,6 +253,17 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
             gen.calls.?.calls_off = tool_grammar.writesDsml(srv, a);
         }
         break :blk gen.finish(cx, prepared.prompt_len, received, thinking, effort, prepared.sampled, prepared.drafts);
+    };
+    done = .{
+        .cached_tokens = box.cached orelse 0,
+        .generated_tokens = gen.collected.items.len,
+        .ttft_s = if (gen.first_ns) |f| clock.seconds(f - received) else null,
+        .decode_tps = if (gen.first_ns != null and gen.last_ns != null and gen.last_ns.? > gen.first_ns.? and gen.collected.items.len > 1)
+            @as(f64, @floatFromInt(gen.collected.items.len - 1)) / clock.seconds(gen.last_ns.? - gen.first_ns.?)
+        else
+            null,
+        .total_s = @max(0, clock.seconds(nowNs(io) - received)),
+        .finish = if (result) |r| (if (std.mem.eql(u8, r.finish_reason, "length")) .length else .stop) else |e| (if (e == error.Cancelled) .cancelled else .@"error"),
     };
     if (result) |_| {} else |e| logEnded(input.id, e, cx.message, prepared.prompt_len, gen.collected.items.len, seconds(nowNs(io) - received));
     return result;
@@ -306,6 +327,8 @@ const Generation = struct {
     streamed_reasoning: reply_text.Shown = .{},
     streaming_done: bool = false,
     wrote_ns: ?i96 = null,
+    /// The admin surface's counter of the tokens this reply holds (null: the request is not tracked).
+    live: ?*std.atomic.Value(u32) = null,
     first_ns: ?i96 = null,
     last_ns: ?i96 = null,
     reason: ?[]const u8 = null, // the server ended the reply (a stop string, the length) before the engine said so
@@ -494,6 +517,7 @@ const Generation = struct {
                 continue;
             };
             if (g.reason == null) try g.commit(tokens);
+            if (g.live) |p| p.store(@intCast(@min(g.collected.items.len, std.math.maxInt(u32))), .monotonic);
         }
     }
 

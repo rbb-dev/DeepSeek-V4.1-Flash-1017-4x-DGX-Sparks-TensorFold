@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const cuda = @import("cuda");
+const engine_api = @import("engine_api");
 const fabric = @import("fabric");
 const roci = @import("rocinante.zig");
 const rv = @import("rocinante_verbs.zig");
@@ -232,6 +233,10 @@ pub const Roci = struct {
         const rails_text = try std.fmt.allocPrint(gpa, "{s},{s}", .{ devices[0], devices[1] });
         defer gpa.free(rails_text);
         roci.startLine(&w, r.g, rails_text, gid, set, signal) catch {};
+        // what the admin page says of the prompt exchanges (every lane is started alike)
+        engine_api.transport.facts.rocinante_known = true;
+        engine_api.transport.facts.rocinante_wait = set.wait_qp;
+        engine_api.transport.facts.rocinante_signal = if (signal == .atomic) .atomic else .write;
         std.log.info("{s}lane {d} of {d}: registration and exchange {d} ms, nap {}, arena {s}", .{ w.buffered(), r.lane, if (first) |f| @as(u8, @intCast((f.span[1] - f.span[0]) / total)) else lanes, (nowNs() - t0) / std.time.ns_per_ms, set.nap, "locked anonymous pages registered with cuMemHostRegister" });
         return r;
     }

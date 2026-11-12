@@ -11,6 +11,8 @@ const tokens = @import("tokens.zig");
 const decisions = @import("decisions.zig");
 const systemone = @import("systemone.zig");
 const status = @import("status_routes.zig");
+const admin = @import("admin.zig");
+const admin_requests = @import("admin_requests.zig");
 const memory = @import("memory_routes.zig");
 const slide = @import("slide.zig");
 const recall = @import("recall_routes.zig");
@@ -24,6 +26,12 @@ const Allocator = std.mem.Allocator;
 const fact_path = "/v1/slide/fact/";
 
 pub fn dispatch(srv: *Server, conn: *Conn, a: Allocator) void {
+    // the admin surface first: its paths would otherwise meet the path-ending router below (/admin/x/models is not /v1's)
+    if (admin.owns(conn.path)) return admin.handle(srv, conn, a, discardBody);
+    // who asks and where, for the record of requests the reply code keeps; the slices belong to this request, so they go
+    // with it
+    admin_requests.context = .{ .label = conn.key_label orelse "unauthenticated", .route = auth.routePath(conn.path) };
+    defer admin_requests.context = .{};
     const m = conn.method;
     // a GET or DELETE that carries a body leaves it in the socket for the next request on a kept connection
     if (std.mem.eql(u8, m, "GET")) {

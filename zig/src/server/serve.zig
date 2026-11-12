@@ -11,6 +11,7 @@ const model_text = @import("model_text.zig");
 const server_mod = @import("server.zig");
 const prepare_gate = @import("prepare_gate.zig");
 const clock = @import("clock.zig");
+const admin_series = @import("admin_series.zig");
 const recall_routes = @import("recall_routes.zig");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
@@ -195,6 +196,20 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         return 1;
     };
     defer store.deinit();
+    // the admin surface's own keys (read-only API on the same port): none, and every /admin/ path is the unknown-path 404.
+    // A file the rules or the filesystem refuse does not stop the start: the store is closed and the line says why.
+    var admin_store: auth.Store = undefined;
+    var admin_on = false;
+    if (env(s, "TENSORFOLD_ADMIN_KEY_FILE")) |path| if (path.len > 0) {
+        admin_store = auth.Store.initAdmin(gpa, path, if (store.enabled()) &store else null, &problem) catch {
+            std.debug.print("tensorfold: TENSORFOLD_ADMIN_KEY_FILE: the admin key store could not be made\n", .{});
+            return 1;
+        };
+        admin_on = true;
+        if (admin_store.valid) {
+            log.line("admin API: read-only at /admin/api/v1 (routes, schema, config, status, ledger, requests, series, logs, keys) and the page at /admin/ui, its own key file", .{});
+        } else log.line("admin API: closed, every /admin/api path answers 404: {s}", .{admin_store.refusal});
+    };
     if (!store.enabled() and !auth.loopback(args.host)) log.line("warning: non-loopback server has no API key; requests are open", .{});
     var ids: std.ArrayList([]const u8) = .empty;
     for ([_][]const []const u8{ &.{s.served}, args.alias }) |group| for (group) |raw| {
@@ -283,6 +298,18 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         return 1;
     };
     defer srv.deinit();
+    if (admin_on) srv.admin_keys = &admin_store;
+    var sampler: ?*admin_series.Sampler = null;
+    if (admin_on) if (admin_series.Sampler.create(gpa)) |smp| {
+        sampler = smp;
+        srv.series = smp;
+        smp.requests = &srv.requests; // (the seats' KV share, read once a second under the table's short lock: connection threads share it, the engine thread never does)
+        smp.start(io, s.engine);
+    } else |_| log.line("admin API: no series (out of memory)", .{});
+    defer if (sampler) |smp| {
+        srv.series = null;
+        smp.destroy();
+    };
     srv.recall = s.recall;
     if (args.loop_guard and !srv.info.loop_guard) {
         std.debug.print("tensorfold: --loop-guard is not supported by this native engine\n", .{});

@@ -2,34 +2,395 @@
 //! requests, the series, the logs, the keys, the history; a dry run, `validate`; and the writes, `set` and `revert`. A write names
 //! rows of class H or R: a row with a live hook (live_config.zig) is handed to the engine, which takes it at its next loop turn;
 //! every row is kept in engine.cfg unless the caller says not, and the history row is on disk before the answer.
+//!
+//! It is the same port and the same kind of gate as /v1: a request needs a key. The keys are the admin keys' own file
+//! (TENSORFOLD_ADMIN_KEY_FILE, read by `auth.Store` exactly as the API key file is, under two more rules: no key shorter
+//! than 32 bytes and none that the /v1 file also holds); a key of the shared key file opens nothing here, and there is
+//! no rule about source addresses (the network around the engine is the operator's). The key's label is its scope:
+//! `admin` or `admin-*` may do everything, `agent-*` and `read-*` and any other label may read, and `/keys` and `/logs`
+//! are the admin's alone. Every refusal of a caller that has no valid key is the 404 any unknown path gets: with no admin
+//! key file, with no key, with a wrong key, with a method the route does not have, or with a path this surface does not
+//! have, so nothing tells a caller that the API exists. A valid key that lacks the scope is told so (403). The page's
+//! three static files are the one exception: with an admin key file configured they answer without a key, at exactly four
+//! paths and only to GET, before the gate. The handlers run on the connection's own thread and read only what /health
+//! reads already (the engine's status call, the metrics, the start-up record of `settings`) and the server's own records
+//! of its requests, its log lines and its samples: none reaches the engine thread.
+const std = @import("std");
+const api = @import("engine_api");
+const settings = api.settings;
 const kv_pool = api.kv_pool;
 const live_config = api.live_config;
 const cfg_write = api.cfg_write;
 const admin_state = @import("admin_state.zig");
 const json = @import("json");
+const http_conn = @import("http_conn.zig");
+const http_body = @import("http_body.zig");
+const auth = @import("auth.zig");
+const log = @import("log.zig");
+const clock = @import("clock.zig");
+const routes = @import("routes.zig");
+const status_routes = @import("status_routes.zig");
+const prepare_gate = @import("prepare_gate.zig");
+const admin_series = @import("admin_series.zig");
+const Server = @import("server.zig").Server;
+const Conn = http_conn.Conn;
+const Allocator = std.mem.Allocator;
+const Value = json.Value;
+
+pub const prefix = "/admin/api/v1";
+
+/// The API's own version, in every answer's `X-TF-Admin-API` and in /status.
+pub const api_major = 1;
+pub const api_minor = 0;
+
+/// The page's three files, in the binary.
+pub const page_html = @embedFile("admin_ui/index.html");
+pub const page_js = @embedFile("admin_ui/app.js");
+pub const page_css = @embedFile("admin_ui/app.css");
+
+/// What every page file carries: no inline script or style may run, nothing may frame the page, and nothing leaves the
+/// origin (the key lives in the page's memory only).
+pub const page_csp = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+const Method = enum { get, post };
+const Route = struct { name: []const u8, method: Method, need: Need, step: u8 };
+
+/// Every route that answers. A route that is not here is the unknown-path 404 for everyone, whatever its method; a POST
+/// arrives route by route as it is built.
+pub const table = [_]Route{
+    .{ .name = "routes", .method = .get, .need = .read, .step = 2 },
+    .{ .name = "schema", .method = .get, .need = .read, .step = 2 },
+    .{ .name = "config", .method = .get, .need = .read, .step = 2 },
+    .{ .name = "status", .method = .get, .need = .read, .step = 2 },
+    .{ .name = "ledger", .method = .get, .need = .read, .step = 4 },
+    .{ .name = "requests", .method = .get, .need = .read, .step = 2 },
+    .{ .name = "series", .method = .get, .need = .read, .step = 2 },
+    .{ .name = "logs", .method = .get, .need = .admin, .step = 2 },
+    .{ .name = "keys", .method = .get, .need = .admin, .step = 2 },
+    .{ .name = "history", .method = .get, .need = .read, .step = 3 },
+    .{ .name = "leases", .method = .get, .need = .read, .step = 5 },
+    .{ .name = "policy", .method = .get, .need = .read, .step = 5 },
+    .{ .name = "keys/reload", .method = .post, .need = .admin, .step = 2 },
     .{ .name = "set", .method = .post, .need = .agent, .step = 5 },
     .{ .name = "revert", .method = .post, .need = .admin, .step = 5 },
+};
+
+/// Whether the request is for the admin surface (every path under /admin/), whatever its method.
+pub fn owns(raw_path: []const u8) bool {
+    const path = auth.routePath(raw_path);
+    return std.mem.eql(u8, path, "/admin") or std.mem.startsWith(u8, path, "/admin/");
+}
+
+const Page = enum { html, js, css, to_index };
+
+/// The page file a raw request path names, or null. The match is exact on the raw path: no query, no dot segments. The index
+/// is /admin/ui/ only; /admin, /admin/ and /admin/ui redirect to it.
+fn pageFile(raw_path: []const u8) ?Page {
+    if (std.mem.eql(u8, raw_path, "/admin/ui/")) return .html;
+    // an address without the page's trailing slash: the page's relative app.js / app.css would resolve under /admin/, so it is
+    // redirected to /admin/ui/ (without it, /admin/ui loaded a page whose relative app.js and app.css did not resolve)
+    if (std.mem.eql(u8, raw_path, "/admin") or std.mem.eql(u8, raw_path, "/admin/") or std.mem.eql(u8, raw_path, "/admin/ui")) return .to_index;
+    if (std.mem.eql(u8, raw_path, "/admin/ui/app.js")) return .js;
+    if (std.mem.eql(u8, raw_path, "/admin/ui/app.css")) return .css;
+    return null;
+}
+
+const Who = struct { label: []const u8, scope: auth.Scope };
+const Ctx = struct { srv: *Server, conn: *Conn, a: Allocator, who: Who };
+
+/// Answers an admin request, or the unknown-path 404. The caller has not read a body: a refused request's body is dropped.
+pub fn handle(srv: *Server, conn: *Conn, a: Allocator, discard: *const fn (*Conn, Allocator) void) void {
+    // the page's files, before the gate, only while an admin key file is configured
+    if (std.mem.eql(u8, conn.method, "GET") and srv.admin_keys != null) if (pageFile(conn.path)) |f| {
+        discard(conn, a);
+        return sendPage(conn, a, f);
+    };
+    const who = identify(srv, conn, a) orelse {
+        discard(conn, a);
+        return routes.unknown(conn, a);
+    };
+    conn.log_label = who.label; // the access line says which admin key asked
+    const route = auth.routePath(conn.path);
+    const want: Method = if (std.mem.eql(u8, conn.method, "GET")) .get else if (std.mem.eql(u8, conn.method, "POST")) .post else {
+        discard(conn, a);
+        return routes.unknown(conn, a);
+    };
+    const r = if (std.mem.startsWith(u8, route, prefix ++ "/")) for (&table) |*t| {
+        if (t.method == want and std.mem.eql(u8, t.name, route[prefix.len + 1 ..])) break t;
+    } else null else null;
+    const found = r orelse {
+        discard(conn, a);
+        return routes.unknown(conn, a);
+    };
+        discard(conn, a);
+        return fail(conn, a, 403, "scope_denied", "this key may not call this route");
+    }
+    const ctx: Ctx = .{ .srv = srv, .conn = conn, .a = a, .who = who };
+    if (found.method == .get) discard(conn, a);
+    const name = found.name;
+    if (std.mem.eql(u8, name, "routes")) return reply(ctx, routesValue(a, who.scope));
+    if (std.mem.eql(u8, name, "schema")) return reply(ctx, schema(a));
+    if (std.mem.eql(u8, name, "config")) return reply(ctx, config(a));
+    if (std.mem.eql(u8, name, "status")) return reply(ctx, statusValue(srv, a, who));
+    if (std.mem.eql(u8, name, "ledger")) return reply(ctx, ledger(a));
+    if (std.mem.eql(u8, name, "requests")) return reply(ctx, requestsValue(srv, a));
+    if (std.mem.eql(u8, name, "series")) return seriesReply(ctx);
+    if (std.mem.eql(u8, name, "logs")) return logsReply(ctx);
+    if (std.mem.eql(u8, name, "keys")) return reply(ctx, keysValue(srv, a));
+    if (std.mem.eql(u8, name, "leases")) return reply(ctx, emptyView(a, "leases", "no lease exists in this release"));
+    if (std.mem.eql(u8, name, "keys/reload")) return keysReload(ctx);
     if (std.mem.eql(u8, name, "set")) return setReply(ctx);
     if (std.mem.eql(u8, name, "revert")) return revertReply(ctx);
+    routes.unknown(conn, a);
+}
+
+/// The request carries an admin key. Exactly one Authorization header and one x-api-key, as /v1's gate reads them.
+fn identify(srv: *Server, conn: *Conn, a: Allocator) ?Who {
+    const keys = srv.admin_keys orelse return null;
+    if (!keys.enabled()) return null;
+    const label = keys.match(a, single(conn, "Authorization"), single(conn, "x-api-key")) orelse return null;
+    const own = a.dupe(u8, label) catch return null; // the store may reread its file under another request
+    return .{ .label = own, .scope = auth.scopeOf(own).scope };
+}
+
+fn single(conn: *const Conn, name: []const u8) ?[]const u8 {
+    if (conn.headerCount(name) != 1) return null;
+    return conn.header(name);
+}
+
+fn phrase(code: u16) []const u8 {
+    return switch (code) {
+        301 => "Moved Permanently",
+        403 => "Forbidden",
+        413 => "Content Too Large",
+        415 => "Unsupported Media Type",
+        else => http_conn.reason(code),
+    };
+}
+
+/// An answer under the admin headers: never cached, never sniffed. A page file also carries its policy headers and an
+/// ETag (`page_tag`), and an API answer the API's version.
+fn send(conn: *Conn, code: u16, content_type: []const u8, body: []const u8, page_tag: ?[]const u8) void {
+    conn.startResponse(code, phrase(code)) catch return;
+    conn.addHeader("Content-Type", content_type) catch return;
+    var len: [24]u8 = undefined;
+    conn.addHeader("Content-Length", std.fmt.bufPrint(&len, "{d}", .{body.len}) catch return) catch return;
+    conn.addHeader("Cache-Control", if (page_tag != null) "no-cache" else "no-store") catch return;
+    conn.addHeader("X-Content-Type-Options", "nosniff") catch return;
+    if (page_tag) |tag| {
+        conn.addHeader("ETag", tag) catch return;
+        conn.addHeader("Content-Security-Policy", page_csp) catch return;
+        conn.addHeader("Referrer-Policy", "no-referrer") catch return;
+        conn.addHeader("X-Frame-Options", "DENY") catch return;
+    } else conn.addHeader("X-TF-Admin-API", std.fmt.comptimePrint("{d}.{d}", .{ api_major, api_minor })) catch return;
+    if (conn.close) conn.addHeader("Connection", "close") catch return;
+    conn.finish(body) catch {};
+}
+
+fn sendPage(conn: *Conn, a: Allocator, f: Page) void {
+    if (f == .to_index) {
+        // relative, so a proxy's path prefix is kept: from /admin "admin/ui/", from /admin/ and /admin/ui "ui/"
+        const location = if (std.mem.eql(u8, conn.path, "/admin")) "admin/ui/" else "ui/";
+        conn.startResponse(301, phrase(301)) catch return;
+        conn.addHeader("Location", location) catch return;
+        conn.addHeader("Content-Length", "0") catch return;
+        conn.addHeader("Cache-Control", "no-cache") catch return;
+        if (conn.close) conn.addHeader("Connection", "close") catch return;
+        conn.finish("") catch {};
+        return;
+    }
+    const body = switch (f) {
+        .html => page_html,
+        .js => page_js,
+        .css => page_css,
+        .to_index => unreachable,
+    };
+    const kind = switch (f) {
+        .html => "text/html;charset=utf-8",
+        .js => "text/javascript;charset=utf-8",
+        .css => "text/css;charset=utf-8",
+        .to_index => unreachable,
+    };
+    // the tag changes with the bytes, so a new release's page is fetched at once
+    const tag = std.fmt.allocPrint(a, "\"{x}\"", .{std.hash.Wyhash.hash(0, body)}) catch return;
+    send(conn, 200, kind, body, tag);
+}
+
+fn sendValue(ctx: Ctx, code: u16, v: Value) void {
+    // an answered read is a poll, as /health's is: its line prints only when polls are logged
+    if (code == 200 and std.mem.eql(u8, ctx.conn.method, "GET")) ctx.conn.quiet_log = !ctx.srv.config.log_polls;
+    const body = json.stringify(ctx.a, v, .{}) catch return fail(ctx.conn, ctx.a, 500, "internal", "admin: out of memory");
+    send(ctx.conn, code, "application/json", body, null);
+}
+
+fn reply(ctx: Ctx, result: anyerror!Value) void {
+    sendValue(ctx, 200, result catch return fail(ctx.conn, ctx.a, 500, "internal", "admin: out of memory"));
+}
+
+/// `{"error": {"code": ..., "message": ...}}` under the admin headers.
+fn fail(conn: *Conn, a: Allocator, code: u16, name: []const u8, message: []const u8) void {
+    const body = std.fmt.allocPrint(a, "{{\"error\": {{\"code\": {s}, \"message\": {s}}}}}", .{
+        json.quote(a, name, .{}) catch return,
+        json.quote(a, message, .{}) catch return,
+    }) catch return;
+    send(conn, code, "application/json", body, null);
+}
+
+fn str(s: []const u8) Value {
+    return .{ .string = s };
+}
+
+fn optNum(a: Allocator, v: ?f64) !Value {
+    const x = v orelse return .null;
+    if (x == @floor(x) and @abs(x) < 1e15) return json.intValue(a, @as(i64, @intFromFloat(x)));
+    return .{ .float = x };
+}
+
+/// GET /routes: what this key may call, so the page needs no list of its own.
+pub fn routesValue(a: Allocator, scope: auth.Scope) !Value {
+    const root = try json.newObject(a);
+    const ver = try json.newObject(a);
+    try ver.put(a, "major", try json.intValue(a, api_major));
+    try ver.put(a, "minor", try json.intValue(a, api_minor));
+    try root.put(a, "api", .{ .object = ver });
+    var rows: std.ArrayList(Value) = .empty;
+    for (&table) |*t| {
+        const o = try json.newObject(a);
+        try o.put(a, "method", str(if (t.method == .get) "GET" else "POST"));
+        try o.put(a, "path", str(try std.fmt.allocPrint(a, "{s}/{s}", .{ prefix, t.name })));
+        try o.put(a, "step", try json.intValue(a, t.step));
+        try rows.append(a, .{ .object = o });
+    }
+    try root.put(a, "routes", .{ .array = rows.items });
+    return .{ .object = root };
+}
+
+/// The options a caller may see: every row that is not hidden.
+fn visibleCount() usize {
+    var n: usize = 0;
+    for (&settings.options) |*o| n += @intFromBool(!o.hidden);
+    return n;
+}
+
+/// GET /schema: every option the engine reads that the surface shows (a hidden row is not here), and the retired names.
+pub fn schema(a: Allocator) !Value {
+    const root = try json.newObject(a);
+    try root.put(a, "schema_version", try json.intValue(a, settings.schema_version));
+    try root.put(a, "count", try json.intValue(a, visibleCount()));
+    const apply = try json.newObject(a);
+    inline for (.{
+    try root.put(a, "apply_classes", .{ .object = apply });
+    var rows: std.ArrayList(Value) = .empty;
+    for (&settings.options) |*o| {
+        if (o.hidden) continue;
+        const r = try json.newObject(a);
+        try r.put(a, "id", try json.intValue(a, o.id));
+        try r.put(a, "name", str(o.name));
+        try r.put(a, "env", str(o.env));
+        try r.put(a, "group", str(o.group));
+        try r.put(a, "tab", str(o.tab));
+        try r.put(a, "kind", str(o.kindName()));
+        try r.put(a, "unit", str(o.unit));
+        try r.put(a, "min", try optNum(a, o.min));
+        try r.put(a, "max", try optNum(a, o.max));
+        try r.put(a, "default", if (o.default.len == 0) .null else str(o.default));
+        try r.put(a, "default_checked", .{ .bool = o.check == .tested });
+        try r.put(a, "apply", str(@tagName(o.apply)));
+        try r.put(a, "secret", .{ .bool = o.secret });
+        const who = try a.alloc(Value, o.who.len);
+        for (o.who, who) |w, *s| s.* = str(@tagName(w));
+        try r.put(a, "who", .{ .array = who });
+        const values = try a.alloc(Value, o.values.len);
+        for (o.values, values) |v, *s| s.* = str(v);
+        try r.put(a, "values", .{ .array = values });
+        try r.put(a, "doc", str(o.doc));
         // whether the engine takes a change to this row while it runs (a hook in rank 0's host or on a server thread)
+        try rows.append(a, .{ .object = r });
+    }
+    try root.put(a, "options", .{ .array = rows.items });
+    const gone = try a.alloc(Value, settings.retired.len);
+    for (&settings.retired, gone) |*t, *slot| {
+        const o = try json.newObject(a);
+        try o.put(a, "env", str(t.env));
+        try o.put(a, "when", str(@tagName(t.when)));
+        try o.put(a, "why", str(t.why));
+        slot.* = .{ .object = o };
+    }
+    try root.put(a, "retired", .{ .array = gone });
+    return .{ .object = root };
+}
+
+/// GET /config: what start-up found for each option (its source and value), and the engine.cfg that was read.
+/// "Active" is the start-up view: this release changes nothing after the start.
+pub fn config(a: Allocator) !Value {
+    const root = try json.newObject(a);
+    try root.put(a, "schema_version", try json.intValue(a, settings.schema_version));
     const version_now = settings_history.version.load(.acquire);
     try root.put(a, "config_version", try json.intValue(a, version_now));
     try root.put(a, "active_version", try json.intValue(a, admin_state.activeVersion(version_now)));
+    // false: no start-up record was taken in this process (a test server), so every source below is "default"
+    try root.put(a, "bootstrapped", .{ .bool = settings.ready.load(.acquire) });
+    const rep = settings.report;
+    if (rep.path.len > 0) {
+        const cfg = try json.newObject(a);
+        try cfg.put(a, "path", str(rep.path));
+        try cfg.put(a, "sha256", str(try std.fmt.allocPrint(a, "{x}", .{rep.sha256[0..]})));
+        try cfg.put(a, "bytes", try json.intValue(a, rep.bytes));
+        try cfg.put(a, "declared_schema", try json.intValue(a, rep.declared));
+        try cfg.put(a, "applied", try json.intValue(a, rep.applied));
+        try cfg.put(a, "environment_won", try json.intValue(a, rep.env_won));
+        try cfg.put(a, "unset", try json.intValue(a, rep.unset));
+        try cfg.put(a, "unknown", try json.intValue(a, rep.unknown));
+        try root.put(a, "engine_cfg", .{ .object = cfg });
+    } else try root.put(a, "engine_cfg", .null);
+    var rows: std.ArrayList(Value) = .empty;
+    for (&settings.options, 0..) |*o, i| {
+        if (o.hidden) continue;
+        const r = try json.newObject(a);
+        const res = settings.resolved[i];
+        try r.put(a, "id", try json.intValue(a, o.id));
+        try r.put(a, "name", str(o.name));
+        try r.put(a, "env", str(o.env));
         // a live change the engine has taken is the value it runs; otherwise the start's
         const live = admin_state.liveValue(o);
         try r.put(a, "source", str(if (live != null) "admin" else @tagName(res.source)));
+        // a key is never shown: only that one is set
         if (live) |t| {
             try r.put(a, "value", if (std.mem.eql(u8, t, "unset")) .null else str(t));
         } else try r.put(a, "value", if (res.source == .default) .null else if (o.secret) str("(set)") else str(res.value));
+        try r.put(a, "default", if (o.default.len == 0) .null else str(o.default));
         const st = admin_state.stateOf(o, currentText(o));
         const mine = admin_state.get(o);
         try r.put(a, "requested", if (st.requested) |t| str(t) else .null);
         try r.put(a, "state", str(@tagName(st.state)));
         try r.put(a, "set_by", if (mine.set_by.len > 0) str(mine.set_by) else .null);
         try r.put(a, "since_version", if (mine.since > 0) try json.intValue(a, mine.since) else .null);
+        try rows.append(a, .{ .object = r });
+    }
+    try root.put(a, "values", .{ .array = rows.items });
+    return .{ .object = root };
+}
+
+/// GET /status: the engine's health record (what /health answers a key holder), the settings' summary, the API's version,
+/// the time, this caller's powers and the server's own view of whether it is idle.
+pub fn statusValue(srv: *Server, a: Allocator, who: Who) !Value {
+    const scope = who.scope;
+    const root = try json.newObject(a);
+    try root.put(a, "admin_api", str("v1"));
+    const ver = try json.newObject(a);
+    try ver.put(a, "major", try json.intValue(a, api_major));
+    try ver.put(a, "minor", try json.intValue(a, api_minor));
+    try root.put(a, "api", .{ .object = ver });
+    const now_ms: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(srv.io).toNanoseconds(), std.time.ns_per_ms));
+    try root.put(a, "at_ms", try json.intValue(a, now_ms));
+    try root.put(a, "at", str(try rfc3339(a, now_ms)));
     // what this key may do in this build: an admin key may write the rows of class H and A (live where the engine has a hook, A through a cfg frame) and R (engine.cfg)
     const writes = scope == .admin;
     try root.put(a, "read_only", .{ .bool = !writes });
+    const caps = try json.newObject(a);
+    try caps.put(a, "scope", str(@tagName(scope)));
+    // the label of the key that asked (a label, never a key), so the page can say who is signed in
+    try caps.put(a, "label", str(who.label));
     const classes = try a.alloc(Value, if (writes) 3 else 0);
     const modes = try a.alloc(Value, if (writes) 2 else 0);
     if (writes) {
@@ -41,6 +402,16 @@ const json = @import("json");
     }
     try caps.put(a, "writable_classes", .{ .array = classes });
     try caps.put(a, "modes", .{ .array = modes });
+    try root.put(a, "capabilities", .{ .object = caps });
+    const ours = srv.requests.idle(srv.io, clock.nowNs(srv.io));
+    const preparing = srv.preparing.load(.acquire) > 0;
+    const idle = try json.newObject(a);
+    try idle.put(a, "idle", .{ .bool = ours.idle and !preparing });
+    try idle.put(a, "idle_for_s", if (ours.for_s) |x| (if (preparing) Value.null else Value{ .float = x }) else .null);
+    // the server's own view: a hint, not the engine's idle condition
+    try idle.put(a, "basis", str("server"));
+    try root.put(a, "idle", .{ .object = idle });
+    try root.put(a, "health", try status_routes.healthValue(srv, a, false));
     const version_now = settings_history.version.load(.acquire);
     const version = try json.intValue(a, version_now);
     try cv.put(a, "active_version", try json.intValue(a, admin_state.activeVersion(version_now)));
@@ -56,6 +427,317 @@ const json = @import("json");
     }
     try cv.put(a, "pending", .{ .array = pend });
     try putPoolStatus(a, root);
+    // the build's release (empty where the server's main set none) and each rank's memory NOW: rank 0's MemAvailable read on this
+    // request, each follower's last report (they send one every 2 s over a link of their own: families/dsv41/peer_mem.zig) with its
+    // age. A rank that has not reported is a row without figures, never zeros.
+    try root.put(a, "release", if (admin_state.release.len > 0) str(admin_state.release) else .null);
+    try root.put(a, "host_memory", try hostMemory(srv, a));
+    try root.put(a, "node_health", try nodeHealth(srv, a));
+    try root.put(a, "turbo", try turboRecord(srv, a));
+    // the checkpoint's own name (the served name is an alias) and what the engine decided about its transports at the start
+    const title = modelName(srv.io, a, srv.config.model_dir) catch null;
+    try root.put(a, "model_name", if (title) |t| str(t) else .null);
+    try root.put(a, "transport", try transportValue(a));
+    const rep = settings.report;
+    const cfg = try json.newObject(a);
+    try cfg.put(a, "schema_version", try json.intValue(a, settings.schema_version));
+    try cfg.put(a, "options", try json.intValue(a, visibleCount()));
+    var from_env: usize = 0;
+    var from_cfg: usize = 0;
+    for (&settings.options, settings.resolved) |*o, r| {
+        if (o.hidden) continue;
+        switch (r.source) {
+            .env => from_env += 1,
+            .cfg => from_cfg += 1,
+            .default => {},
+        }
+    }
+    try cfg.put(a, "from_environment", try json.intValue(a, from_env));
+    try cfg.put(a, "from_engine_cfg", try json.intValue(a, from_cfg));
+    try cfg.put(a, "engine_cfg", if (rep.path.len > 0) str(rep.path) else .null);
+    try root.put(a, "settings", .{ .object = cfg });
+    return .{ .object = root };
+}
+
+/// status.host_memory: the memory each rank has free now. Rank 0's is read here; a follower's is its last report and the age of it.
+fn hostMemory(srv: *Server, a: Allocator) !Value {
+    const hm = try json.newObject(a);
+    try hm.put(a, "basis", str("now: MemAvailable, rank 0 read at this request, each follower as it last reported (every 2 s)"));
+    const world: usize = if (kv_pool.ready.load(.acquire)) @min(kv_pool.report.world, 4) else 1;
+    var rows: std.ArrayList(Value) = .empty;
+    var r: usize = 0;
+    while (r < 4) : (r += 1) {
+        const got = if (r == 0) null else api.peer_mem.read(r);
+        if (r >= world and got == null) continue;
+        const o = try json.newObject(a);
+        try o.put(a, "rank", try json.intValue(a, r));
+        if (r == 0) {
+            if (prepare_gate.memAvailable(srv.io)) |avail| {
+                try o.put(a, "available_bytes", try json.intValue(a, avail));
+                try o.put(a, "age_ms", try json.intValue(a, 0));
+            } else {
+                try o.put(a, "available_bytes", .null);
+                try o.put(a, "age_ms", .null);
+            }
+        } else if (got) |g| {
+            try o.put(a, "available_bytes", try json.intValue(a, g.available));
+            try o.put(a, "total_bytes", try json.intValue(a, g.total));
+            try o.put(a, "age_ms", try json.intValue(a, g.age_ms));
+        } else {
+            try o.put(a, "available_bytes", .null);
+            try o.put(a, "age_ms", .null);
+        }
+        try rows.append(a, .{ .object = o });
+    }
+    try hm.put(a, "ranks", .{ .array = rows.items });
+    return .{ .object = hm };
+}
+
+/// The measured record of the Turbo switch (a prompt pass of 8,192 rows and split matrix multiplies: TF_DS_PASS_ROWS=8192 with
+/// TF_DS_GEMM_HALVES=1), built into the binary as admin_ui/turbo.json; a file named by TENSORFOLD_TURBO_RECORD wins, so the
+/// numbers can be filled in after a measurement without a new build. The page writes its tile from these numbers and never
+/// from its own; a record that is missing, unreadable or incomplete reads `measured: false`. What Turbo costs is KV pool positions
+/// (the pool is the memory it takes: free memory stays where the free target keeps it), so the record names the positions and their share.
+const turbo_built_in = @embedFile("admin_ui/turbo.json");
+
+pub fn turboFrom(a: Allocator, text: []const u8, source: []const u8) !Value {
+    const out = try json.newObject(a);
+    try out.put(a, "source", str(source));
+    const parsed = json.parse(a, text) catch null;
+    const doc: ?Value = if (parsed) |p| switch (p) {
+        .ok => |v| if (v == .object) v else null,
+        else => null,
+    } else null;
+    const d = doc orelse {
+        try out.put(a, "measured", .{ .bool = false });
+        return .{ .object = out };
+    };
+    // measured only when it says so and every number the page's tile uses is a number
+    const numbers = [_][]const u8{ "long_speedup", "short_speedup", "pool_cost_positions", "pool_cost_pct" };
+    var complete = if (d.get("measured")) |m| m == .bool and m.bool else false;
+    for (numbers) |k| {
+        const v = d.get(k) orelse {
+            complete = false;
+            continue;
+        };
+        if (v != .float and v != .int) complete = false;
+    }
+    try out.put(a, "measured", .{ .bool = complete });
+    if (!complete) {
+        if (d.get("note")) |n| if (n == .string) try out.put(a, "note", n);
+        return .{ .object = out };
+    }
+    for ([_][]const u8{ "build", "date", "what", "source_run", "short_build", "beside_build", "long_speedup", "short_speedup", "beside_prompt_ratio", "beside_streams_ratio", "pool_normal_positions", "pool_turbo_positions", "pool_cost_positions", "pool_cost_pct", "replies_equal" }) |k| {
+        if (d.get(k)) |v| switch (v) {
+            .float, .int, .string, .bool => try out.put(a, k, v),
+            else => {},
+        };
+    }
+    return .{ .object = out };
+}
+
+fn turboRecord(srv: *Server, a: Allocator) !Value {
+    if (std.c.getenv("TENSORFOLD_TURBO_RECORD")) |p| {
+        const buf = try a.alloc(u8, 16 * 1024);
+        if (std.Io.Dir.cwd().readFile(srv.io, std.mem.span(p), buf)) |text| {
+            return turboFrom(a, text, "record file");
+        } else |_| {}
+    }
+    return turboFrom(a, turbo_built_in, "built in");
+}
+
+/// A health figure the host gave, or null (`unknown` is never a number on the page).
+fn knownInt(a: Allocator, v: i32) !Value {
+    return if (v == api.peer_mem.unknown) .null else try json.intValue(a, v);
+}
+fn knownTenth(v: i32, per: f64) Value {
+    return if (v == api.peer_mem.unknown) .null else .{ .float = @as(f64, @floatFromInt(v)) / per };
+}
+fn counterValue(a: Allocator, v: u64) !Value {
+    return if (v == std.math.maxInt(u64)) .null else try json.intValue(a, v);
+}
+
+/// The NVML clock event reasons set in `bits`, by NVML's own names (the idle bit is the GPU resting, not a limit).
+pub fn reasonNames(a: Allocator, bits: u64) ![]Value {
+    const names = [_]struct { bit: u64, name: []const u8 }{
+        .{ .bit = 0x2, .name = "applications_clocks_setting" }, .{ .bit = 0x4, .name = "sw_power_cap" },
+        .{ .bit = 0x8, .name = "hw_slowdown" },                 .{ .bit = 0x10, .name = "sync_boost" },
+        .{ .bit = 0x20, .name = "sw_thermal_slowdown" },        .{ .bit = 0x40, .name = "hw_thermal_slowdown" },
+        .{ .bit = 0x80, .name = "hw_power_brake_slowdown" },    .{ .bit = 0x100, .name = "display_clock_setting" },
+    };
+    var out: std.ArrayList(Value) = .empty;
+    for (names) |n| if (bits & n.bit != 0) try out.append(a, str(n.name));
+    return out.items;
+}
+
+/// status.node_health: for each rank, the host's health as that Spark last reported it (rank 0 samples itself): memory, CPU,
+/// the ACPI zones, the GPU (read-only: its clock and the limits NVML names, never a way to change them), the NVMe and the two rails'
+/// cumulative counters (the page takes rates between two readings). A figure the host did not give is null, never zero.
+fn nodeHealth(srv: *Server, a: Allocator) !Value {
+    _ = srv;
+    const hp = api.peer_mem;
+    const nh = try json.newObject(a);
+    try nh.put(a, "basis", str("as each Spark last reported it: a block when a value moved past its step, at least every 2 s; rank 0 samples itself every second"));
+    try nh.put(a, "version", try json.intValue(a, hp.health_version));
+    const names = try a.alloc(Value, hp.max_zones);
+    for (names, 0..) |*slot, i| slot.* = str(hp.zoneName(i));
+    try nh.put(a, "zone_names", .{ .array = names });
+    const world: usize = if (kv_pool.ready.load(.acquire)) @min(kv_pool.report.world, 4) else 1;
+    var rows: std.ArrayList(Value) = .empty;
+    var r: usize = 0;
+    while (r < 4) : (r += 1) {
+        const got = hp.readHealth(r);
+        if (r >= world and got == null) continue;
+        const o = try json.newObject(a);
+        try o.put(a, "rank", try json.intValue(a, r));
+        if (got) |g| {
+            const h = g.health;
+            try o.put(a, "age_ms", try json.intValue(a, g.age_ms));
+            try o.put(a, "mem_available_bytes", try json.intValue(a, h.mem_available));
+            try o.put(a, "mem_total_bytes", try json.intValue(a, h.mem_total));
+            try o.put(a, "load1", knownTenth(h.load1_x100, 100));
+            try o.put(a, "cpu_busy_pct", knownTenth(h.cpu_busy_x10, 10));
+            try o.put(a, "cpus", try knownInt(a, h.ncpu));
+            const zs = try a.alloc(Value, hp.max_zones);
+            for (zs, h.zone_mc) |*slot, mc| slot.* = knownTenth(mc, 1000);
+            try o.put(a, "zones_c", .{ .array = zs });
+            const gpu = try json.newObject(a);
+            try gpu.put(a, "temp_c", try knownInt(a, h.gpu_temp_c));
+            try gpu.put(a, "util_pct", try knownInt(a, h.gpu_util_pct));
+            try gpu.put(a, "clock_mhz", try knownInt(a, h.gpu_clock_mhz));
+            try gpu.put(a, "clock_max_mhz", try knownInt(a, h.gpu_clock_max_mhz));
+            try gpu.put(a, "power_w", knownTenth(h.gpu_power_mw, 1000));
+            const known = h.gpu_reasons != hp.reasons_unknown;
+            try gpu.put(a, "reasons", if (known) .{ .array = try reasonNames(a, h.gpu_reasons) } else .null);
+            try gpu.put(a, "idle", if (known) .{ .bool = h.gpu_reasons & 1 != 0 } else .null);
+            try o.put(a, "gpu", .{ .object = gpu });
+            const nv = try json.newObject(a);
+            try nv.put(a, "temp_c", knownTenth(h.nvme_temp_mc, 1000));
+            try nv.put(a, "wear_pct", try knownInt(a, h.nvme_wear_pct));
+            try o.put(a, "nvme", .{ .object = nv });
+            const rails = try a.alloc(Value, 2);
+            for (rails, h.rails, [2][]const u8{ "A", "B" }) |*slot, rl, nm| {
+                const ro = try json.newObject(a);
+                try ro.put(a, "rail", str(nm));
+                try ro.put(a, "rx_bytes", try counterValue(a, rl.rx_bytes));
+                try ro.put(a, "tx_bytes", try counterValue(a, rl.tx_bytes));
+                try ro.put(a, "errors", try counterValue(a, rl.errors));
+                try ro.put(a, "discards", try counterValue(a, rl.discards));
+                slot.* = .{ .object = ro };
+            }
+            try o.put(a, "rails", .{ .array = rails });
+        } else try o.put(a, "age_ms", .null);
+        try rows.append(a, .{ .object = o });
+    }
+    try nh.put(a, "ranks", .{ .array = rows.items });
+    return .{ .object = nh };
+}
+
+extern "c" fn realpath(noalias path: [*:0]const u8, noalias resolved: [*]u8) ?[*:0]u8;
+
+/// A directory name that names nothing: the folders a bake or a cache puts a checkpoint in.
+fn genericName(name: []const u8) bool {
+    if (name.len == 0) return true;
+    for ([_][]const u8{ "model", "models", "weights", "checkpoint", "snapshot", "snapshots", "hub", "hf", "data", "current", "latest", "main" }) |g| {
+        if (std.ascii.eqlIgnoreCase(name, g)) return true;
+    }
+    if (name.len >= 7) {
+        for (name) |ch| if (!std.ascii.isHex(ch)) return false;
+        return true; // a snapshot hash
+    }
+    return false;
+}
+
+/// "DeepSeek-V4.1-Flash-1017" reads "DeepSeek V4.1 Flash 1017".
+fn tidyName(a: Allocator, name: []const u8) ![]const u8 {
+    const out = try a.dupe(u8, name);
+    for (out) |*ch| if (ch.* == '-' or ch.* == '_') {
+        ch.* = ' ';
+    };
+    return out;
+}
+
+/// The repository name inside a Hugging Face cache path (.../models--org--name/snapshots/rev/...): "name". Null when the path has none.
+fn hubName(path: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |part| {
+        if (!std.mem.startsWith(u8, part, "models--")) continue;
+        const rest = part["models--".len..];
+        const name = if (std.mem.indexOf(u8, rest, "--")) |i| rest[i + 2 ..] else rest;
+        return if (genericName(name)) null else name;
+    }
+    return null;
+}
+
+/// The name a checkpoint's config.json gives itself (_name_or_path, name_or_path, name), without its organisation. Null when it names nothing
+/// but a generic folder.
+fn configName(a: Allocator, text: []const u8) ?[]const u8 {
+    const doc = switch (json.parse(a, text) catch return null) {
+        .ok => |v| v,
+        .err => return null,
+    };
+    if (doc != .object) return null;
+    for ([_][]const u8{ "_name_or_path", "name_or_path", "name" }) |k| {
+        const v = doc.get(k) orelse continue;
+        if (v != .string) continue;
+        const base_name = std.fs.path.basename(std.mem.trimEnd(u8, v.string, "/"));
+        if (!genericName(base_name)) return base_name;
+    }
+    return null;
+}
+
+/// A readable name for the directory's last component alone (a folder called "model" or a snapshot hash names nothing: null).
+pub fn modelTitle(a: Allocator, dir: []const u8) !?[]const u8 {
+    const path = std.mem.trimEnd(u8, dir, "/");
+    if (hubName(path)) |n| return try tidyName(a, n);
+    const last = std.fs.path.basename(path);
+    if (genericName(last)) return null;
+    return try tidyName(a, last);
+}
+
+/// The checkpoint's own name, from what the folder says about its source, in this order: where its config.json really lives (a baked
+/// served folder links its files into the Hugging Face cache, models--org--name), the name inside config.json, then the folder's own name
+/// unless it is a generic word. Null when none names it (the page then shows the served name).
+pub fn modelName(io: std.Io, a: Allocator, dir: []const u8) !?[]const u8 {
+    if (dir.len == 0) return null;
+    const cfg = try std.fs.path.joinZ(a, &.{ dir, "config.json" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (realpath(cfg, &buf)) |real| if (hubName(std.mem.span(real))) |n| return try tidyName(a, n);
+    const text = std.Io.Dir.cwd().readFileAlloc(io, cfg, a, .limited(16 << 20)) catch null;
+    if (text) |t| if (configName(a, t)) |n| return try tidyName(a, n);
+    return modelTitle(a, dir);
+}
+
+fn signalWord(sig: api.transport.Signal) Value {
+    return switch (sig) {
+        .write => str("write"),
+        .atomic => str("atomic"),
+        .unknown => .null,
+    };
+}
+
+/// status.transport: what the start decided, in the engine's own switches (api.transport). A part the start did not record is null, never a guess.
+fn transportValue(a: Allocator) !Value {
+    const f = api.transport.facts;
+    const t = try json.newObject(a);
+    const roci = try json.newObject(a);
+    try roci.put(a, "known", .{ .bool = f.rocinante_known });
+    try roci.put(a, "waits_in_card", .{ .bool = f.rocinante_wait });
+    try roci.put(a, "arrival_signal", signalWord(f.rocinante_signal));
+    try t.put(a, "prompt_exchanges", .{ .object = roci });
+    const rings = try json.newObject(a);
+    try rings.put(a, "known", .{ .bool = f.rings_known });
+    try rings.put(a, "on", .{ .bool = f.rings_on });
+    try rings.put(a, "waits_in_card", .{ .bool = f.rings_wait });
+    try rings.put(a, "arrival_signal", if (f.rings_word) signalWord(f.rings_signal) else .null);
+    try t.put(a, "generation_exchanges", .{ .object = rings });
+    const watch = try json.newObject(a);
+    try watch.put(a, "links", try json.intValue(a, f.watch_links));
+    try t.put(a, "link_watch", .{ .object = watch });
+    // the failure counters (a lane failed, a ring aborted) are not kept anywhere a request can read without a lock on the exchange's path: not served
+    return .{ .object = t };
+}
+
 const gib_f: f64 = 1 << 30;
 
 /// A number of GiB as canonical text (the shortest decimal), the way every value in the admin answers is a string.
@@ -70,7 +752,10 @@ fn featureOf(id: u8) kv_pool.Feature {
 /// GET /ledger: what the start took, line by line, on every rank, largest first, where each line was taken, each rank's sum
 /// against what its device holds at the start's end, the pool and the vote that chose it. Empty, and saying so, in a process that
 /// sized no pool.
+pub fn ledger(a: Allocator) !Value {
+    const root = try json.newObject(a);
     if (!kv_pool.ready.load(.acquire)) {
+        try root.put(a, "entries", .{ .array = try a.alloc(Value, 0) });
         try root.put(a, "note", str("no start record: this process sized no KV pool, or the engine has not finished starting"));
         return .{ .object = root };
     }
@@ -146,6 +831,9 @@ fn featureOf(id: u8) kv_pool.Feature {
     try pool.put(a, "difference_gib", .{ .float = diff });
     try root.put(a, "pool", .{ .object = pool });
     try root.put(a, "bytes_per_token", try json.intValue(a, lead.bytes_per_token));
+    return .{ .object = root };
+}
+
 /// status.kv_pool and status.memory: the pool as the start sized it and each Spark's memory at the start. Both are left out
 /// until a start has recorded them: a group with no source is never zero-filled.
 fn putPoolStatus(a: Allocator, root: *json.Object) !void {
@@ -191,6 +879,270 @@ fn putPoolStatus(a: Allocator, root: *json.Object) !void {
     }
     try mem.put(a, "ranks", .{ .array = ranks });
     try root.put(a, "memory", .{ .object = mem });
+}
+
+/// A read view of something no change has made yet: an empty list under `list` and the reason it is empty.
+fn emptyView(a: Allocator, list: []const u8, note: []const u8) !Value {
+    const root = try json.newObject(a);
+    try root.put(a, list, .{ .array = try a.alloc(Value, 0) });
+    try root.put(a, "note", str(note));
+    return .{ .object = root };
+}
+
+/// GET /requests: the requests in flight and the last finished ones (labels, counts and times, never text), and the
+/// replies counted so far by key label and status.
+pub fn requestsValue(srv: *Server, a: Allocator) !Value {
+    const v = try srv.requests.view(srv.io, a, clock.nowNs(srv.io));
+    const root = try json.newObject(a);
+    try root.put(a, "in_flight", v.in_flight);
+    try root.put(a, "recent", v.recent);
+    try root.put(a, "untracked", try json.intValue(a, v.untracked));
+    try root.put(a, "by_label", try byLabel(srv, a));
+    return .{ .object = root };
+}
+
+fn byLabel(srv: *Server, a: Allocator) !Value {
+    const Row = struct { label: []const u8, total: u64, statuses: std.ArrayList(struct { status: u16, count: u64 }) };
+    var rows: std.ArrayList(Row) = .empty;
+    {
+        srv.metrics.mutex.lockUncancelable(srv.io);
+        defer srv.metrics.mutex.unlock(srv.io);
+        for (srv.metrics.requests.items) |r| {
+            const at = for (rows.items, 0..) |x, i| {
+                if (std.mem.eql(u8, x.label, r.key)) break i;
+            } else blk: {
+                try rows.append(a, .{ .label = try a.dupe(u8, r.key), .total = 0, .statuses = .empty });
+                break :blk rows.items.len - 1;
+            };
+            rows.items[at].total += r.count;
+            try rows.items[at].statuses.append(a, .{ .status = r.status, .count = r.count });
+        }
+    }
+    const out = try a.alloc(Value, rows.items.len);
+    for (rows.items, out) |x, *slot| {
+        const o = try json.newObject(a);
+        try o.put(a, "label", str(x.label));
+        try o.put(a, "requests", try json.intValue(a, x.total));
+        const st = try json.newObject(a);
+        for (x.statuses.items) |s| try st.put(a, try std.fmt.allocPrint(a, "{d}", .{s.status}), try json.intValue(a, s.count));
+        try o.put(a, "statuses", .{ .object = st });
+        slot.* = .{ .object = o };
+    }
+    return .{ .array = out };
+}
+
+/// The value of query parameter `name` in a raw request path, percent-decoded into `a`; null when it is absent.
+fn queryValue(a: Allocator, raw_path: []const u8, name: []const u8) ?[]const u8 {
+    const q = std.mem.indexOfScalar(u8, raw_path, '?') orelse return null;
+    var it = std.mem.splitScalar(u8, raw_path[q + 1 ..], '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
+        if (!std.mem.eql(u8, pair[0..eq], name)) continue;
+        const raw = if (eq < pair.len) pair[eq + 1 ..] else "";
+        var out = a.alloc(u8, raw.len) catch return null;
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < raw.len) : (i += 1) {
+            if (raw[i] == '+') {
+                out[n] = ' ';
+            } else if (raw[i] == '%' and i + 2 < raw.len + 0 and std.ascii.isHex(raw[i + 1]) and std.ascii.isHex(raw[i + 2])) {
+                out[n] = std.fmt.parseInt(u8, raw[i + 1 .. i + 3], 16) catch return null;
+                i += 2;
+            } else out[n] = raw[i];
+            n += 1;
+        }
+        return out[0..n];
+    }
+    return null;
+}
+
+fn queryNumber(ctx: Ctx, name: []const u8, default: u64, max: u64) ?u64 {
+    const t = queryValue(ctx.a, ctx.conn.path, name) orelse return default;
+    return @min(std.fmt.parseInt(u64, t, 10) catch return null, max);
+}
+
+/// GET /series?name=&seconds=&step=: the sampler's ring (empty while the sampler is not running).
+fn seriesReply(ctx: Ctx) void {
+    const name = queryValue(ctx.a, ctx.conn.path, "name") orelse return fail(ctx.conn, ctx.a, 400, "missing_field", "name: one of decode_tps, prefill_tps, running, waiting, generation_tokens, memory_active");
+    const seconds = queryNumber(ctx, "seconds", 600, admin_series.capacity) orelse return fail(ctx.conn, ctx.a, 400, "bad_query", "seconds: a whole number");
+    const step = queryNumber(ctx, "step", 1, admin_series.capacity) orelse return fail(ctx.conn, ctx.a, 400, "bad_query", "step: a whole number");
+    const root = json.newObject(ctx.a) catch return;
+    root.put(ctx.a, "name", str(name)) catch return;
+    // "seat_kv": every seat's KV share in one reply (the pool chart's layers), each as a points / peaks pair
+    if (std.mem.eql(u8, name, "seat_kv")) {
+        const rows = ctx.a.alloc(Value, admin_series.seat_rows) catch return;
+        var since: ?i64 = null;
+        var last: ?i64 = null;
+        var stepw: u32 = @intCast(@max(1, step));
+        for (rows, 0..) |*slot, k| {
+            const o = json.newObject(ctx.a) catch return;
+            var nb: [24]u8 = undefined;
+            const nm = std.fmt.bufPrint(&nb, "seat_kv_{d}", .{k}) catch return;
+            const w = if (ctx.srv.series) |s| (s.window(ctx.srv.io, ctx.a, nm, @intCast(seconds), @intCast(@max(1, step))) catch return fail(ctx.conn, ctx.a, 500, "internal", "admin: out of memory")) else null;
+            if (w) |x| {
+                since = x.since_ms;
+                last = x.last_ms;
+                stepw = x.step_s;
+                o.put(ctx.a, "points", .{ .array = x.points }) catch return;
+                o.put(ctx.a, "peaks", .{ .array = x.peaks }) catch return;
+            } else {
+                o.put(ctx.a, "points", .{ .array = ctx.a.alloc(Value, 0) catch return }) catch return;
+                o.put(ctx.a, "peaks", .{ .array = ctx.a.alloc(Value, 0) catch return }) catch return;
+            }
+            slot.* = .{ .object = o };
+        }
+        root.put(ctx.a, "step_s", json.intValue(ctx.a, stepw) catch return) catch return;
+        root.put(ctx.a, "since_ms", if (since) |v| (json.intValue(ctx.a, v) catch return) else .null) catch return;
+        root.put(ctx.a, "last_ms", if (last) |v| (json.intValue(ctx.a, v) catch return) else .null) catch return;
+        root.put(ctx.a, "seats", .{ .array = rows }) catch return;
+        return sendValue(ctx, 200, .{ .object = root });
+    }
+    if (ctx.srv.series) |s| {
+        const w = (s.window(ctx.srv.io, ctx.a, name, @intCast(seconds), @intCast(@max(1, step))) catch return fail(ctx.conn, ctx.a, 500, "internal", "admin: out of memory")) orelse
+            return fail(ctx.conn, ctx.a, 400, "unknown_series", "name: one of decode_tps, prefill_tps, running, waiting, generation_tokens, memory_active");
+        root.put(ctx.a, "step_s", json.intValue(ctx.a, w.step_s) catch return) catch return;
+        root.put(ctx.a, "since_ms", json.intValue(ctx.a, w.since_ms) catch return) catch return;
+        root.put(ctx.a, "last_ms", json.intValue(ctx.a, w.last_ms) catch return) catch return;
+        root.put(ctx.a, "points", .{ .array = w.points }) catch return;
+        root.put(ctx.a, "peaks", .{ .array = w.peaks }) catch return;
+    } else {
+        root.put(ctx.a, "step_s", json.intValue(ctx.a, @max(1, step)) catch return) catch return;
+        root.put(ctx.a, "since_ms", .null) catch return;
+        root.put(ctx.a, "last_ms", .null) catch return;
+        root.put(ctx.a, "points", .{ .array = ctx.a.alloc(Value, 0) catch return }) catch return;
+        root.put(ctx.a, "peaks", .{ .array = ctx.a.alloc(Value, 0) catch return }) catch return;
+    }
+    sendValue(ctx, 200, .{ .object = root });
+}
+
+/// GET /logs?since=&limit=&level=&contains=: the newest server lines from the ring.
+fn logsReply(ctx: Ctx) void {
+    const since = queryNumber(ctx, "since", 0, std.math.maxInt(u64)) orelse return fail(ctx.conn, ctx.a, 400, "bad_query", "since: a whole number");
+    const limit = queryNumber(ctx, "limit", 500, log.ring.capacity) orelse return fail(ctx.conn, ctx.a, 400, "bad_query", "limit: a whole number");
+    const level_text = queryValue(ctx.a, ctx.conn.path, "level") orelse "info";
+    const min: log.ring.Level = if (std.mem.eql(u8, level_text, "info")) .info else if (std.mem.eql(u8, level_text, "warn")) .warn else if (std.mem.eql(u8, level_text, "error")) .@"error" else return fail(ctx.conn, ctx.a, 400, "bad_query", "level: info, warn or error");
+    const page = log.ring.read(ctx.a, since, @intCast(limit), min, queryValue(ctx.a, ctx.conn.path, "contains") orelse "") catch return fail(ctx.conn, ctx.a, 500, "internal", "admin: out of memory");
+    const root = json.newObject(ctx.a) catch return;
+    const rows = ctx.a.alloc(Value, page.lines.len) catch return;
+    for (page.lines, rows) |x, *slot| {
+        const o = json.newObject(ctx.a) catch return;
+        o.put(ctx.a, "seq", json.intValue(ctx.a, x.seq) catch return) catch return;
+        o.put(ctx.a, "at_ms", json.intValue(ctx.a, x.at_ms) catch return) catch return;
+        o.put(ctx.a, "level", str(@tagName(x.level))) catch return;
+        o.put(ctx.a, "text", str(ctx.a.dupe(u8, x.text[0..x.len]) catch return)) catch return;
+        slot.* = .{ .object = o };
+    }
+    root.put(ctx.a, "lines", .{ .array = rows }) catch return;
+    root.put(ctx.a, "next_seq", json.intValue(ctx.a, page.next_seq) catch return) catch return;
+    root.put(ctx.a, "dropped", json.intValue(ctx.a, page.dropped) catch return) catch return;
+    sendValue(ctx, 200, .{ .object = root });
+}
+
+/// GET /keys: the labels of both key files and what each store holds. Never a key, a digest or a file's path.
+pub fn keysValue(srv: *Server, a: Allocator) !Value {
+    const root = try json.newObject(a);
+    var api_labels: []const []const u8 = &.{};
+    var shared_summary: ?auth.Store.Summary = null;
+    if (srv.keys) |k| shared_summary = try k.labels(a, &api_labels);
+    const counts = try byLabel(srv, a);
+    const rows = try a.alloc(Value, api_labels.len);
+    for (api_labels, rows) |label, *slot| {
+        const o = try json.newObject(a);
+        try o.put(a, "label", str(label));
+        var n: u64 = 0;
+        for (counts.array) |c| if (std.mem.eql(u8, json.strOr(c.get("label")), label)) {
+            n = std.fmt.parseInt(u64, c.get("requests").?.int, 10) catch 0;
+        };
+        try o.put(a, "requests", try json.intValue(a, n));
+        slot.* = .{ .object = o };
+    }
+    try root.put(a, "api_keys", .{ .array = rows });
+    var admin_labels: []const []const u8 = &.{};
+    var admin_summary: ?auth.Store.Summary = null;
+    if (srv.admin_keys) |k| admin_summary = try k.labels(a, &admin_labels);
+    const arows = try a.alloc(Value, admin_labels.len);
+    for (admin_labels, arows) |label, *slot| {
+        const o = try json.newObject(a);
+        const sc = auth.scopeOf(label);
+        try o.put(a, "label", str(label));
+        try o.put(a, "scope", str(@tagName(sc.scope)));
+        if (sc.scope == .agent) try o.put(a, "profile", str(label));
+        slot.* = .{ .object = o };
+    }
+    try root.put(a, "admin_keys", .{ .array = arows });
+    const stores = try json.newObject(a);
+    try stores.put(a, "api", try storeValue(a, shared_summary));
+    try stores.put(a, "admin", try storeValue(a, admin_summary));
+    try root.put(a, "stores", .{ .object = stores });
+    return .{ .object = root };
+}
+
+fn storeValue(a: Allocator, summary: ?auth.Store.Summary) !Value {
+    const o = try json.newObject(a);
+    const s = summary orelse {
+        try o.put(a, "keys", try json.intValue(a, 0));
+        try o.put(a, "valid", .{ .bool = true });
+        try o.put(a, "refused_reason", .null);
+        return .{ .object = o };
+    };
+    try o.put(a, "keys", try json.intValue(a, s.keys));
+    try o.put(a, "valid", .{ .bool = s.valid });
+    try o.put(a, "refused_reason", if (s.refusal.len > 0) str(try a.dupe(u8, s.refusal)) else .null);
+    return .{ .object = o };
+}
+
+/// What a write must pass before its body is looked at: JSON content, an Origin that is this server's own (a browser
+/// form cannot set either), and a body of at most 64 KiB. Returns the body, or null after answering.
+fn writeBody(ctx: Ctx) ?[]const u8 {
+    const conn = ctx.conn;
+    const a = ctx.a;
+    const kind = conn.header("Content-Type") orelse "";
+    const semi = std.mem.indexOfScalar(u8, kind, ';') orelse kind.len;
+    if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, kind[0..semi], " \t"), "application/json")) {
+        _ = http_body.read(conn, a, http_body.limit) catch {};
+        fail(conn, a, 415, "unsupported_media_type", "send Content-Type: application/json");
+        return null;
+    }
+    if (conn.header("Origin")) |origin| {
+        const host = conn.header("Host") orelse "";
+        const at = std.mem.indexOf(u8, origin, "://");
+        const authority = if (at) |i| origin[i + 3 ..] else origin;
+        if (host.len == 0 or !std.ascii.eqlIgnoreCase(authority, host)) {
+            _ = http_body.read(conn, a, http_body.limit) catch {};
+            fail(conn, a, 403, "origin_denied", "the Origin is not this server's");
+            return null;
+        }
+    }
+    const body = http_body.read(conn, a, 65536) catch {
+        fail(conn, a, 500, "internal", "admin: out of memory");
+        return null;
+    };
+    switch (body) {
+        .ok => |b| return b,
+        .refused => {
+            conn.close = true;
+            fail(conn, a, 413, "body_too_large", "an admin request body is at most 65,536 bytes");
+            return null;
+        },
+    }
+}
+
+/// POST /keys/reload: both key stores reread their files now (what SIGHUP does), and say how many keys each holds.
+fn keysReload(ctx: Ctx) void {
+    const body = writeBody(ctx) orelse return;
+    const parsed = json.parse(ctx.a, if (body.len == 0) "{}" else body) catch return fail(ctx.conn, ctx.a, 500, "internal", "admin: out of memory");
+    const doc = switch (parsed) {
+        .ok => |v| v,
+        .err => return fail(ctx.conn, ctx.a, 400, "bad_json", "the body is not JSON"),
+    };
+    if (doc != .object) return fail(ctx.conn, ctx.a, 400, "bad_json", "the body is a JSON object");
+    if (doc.object.count() > 0) return fail(ctx.conn, ctx.a, 400, "unknown_field", doc.object.keys()[0]);
+    const root = json.newObject(ctx.a) catch return;
+    const api_summary: ?auth.Store.Summary = if (ctx.srv.keys) |k| k.reloadNow() else null;
+    const admin_summary: ?auth.Store.Summary = if (ctx.srv.admin_keys) |k| k.reloadNow() else null;
+    root.put(ctx.a, "api", storeValue(ctx.a, api_summary) catch return) catch return;
+    root.put(ctx.a, "admin", storeValue(ctx.a, admin_summary) catch return) catch return;
+    sendValue(ctx, 200, .{ .object = root });
 }
 
 /// One change a request asks for, once it passed every check: the option, the canonical text (`unset`: leave it to the engine),
@@ -757,4 +1709,35 @@ fn warningText(a: Allocator, code: []const u8, name: []const u8, message: []cons
 fn currentText(o: *const settings.Option) ?[]const u8 {
     if (admin_state.liveValue(o)) |t| return if (std.mem.eql(u8, t, "unset")) (if (o.default.len == 0) null else o.default) else t;
     return activeText(o);
+}
+
+/// RFC 3339 UTC time of a unix time in milliseconds.
+fn rfc3339(a: Allocator, ms: i64) ![]const u8 {
+    const secs: u64 = @intCast(@max(0, @divTrunc(ms, 1000)));
+    const es: std.time.epoch.EpochSeconds = .{ .secs = secs };
+    const day = es.getEpochDay().calculateYearDay();
+    const md = day.calculateMonthDay();
+    const t = es.getDaySeconds();
+    return std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
+        day.year,                           @backingInt(md.month),  md.day_index + 1,
+        t.getHoursIntoDay(),                t.getMinutesIntoHour(), t.getSecondsIntoMinute(),
+        @as(u64, @intCast(@mod(ms, 1000))),
+    });
+}
+
+test "a unix time reads as RFC 3339" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings("2026-11-08T21:50:07.042Z", try rfc3339(arena.allocator(), 1_794_174_607_042));
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00.000Z", try rfc3339(arena.allocator(), 0));
+}
+
+test "a query value is percent-decoded and exact" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("a b&c", queryValue(a, "/x?name=a+b%26c&n=1", "name").?);
+    try std.testing.expectEqualStrings("1", queryValue(a, "/x?name=a&n=1", "n").?);
+    try std.testing.expect(queryValue(a, "/x?name=a", "nam") == null);
+    try std.testing.expect(queryValue(a, "/x", "name") == null);
 }
