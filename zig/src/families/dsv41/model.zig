@@ -740,6 +740,10 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
         if (std.c.getenv("TF_DS_L2_DN_MB")) |v| round.l2_dn_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dn_mb;
         if (std.c.getenv("TF_DS_L2_DEC_MB")) |v| round.l2_dec_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dec_mb;
+        // rank 0's ports for its followers listen before its weights load: a follower that loads first connects and
+        // waits in its port's backlog instead of retrying until rank 0 and the followers before it are in
+        m.fan = try prompt2d.Fan.listenAt(o.master, o.listen, o.port, o.rank, o.world);
+        errdefer m.fan.close();
         const ord = if (o.world == 4) try prompt2d.order() else [4]u32{ 0, 1, 2, 3 };
         const role: u32 = if (o.world == 4) ord[o.rank] else o.rank;
         const cache_name = try rank_cache.find(a, io, m.cache_dir, role, o.world);
@@ -779,6 +783,8 @@ pub fn startSettings(o: Options) prompt2d.Settings {
             if (std.c.getenv("TF_DS_DRAFT_DUMP_PASS")) |dp| draft.ddump_pass = std.fmt.parseInt(usize, std.mem.span(dp), 10) catch 2;
         }
         sp.parity = sp.pair != null and parityGU(); // TF_DS_2D_GU=parity: the balanced experts split
+        // the ranks' links (rank 0 takes its followers in order; a follower retries its connect for TF_DS_CONNECT_S)
+        try m.fan.join(io, o.master, o.port, o.rank, o.world, prompt2d.connectSeconds());
         m.par = if (sp.parity and parOne() and c.format == .exl3) try exl3_experts2d.ParKernels.load(d, cuda.kernels.dsv41_experts_par) else null;
         errdefer if (m.par) |*x| x.unload();
         m.mxk = if (c.format == .native) try mx.Kernels.load(d, cuda.kernels.dsv41_native) else null;

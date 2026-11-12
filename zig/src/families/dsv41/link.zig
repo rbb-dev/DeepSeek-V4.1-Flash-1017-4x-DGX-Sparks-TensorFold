@@ -29,6 +29,13 @@ pub const Link = struct {
 
     /// Rank 0: listen on `ip`:`port` and take the one peer's connection.
     pub fn listen(ip: [4]u8, port: u16) !Link {
+        var p = try Ports.open(&.{ip}, port);
+        defer p.close();
+        return p.accept(1);
+    }
+
+    /// A socket bound to `ip`:`port` and listening (a backlog of one: the port is one peer's).
+    fn bound(ip: [4]u8, port: u16) !c.fd_t {
         const fd = try socket();
         errdefer _ = c.close(fd);
         const one: c_int = 1;
@@ -36,11 +43,7 @@ pub const Link = struct {
         var a = addr(ip, port);
         if (c.bind(fd, @ptrCast(&a), @sizeOf(c.sockaddr.in)) != 0) return error.BindFailed;
         if (c.listen(fd, 1) != 0) return error.ListenFailed;
-        const peer = c.accept(fd, null, null);
-        if (peer < 0) return error.AcceptFailed;
-        _ = c.close(fd);
-        tune(peer);
-        return .{ .fd = peer };
+        return fd;
     }
 
     /// Rank 1: connect to rank 0, retrying for up to `seconds` while it starts.
@@ -138,6 +141,39 @@ pub const Link = struct {
         if (n > buf.len) return error.FrameTooLong;
         try l.readAll(buf[0..n]);
         return buf[0..n];
+    }
+};
+
+/// Rank 0's ports for its followers: follower g's (g = 1 to n) is `port + g - 1` on `ips[g - 1]`. All of them listen
+/// from `open` on, so a follower that is ready early connects into its port's backlog (the kernel completes the
+/// handshake) and waits there while rank 0 loads its weights or takes the followers before it.
+pub const Ports = struct {
+    fds: [3]c.fd_t = .{ -1, -1, -1 },
+
+    pub fn open(ips: []const [4]u8, port: u16) !Ports {
+        if (ips.len > 3) return error.TooManyFollowers;
+        var p: Ports = .{};
+        errdefer p.close();
+        return p;
+    }
+
+    /// Follower g's link (g from 1): its connection, waited for if it has not come yet; its port then closes.
+    pub fn accept(p: *Ports, g: usize) !Link {
+        const fd = p.fds[g - 1];
+        if (fd < 0) return error.NoSuchFollower;
+        const peer = c.accept(fd, null, null);
+        if (peer < 0) return error.AcceptFailed;
+        _ = c.close(fd);
+        p.fds[g - 1] = -1;
+        Link.tune(peer);
+        return .{ .fd = peer };
+    }
+
+    pub fn close(p: *Ports) void {
+        for (&p.fds) |*fd| if (fd.* >= 0) {
+            _ = c.close(fd.*);
+            fd.* = -1;
+        };
     }
 };
 

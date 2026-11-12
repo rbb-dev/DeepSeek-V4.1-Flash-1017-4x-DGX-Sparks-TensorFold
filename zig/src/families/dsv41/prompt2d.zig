@@ -26,6 +26,7 @@ const rdma_mod = @import("rdma.zig");
 const round2d = @import("round2d.zig");
 const round_rows = @import("round.zig").max_rows;
 const Link = @import("link.zig").Link;
+const Ports = @import("link.zig").Ports;
 const Comm = @import("comm.zig").Comm;
 
 const nccl = cuda.nccl;
@@ -43,11 +44,16 @@ pub fn split(g: u32, world: u32) !plan.Split {
     };
 }
 
-/// The links of a run and its NCCL world: rank 0 listens on PORT + g - 1 for follower g, one follower at a time (each
-/// follower retries its connect while rank 0 gets to it), so two ranks link exactly as before (rank 1 on PORT).
-/// NCCL's unique id goes from rank 0 down every link. (The port's link to N followers replaces this.)
+/// How long a follower retries its connect to rank 0: TF_DS_CONNECT_S seconds, 300 by default. Rank 0's ports listen
+/// from its start (Fan.listenAt, before its weights load), so this covers only rank 0's process starting late.
+pub fn connectSeconds() u32 {
+    const v = std.c.getenv("TF_DS_CONNECT_S") orelse return 300;
+    return std.fmt.parseInt(u32, std.mem.span(v), 10) catch 300;
+}
+
 pub const Fan = struct {
     links: [3]?Link = .{ null, null, null },
+    ports: ?Ports = null, // rank 0's, from listenAt until join has taken every follower
 
     pub fn open(io: std.Io, ip: [4]u8, port: u16, rank: u32, world: u32) !Fan {
         return openAt(io, ip, null, port, rank, world);
@@ -57,18 +63,43 @@ pub const Fan = struct {
     /// node: on a ring without a switch a follower reaches the head at the address of the cable it comes in on), else
     /// on `ip` for all of them.
     pub fn openAt(io: std.Io, ip: [4]u8, listen: ?[3][4]u8, port: u16, rank: u32, world: u32) !Fan {
+        var f = try listenAt(ip, listen, port, rank, world);
         errdefer f.close();
-        if (world > 4) return error.UnsupportedWorld;
-        if (world < 2) return f;
-        if (rank == 0) {
-            for (1..world) |g| f.links[g - 1] = try Link.listen(ip, port + @as(u16, @intCast(g - 1)));
-        } else {
-            f.links[0] = try Link.connect(io, ip, port + @as(u16, @intCast(rank - 1)), 300);
-        }
+        try f.join(io, ip, port, rank, world, connectSeconds());
         return f;
     }
 
+    /// openAt's first half: rank 0's ports for all its followers, listening from here on (Model.open calls it before
+    /// the weights load, so a follower that loads faster than rank 0 is not left retrying); nothing on a follower.
+    pub fn listenAt(ip: [4]u8, listen: ?[3][4]u8, port: u16, rank: u32, world: u32) !Fan {
+        if (world > 4) return error.UnsupportedWorld;
+        var f: Fan = .{};
+        if (rank != 0 or world < 2) return f;
+        var ips: [3][4]u8 = undefined;
+        for (ips[0 .. world - 1], 0..) |*a, i| a.* = if (listen) |l| l[i] else ip;
+        f.ports = try Ports.open(ips[0 .. world - 1], port);
+        return f;
+    }
+
+    /// openAt's second half: rank 0 takes its followers in order; a follower connects to its port on rank 0, retrying
+    /// for `seconds` while rank 0 starts.
+    pub fn join(f: *Fan, io: std.Io, ip: [4]u8, port: u16, rank: u32, world: u32, seconds: u32) !void {
+        if (world < 2) return;
+        if (rank == 0) {
+            for (1..world) |g| f.links[g - 1] = try f.ports.?.accept(g);
+            f.ports = null;
+            return;
+        }
+        const at = port + @as(u16, @intCast(rank - 1));
+        f.links[0] = Link.connect(io, ip, at, seconds) catch |err| {
+            if (err == error.ConnectFailed) std.log.err("rank {d}: rank 0 did not answer at {d}.{d}.{d}.{d}:{d} in {d} s (TF_DS_CONNECT_S)", .{ rank, ip[0], ip[1], ip[2], ip[3], at, seconds });
+            return err;
+        };
+    }
+
     pub fn close(f: *Fan) void {
+        if (f.ports) |*p| p.close();
+        f.ports = null;
         for (&f.links) |*l| {
             if (l.*) |*x| x.close();
             l.* = null;
