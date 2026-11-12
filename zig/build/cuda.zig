@@ -191,6 +191,12 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     ds_hc_replay.addImport("dsv41", ds_check.import_table.get("dsv41").?);
     ds_hc_replay.addImport("cuda", cuda);
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-hc-replay", .root_module = ds_hc_replay }));
+    // WP6: _index_score_rows at TF_DS_IDX_RB=1 (today) vs 2 (the kit's own other capture), random fixed-seed data,
+    // keyed and plain, even and odd row counts, bit compared
+    const ds_idx_replay = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/idx_replay_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    ds_idx_replay.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+    ds_idx_replay.addImport("cuda", cuda);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-idx-replay", .root_module = ds_idx_replay }));
     // the Engram reader's buffered, O_DIRECT and AIO paths on the real tables, every byte compared
     const ds_engram = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/engram_check_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     ds_engram.addImport("dsv41", ds_check.import_table.get("dsv41").?);

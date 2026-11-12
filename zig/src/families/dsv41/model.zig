@@ -29,22 +29,7 @@ const comm_mod = @import("comm.zig");
 const link = @import("link.zig");
 const ring2d = @import("ring2d.zig");
 const rdma = @import("rdma.zig");
-const neighbor = @import("neighbor.zig");
-
-/// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
-pub const chunk_rows = 4096;
-/// TF_DS_WAVES=1: a prompt pass of more than wave_rows rows runs as two waves, two chunks of at most wave_rows rows
-/// (fillPair), layer by layer, each wave's partial gathers on a stream and an NCCL communicator of their own while the
-/// stream runs the other wave. Every kernel takes the rows and inputs of two wave_rows chunks one after the other.
-pub const wave_rows = 2048;
-
-pub fn wavesOn() bool {
-    const v = std.c.getenv("TF_DS_WAVES") orelse return false;
-    return std.mem.eql(u8, std.mem.span(v), "1");
-}
-/// Rows between resume points: the served build's 2048-row grid. Kept states land on it; a pass is cut short to end at
-/// the next one it keeps, so a longer pass resumes where a 2048-row pass would.
-pub const resume_rows = 2048;
+const tri_index = @import("tri_index.zig");
 
 /// TF_DS_ENGRAM_WORKER=0: a fill's Engram rows read by a thread a chunk (the chunk before's end to this one's first
 /// Engram layer) instead of the fill's worker.
@@ -741,6 +726,10 @@ pub fn startSettings(o: Options) prompt2d.Settings {
     rope_buf: cuda.DeviceBuffer,
     arena: prompt.Arena,
         readWorkerEnv();
+        // WP6 (docs/prefill-plan.md): TF_DS_IDX_RB=2 batches the indexer's prompt-chunk scoring kernel to the
+        // kit's own captured RB=2 variant (dequantizing a 64-key tile once for 2 rows instead of 1); the kit
+        // never captured RB above 2. Off (RB=1, today's behavior) unless set; validate on your own ring first.
+        if (std.c.getenv("TF_DS_IDX_RB")) |v| tri_index.idx_rb = std.fmt.parseInt(usize, std.mem.span(v), 10) catch tri_index.idx_rb;
         if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
         if (std.c.getenv("TF_DS_L2_DN_MB")) |v| round.l2_dn_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dn_mb;
         if (std.c.getenv("TF_DS_L2_DEC_MB")) |v| round.l2_dec_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dec_mb;
