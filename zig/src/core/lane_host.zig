@@ -251,14 +251,38 @@ pub const LaneHost = struct {
         return job.host.foregroundWaiting() or job.host.core.activeCount() > 0;
     }
 
-    /// Whether work besides this job's prompt pass waits (a queued request, another pass, a decoding stream, a cancel):
-    /// a stepped pass then ends its step after its chunks, else it runs on (asked on the engine thread, between chunks).
-    fn othersWait(ctx: *anyopaque) bool {
+    /// The hook's plan for this job's step just issued, at the default cadence (one prompt step a turn in rotation, then
+    /// one round while a stream decodes; `ready` is `.round`): a round while a stream decodes; else another prompt's
+    /// step when another admitted prompt fills or waits for its first step, or a request is queued or woken with a lane
+    fn betweenNext(ctx: *anyopaque) lanes.stream.Next {
         const job: *Job = @ptrCast(@alignCast(ctx));
         const h = job.host;
+        if (h.core.activeCount() > 0) return .round;
+        if (h.core.fills()) {
+            h.lock();
+            defer h.unlock();
+            for (h.admitted.items) |other| if (other != job and other.prefilled == null) return .other;
+            if (h.queued.items.len + h.ready.items.len > 0 and h.admitted.items.len < h.info_.lanes) return .other;
+        }
+        return if (job.prefilled == null) .same else .idle;
+    }
+
+    /// The hook's facts for this job's next step (lanes.stream.Facts; passRows reads them alone): another stream decodes;
+    /// another admitted prompt is past its first step and not prefilled (filling); a request is queued, parked, woken,
+    /// or admitted and not yet started (waiting); the family's resume rows as the step rows while a stream decodes (one
+    fn betweenFacts(ctx: *anyopaque) lanes.stream.Facts {
+        const job: *Job = @ptrCast(@alignCast(ctx));
+        const h = job.host;
+        const decoding = h.core.activeCount() > 0;
         h.lock();
         defer h.unlock();
-        return h.queued.items.len > 0 or h.filling.items.len > 1 or h.core.activeCount() > 0 or h.cancels.items.len > 0 or h.closing;
+        var fills = false;
+        var waits = h.queued.items.len > 0 or h.waitingCount() > 0;
+        for (h.admitted.items) |other| {
+            if (other == job) continue;
+            if (!other.started) {
+            } else if (other.prefilled == null) fills = true;
+        }
     }
 
     /// A foreground request is queued (they queue ahead of every background one); the caller holds the lock.
@@ -275,6 +299,8 @@ pub const LaneHost = struct {
             h.wake.waitTimeout(h.io, &h.mutex, until) catch |e| return e == error.Timeout;
         }
         return false;
+    }
+
     }
 
     /// Hands a stream the tokens its rounds committed since the last delivery (their logprob rows first).
@@ -456,6 +482,7 @@ pub const LaneHost = struct {
             _ = h.drop(job, "out of memory");
             return false;
         };
+        job.stream.between = .{ .ptr = job, .run = between, .ready = betweenReady, .next = betweenNext, .facts = betweenFacts };
         job.started = true;
         job.fill_on.store(true, .release); // status readers count the fill from here until the pass reports
         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();

@@ -199,6 +199,11 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-wp4-replay", .root_module = ds_wp4_replay }));
     // The owned-row paths against a whole chunk's launches on the real kernels (TF_DS_FRONT_OWNED's front,
     // TF_DS_FFN_CODES's routing): each path's rows the bytes the 2,048-row launches give them, at owned blocks of 512,
+    // 256 and 1,024 rows; TF_DS_PACK_CODES' assembled codes against down's quant of the assembled pack;
+    // TF_DS_ENGRAM_OWNER_SUM's gate at owned blocks against the whole chunk's; TF_DS_CAT_CODES' wo_b against mx.linear;
+    // TF_DS_BOUNDARY_OWNED's kv-source update at owned blocks through the gathers' spans against the whole chunk's; and
+    // at each pass's rows (--rows), hc_pre_pf and the indexer's scores at the four quarters against the whole pass's
+    // launch, and the boundary's launch after them
     const ds_rows_replay = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/rows_replay_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     ds_rows_replay.addImport("dsv41", ds_check.import_table.get("dsv41").?);
     ds_rows_replay.addImport("cuda", cuda);

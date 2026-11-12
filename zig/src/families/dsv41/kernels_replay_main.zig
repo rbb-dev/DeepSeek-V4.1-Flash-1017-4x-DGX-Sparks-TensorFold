@@ -1,3 +1,6 @@
+//!   - TF_DS_PASS_TAIL: the pass rule at the served prompt lengths, served, D1 and with a merged final pass (its counts
+//!     and every plan's whole non-final passes on the resume grid), and the indexer at a merged final pass's compressed
+//!     key count against the count of the chunk it replaces: the same keys and top-k picks; one changed code byte differs.
 //!   - TF_DS_RING_WC: a ring's data slots from cudaHostAlloc(Mapped | WriteCombined) against the baseline mmap +
 //!     cuMemHostRegister, on the real staging, publish and collecting kernels: the staging kernel's slot and the
 //!     publish kernel's fixed slot read back from the host byte for byte; the doorbell, size, slot name and last
@@ -56,6 +59,176 @@
 //!     values (mx.fake, bf16, widened) byte-equal, and the values it moved; mode 3 against each value's bits plus one
 //!     (zeros, infinities, NaN and the largest finite values kept) byte-equal.
             r.report(try std.fmt.bufPrint(&line, "pf_split {s} control: one code of row 700 changed ({s})", .{ sh.name, config_names[@backingInt(cfg_on) - 2] }), differs(want, got), false);
+// -- TF_DS_PASS_TAIL -------------------------------------------------------------------------------------------------
+
+/// Whether a plan tiles its prompt on the resume grid with whole units but its final pass, which ends at the prompt
+/// within the cap: the rule checkPasses enforces, over a plan already built.
+fn planHolds(p: *const dsv41.lanes.Passes, len: usize, rows: usize) bool {
+    if (p.len == 0) return false;
+    var at: usize = 0;
+    for (p.slice(), 0..) |q, i| {
+        if (q.start != at or q.start % rows != 0) return false;
+        if (i + 1 < p.len and q.n % rows != 0) return false;
+        at = q.start + q.n;
+    }
+    const last = p.list[p.len - 1];
+    return at == len and last.n <= 2 * rows;
+}
+
+/// Whether two plans are the same passes (first row and rows).
+fn samePlan(a: *const dsv41.lanes.Passes, b: *const dsv41.lanes.Passes) bool {
+    if (a.len != b.len) return false;
+    for (a.slice(), b.slice()) |x, y| if (x.start != y.start or x.n != y.n) return false;
+    return true;
+}
+
+/// The pass rule at the served prompt lengths: the served, D1 and merged-tail pass counts, and every merged plan's whole
+/// non-final passes on the resume grid. A prompt whose last grid remainder is decode-sized keeps the baseline passes (the
+/// control plan with a pass a row longer fails the rule).
+fn passRule(r: *Run, _: std.Random) !void {
+    const rows = dsv41.model.chunk_rows;
+    const cap: u32 = @intCast(2 * rows);
+    const Case = struct { len: usize, served: usize, d1: usize, d2a: usize };
+    const cases = [_]Case{
+        .{ .len = 546, .served = 1, .d1 = 1, .d2a = 1 },
+        .{ .len = 1036, .served = 1, .d1 = 1, .d2a = 1 },
+        .{ .len = 1133, .served = 1, .d1 = 1, .d2a = 1 },
+        .{ .len = 2039, .served = 1, .d1 = 1, .d2a = 1 },
+        .{ .len = 2225, .served = 2, .d1 = 2, .d2a = 1 },
+        .{ .len = 3149, .served = 2, .d1 = 2, .d2a = 1 },
+        .{ .len = 3229, .served = 2, .d1 = 2, .d2a = 1 },
+        .{ .len = 4288, .served = 3, .d1 = 2, .d2a = 2 },
+        .{ .len = 4703, .served = 3, .d1 = 2, .d2a = 2 },
+        .{ .len = 6517, .served = 4, .d1 = 3, .d2a = 2 },
+        .{ .len = 6767, .served = 4, .d1 = 3, .d2a = 2 },
+        .{ .len = 8364, .served = 5, .d1 = 3, .d2a = 3 },
+        .{ .len = 9180, .served = 5, .d1 = 3, .d2a = 3 },
+        .{ .len = 12841, .served = 6, .d1 = 4, .d2a = 4 },
+        .{ .len = 14524, .served = 7, .d1 = 5, .d2a = 4 },
+        .{ .len = 17992, .served = 7, .d1 = 5, .d2a = 5 },
+        .{ .len = 18797, .served = 8, .d1 = 6, .d2a = 5 },
+        .{ .len = 37334, .served = 12, .d1 = 10, .d2a = 10 },
+        .{ .len = 37588, .served = 12, .d1 = 10, .d2a = 10 },
+        .{ .len = 156889, .served = 41, .d1 = 39, .d2a = 39 },
+    };
+    var counts = true;
+    var plans = true;
+    for (cases) |c| {
+        const served = dsv41.lanes.checkPasses(c.len, 0, 2 * rows, 4 * rows, &.{cap}, &.{}, false) catch {
+            counts = false;
+            continue;
+        };
+        const d1 = dsv41.lanes.checkPasses(c.len, 0, 2 * rows, 0, &.{cap}, &.{}, false) catch {
+            counts = false;
+            continue;
+        };
+        const d2a = dsv41.lanes.checkPasses(c.len, 0, 2 * rows, 0, &.{cap}, &.{}, true) catch {
+            counts = false;
+            continue;
+        };
+        counts = counts and served.len == c.served and d1.len == c.d1 and d2a.len == c.d2a;
+        plans = plans and planHolds(&d2a, c.len, rows);
+    }
+    // 4,097 rows: the 1-row tail is decode-sized and keeps the baseline passes, never the merged 2,049-row pass
+    const ref = dsv41.lanes.checkPasses(2 * rows + 1, 0, 2 * rows, 0, &.{cap}, &.{}, false) catch return r.note("pass_rule: the 4,097-row plan runs", false);
+    const tailed = dsv41.lanes.checkPasses(2 * rows + 1, 0, 2 * rows, 0, &.{cap}, &.{}, true) catch return r.note("pass_rule: the 4,097-row merged plan runs", false);
+    plans = plans and samePlan(&ref, &tailed);
+    var line: [320]u8 = undefined;
+    r.note(try std.fmt.bufPrint(&line, "pass_rule: {d} prompt lengths' served, D1 and merged-tail pass counts are the expected ones", .{cases.len}), counts);
+    const good = dsv41.lanes.checkPasses(14524, 0, 2 * rows, 0, &.{cap}, &.{}, true) catch return r.note("pass_rule: the merged-tail plan at 14,524 rows runs", false);
+    var bad = good;
+    bad.list[1].n += 1;
+    r.note(try std.fmt.bufPrint(&line, "pass_rule control: the 14,524-row plan with its second pass a row longer ({d} rows) is refused", .{bad.list[1].n}), !planHolds(&bad, 14524, rows) and planHolds(&good, 14524, rows));
+}
+
+/// The indexer at a merged final pass's compressed key count against the count of the chunk it replaces: the same keys
+/// and the same top-k picks. Each case is the changed pass's first row, its rows in the baseline and merged (compress ratio 2:
+/// N = (start + n) / 2), and the query rows; each row's vis is its own position's count, with rows that see every key of
+/// the baseline pass, its last three, half and none. The control: one visible key's code byte changed changes the keys.
+fn passTail(r: *Run, rng: std.Random) !void {
+    const d = r.d;
+    const IH: usize = 32;
+    const ID: usize = 128;
+    const KK: usize = topk_k;
+    const Case = struct { start: usize, today: usize, merged: usize, rows: usize };
+    const cases = [_]Case{
+        .{ .start = 0, .today = 1024, .merged = 1112, .rows = 64 }, // 2,225 prompt rows: 2,048 then 2,225
+        .{ .start = 0, .today = 1024, .merged = 1614, .rows = 64 }, // 3,229
+        .{ .start = 12288, .today = 7168, .merged = 7262, .rows = 64 }, // 14,524: the last 2,048-row chunk merged to 2,236
+    };
+    const keep_u = dsv41.tri_index.idx_u;
+    defer dsv41.tri_index.idx_u = keep_u;
+    dsv41.tri_index.idx_u = false;
+    var line: [320]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer for (keep.items) |*b| b.free();
+    var control: usize = 0;
+    for (cases, 0..) |c, ci| {
+        const nmax = @max(c.today, c.merged);
+        const codes = try a.alloc(u8, nmax * ID / 2);
+        rng.bytes(codes);
+        for (codes[0..256], 0..) |*x, i| x.* = @intCast(i);
+        const scales = try a.alloc(u8, nmax * ID / 32);
+        for (scales) |*x| x.* = 112 + rng.uintLessThan(u8, 14);
+        const vis = try a.alloc(i64, c.rows);
+        for (vis, 0..) |*v, i| v.* = @intCast(@min(c.today, (c.start + i + 1) / 2));
+        vis[c.rows - 4] = @intCast(c.today);
+        vis[c.rows - 3] = @intCast(c.today - 3);
+        vis[c.rows - 2] = @intCast(c.today / 2);
+        vis[c.rows - 1] = 0;
+        const q = try upload(d, try bf16s(c.rows * IH * ID, rng, 0.5, a));
+        const w = try upload(d, try bf16s(c.rows * IH, rng, 0.25, a));
+        const codes_b = try upload(d, codes);
+        const scales_b = try upload(d, scales);
+        const vis_b = try upload(d, std.mem.sliceAsBytes(vis));
+        const keys_today = try cuda.DeviceBuffer.alloc(d, c.rows * c.today * 8);
+        const keys_merged = try cuda.DeviceBuffer.alloc(d, c.rows * c.merged * 8);
+        const tmax_today = try cuda.DeviceBuffer.alloc(d, c.rows * ((c.today + 63) / 64) * 8);
+        const tmax_merged = try cuda.DeviceBuffer.alloc(d, c.rows * ((c.merged + 63) / 64) * 8);
+        const out_today = try cuda.DeviceBuffer.alloc(d, c.rows * KK * 8);
+        const out_merged = try cuda.DeviceBuffer.alloc(d, c.rows * KK * 8);
+        const top_today = try cuda.DeviceBuffer.alloc(d, c.rows * KK * 8);
+        const top_merged = try cuda.DeviceBuffer.alloc(d, c.rows * KK * 8);
+        for ([_]cuda.DeviceBuffer{ q, w, codes_b, scales_b, vis_b, keys_today, keys_merged, tmax_today, tmax_merged, out_today, out_merged, top_today, top_merged }) |b| try keep.append(a, b);
+        const k: dsv41.tri_index.IndexK = .{ .fp4 = .{ .codes = codes_b.ptr, .scales = scales_b.ptr } };
+        try dsv41.tri_index.indexScore(r.t, q.ptr, k, w.ptr, vis_b.ptr, c.today, keys_today.ptr, null, true, tmax_today.ptr, false, c.rows, IH, ID);
+        try dsv41.tri_index.indexScore(r.t, q.ptr, k, w.ptr, vis_b.ptr, c.merged, keys_merged.ptr, null, true, tmax_merged.ptr, false, c.rows, IH, ID);
+        try r.s.synchronize();
+        const kt = try get(keys_today.ptr, keys_today.len, d);
+        defer free(kt);
+        const km = try get(keys_merged.ptr, keys_merged.len, d);
+        defer free(km);
+        var keys_diff: usize = 0;
+        for (0..c.rows) |row| keys_diff += differs(kt[row * c.today * 8 ..][0 .. c.today * 8], km[row * c.merged * 8 ..][0 .. c.today * 8]);
+        const top_t: dsv41.tri_index.TopK = .{ .top = top_today.ptr, .ctx = @ptrCast(r), .run = topkI64Run };
+        try dsv41.tri_index.topkSelect(r.t, keys_today.ptr, c.today, KK, vis_b.ptr, out_today.ptr, top_t, c.rows, c.today);
+        const top_m: dsv41.tri_index.TopK = .{ .top = top_merged.ptr, .ctx = @ptrCast(r), .run = topkI64Run };
+        try dsv41.tri_index.topkSelect(r.t, keys_merged.ptr, c.merged, KK, vis_b.ptr, out_merged.ptr, top_m, c.rows, c.merged);
+        try r.s.synchronize();
+        const ot = try get(out_today.ptr, out_today.len, d);
+        defer free(ot);
+        const om = try get(out_merged.ptr, out_merged.len, d);
+        defer free(om);
+        r.report(try std.fmt.bufPrint(&line, "pass_tail {d} rows from {d}: the indexer's keys at {d} and {d} compressed keys, the first {d} of each row", .{ c.merged, c.start, c.today, c.merged, c.today }), keys_diff, true);
+        r.report(try std.fmt.bufPrint(&line, "pass_tail {d} rows from {d}: the top-k picks at {d} and {d} compressed keys", .{ c.merged, c.start, c.today, c.merged }), differs(ot, om), true);
+        if (ci == 0) {
+            // one code byte of the key at position 300, visible to the rows with vis past it
+            const at = codes_b.ptr + 300 * (ID / 2) + 7;
+            var was: [1]u8 = undefined;
+            const changed = [1]u8{was[0] ^ 0x40};
+            try dsv41.tri_index.indexScore(r.t, q.ptr, k, w.ptr, vis_b.ptr, c.merged, keys_merged.ptr, null, true, tmax_merged.ptr, false, c.rows, IH, ID);
+            try r.s.synchronize();
+            const km2 = try get(keys_merged.ptr, keys_merged.len, d);
+            defer free(km2);
+            for (0..c.rows) |row| control += differs(km[row * c.merged * 8 ..][0 .. c.merged * 8], km2[row * c.merged * 8 ..][0 .. c.merged * 8]);
+        }
+    }
+    r.report("pass_tail control: one visible key's code byte changed at 1,112 compressed keys: the keys", control, false);
+}
+
         for (names, want, got) |nm, w, g| r.report(try std.fmt.bufPrint(&line, "idx_proj_owned q={d} (pf_split {s}): {s} at every owned block against the whole chunk's", .{ q, mx.PfSplit.name(@backingInt(sw)).?, nm }), differs(w, g), true);
 // -- the rings' data slots: write-combined and in-place --------------------------------------------------------------
 
@@ -5371,6 +5544,8 @@ fn qgateBody(r: *Run, rng: std.Random) !void {
     r.report("qgate_body 3: each nonzero finite value's bits plus one, zeros, infinities, NaN and the largest finite values kept", diff3, true);
 }
 
+    .{ "pass_rule", passRule, 3 },
+    .{ "pass_tail", passTail, 7 },
     .{ "qgate_body", qgateBody, 3 },
     .{ "ring_wc", ringWc, 6 },
     .{ "ring_inplace", ringInplace, 8 },

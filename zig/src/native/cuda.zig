@@ -506,6 +506,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .fill_rounds = if (@hasField(@TypeOf(loaded), "fill_rounds")) loaded.fill_rounds else 0,
         .efforts = familyEfforts(F),
     }, .{ .ctx = loaded.ctx, .text = F.explain });
+    // the family's resume grid: a prompt step's rows between two rounds at the default cadence (the scheduling facts)
+    const resume_rows: u32 = if (@hasField(@TypeOf(loaded), "grid")) loaded.grid else 0;
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }

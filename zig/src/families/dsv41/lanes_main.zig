@@ -47,6 +47,22 @@ const Job = struct {
     done: bool = false,
 };
 
+/// The driver's answers for a stream's prompt steps: no round runs between a pass's chunks here and no decoder waits
+/// on a pass's size, so nothing decodes, fills or waits beside it (the served rule's quiet case sizes its passes).
+const Quiet = struct {
+    fn run(_: *anyopaque) anyerror!void {}
+    fn ready(_: *anyopaque) bool {
+        return false;
+    }
+    fn facts(_: *anyopaque) lanes.stream.Facts {
+        return .{ .decoding = false, .filling = false, .waiting = false, .step_rows = std.math.maxInt(u32) };
+    }
+    fn next(_: *anyopaque) lanes.stream.Next {
+        return .same;
+    }
+};
+var quiet_token: u8 = 0;
+
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
     const gpa = init.gpa;
@@ -248,6 +264,7 @@ pub fn main(init: std.process.Init) !u8 {
                 .drafts = !serial,
                 .proposer = j.proposer.proposer(),
             });
+            j.stream.between = .{ .ptr = &quiet_token, .run = Quiet.run, .ready = Quiet.ready, .facts = Quiet.facts, .next = Quiet.next };
             admitted += 1;
             core.addStream(&j.stream) catch |err| {
                 try w.print("{{\"rank\": 0, \"request\": {d}, \"name\": \"{s}\", \"error\": \"{s}\"}}\n", .{ j.index, r.name, @errorName(err) });

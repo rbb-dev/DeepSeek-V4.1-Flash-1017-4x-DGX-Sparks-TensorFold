@@ -52,10 +52,12 @@ pub const draft = @import("draft.zig");
 pub const sampling = @import("sampling.zig");
 pub const model = @import("model.zig");
 pub const lanes = @import("lanes.zig");
+/// tf-dsv41-rows-replay's pass sizes and, at each, the nodes' quarters, the planes' offsets and a control's row.
 /// A decode ring's progress watchdog.
 pub const ring_watch = @import("ring_watch.zig");
 /// Where this rank's host is, for a failure that names it.
 pub const where = @import("where.zig");
+pub const pass_replay = @import("pass_replay.zig");
 /// The owned-rows plan of a chunk of any row count.
 pub const slab_plan = @import("slab_plan.zig");
 pub const any_check = @import("any_check.zig");
@@ -131,6 +133,7 @@ test {
     refAll(lanes);
     refAll(ring_watch);
     refAll(where);
+    refAll(pass_replay);
     refAll(slab_plan);
     refAll(rocinante);
     refAll(rocinante_verbs);

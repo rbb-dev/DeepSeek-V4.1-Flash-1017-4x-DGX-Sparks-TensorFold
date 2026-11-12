@@ -57,6 +57,12 @@ const pair_nap = @import("rdma_nap.zig");
 const any_check = @import("any_check.zig");
 const rdma = @import("rdma.zig");
 const tri_index = @import("tri_index.zig");
+/// The served prompt chunk (TF_DS_PREFILL_CHUNK), the resume grid: a prompt's passes start at its multiples, and every
+/// kept state, mark and frame of the grid stands on one. A pass runs one unit, or with TF_DS_PASS_ROWS up to
+/// pass_rows_max rows of whole units (lanes.passLen), where the facts allow (lanes.stream.passRows); with
+/// TF_DS_PASS_TAIL the final pass takes the remainder up to the pass rows.
+pub const chunk_rows = prompt2d.chunk_rows;
+
 
 /// TF_DS_ENGRAM_WORKER=0: a fill's Engram rows read by a thread a chunk (the chunk before's end to this one's first
 /// Engram layer) instead of the fill's worker.
@@ -262,7 +268,15 @@ const pass_rows_default_floor: usize = 96 << 30;
                 m.eh.?.paio = m.paio;
             }
         } else if (c.engram_layers.slice().len > 0) return error.NoEngramTables;
+    var v: ?[]const u8 = if (std.c.getenv("TF_DS_PASS_ROWS")) |x| std.mem.span(x) else null;
     if (passRowsFallback(v, speed_defaults.defaulted("TF_DS_PASS_ROWS"), total_bytes)) |why| {
+        std.log.warn("TF_DS_PASS_ROWS: 2048 instead of the default 4096: {s}; without 4,096-row passes: {s}", .{ why, speed_defaults.costOf("TF_DS_PASS_ROWS") });
+        v = "2048";
+    }
+    };
+    if (rows > chunk_rows) std.log.info("TF_DS_PASS_ROWS={d}: a prompt's passes of up to {d} rows on the {d}-row grid from position {d} (TF_DS_PASS_FROM) where nothing decodes, fills or waits", .{ rows, rows, chunk_rows, from });
+    return rows;
+}
 
         // a vision checkpoint's image routing bias (without it a prompt with images is refused; text runs as ever)
         if (c.vision) {
@@ -277,61 +291,13 @@ const pass_rows_default_floor: usize = 96 << 30;
         return m;
     }
 
-    pub fn close(m: *Model) void {
-        m.joinAhead();
-        m.stream.synchronize() catch {};
-        if (m.img_buf) |*b| b.free();
-        m.spans.deinit(m.gpa);
-        if (m.graphs) |*g| g.deinit();
-        if (m.pgraphs) |*g| g.deinit();
-        if (m.timer) |t| {
-            t.deinit();
-            m.gpa.destroy(t);
-        }
-        if (m.ptimer) |t| {
-            t.deinit();
-            m.gpa.destroy(t);
-        }
-        m.rd.dropSide(&m.eng);
-        m.rd.dropPrefetch();
-        m.rd.dropPar();
-        if (m.aio) |x| x.deinit();
-        if (m.paio) |x| x.deinit();
-        if (m.epool) |p| p.deinit(m.gpa);
-        if (m.tables) |*t| t.close();
-        if (m.neighbor_gather) |*ng| ng.close(m.gpa);
-        if (m.rdma_rings) |*r| r.close(m.gpa);
-        m.blas.close();
-        m.arena.deinit();
-        m.rope_buf.free();
-        if (m.par) |*x| x.unload();
-        m.ex.unload();
-        m.ops.unload();
-        m.exk.unload();
-        m.lg.unload();
-        m.pf.unload();
-        m.set.deinit();
-        if (m.ring) |r| {
-            r.stop();
-            r.destroy(m.gpa);
-        }
-        if (m.rdma_mod) |*x| x.unload();
-        if (m.waves) {
-            for (&m.wev) |*w| for (w) |*ev| ev.deinit();
-            if (m.cs) |*x| x.deinit();
-        }
-        if (m.comm2) |*x| x.deinit();
-        m.comm.deinit();
-        m.watch.stop(); // (still watching up to here: a wait above on a rank that went ends this process)
-        m.fan.close();
-        m.w.deinit();
-        m.cache_file.close(m.io);
-        m.ix.deinit();
-        m.cache_dir.close(m.io);
-        m.stream.deinit();
-        m.host.deinit();
-        m.gpa.destroy(m);
-    }
+/// TF_DS_PASS_FROM's setting (prompt2d.passFromSetting); text that is no setting runs the default, said once.
+fn readPassFrom() u32 {
+    const v: ?[]const u8 = if (std.c.getenv("TF_DS_PASS_FROM")) |x| std.mem.span(x) else null;
+    return prompt2d.passFromSetting(v, chunk_rows) orelse {
+        return 4 * chunk_rows;
+    };
+}
 
     fn synchronize(m: *Model) !void {
         try m.stream.synchronize();
@@ -643,6 +609,8 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         .pool = o.pool,
         .replay_floor = @intFromBool(prompt.replay_floor),
         .exch = prompt2d.exchAsked(),
+        .pass_rows = prompt2d.pass_rows_asked,
+        .pass_from = prompt2d.pass_from_asked,
     };
 }
 
@@ -803,6 +771,12 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     _ = std.c.close(fd);
 }
 
+    pass_rows: usize = chunk_rows, // a pass's rows at most (TF_DS_PASS_ROWS, every rank alike): the chunk's allocation
+    cache_dir: std.Io.Dir,
+    cache_file: std.Io.File,
+    ix: rank_cache.Index,
+    w: weights.Weights,
+    fan: prompt2d.Fan,
     vfan: prompt2d.Fan, // the host collectives' links (prompt2d.hostLinksAsked), else none
     watch: link.Watch, // watchPeers: a peer rank that stops stops this one too
     star_busy: std.atomic.Value(bool), // star.Star's guard against two threads in one collective
@@ -902,7 +876,9 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             }
             prompt2d.roci_stagger3_asked = prompt2d.roci_stagger_lanes == 3; // every rank alike (Settings)
         }
+        prompt2d.pass_from_asked = readPassFrom(); // rank 0's (Settings.pass_from: never compared)
         rocinante_mod.setCap(prompt2d.pass_rows_asked); // (the transport's arenas and plans follow the pass rows, before any layout is read)
+        prompt2d.pass_tail_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_PASS_TAIL")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.ring_wc_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_RING_WC")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.ring_inplace_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_RING_INPLACE")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         const ring_word_text: ?[]const u8 = if (std.c.getenv("TF_DS_RING_WORD")) |v| std.mem.span(v) else null;
@@ -951,6 +927,22 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         ops_mod.Ops.add2_vec_on = prompt2d.switchDefaultOn(if (std.c.getenv("TF_DS_ADD2_VEC")) |v| std.mem.span(v) else null); // the bytes are the scalar kernel's: a rank may differ
         if (std.c.getenv("TF_EXL3_L2_DELAY_NS")) |v| ops_mod.l2_delay_ns = std.fmt.parseInt(c_longlong, std.mem.span(v), 10) catch ops_mod.l2_delay_ns;
         if (std.c.getenv("TF_EXL3_L2_RATE_GBPS")) |v| ops_mod.l2_rate_gbps = std.fmt.parseFloat(f64, std.mem.span(v)) catch ops_mod.l2_rate_gbps;
+        m.pass_rows = prompt2d.pass_rows_asked; // (every rank alike: the start-up exchange refuses a follower that differs)
+        if (prompt2d.pass_tail_asked) std.log.info("TF_DS_PASS_TAIL=1: a prompt's final pass runs up to {d} rows, the remainder after whole {d}-row units merged into it; every other pass stays whole units on the grid", .{ m.pass_rows, chunk_rows });
+        m.fill_slot = 0;
+        m.prof = false;
+        m.timer = null;
+        m.ptimer = null;
+        m.t_enqueue = 0;
+        m.t_forward = 0;
+        m.t_absorb = 0;
+        m.dpool = null;
+        m.dr = null;
+        m.tables = null;
+        m.epool = null;
+        m.aio = null;
+        m.paio = null;
+        m.eh = null;
         m.graph_fallbacks = .init(0);
         m.pair = false;
         m.pair_open = .init(false);
@@ -1142,6 +1134,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         if (m.mxk) |*x| m.eng.mx = x;
         try agreeQgateCanary(d, &m.comm, m.stream, prompt2d.qgate_canary_asked);
         if (prompt.qgate_body != .off) try m.mxk.?.useQgateBody();
+        m.ch = try prompt.Chunk.init(&m.eng, &m.arena, m.pass_rows, m.ctx_cap); // a stream's keys at most
         errdefer m.rd.dropPar();
         errdefer m.rd.dropPrefetch();
         errdefer m.rd.dropSide(&m.eng);
@@ -1181,6 +1174,8 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             m.tables = try engram_io.Tables.open(gpa, io, edir);
             m.epool = try engram_io.Pool.init(gpa, io, 64);
                 const owned = false; // (TF_DS_ENGRAM_OWNED is a retired name: the whole tables are on every node)
+                    .chunk_rows = m.pass_rows,
+                    .chunk_dev = try m.arena.take(m.pass_rows * sl * rec),
                     .chunk_dev_b = if (prompt2d.roci_stagger_asked) try m.arena.take(m.pass_rows * sl * rec) else 0,
                     .chunk_dev_c = if (prompt2d.roci_stagger_asked and prompt2d.roci_stagger_lanes >= 3) try m.arena.take(m.pass_rows * sl * rec) else 0,
         if (c.vision and c.format == .exl3) { // (Format.native: the checkpoint's own gate.bias_vl, loaded with the weights)
@@ -1188,6 +1183,10 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             m.loadVisionBias(path) catch |err| if (o.vision_bias != null or err != error.FileNotFound) return err;
         }
 
+        m.host_pos = try a.alloc(i64, m.pass_rows);
+        m.ids64 = try a.alloc(i64, m.pass_rows);
+        m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
+        m.logits = try a.alloc(f32, round.max_rows * m.vocab);
         return engram_rows.workerSlotsN(m.pass_rows / chunk_rows, if (prompt2d.roci_stagger_asked) prompt2d.roci_stagger_lanes else 1);
     /// A pair's second pass: its lane before the first's (it borrows the first's arena), then its events, handle and stream.
     fn closePair(m: *Model) void {
@@ -1602,8 +1601,15 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     /// drafting, its DSpark taps absorbed into the slot's drafter rings. True when it reached the head.
     pub fn fillChunk(m: *Model, seq: []const i32, start: usize, n: usize, replay: usize) !bool {
         try m.pairJoin();
+        // a pass: a remainder under the resume rows, whole resume units up to the pass rows, or, with TF_DS_PASS_TAIL, the
+        // final pass's remainder up to the pass rows (it starts on the resume grid)
+        if (n == 0 or n > m.pass_rows or seq.len != start + n) return error.BadChunk;
+        if (n > chunk_rows and n % chunk_rows != 0) {
+            if (!prompt2d.pass_tail_asked or start % chunk_rows != 0) return error.BadChunk;
+        }
         const c = e.c;
         const ch = &m.ch;
+        try ch.view(n, chunk_rows);
         // an image position's id is negative in the sequence (its n-grams dead for Engram): its embedding's id is the
         // image token's, which its span row then replaces
         const image_id: i64 = if (c.image_token) |t| t else 0;

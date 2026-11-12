@@ -154,7 +154,39 @@ fn clashes(used: []const [2]usize, lo: usize, hi: usize) bool {
 
 /// Whether one of the prompt cache's marks has its resume point at `at` (each kept at the resume point at or before it).
 fn markEnds(marks: []const u32, at: usize) bool {
-    for (marks) |w| if (w / model.resume_rows * model.resume_rows == at) return true;
+    for (marks) |w| if (w / model.chunk_rows * model.chunk_rows == at) return true;
+    return false;
+}
+
+/// Whether a pass from `start` may take the prompt's remainder (`rest`) as one final pass: the switch is on, the
+/// remainder fits the cap, and the prompt's last grid remainder is not decode-sized. At or under
+/// `prompt.decode_rows` the baseline tail pass takes a decode-class kernel (a ring window at 16 rows or fewer, the grouped
+/// linears and the decode matmul at 128 or fewer); a merged pass runs those rows with the prompt kernels, a different
+/// class. A remainder of 0 (or one past the decode rows) leaves the tail in the prompt kernels either way.
+pub fn tailFinals(len: usize, start: usize, cap: usize, tail: bool) bool {
+    if (!tail or len - start > cap) return false;
+    const rem = len % model.chunk_rows;
+    return rem == 0 or rem > prompt.decode_rows;
+}
+
+/// A prompt pass's rows from `start` of a `len`-row prompt under `cap` (stream.passRows'): a remainder under the resume
+/// rows alone, else whole resume units up to the cap. With `tail`, a remainder that fits the cap is the final pass
+/// itself, whole units or not, when tailFinals allows it; every pass before it stays whole units.
+pub fn passLen(start: usize, len: usize, cap: usize, tail: bool) usize {
+    const rest = len - start;
+    if (tailFinals(len, start, cap, tail)) return rest;
+    if (rest < model.chunk_rows) return rest;
+    return @min(cap, rest / model.chunk_rows * model.chunk_rows);
+}
+
+/// A pass's rows from `start`: passLen's, cut at the first state it keeps. With `tail`, a final pass that tailFinals
+/// allows ends at the prompt's end instead: the last resume point does not cut it (a mark still does).
+pub fn passRowsAt(start: usize, len: usize, cap: usize, tail: bool, marks: []const u32, last_end: usize, replay: usize) usize {
+    const n = passLen(start, len, cap, tail);
+    const le = if (tailFinals(len, start, cap, tail)) 0 else last_end;
+    return cutAtKeep(marks, le, replay, len, start, n);
+}
+
 /// The rows of the third pass of a group (TF_DS_ROCI_STAGGER_LANES=3) behind a pair whose second pass starts at `mid` and has `n2` rows, by
 /// the pass rule (passRowsAt), or null where there is none: fewer than three lanes open, a stream decoding or the host owing rounds (the rounds
 /// owed after a pair are counted for two passes), no prompt rows left behind the pair, or a stop at the pair's end (the prompt cache keeps a
@@ -166,16 +198,86 @@ pub fn thirdPassRows(open_lanes: usize, decoding: bool, rounds: u32, mid: usize,
     return passRowsAt(mid2, len, cap, tail, marks, last_end, replay);
 }
 
+/// A pass of a prompt's plan: its first row, its rows, and the cap the host allowed it.
+pub const Pass = struct { start: usize, n: usize, cap: usize };
+
+/// The most passes one prompt's plan holds.
+pub const max_passes = 256;
+
+/// A prompt's passes from `at` under the rule: their first rows and rows, and those over the resume rows.
+pub const Passes = struct {
+    list: [max_passes]Pass = undefined,
+    len: usize = 0,
+    long: usize = 0,
+
+    pub fn slice(p: *const Passes) []const Pass {
+        return p.list[0..p.len];
+    }
+};
+
+/// The prompt's passes from `at` under the rule (the caps one after another from `caps`, the last repeated), each pass's
+/// rows from passRowsAt.
+pub fn passPlan(len: usize, at: usize, pass_rows: usize, pass_from: usize, caps: []const u32, marks: []const u32, tail: bool) !Passes {
+    const r = model.chunk_rows;
+    const replay = len -| 128;
+    const last_end = @min(replay, len - 1) / r * r;
+    var p: Passes = .{};
+    var start = at;
+    while (start < len) : (p.len += 1) {
+        if (p.len == max_passes) return error.TooManyPasses;
+        const quiet: lanes.stream.Facts = .{ .decoding = false, .filling = false, .waiting = false, .step_rows = std.math.maxInt(u32) };
+        const asked: u32 = caps[@min(p.len, caps.len - 1)];
+        const n = passRowsAt(start, len, cap, tail, marks, last_end, replay);
+        if (n == 0) return error.EmptyPass;
+        p.list[p.len] = .{ .start = start, .n = n, .cap = cap };
+        p.long += @intFromBool(n > r);
+        start += n;
+    }
+    if (start != len) return error.PassesDoNotTile;
+    return p;
+}
+
+/// The prompt's passes from `at` under the rule, each checked against the 2,048-row grid's chunks: a pass holding a
+/// decoder row (at or past the replay) or under the resume rows is exactly one of them (with `tail`, a final pass that
+/// ends at the prompt may run up to its cap); a longer one runs encoder rows only and starts and ends on the grid. Every
+/// mark's resume point (at or before the replay, past `at`, short of the end) is a pass end, and so is the last resume
+/// point unless the final pass is merged.
+pub fn checkPasses(len: usize, at: usize, pass_rows: usize, pass_from: usize, caps: []const u32, marks: []const u32, tail: bool) !Passes {
+    const r = model.chunk_rows;
+    const replay = len -| 128;
+    const last_end = @min(replay, len - 1) / r * r;
+    const p = try passPlan(len, at, pass_rows, pass_from, caps, marks, tail);
+    var merged_final = false;
+    for (p.slice()) |q| {
+        const decoder = q.start + q.n > replay;
+        const merged = tailFinals(len, q.start, q.cap, tail) and q.start % r == 0 and q.start + q.n == len and q.n <= q.cap and q.n > r;
+        if (decoder or q.n < r) {
+            if (q.start % r != 0 or (q.n != @min(r, len - q.start) and !merged)) return error.NotTheGridsChunk;
+        } else if (q.start % r != 0 or (q.start + q.n) % r != 0 or q.start + q.n > replay) return error.LongPassNotEncoderOnly;
+        if (q.n > pass_rows) return error.PassOverRows;
+        merged_final = merged_final or merged;
+    }
+    if (last_end > at and !merged_final and !hasEnd(p.slice(), last_end)) return error.LastResumeNotAnEnd;
+    for (marks) |w| {
+        const k = w / r * r;
+        if (k > at and k <= replay and k < len and !hasEnd(p.slice(), k)) return error.MarkNotAnEnd;
+    }
+    return p;
+}
+
+/// Whether a pass of `ps` ends at `x`.
+fn hasEnd(ps: []const Pass, x: usize) bool {
+    for (ps) |q| if (q.start + q.n == x) return true;
     return false;
 }
 
-/// A pass of `n` rows from `start` cut to end at the first state it keeps (the last resume point or a mark's), so that
-/// state stands at a pass end.
-fn cutAtKeep(marks: []const u32, last_end: usize, replay: usize, len: usize, start: usize, n: usize) usize {
+/// A pass of `n` rows from `start` cut to end at the first state it keeps (the last resume point, or a mark's resume
+/// point at or before the replay and short of the prompt's end), so that state stands at a pass end.
+pub fn cutAtKeep(marks: []const u32, last_end: usize, replay: usize, len: usize, start: usize, n: usize) usize {
     var end = start + n;
     if (last_end > start and last_end < end) end = last_end;
     for (marks) |w| {
-        const k = w / model.resume_rows * model.resume_rows;
+        const k = w / model.chunk_rows * model.chunk_rows;
         if (k > start and k < end and k <= replay and k < len) end = k;
     }
     return end - start;
@@ -212,6 +314,168 @@ pub fn placeSoft(gpa: std.mem.Allocator, live: []const [2]usize, kept: []const [
     used.shrinkRetainingCapacity(live.len);
     for (kept) |k| try used.append(gpa, .{ k[0], k[0] + k[1] });
     return place(used.items, size, cap);
+}
+
+test "cutAtKeep ends a long pass at the resume point it keeps" {
+    const r = model.chunk_rows;
+    const c = 2 * r;
+    // no state to keep inside: the whole pass
+    try std.testing.expectEqual(@as(usize, c), cutAtKeep(&.{}, 0, 10 * r, 10 * r, 0, c));
+    // the last resume point inside the pass
+    try std.testing.expectEqual(@as(usize, r), cutAtKeep(&.{}, 3 * r, 10 * r, 10 * r, 2 * r, c));
+    // a mark floors to its resume point; the nearer of the two wins
+    try std.testing.expectEqual(@as(usize, r), cutAtKeep(&.{@intCast(3 * r + 5)}, 9 * r, 10 * r, 10 * r, 2 * r, c));
+    // a mark past the replay or at the prompt's end keeps nothing
+    try std.testing.expectEqual(@as(usize, c), cutAtKeep(&.{@intCast(r)}, 0, r - 1, 10 * r, 0, c));
+    // a resume point at the pass end needs no cut
+    try std.testing.expectEqual(@as(usize, c), cutAtKeep(&.{@intCast(c)}, c, 10 * r, 10 * r, 0, c));
+}
+
+test "a pass's rows: a remainder under the resume rows alone, else whole resume units up to the cap; a merged final pass takes the remainder" {
+    const r = model.chunk_rows;
+    try std.testing.expectEqual(@as(usize, 2 * r), passLen(0, 10 * r, 2 * r, false));
+    try std.testing.expectEqual(@as(usize, r), passLen(0, 10 * r, r, false));
+    // whole units only: 1.5 units left at a cap of two gives one
+    try std.testing.expectEqual(@as(usize, r), passLen(8 * r, 9 * r + r / 2, 2 * r, false));
+    try std.testing.expectEqual(@as(usize, r / 2), passLen(9 * r, 9 * r + r / 2, 2 * r, false));
+    try std.testing.expectEqual(@as(usize, 5), passLen(0, 5, 2 * r, false));
+    // the tail: a prompt-sized remainder up to the cap is the pass; a decode-sized one keeps whole units
+    try std.testing.expectEqual(@as(usize, r), passLen(0, r + 1, 2 * r, true));
+    try std.testing.expectEqual(@as(usize, r), passLen(0, r + 1, 2 * r, false));
+    try std.testing.expectEqual(@as(usize, r + 129), passLen(0, r + 129, 2 * r, true));
+    try std.testing.expectEqual(@as(usize, r), passLen(0, r + 129, 2 * r, false));
+    try std.testing.expectEqual(@as(usize, 2 * r), passLen(0, 3 * r, 2 * r, true));
+    // 19,685 rows from 16,384: the tail is 3,301 rows, not 2,048
+    try std.testing.expectEqual(@as(usize, 3301), passLen(8 * r, 8 * r + 3301, 2 * r, true));
+    try std.testing.expectEqual(@as(usize, r), passLen(8 * r, 8 * r + 3301, 2 * r, false));
+}
+
+test "the tail rule: a final pass that fits the cap is not cut at the last resume point, but a mark still cuts it" {
+    const r = model.chunk_rows;
+    // 12,288 rows from 8,192: two units, and the last resume point (10,240) does not cut them
+    try std.testing.expectEqual(@as(usize, 2 * r), passRowsAt(4 * r, 6 * r, 2 * r, true, &.{}, 5 * r, 10 * r));
+    try std.testing.expectEqual(@as(usize, r), passRowsAt(4 * r, 6 * r, 2 * r, false, &.{}, 5 * r, 10 * r));
+    // a mark at 10,245 still cuts at 10,240, and the rest is the final pass
+    try std.testing.expectEqual(@as(usize, r), passRowsAt(4 * r, 6 * r, 2 * r, true, &.{@intCast(5 * r + 5)}, 5 * r, 10 * r));
+}
+
+test "a prompt whose last grid remainder is decode-sized keeps the baseline passes: its tail runs the decode kernels" {
+    const r = model.chunk_rows;
+    // 4,097 rows: the baseline passes are 2,048, 2,048 and the 1-row tail. A merged 2,049-row pass would run that row in the
+    // prompt kernels (non-ring window, one split, prefill linears) instead of the decode kernels (ring window, eight
+    // splits, grouped linears), which changed bits.
+    const ref = try checkPasses(2 * r + 1, 0, 2 * r, 0, &.{@intCast(2 * r)}, &.{}, false);
+    const tail = try checkPasses(2 * r + 1, 0, 2 * r, 0, &.{@intCast(2 * r)}, &.{}, true);
+    try std.testing.expectEqual(ref.len, tail.len);
+    for (ref.slice(), tail.slice()) |a, b| {
+        try std.testing.expectEqual(a.start, b.start);
+        try std.testing.expectEqual(a.n, b.n);
+    }
+    // every remainder at or under the decode rows keeps the baseline split
+    for ([_]usize{ 1, 16, 17, 127, 128 }) |rem| {
+        const a = try checkPasses(2 * r + rem, 0, 2 * r, 0, &.{@intCast(2 * r)}, &.{}, false);
+        const b = try checkPasses(2 * r + rem, 0, 2 * r, 0, &.{@intCast(2 * r)}, &.{}, true);
+        try std.testing.expectEqual(a.len, b.len);
+        for (a.slice(), b.slice()) |x, y| try std.testing.expectEqual(x.n, y.n);
+    }
+    // one past them, the remainder is a prompt-sized pass and merges: 2,177 rows are one pass (and 4,225 rows keep
+    // the baseline 4,096 + 129 split, with the 129-row tail still a prompt-sized pass)
+    try std.testing.expectEqual(@as(usize, 1), (try checkPasses(r + 129, 0, 2 * r, 0, &.{@intCast(2 * r)}, &.{}, true)).len);
+    const two = try checkPasses(2 * r + 129, 0, 2 * r, 0, &.{@intCast(2 * r)}, &.{}, true);
+    try std.testing.expectEqual(@as(usize, 2), two.len);
+    try std.testing.expectEqual(@as(usize, 129), two.list[1].n);
+}
+
+test "the pass rule keeps every row in the grid's own chunk: a decoder row's pass and a short one are a 2,048-row chunk, a longer one encoder-only and whole; a merged final pass ends at the prompt" {
+    const r = model.chunk_rows;
+    var prng = std.Random.DefaultPrng.init(0x9a55);
+    const rng = prng.random();
+    var long_passes: usize = 0;
+    var short_only: usize = 0;
+    // every length to 8 resume units and 300 rows past, at pass rows 2,048 and 4,096, pass_from 0 and 8,192, without and
+    // with a merged final pass, the cap 4,096 at every step, then 2,048 or 4,096 at random from step to step
+    var len: usize = 1;
+    while (len <= 8 * r + 300) : (len += 1) for ([_]usize{ r, 2 * r }) |pr| for ([_]usize{ 0, 4 * r }) |from| for ([_]bool{ false, true }) |tail| {
+        const quiet = try checkPasses(len, 0, pr, from, &.{@intCast(2 * r)}, &.{}, tail);
+        if (pr == r) short_only += quiet.long;
+        long_passes += quiet.long;
+        var caps: [16]u32 = undefined;
+        for (&caps) |*c| c.* = if (rng.boolean()) @intCast(2 * r) else @intCast(r);
+        _ = try checkPasses(len, 0, pr, from, &caps, &.{}, tail);
+    };
+    // resumed prompts with marks: from a resume point at or before the replay, two to five marks anywhere
+    for (0..5000) |_| {
+        const l = 1 + rng.uintLessThan(usize, 24 * r);
+        const replay = l -| 128;
+        const at = rng.uintLessThan(usize, replay / r + 1) * r;
+        if (at >= l) continue;
+        var marks: [5]u32 = undefined;
+        const nm = 2 + rng.uintLessThan(usize, 4);
+        for (marks[0..nm]) |*w| w.* = @intCast(rng.uintLessThan(usize, l + 1));
+        _ = try checkPasses(l, at, 2 * r, rng.uintLessThan(usize, 5) * r, &.{@intCast(2 * r)}, marks[0..nm], rng.boolean());
+    }
+    // pass rows of 2,048 give no longer pass; 4,096 give them
+    try std.testing.expectEqual(@as(usize, 0), short_only);
+    try std.testing.expect(long_passes > 0);
+    // a quiet 10-unit prompt (and its 128 decoder rows) from position 0 at pass rows 4,096: five passes of 4,096, then
+    // the decoder rows' chunk
+    const quiet = try checkPasses(10 * r + 128, 0, 2 * r, 0, &.{@intCast(2 * r)}, &.{}, false);
+    try std.testing.expectEqual(@as(usize, 6), quiet.len);
+    try std.testing.expectEqual(@as(usize, 5), quiet.long);
+    // from pass_from 8,192: four passes of 2,048 first, then three of 4,096 and the decoder rows' chunk
+    const from8 = try checkPasses(10 * r + 128, 0, 2 * r, 4 * r, &.{@intCast(2 * r)}, &.{}, false);
+    try std.testing.expectEqual(@as(usize, 8), from8.len);
+    try std.testing.expectEqual(@as(usize, 3), from8.long);
+    // with the tail, 2,049 rows keep the baseline 2,048 + 1 split (the 1-row tail is decode-sized); 2,177 rows are one pass,
+    // and 4,096 rows one, not two
+    const small = try checkPasses(r + 1, 0, 2 * r, 0, &.{@intCast(2 * r)}, &.{}, true);
+    try std.testing.expectEqual(@as(usize, 2), small.len);
+    try std.testing.expectEqual(@as(usize, 1), small.list[1].n);
+    try std.testing.expectEqual(@as(usize, 1), (try checkPasses(r + 129, 0, 2 * r, 0, &.{@intCast(2 * r)}, &.{}, true)).len);
+    try std.testing.expectEqual(@as(usize, 2), (try checkPasses(r + 129, 0, 2 * r, 0, &.{@intCast(2 * r)}, &.{}, false)).len);
+    try std.testing.expectEqual(@as(usize, 1), (try checkPasses(2 * r, 0, 2 * r, 0, &.{@intCast(2 * r)}, &.{}, true)).len);
+    try std.testing.expectEqual(@as(usize, 2), (try checkPasses(2 * r, 0, 2 * r, 0, &.{@intCast(2 * r)}, &.{}, false)).len);
+}
+
+test "the pass counts of the served rule, D1 and the merged final pass at the design's lengths" {
+    const r = model.chunk_rows;
+    const Case = struct { len: usize, served: usize, d1: usize, d2a: usize };
+    const cases = [_]Case{
+        .{ .len = 546, .served = 1, .d1 = 1, .d2a = 1 },
+        .{ .len = 1036, .served = 1, .d1 = 1, .d2a = 1 },
+        .{ .len = 1133, .served = 1, .d1 = 1, .d2a = 1 },
+        .{ .len = 2039, .served = 1, .d1 = 1, .d2a = 1 },
+        .{ .len = 2225, .served = 2, .d1 = 2, .d2a = 1 },
+        .{ .len = 3149, .served = 2, .d1 = 2, .d2a = 1 },
+        .{ .len = 3229, .served = 2, .d1 = 2, .d2a = 1 },
+        .{ .len = 4288, .served = 3, .d1 = 2, .d2a = 2 },
+        .{ .len = 4703, .served = 3, .d1 = 2, .d2a = 2 },
+        .{ .len = 6517, .served = 4, .d1 = 3, .d2a = 2 },
+        .{ .len = 6767, .served = 4, .d1 = 3, .d2a = 2 },
+        .{ .len = 8364, .served = 5, .d1 = 3, .d2a = 3 },
+        .{ .len = 9180, .served = 5, .d1 = 3, .d2a = 3 },
+        .{ .len = 12841, .served = 6, .d1 = 4, .d2a = 4 },
+        .{ .len = 14524, .served = 7, .d1 = 5, .d2a = 4 },
+        .{ .len = 17992, .served = 7, .d1 = 5, .d2a = 5 },
+        .{ .len = 18797, .served = 8, .d1 = 6, .d2a = 5 },
+        .{ .len = 37334, .served = 12, .d1 = 10, .d2a = 10 },
+        .{ .len = 37588, .served = 12, .d1 = 10, .d2a = 10 },
+        .{ .len = 156889, .served = 41, .d1 = 39, .d2a = 39 },
+    };
+    const cap: u32 = @intCast(2 * r);
+    for (cases) |c| {
+        try std.testing.expectEqual(c.served, (try checkPasses(c.len, 0, 2 * r, 4 * r, &.{cap}, &.{}, false)).len);
+        try std.testing.expectEqual(c.d1, (try checkPasses(c.len, 0, 2 * r, 0, &.{cap}, &.{}, false)).len);
+        const d2a = try checkPasses(c.len, 0, 2 * r, 0, &.{cap}, &.{}, true);
+        try std.testing.expectEqual(c.d2a, d2a.len);
+        // every pass starts on the grid, every pass but the last is whole units, and the last ends at the prompt within
+        // the pass rows
+        for (d2a.slice()) |q| try std.testing.expectEqual(@as(usize, 0), q.start % r);
+        for (d2a.slice()[0 .. d2a.len - 1]) |q| try std.testing.expectEqual(@as(usize, 0), q.n % r);
+        const last = d2a.list[d2a.len - 1];
+        try std.testing.expectEqual(c.len, last.start + last.n);
+        try std.testing.expect(last.n <= 2 * r);
+    }
 }
 
 test "a placement leaves a kept state room to grow while one fits so" {
@@ -927,6 +1191,12 @@ pub const Lanes = struct {
         const f = &self.fills[lane.slot].?;
         const seq = &self.seqs[lane.slot];
         const len = s.prompt_len;
+        // the pass (rank 0's rule; the followers run the frame): the rows the host's facts allow, whole resume units up
+        // to them (the final pass may take the remainder with TF_DS_PASS_TAIL), cut at the first state it keeps
+        const hf = s.hostFacts();
+        const decoding_now = if (hf) |x| x.decoding else false;
+        const cap = lanes.stream.passRows(hf, f.start, prompt2d.pass_from_asked, @intCast(m.pass_rows), model.chunk_rows, prompt2d.pass_filling_asked);
+        const n = passRowsAt(f.start, len, cap, prompt2d.pass_tail_asked, s.reuse.marks, f.last_end, f.replay);
         // TF_DS_ROCI_STAGGER: this pass and the next one as a pair (rank 0's rule; the followers run the frame). The pair does not end
         // its first pass where the prompt cache keeps a state or a hook runs, so every such stop is a stop of a pair.
         var n2: usize = 0;

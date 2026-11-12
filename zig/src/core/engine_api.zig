@@ -264,6 +264,9 @@ pub const Info = struct {
     prompt_logprobs: bool = false,
     /// Prompt rows a prefill chunk at most, for the server's chunk starts (0: the engine cuts prompts itself).
     prefill_step: u32 = 0,
+    /// The family's resume grid (its prompt chunk): the rows a prompt step runs between two rounds at the default
+    /// cadence, the host's step rows while a stream decodes (lanes.stream.Facts). 0: the host plans none.
+    resume_rows: u32 = 0,
     /// The live streams' rounds the lane host runs between two steps of a prompt pass (0: a step every turn of its
     /// loop, a round between); none waits while no stream decodes.
     fill_rounds: u32 = 0,

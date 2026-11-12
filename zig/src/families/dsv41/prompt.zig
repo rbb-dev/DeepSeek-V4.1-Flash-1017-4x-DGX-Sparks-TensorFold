@@ -49,6 +49,11 @@ const round = @import("round.zig");
 /// steps marked inside their phases (a_in, a_q, a_idx, a_core, a_woa; m_rt, m_gu, m_x), the rest of each in its own.
 pub var ptimer: ?*round.PhaseTimer = null;
 
+/// The most rows the attention front, wo_a and the linear matmul take the decode kernels with; above it they run the
+/// prompt kernels (the router and the indexer's projection switch at the kernel set's own decode row count, 16). A
+/// final pass at or under it takes a decode-class kernel a longer pass does not.
+pub const decode_rows: usize = 128;
+
 /// The monotonic clock (ns), for the engramWorker thread: no
 /// std.Io handle reaches that thread, so this calls libc directly rather than going through Model.now's std.Io path.
 fn nowNs() i128 {
@@ -288,6 +293,8 @@ fn overlap(sp: Span, start: usize, n: usize) ?[2]usize {
 
 pub const Chunk = struct {
     lane: u2 = 0, // the Rocinante lane this chunk's pass runs on (1: the second pass of a pair, 2: the third of a group of three)
+    cap: usize, // the pass's view (Chunk.view): its owned-row paths' and plane strides' rows, at most rows_max
+    rows_max: usize = 0, // the rows every buffer holds (init's cap)
     spans: []const Span = &.{}, // the prompt's image spans (absolute positions)
     img_rows: u64 = 0, // bf16 [span tokens, D]: their rows
     pick_vl: u64 = 0, // int32 [cap, slots]: the routing of span rows with the image bias, before it joins pick
@@ -434,6 +441,13 @@ pub const Chunk = struct {
     mxs: mx.Scratch = undefined,
     mxe: mx.ExpertScratch = undefined,
 
+    /// The view of a pass of n rows (viewRows: its own rows when whole, the resume rows under them), within the rows
+    /// every buffer holds.
+    pub fn view(ch: *Chunk, n: usize, resume_rows: usize) !void {
+        const v = viewRows(n, resume_rows);
+        if (v > ch.rows_max) return error.ChunkTooLong;
+        ch.cap = v;
+    }
 
     /// Every buffer for `cap` rows from `a`, the compressed layers' for chunks ending by position `tokens`; the scratch
     /// the served build zeros (or fills with -1) is set the same.
@@ -452,6 +466,7 @@ pub const Chunk = struct {
         ch.spans = &.{};
         ch.img_rows = 0;
         ch.cap = cap;
+        ch.rows_max = cap;
         ch.n = 0;
         ch.start = 0;
         ch.pending = false;
@@ -675,6 +690,12 @@ pub const Chunk = struct {
     }
 };
 
+/// A pass's view of its chunk: the cap its owned-row paths and plane strides read (a whole pass of n rows: n, n == cap;
+/// a pass under the resume rows: the resume rows, so n < cap and the unsharded path runs, as at the grid's own chunks).
+pub fn viewRows(n: usize, resume_rows: usize) usize {
+    return @max(n, resume_rows);
+}
+
 /// Format.native's scratch for chunks of `cap` rows (and rounds and drafter passes, fewer): the widest K any native
 /// linear reads (wo_a's groups together), the largest split partials, and the experts' grouping for the routed rows.
 fn mxScratch(e: *const Engine, ch: *Chunk, a: *Arena, cap: usize) !void {
@@ -825,7 +846,7 @@ pub fn counterOf(ch: *const Chunk, l: weights.Linear) !u64 {
 /// (row stride ldos[i], dtype types[i]); programmatic dependent launches, split-K partials dropped from L2 (the served
 /// TF_EXL3_PDL and TF_EXL3_L2_DISCARD).
 pub fn grouped(e: *const Engine, ch: *const Chunk, m: usize, ls: []const weights.Linear, xs: []const u64, ldxs: []const usize, outs: []const u64, ldos: []const usize, types: []const exl3_linear.DType) !void {
-    if (m == 0 or m > 128 or ls.len > 8) return error.NotADecodeWindow;
+    if (m == 0 or m > decode_rows or ls.len > 8) return error.NotADecodeWindow;
     if (e.mx) |k| {
         // Format.native: each linear on its own (its rows quantized, the MX or bf16 GEMM): the bits of any row count
         for (ls, 0..) |l, i| try mx.linear(k, e.s, ch.mxs, l, xs[i], .bf16, ldxs[i], m, outs[i], ldos[i], types[i], false, null);
@@ -848,11 +869,12 @@ pub fn grouped(e: *const Engine, ch: *const Chunk, m: usize, ls: []const weights
 pub fn groupedDecode(e: *const Engine, ch: *const Chunk, m: usize, ls: []const weights.Linear, xs: []const u64, ldxs: []const usize, outs: []const u64, ldos: []const usize, types: []const exl3_linear.DType) !void {
     const k = e.mx orelse return grouped(e, ch, m, ls, xs, ldxs, outs, ldos, types);
     // past mx.decode_rows rows (the drafter's pass of 13+ streams) linearsDecode runs slabs of the same kernels
+    if (m == 0 or m > decode_rows or ls.len > 8) return error.NotADecodeWindow;
     try mx.linearsDecode(k, e.s, ch.mxs, ls, xs, ldxs, m, outs, ldos, types, ch.mxe.z);
 }
 
 pub fn groupedRotated(e: *const Engine, ch: *const Chunk, m: usize, calls: []exl3_linear.Call) !void {
-    if (m == 0 or m > 128 or calls.len > exl3_linear.gmax) return error.NotADecodeWindow;
+    if (m == 0 or m > decode_rows or calls.len > exl3_linear.gmax) return error.NotADecodeWindow;
     if (e.mx != null) return error.RotatedRowsOnNative; // Format.native: the callers pass plain rows (grouped)
     for (calls) |*c| c.counters = try counterOf(ch, c.layer);
     try exl3_linear.glinear(e.lin, e.s, calls, m, ch.gz, true, true);
@@ -999,6 +1021,8 @@ pub const GatherStep = struct { owned: QRows };
 /// a full-cap 2D chunk, strictly before the replay-cut boundary layer (c.layers / 2, which needs every row's h /
 /// pre / x globally and is never sharded: replayCut truncates ch.n there for the decoder's own, unchanged path).
 /// node g of `world` owns rows [g * q, (g + 1) * q), q = cap / world. A short chunk, a resumed chunk under cap
+/// rows, a partial final pass (a cap off the resume grid), a non-2D engine or the flag off (agreeQuarterHc) all fall
+/// through to the baseline unsharded path (null).
 /// The owned rows of this rank: its slab of the chunk (slab_plan.slab), empty for a rank beyond the chunk's rows.
 fn anySlab(e: *const Engine, ch: *const Chunk) QRows {
     const s = slab_plan.slab(ch.n, e.comm.rank);
@@ -1260,6 +1284,7 @@ pub fn mmRows(e: *const Engine, ch: *const Chunk, m: usize, l: weights.Linear, x
     };
     // Format.native: one kernel for every row count (a row's bits at any m)
     if (e.mx) |k| return mx.linear(k, e.s, ch.mxs, l, x, .bf16, ldx, m, out, os, dt, false, null);
+    if (m > decode_rows) return exl3_prefill.matmul(e.pf, e.t, ch.ws, l, x, .bf16, ldx, out, out_type, os, m);
     try grouped(e, ch, m, &.{l}, &.{x}, &.{ldx}, &.{out}, &.{os}, &.{dt});
 }
 
@@ -1424,6 +1449,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     if (e.mx) |k| {
             dump(e, li, "o_fake", ch.mxs.fake, n * hl * hd * 2);
             dump(e, li, "wo_a0", lay.wo_a[0].w, @as(usize, lay.wo_a[0].n) * lay.wo_a[0].k * 2);
+    } else if (n > decode_rows) {
         for (lay.wo_a[0..groups], 0..) |wo, g| {
             try mm(e, ch, wo, ch.o + g * gk * 2, hl * hd, ch.u + col * 2, .bf16, uw);
             col += wo.n;
@@ -1484,6 +1510,7 @@ pub fn frontRows(k: *const mx.Kernels, t: tri.Tri, s: cuda.Stream, sc: mx.Scratc
     try mx.quant(k, s, x + r.start * ldx * 2, .bf16, ldx, r.n, kd, sc.q, kd, sc.s, kd / 32);
     try mx.gemm(k, s, lay.wq_a, sc.q, kd, sc.s, kd / 32, r.n, qa + r.start * qw * 2, qw, .bf16, false, sc.z);
     try mx.gemm(k, s, lay.wkv, sc.q, kd, sc.s, kd / 32, r.n, y + r.start * hd * 2, hd, .bf16, false, sc.z);
+    return if (n > decode_rows) .linears else .grouped;
 }
 
 /// Whether one quant of x's rows feeds both of a layer's front linears: wq_a and wkv FP8 / FP4 on one K.
@@ -1540,6 +1567,7 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
 
 /// kvSourceUpdate of `n` rows of x [*, hidden] bf16 from position `start`: the compressor on those rows, their groups
 /// into the layer's caches (the whole chunk's: ch.x, ch.start, ch.n; the boundary's owned rows: theirs).
+pub fn kvSourceAt(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize, x: u64, start: usize, n: usize) !void {
     const lay = e.w.layers[li];
     const c = e.c;
     const hd = c.head_dim;
@@ -1702,6 +1730,9 @@ pub fn boundaryOwnedOff(lay: weights.Layer) ?[]const u8 {
 /// c.candidate_source). That bound is not coincidental: it is the indexer's own switch point, after which the
 /// per-row "keyed" scoring this shards stops and a cross-layer pool (ch.pool, written once at li ==
 /// candidate_source over every row, read by every later layer) takes over -- excluded here by construction, so
+/// no boundary resync like WP4's is needed. A short chunk, a resumed chunk under cap rows, a partial final pass (a cap
+/// off the resume grid), a non-2D engine, an unaligned quarter (the kit's index kernels need every block's rows to
+/// start on a 16-row boundary) or the flag off (agreeIdxShard) all fall through to the baseline unsharded path (null).
 fn idxShardRange(e: *const Engine, ch: *const Chunk, li: usize) ?QRows {
     const t = e.two orelse return null;
     if (!t.idx_shard) return null;
@@ -2313,6 +2344,10 @@ pub const EngramHost = struct {
     wk_seq: []const i32 = &.{}, // the prompt it reads (its whole ids)
     wk_start: usize = 0, // its first chunk's start
     wk_group: usize = 0, // TF_DS_ROCI_WORKER_PAIR_MAJOR with two passes in flight: 4 chunks a group (WorkerOrder.group)
+    // engramApply's rows when the worker read them: the pass's resume units in order (use_n of them, use_unit rows each
+    // but the last), or their records instead with packed shards (engramWorkerStage)
+    use_n: usize = 0,
+    use_unit: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, c: *const Config, hasher: engram.Hasher, tables: *const engram_io.Tables, pool: *engram_io.Pool, rank: usize, world: usize, cap: usize) !EngramHost {
         const cols = hasher.cols();
@@ -2661,8 +2696,35 @@ pub fn engramProject(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, s
     const m = n * k;
     const prof = eh.io != null;
     var tq = if (prof) pstamp(e, eh) else 0;
+    if (eh.use_n > 0) {
+        // the fill's worker's resume units of the pass in order, each at its rows: its decoded rows, or its records
+        // (packed shards) decoded on the GPU
+        if (prof) eh.p_rows += lap(e, eh, &tq);
+        for (0..eh.use_n) |u| {
+            const r0 = u * eh.use_unit;
+            const nu = @min(eh.use_unit, n - r0);
+            const at = ch.eb + r0 * ew.k * 2;
             if (eh.pk) |pr| try pr.chunkApplyOn(eh.use_stage[u].?, nu, e.s, at, ch.lane) else try upload(e, at, eh.use_rows[u].?.ptr, nu * ew.k * 2);
+        }
+        if (prof) eh.p_upload += lap(e, eh, &tq);
+    } else if (eh.pk) |pr| {
+        // packed shards: the chunk's records (read ahead when they are this chunk's, else read here), decoded on the GPU
+        const st = if (l < 2 and eh.ahead_ready[l] and eh.ahead_start == ch.start and eh.ahead_n == n) blk: {
         try pr.chunkApply(st, n, e.s, ch.eb);
+        if (l < 2 and eh.ahead_ready[l] and eh.ahead_start == ch.start and eh.ahead_n == n) {
+            rows = eh.ahead_rows[l];
+            eh.ahead_ready[l] = false;
+        } else {
+            eh.hasher.hashes(seq, ch.start, n, eh.hashes[0 .. n * eh.hasher.layers * cols]);
+            for (0..n) |r| {
+                for (0..k) |j| eh.flat[r * k + j] = eh.hashes[(r * eh.hasher.layers + l) * cols + eh.lo + j];
+            }
+            if (eh.paio) |aio| try aioGather(aio, t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]) else try eh.pool.gather(t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]);
+            engram.decodeRows(eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s], eh.rows[0 .. m * t.row_w], m, t.row_w, t.row_s, 8); // the rows on 8 threads
+        }
+        if (prof) eh.p_rows += lap(e, eh, &tq);
+        try upload(e, ch.eb, rows.ptr, m * t.row_w * 2);
+        if (prof) eh.p_upload += lap(e, eh, &tq);
 }
 
 /// Whether layer li's Engram sums run on the transport at owned rows (TF_DS_ROCI_ENGRAM_AHEAD hoists those alone).
@@ -3028,6 +3090,19 @@ test "the replay floor on: no prompt length's decoder chunk reads a key below th
     try std.testing.expectEqual(@as(usize, 64 * 31), stale_lengths);
 }
 
+test "a 4,097-row prompt's tail pass runs the decode kernels, a merged pass the prompt kernels" {
+    // 4,097 rows: the baseline third pass is the one row at 4,096 (a ring window, eight splits, the grouped linears). A
+    // merged 2,049-row pass runs that row non-ring with one split and the prefill linears: different bits.
+    const tail = chunkMode(1, 4096, 0, 128, false);
+    try std.testing.expect(tail.ring);
+    try std.testing.expectEqual(tri_attn.attn_splits, tri_attn.splits(1, tail.one_split));
+    const whole = chunkMode(2049, 2048, 0, 128, false);
+    try std.testing.expect(!whole.ring);
+    try std.testing.expectEqual(@as(usize, 1), tri_attn.splits(2049, whole.one_split));
+    try std.testing.expectEqual(Front.grouped, attnFront(false, false, true, true, 1));
+    try std.testing.expectEqual(Front.linears, attnFront(false, false, true, true, 2049));
+}
+
 test "hd ** -0.5 as the served build passes it" {
     try std.testing.expectEqual(@as(u32, 0x3d3504f3), @as(u32, @bitCast(scale(512))));
 }
@@ -3054,6 +3129,7 @@ fn checkpointLayers(lays: *[40]weights.Layer) !void {
     }
 }
 
+        const today: Front = if (n > decode_rows) .linears else .grouped;
 test "the owned front's q norm is the whole chunk's launch at the owned rows' offsets: one _rmsnorm program a row" {
     var log: tri.Log = .{ .gpa = std.testing.allocator };
     defer log.deinit();
@@ -3224,6 +3300,31 @@ test "the boundary's in-place gathers put every rank's owned groups of the four 
         for (0..start * row) |i| try std.testing.expectEqual(@as(u8, 0xee), m[buf + i]);
         for ((start + n) * row..(start + n + 4) * row) |i| try std.testing.expectEqual(@as(u8, 0xee), m[buf + i]);
     };
+}
+
+test "a chunk's view of a pass stays within the rows its buffers hold" {
+    var ch: Chunk = undefined;
+    ch.rows_max = 4096;
+    ch.cap = 4096;
+    try ch.view(2048, 2048);
+    try std.testing.expectEqual(@as(usize, 2048), ch.cap);
+    try ch.view(4096, 2048);
+    try std.testing.expectEqual(@as(usize, 4096), ch.cap);
+    try ch.view(17, 2048);
+    try std.testing.expectEqual(@as(usize, 2048), ch.cap);
+    try std.testing.expectError(error.ChunkTooLong, ch.view(6144, 2048));
+    // a chunk of the resume rows alone (TF_DS_PASS_ROWS unset): every pass's view is the baseline cap
+    ch.rows_max = 2048;
+    try ch.view(2048, 2048);
+    try std.testing.expectEqual(@as(usize, 2048), ch.cap);
+    try std.testing.expectError(error.ChunkTooLong, ch.view(4096, 2048));
+}
+
+test "a pass's view: its own rows when whole, the resume rows under them" {
+    try std.testing.expectEqual(@as(usize, 2048), viewRows(2048, 2048));
+    try std.testing.expectEqual(@as(usize, 4096), viewRows(4096, 2048));
+    try std.testing.expectEqual(@as(usize, 2048), viewRows(2047, 2048));
+    try std.testing.expectEqual(@as(usize, 2048), viewRows(1, 2048));
 }
 
 /// The worker (greedy, blocked by its slot guard) against the host consuming a pair's units in the pair's issue order: A's layer-1

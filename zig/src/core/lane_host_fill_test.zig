@@ -159,40 +159,226 @@ test "partial admission releases cancelled prompts, isolates refusal, and retrie
         try std.testing.expectEqual(@as(usize, 0), target.lanes.count());
     }
 }
+
+// -- the scheduling hook's facts and plan (lanes.stream.Facts, Next) at the default cadence ------------------------
+
+const Step = lanes.fake.Fake.StepSeen;
+
+/// A run of the served host over the chunked fake with its pass rule (resume 4 rows, pass 8): the truth beside the
+/// fake's log of every step (whether a stream decoded as it began, read in the prefill hook), and the step at which
+/// each request was submitted (0: before the host started; `later` ones from the hook, when the stream of `on_len`
+/// begins its `at`-th step). Every request has a prompt length of its own (`prompt_lens`).
+const Cadence = struct {
+    engine: api.Engine = undefined,
+    core: *lanes.Engine = undefined,
+    later: []const Later = &.{},
+    fired: [4]bool = @splat(false),
+    prompt_lens: [4]usize = @splat(0),
+    submitted_at: [4]?usize = @splat(null),
+    decoding: std.ArrayList(bool) = .empty,
+    lens: std.ArrayList(usize) = .empty,
+    reasons: [4]?api.Reason = @splat(null),
+    done: std.atomic.Value(u32) = .init(0),
+    want: u32 = 0,
+
+    const Later = struct { id: api.Id, request: *const api.Request, on_len: usize, at: usize };
+
+    fn hook(ctx: *anyopaque, s: *lanes.Stream, _: usize) void {
+        const x: *Cadence = @ptrCast(@alignCast(ctx));
+        const i = x.lens.items.len;
+        x.decoding.append(gpa, x.core.activeCount() > 0) catch unreachable;
+        var before: usize = 0;
+        for (x.lens.items) |l| before += @intFromBool(l == s.prompt_len);
+        for (x.later, 0..) |l, k| {
+            if (x.fired[k] or s.prompt_len != l.on_len or before != l.at) continue;
+            x.fired[k] = true;
+            x.submitted_at[@intCast(l.id - 1)] = i;
+            x.engine.submit(l.id, l.request, .{ .ctx = x, .event = event }) catch unreachable;
+        }
+        x.lens.append(gpa, s.prompt_len) catch unreachable;
+    }
+
+    fn event(ctx: *anyopaque, id: api.Id, e: *const api.Event) void {
+        const x: *Cadence = @ptrCast(@alignCast(ctx));
+        switch (e.*) {
+            .finished => |f| {
+                x.reasons[@intCast(id - 1)] = f.reason;
+                _ = x.done.fetchAdd(1, .release);
+            },
+            else => {},
+        }
+    }
+
+    fn wait(x: *Cadence) !void {
+        for (0..5000) |_| {
+            if (x.done.load(.acquire) == x.want) return;
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+        }
+        return error.RequestsDidNotFinish;
+    }
+
+    fn deinit(x: *Cadence) void {
+        x.decoding.deinit(gpa);
+        x.lens.deinit(gpa);
+    }
+
+    /// The `first` requests submitted before the host of `n_lanes` lanes starts, the `later` ones from the hook; the fake
+    /// keeps its log for the caller.
+    fn run(x: *Cadence, target: *lanes.fake.Fake, first: []const *const api.Request, n_lanes: u32) !void {
+        var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+        defer cfg.deinit(gpa);
+        target.prefill_hook = hook;
+        target.prefill_hook_ctx = x;
+        var clock: lanes.fake.FixedClock = .{};
+        var core = lanes.Engine.init(gpa, &cfg, target.chunkedBackend(), clock.clock());
+        defer core.deinit();
+        x.engine = host.engine();
+        x.core = &core;
+        x.want = @intCast(first.len + x.later.len);
+        for (first, 1..) |r, id| {
+            x.submitted_at[id - 1] = 0;
+            try x.engine.submit(id, r, .{ .ctx = x, .event = event });
+        }
+        try host.start();
+        defer host.stop();
+        try x.wait();
+    }
+
+    /// The facts every step must have been given, from the log: a stream decoding as it began (the hook's reading);
+    /// another request submitted by then and not yet at its first step (waiting); another one past its first step and
+    /// short of its last (filling); the resume rows as step rows while a stream decodes, else no bound.
+    fn expectFacts(x: *const Cadence, steps: []const Step) !void {
+        try std.testing.expectEqual(steps.len, x.decoding.items.len);
+        for (steps, 0..) |st, i| {
+            var waiting = false;
+            var filling = false;
+            for (x.submitted_at, x.prompt_lens) |at, len| {
+                const sub = at orelse continue;
+                if (len == st.prompt_len) continue;
+                const span = spanOf(steps, len);
+                if (span) |sp| if (sp[0] < i and sp[1] > i) {
+                    filling = true;
+                };
             }
+            const f = st.facts.?;
+            try std.testing.expectEqual(x.decoding.items[i], f.decoding);
+            try std.testing.expectEqual(waiting, f.waiting);
+            try std.testing.expectEqual(filling, f.filling);
+            try std.testing.expectEqual(@as(u32, if (f.decoding) 4 else std.math.maxInt(u32)), f.step_rows);
         }
+    }
+};
+
+/// The first and last step indices of the stream of prompt length `len`.
+fn spanOf(steps: []const Step, len: usize) ?[2]usize {
+    var lo: ?usize = null;
+    var hi: usize = 0;
+    for (steps, 0..) |st, i| if (st.prompt_len == len) {
+        if (lo == null) lo = i;
+        hi = i;
     };
-    var order: Order = .{};
-    const short = [_]u32{ 2, 7, 1, 8 };
-    const long = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3 };
-    const background: Request = .{ .prompt = &short, .max_tokens = 4, .background = true };
-    const foreground: Request = .{ .prompt = &long, .max_tokens = 4 };
-    const e = host.engine();
-    // the background prompt's first chunk sends the foreground request: it is admitted while the other fills
-    const Arrive = struct {
-        engine: api.Engine,
-        request: *const Request,
-        order: *Order,
-        sent: bool = false,
-        fn call(ctx: *anyopaque, _: *lanes.Stream, _: usize) void {
-            const a: *@This() = @ptrCast(@alignCast(ctx));
-            if (a.sent) return;
-            a.sent = true;
-            a.engine.submit(2, a.request, .{ .ctx = a.order, .event = Order.event }) catch {};
-        }
+    return if (lo) |l| .{ l, hi } else null;
+}
+
+/// What followed step i in the log: a round (the fake served decode calls before the next step), this stream's next
+/// step, or another stream's.
+fn followed(steps: []const Step, i: usize) lanes.stream.Next {
+    const j = i + 1;
+    if (steps[j].decodes > steps[i].decodes) return .round;
+    return if (steps[j].prompt_len == steps[i].prompt_len) .same else .other;
+}
+
+test "the hook answers what the host then does: each step's facts as it begins, its next at its end" {
+    // a 32-token prompt alone, then a 16-token one arriving at its second step (they alternate), the shorter decoding
+    // beside the rest of the longer, and a 4-token one arriving at its sixth step
+    const p1: [32]u32 = @splat(3);
+    const p2: [16]u32 = @splat(4);
+    const p3: [4]u32 = @splat(5);
+    const r1: api.Request = .{ .prompt = &p1, .max_tokens = 8, .drafts = false };
+    const r2: api.Request = .{ .prompt = &p2, .max_tokens = 24, .drafts = false };
+    const r3: api.Request = .{ .prompt = &p3, .max_tokens = 4, .drafts = false };
+    var run: Cadence = .{ .later = &.{ .{ .id = 2, .request = &r2, .on_len = 32, .at = 1 }, .{ .id = 3, .request = &r3, .on_len = 32, .at = 5 } } };
+    defer run.deinit();
+    run.prompt_lens = .{ 32, 16, 4, 0 };
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    try run.run(&target, &.{&r1}, 3);
+    for (run.reasons[0..3]) |r| try std.testing.expectEqual(api.Reason.length, r.?);
+    const steps = target.steps.items;
+    try run.expectFacts(steps);
+    var seen = std.EnumSet(lanes.stream.Next){};
+    for (steps, 0..) |st, i| {
+        const n = st.next orelse continue; // (a prompt's last step is not asked)
+        try std.testing.expectEqual(followed(steps, i), n);
+        seen.insert(n);
+    }
+    // every answer of the default cadence came up: the prompt alone, rotation, a round while a stream decodes
+    try std.testing.expect(seen.contains(.same) and seen.contains(.other) and seen.contains(.round));
+}
+
+test "a lone prompt with nothing decoding or waiting steps by the pass rows" {
+    const p: [37]u32 = @splat(3);
+    const r: api.Request = .{ .prompt = &p, .max_tokens = 4, .drafts = false };
+    var run: Cadence = .{};
+    defer run.deinit();
+    run.prompt_lens = .{ 37, 0, 0, 0 };
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    try run.run(&target, &.{&r}, 2);
+    try run.expectFacts(target.steps.items);
+    // whole pass rows, then a whole resume unit, then the remainder under the resume rows alone
+    const want = [_]usize{ 8, 8, 8, 8, 4, 1 };
+    try std.testing.expectEqual(want.len, target.steps.items.len);
+    for (target.steps.items, want) |st, w| try std.testing.expectEqual(w, st.rows);
+}
+
+test "one decoding stream beside a long prompt: every pass of the resume rows, and a round between every two" {
+    // a 4-token prompt decodes 40 tokens; a 64-token prompt arrives at its step and fills beside it
+    const pa: [4]u32 = @splat(5);
+    const pb: [64]u32 = @splat(3);
+    const ra: api.Request = .{ .prompt = &pa, .max_tokens = 40, .drafts = false };
+    const rb: api.Request = .{ .prompt = &pb, .max_tokens = 4, .drafts = false };
+    var run: Cadence = .{ .later = &.{.{ .id = 2, .request = &rb, .on_len = 4, .at = 0 }} };
+    defer run.deinit();
+    run.prompt_lens = .{ 4, 64, 0, 0 };
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    try run.run(&target, &.{&ra}, 2);
+    const steps = target.steps.items;
+    try run.expectFacts(steps);
+    var long: usize = 0;
+    var last: ?usize = null;
+    for (steps, 0..) |st, i| {
+        if (st.prompt_len != 64) continue;
+        long += 1;
+        try std.testing.expect(st.facts.?.decoding);
+        try std.testing.expect(st.rows <= 4);
+        if (last) |l| try std.testing.expect(steps[i].decodes > steps[l].decodes);
+        last = i;
+    }
+    try std.testing.expectEqual(@as(usize, 16), long);
+}
+
+test "a second prompt filling beside a lone one: both step by the resume rows" {
+    const pb: [32]u32 = @splat(3);
+    const pc: [33]u32 = @splat(4);
+    const rb: api.Request = .{ .prompt = &pb, .max_tokens = 4, .drafts = false };
+    const rc: api.Request = .{ .prompt = &pc, .max_tokens = 4, .drafts = false };
+    var run: Cadence = .{};
+    defer run.deinit();
+    run.prompt_lens = .{ 32, 33, 0, 0 };
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    try run.run(&target, &.{ &rb, &rc }, 2);
+    const steps = target.steps.items;
+    try run.expectFacts(steps);
+    var beside: usize = 0;
+    for (steps) |st| if (st.facts.?.filling or st.facts.?.waiting) {
+        beside += 1;
+        try std.testing.expect(st.rows <= 4);
     };
-    var arrive: Arrive = .{ .engine = e, .request = &foreground, .order = &order };
-    target.prefill_hook = Arrive.call;
-    target.prefill_hook_ctx = &arrive;
-    try e.submit(1, &background, .{ .ctx = &order, .event = Order.event });
-    try host.start();
-    defer host.stop();
-    while (true) {
-        order.mutex.lockUncancelable(std.testing.io);
-        const d = order.done;
-        order.mutex.unlock(std.testing.io);
-        if (d == 2) break;
-        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    try std.testing.expect(beside >= 15);
+}
     }
     try std.testing.expectEqualSlices(Id, &.{ 2, 1 }, &order.prefilled);
 }

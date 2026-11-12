@@ -98,12 +98,31 @@ pub const MarkHook = struct {
     at: *const fn (ptr: *anyopaque, s: *Stream, at: u32) void,
 };
 
+/// What follows a prompt's step in the host's plan, asked at the step's end: this prompt's next step, a decode round of
+/// the live streams, another prompt's step, or nothing.
+pub const Next = enum { same, round, other, idle };
+
+/// The host's scheduling facts for a prompt's next step, asked at the step's start (passRows reads them alone):
+/// `decoding`, another stream decodes; `filling`, another prompt than this one fills (its fill started and not
+/// finished); `waiting`, a request other than this one is queued, parked, woken, or admitted and not yet started;
+/// `step_rows`, the most prompt rows the step may run before the host's next round (under the default cadence the
+
+/// The most rows a prompt's step at `start` may pass, from the host's facts alone: `resume_rows` with no facts (a host
+    const x = f orelse return resume_rows;
+    if (!x.decoding or x.step_rows >= pass_rows) return pass_rows;
+}
+
 /// Whether the step at `start` is a whole pass of the booted `pass_rows` by the host's facts alone, and may be the first of a pair:
 /// Where `pass_rows` is the resume rows (TF_DS_PASS_ROWS=2048) a cut pass has the booted rows too, so the rows cannot tell a whole
 /// pass from a cut one; the facts do. For pass rows above the resume rows it is passRows(...) == pass_rows and !decoding (a test).
     const x = f orelse return false;
 }
 
+    ready: *const fn (ptr: *anyopaque) bool, // whether `run` would run a round (another stream is live): `next == .round`
+    /// What follows the step just issued (asked at its end). Null: the host has no plan to tell.
+    next: ?*const fn (ptr: *anyopaque) Next = null,
+    /// The host's facts for this prompt's next step (asked at its start). Null: none, and passRows gives the resume rows.
+    facts: ?*const fn (ptr: *anyopaque) Facts = null,
 /// A backend that issues work ahead of the device (the host returns while the kernels still run) gates the count: `gate`
 /// holds `generation << 32 | rows` the device has finished, and a reader counts no more than that.
     gen: std.atomic.Value(u32) = .init(0),
@@ -350,6 +369,20 @@ pub const Stream = struct {
         return @as(i64, s.max_new) - @as(i64, @intCast(s.emitted().len));
     }
 
+    /// The host's facts for this stream's next prompt step (null without a hook or its facts).
+    pub fn hostFacts(s: *const Stream) ?Facts {
+        const b = s.between orelse return null;
+        const f = b.facts orelse return null;
+        return f(b.ptr);
+    }
+
+    /// What the host runs after this stream's prompt step (null without a hook or its plan).
+    pub fn hostNext(s: *const Stream) ?Next {
+        const b = s.between orelse return null;
+        const n = b.next orelse return null;
+        return n(b.ptr);
+    }
+
     /// Whether the request was cancelled (false with no hook); a prompt pass asks before each chunk.
     pub fn isCancelled(s: *const Stream) bool {
         const c = s.cancel_check orelse return false;
@@ -583,6 +616,25 @@ test "loop guard fires, closes thinking, and latches once" {
     try std.testing.expect(!s.finished and s.loop_period.? == 1);
 }
 
+
+test "passRows gives resume rows below pass_from, while a request waits, while another prompt fills and with no hook, else pass rows when nothing decodes or step_rows reaches them" {
+    const quiet: Facts = .{ .decoding = false, .filling = false, .waiting = false, .step_rows = std.math.maxInt(u32) };
+    // no hook: the resume rows
+    // nothing decodes, fills or waits: the pass rows, from pass_from on
+    // another request waits, or another prompt fills
+    var f = quiet;
+    f.waiting = true;
+    f = quiet;
+    f.filling = true;
+    // a stream decodes: the resume rows at the default cadence's step rows, the pass rows once a plan's step rows reach them
+    f = quiet;
+    f.decoding = true;
+    f.step_rows = 2048;
+    f.step_rows = 4096;
+    f.step_rows = 6144;
+    // pass rows equal to the resume rows: always the resume rows
+}
+
 test "wholePass: the facts of a pass at the booted rows, from pass_from on, with nothing decoding; the rows alone cannot tell it from a cut pass" {
     const quiet: Facts = .{ .decoding = false, .filling = false, .waiting = false, .step_rows = std.math.maxInt(u32) };
     var f = quiet;
@@ -598,6 +650,31 @@ test "wholePass: the facts of a pass at the booted rows, from pass_from on, with
     };
 }
 
+test "a stream asks its host's hook for the facts and the plan, and has neither without one" {
+    const H = struct {
+        fn run(_: *anyopaque) anyerror!void {}
+        fn ready(_: *anyopaque) bool {
+            return false;
+        }
+        fn facts(_: *anyopaque) Facts {
+            return .{ .decoding = true, .filling = false, .waiting = true, .step_rows = 2048 };
+        }
+        fn next(_: *anyopaque) Next {
+            return .other;
+        }
+    };
+    var s = try Stream.init(std.testing.allocator, .{ .id = "s", .prompt = &.{ 1, 2, 3 }, .max_new = 1, .drafts = false });
+    defer s.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?Facts, null), s.hostFacts());
+    try std.testing.expectEqual(@as(?Next, null), s.hostNext());
+    var token: u8 = 0;
+    s.between = .{ .ptr = &token, .run = H.run, .ready = H.ready };
+    try std.testing.expectEqual(@as(?Facts, null), s.hostFacts());
+    try std.testing.expectEqual(@as(?Next, null), s.hostNext());
+    s.between = .{ .ptr = &token, .run = H.run, .ready = H.ready, .facts = H.facts, .next = H.next };
+    try std.testing.expectEqual(@as(?Facts, H.facts(&token)), s.hostFacts());
+    try std.testing.expectEqual(@as(?Next, .other), s.hostNext());
+}
 const reference = @import("novelty.zig").reference;
 
 /// Commit `tokens` `batch` at a time as the lane core's rounds do, cut where loopCut cuts, until the guard fires or the

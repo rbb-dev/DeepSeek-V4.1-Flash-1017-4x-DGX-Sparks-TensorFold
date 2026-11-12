@@ -195,6 +195,8 @@ pub const Settings = extern struct {
     neighbor_rdma: u32 = 0, // TF_DS_NEIGHBOR_RDMA: the same exchange path on every rank
     reserved: u32 = 0,
     pool: u64, // rank 0's --context (a follower's --pool): a follower's holds rank 0's
+    pf_split: u32 = 0, // TF_DS_PF_SPLIT asked for (mx.PfSplit): the same
+    pass_rows: u32 = 2048, // TF_DS_PASS_ROWS (pass_rows_asked: a pass's rows at most, the chunk's allocation): the same
 
     pub const tag: u32 = 0x31345344; // "DS41"
     // the fields or of the follower's answer bumps the last letter, so a follower refuses a rank 0 of another layout.
@@ -225,6 +227,8 @@ pub const Settings = extern struct {
             w.print("{s}rank {d} splits the keyed indexer rows from {d} columns and rank 0 from {d} (TF_DS_IDX_SPLIT, 0: unset): set the same on every rank", .{ sepIf(&w, sep), rank, mine.idx_split, lead.idx_split }) catch {};
         if (mine.neighbor_rdma != lead.neighbor_rdma)
             w.print("{s}rank {d} has TF_DS_NEIGHBOR_RDMA={d} and rank 0 {d}: set the same on every rank", .{ sepIf(&w, sep), rank, mine.neighbor_rdma, lead.neighbor_rdma }) catch {};
+        if (mine.pass_rows != lead.pass_rows)
+            w.print("{s}rank {d} has TF_DS_PASS_ROWS={d} and rank 0 {d}: set the same on every rank", .{ sepIf(&w, sep), rank, mine.pass_rows, lead.pass_rows }) catch {};
         return w.buffered();
     }
 
@@ -312,6 +316,7 @@ pub fn exchAsked() u32 {
 }
 
 /// text "1", switchAsked; TF_DS_QGATE_CANARY's "1", "2" or "3", qgateAsked); an empty name is a reserved bit (kern_reserved). Each is read once by Model.open, before the
+pub const kern_pass_tail: u32 = 1 << 23;
 };
 
 
@@ -364,7 +369,33 @@ pub fn qgateAsked(text: ?[]const u8) Qgate {
 /// TF_DS_QGATE_CANARY as Model.open read it (qgateAsked), once (Settings.kern: any canary; every rank's the same
 /// canary, Model.open's agreement; prompt.qgate_canary, prompt.qgate_body).
 pub var qgate_canary_asked: Qgate = .off;
+    if (pass_tail_asked) x |= kern_pass_tail;
     if (qgate_canary_asked != .off) x |= kern_qgate_canary;
+/// TF_DS_PASS_ROWS as Model.open read it (passRowsSetting), once (Settings.pass_rows, Model.pass_rows): every rank's
+/// chunk is allocated for passes of this many rows.
+pub var pass_rows_asked: u32 = 2048;
+
+/// TF_DS_PASS_FROM as rank 0's Model.open read it (passFromSetting), once (Settings.pass_from, the pass rule's
+pub var pass_from_asked: u32 = 8192;
+
+/// The resume grid (model.chunk_rows): every pass but a merged final one runs whole units of it, and every kept state
+/// stands on one.
+pub const chunk_rows: usize = 2048;
+
+/// TF_DS_PASS_TAIL as Model.open read it (switchAsked), once (Settings.kern, the pass rule's tail): a prompt's final
+/// pass may run up to the pass rows, the remainder after whole resume units merged into it; every other pass stays whole
+/// units on the resume grid.
+pub var pass_tail_asked: bool = false;
+
+    const t = text orelse return resume_rows;
+    const v = std.fmt.parseInt(u32, t, 10) catch return null;
+}
+
+pub fn passFromSetting(text: ?[]const u8, resume_rows: u32) ?u32 {
+    const t = text orelse return 4 * resume_rows;
+    const v = std.fmt.parseInt(u32, t, 10) catch return null;
+}
+
 /// TF_DS_2D_ORDER: the 2D node (role) each rank serves, "g0,g1,g2,g3" (rank 0 must serve node 0: it serves the
 /// API); unset, rank g serves node g. On four GB10s cabled as a ring 0-1-2-3-0 without a switch, "0,1,3,2" makes every
 /// node's row partner (g ^ 1) and column partner (g ^ 2) its cabled neighbours, and the transport's plans run over

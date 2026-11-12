@@ -2,7 +2,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const be = @import("backend.zig");
-const Stream = @import("stream.zig").Stream;
+const stream_mod = @import("stream.zig");
+const Stream = stream_mod.Stream;
 const Sampling = @import("sampling.zig").Sampling;
 const keyBits = @import("sampling.zig").keyBits;
 const accept = @import("accept.zig");
@@ -57,17 +58,36 @@ pub const Fake = struct {
     prefill_hook_ctx: ?*anyopaque = null,
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
     refuse_full: usize = 0, // prefill refuses this many times with error.ContextFull while another lane is live
+    /// The chunked backend's steps sized by the host's facts (stream.passRows over this grid) and a pass length without
+    /// marks; each step logged in `steps` with its facts (read after prefill_hook) and, short of the prompt's end, the
+    /// host's next. Null: four rows a step, nothing logged.
+    pass_rule: ?PassRule = null,
+    steps: std.ArrayList(StepSeen) = .empty,
+    decodes: u64 = 0, // verify and queue calls (a round's work, pipelined or verified)
+
     ranked: bool = false, // the head gives its held chain back (alternatives)
     memory_lanes: ?usize = null, // prefill past this many live lanes fails with error.LaneMemory (no room yet)
     fail_round: ?u64 = null, // this round's verify fails with error.GpuFailed, as a round the GPU fails does
     last_rows: usize = 0, // the last verify's rows, for test clocks
     last_sampled: bool = false, // and whether one of its streams drew keyed samples
 
+    /// One logged step: the stream's prompt length (which request), where it started, its rows, the host's facts at its
+    /// start and next at its end, and the decode calls (verify or queue: a round's) served before it.
+    pub const StepSeen = struct { prompt_len: usize, start: usize, rows: usize, facts: ?stream_mod.Facts, next: ?stream_mod.Next, decodes: u64 };
+
     pub fn deinit(x: *Fake) void {
         var it = x.lanes.valueIterator();
         while (it.next()) |l| freeLane(x.gpa, l);
         x.lanes.deinit(x.gpa);
         x.drawn.deinit(x.gpa);
+        x.steps.deinit(x.gpa);
+    }
+
+    /// A pass's rows without marks: a remainder under the resume rows alone, else whole resume units up to the cap.
+    pub fn passLen(start: usize, len: usize, cap: u32, resume_rows: u32) usize {
+        const rest = len - start;
+        if (rest < resume_rows) return rest;
+        return @min(cap, rest / resume_rows * resume_rows);
     }
 
     fn freeLane(gpa: Allocator, l: *Lane) void {
@@ -104,10 +124,17 @@ pub const Fake = struct {
         const begin = h.items.len;
         x.prefill_count += 1;
         if (x.prefill_hook) |hook| hook(x.prefill_hook_ctx.?, s, begin / 4);
+        var rows: usize = 4;
+        var facts: ?stream_mod.Facts = null;
+        if (x.pass_rule) |r| {
+            facts = s.hostFacts();
+        }
+        const end = @min(begin + rows, s.prompt_len);
         for (s.prompt()[begin..end], begin + 1..) |t, at| {
             try h.append(x.gpa, t);
             if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(at));
         }
+        if (x.pass_rule != null) try x.steps.append(x.gpa, .{ .prompt_len = s.prompt_len, .start = begin, .rows = end - begin, .facts = facts, .next = if (end < s.prompt_len) s.hostNext() else null, .decodes = x.decodes });
         return end == s.prompt_len;
     }
 
@@ -249,29 +276,15 @@ pub const Fake = struct {
         return error.NoAllowedToken;
     }
 
-    fn alternatives(ptr: *anyopaque, s: *Stream, out: []be.Alternative) anyerror!usize {
-        const x = self(ptr);
-        if (!x.ranked) return 0;
-        const held = x.lane(s).held.items;
-        const n = @min(out.len, held.len);
-        for (out[0..n], held[0..n]) |*o, t| o.* = .{ .tokens = .{ t, (t + 1) % vocab, (t + 2) % vocab, (t + 3) % vocab }, .probs = .{ 0.5, 0.2, 0.1, 0.1 } };
-        return n;
-    }
-
     fn heldDrafts(ptr: *anyopaque, s: *Stream, out: []u32) anyerror!void {
         const h = self(ptr).lane(s).held.items;
         if (out.len > h.len) return error.NotHeld;
         @memcpy(out, h[0..out.len]);
     }
 
-    fn firstRow(ptr: *anyopaque, s: *Stream) anyerror!Row {
-        const x = self(ptr);
-        const h = x.lane(s).history.items;
-        return rowAt(h, x.targetNext(h, s.sampling, h.len), s.logprobs.?);
-    }
-
     fn queue(ptr: *anyopaque, s: *Stream, feed: be.Feed, position: u64) anyerror!u64 {
         const x = self(ptr);
+        x.decodes += 1;
         const l = x.lane(s);
         try l.history.append(x.gpa, x.value(feed));
         return x.draw(l, s, position);
@@ -287,6 +300,7 @@ pub const Fake = struct {
         if (x.fail_round == x.rounds) return error.GpuFailed;
         x.last_rows = 0;
         x.last_sampled = false;
+        x.decodes += 1;
         for (windows, out) |w, o| {
             x.last_rows += w.rows();
             x.last_sampled = x.last_sampled or w.stream.sampling != null;
@@ -387,3 +401,27 @@ pub const FixedClock = struct {
         return 6.0 + @as(f64, @floatFromInt(c.calls % 7)) * 0.5;
     }
 };
+
+test "with no hook every pass is at most the resume rows" {
+    const gpa = std.testing.allocator;
+    for ([_]usize{ 37, 40, 3 }) |len| {
+        var x: Fake = .{ .gpa = gpa, .pass_rule = .{ .resume_rows = 4, .pass_rows = 8 } };
+        defer x.deinit();
+        const prompt = try gpa.alloc(u32, len);
+        defer gpa.free(prompt);
+        @memset(prompt, 5);
+        var s = try Stream.init(gpa, .{ .id = "alone", .prompt = prompt, .max_new = 1, .drafts = false });
+        defer s.deinit(gpa);
+        const b = x.chunkedBackend();
+        var steps: usize = 1;
+        while (!try b.vtable.prefill_step.?(b.ptr, &s)) : (steps += 1) if (steps > len) return error.PassDidNotAdvance;
+        var at: usize = 0;
+        for (x.steps.items) |st| {
+            try std.testing.expectEqual(at, st.start);
+            try std.testing.expect(st.rows <= 4);
+            try std.testing.expectEqual(@as(?stream_mod.Facts, null), st.facts);
+            at += st.rows;
+        }
+        try std.testing.expectEqual(len, at);
+    }
+}
