@@ -29,6 +29,51 @@ const DevicePtr = cuda.abi.DevicePtr;
 pub const max_ranks = seqs.max_ranks;
 pub const max_devices = seqs.max_devices;
 const recv_depth = 256; // receive requests kept posted on every QP (a write with immediate consumes one)
+/// The device scalars: seq (u64, offset 0), staged (u32, 8), probe (8 x u64, 16), then send_last [max_users] (80): the sequence each in-place user
+/// last published, written and read by the GPU alone, so it lives in device memory (the await kernel reads it from L2, not from pinned host memory).
+const scalars_bytes = 80 + max_users * 8;
+
+/// The arrival signal TF_DS_RING_WORD may use: the sending proxy writes each lane's data with a plain RDMA WRITE
+/// and then, on the same queue pair, the lane's 64-bit generation word. `.word` writes the sequence itself as an
+/// inline 8-byte RDMA WRITE; `.atomic` adds one to the word with an RDMA ATOMIC fetch-and-add (the signal the IB
+/// spec covers for a write that follows data). The collecting kernel waits on the word instead of a proxy-published
+/// flag.
+pub const Roci = enum {
+    off,
+    word,
+    atomic,
+
+    pub fn on(x: Roci) bool {
+        return x != .off;
+    }
+
+    /// The signal's name for the bench's line (TF_DS_RING_WORD_SIGNAL's own words).
+    pub fn signalName(x: Roci) []const u8 {
+        return switch (x) {
+            .off => "off",
+            .word => "word",
+            .atomic => "atomic",
+        };
+    }
+
+    /// The words a peer's lane holds after `sent` signals from zero: the sequence for `.word`, the count for `.atomic`.
+    pub fn reached(w: u64, expected: u64) bool {
+        return w >= expected;
+    }
+};
+
+/// The generation words a peer's lane writes into this rank's region: one per lane, at `peer * max_devices + lane`;
+/// the last word is the proxy's local source for the inline write. The region is ordinary pinned host memory (the
+/// words are never write-combined: the NIC and the CPU read-modify-write them).
+pub fn rociWords() usize {
+    return max_ranks * max_devices + 1;
+}
+
+/// The signals a `.word` ring's lane has sent when it reaches sequence `q`: the word is the sequence. An `.atomic`
+/// lane's word counts the fetch-and-adds; the first sequence is 1, so its word is its sequence too.
+pub fn ringWordSignalWord(q: u64) u64 {
+    return q;
+}
 const send_depth = 512;
 const cq_depth = 4096;
 const stage_threads = 512;
@@ -36,6 +81,7 @@ const collect_threads = 256;
 const mtu_4096 = 5;
 const port_num = 1;
 const relay_wr: u64 = 1 << 63; // a relayed write's wr_id: its sequence with this bit
+const fault_magic: u64 = 0x524f_4349_0000_0001; // a generation-word wait's record: "ROCI", written once
 const wc_recv_rdma_with_imm = 129;
 const host_register_portable = 0x01;
 const host_register_devicemap = 0x02;
@@ -62,6 +108,8 @@ pub const Settings = struct {
     unroll: bool = true,
     fence: bool = true,
     probing: bool = false,
+    roci: Roci = .off, // TF_DS_RING_WORD: each lane's plain data write then the generation word it waits on in-kernel
+    roci_deadline_ns: u64 = 120 * std.time.ns_per_s, // a lane's word not reaching its sequence: fail stop after this
     wait_explicit: bool = true, // TF_DS_RING_WAIT was set (to 1), not the default: only names the switch in a refusal (Model.open has already fallen back where the default cannot run)
     wait: bool = false, // TF_DS_RING_WAIT (needs roci == .word): Core Direct queue pairs wait in the card on the doorbell; no proxy thread
     cpu: ?u16 = null, // the proxy thread's CPU (TF_DS_RDMA_CPUS), else wherever the scheduler puts it
@@ -75,6 +123,8 @@ pub const Info = extern struct {
     rkey: [max_devices]u32,
     gid: [max_devices][16]u8,
     recv: u64,
+    gen: u64, // TF_DS_RING_WORD: this rank's generation-word region (0: none)
+    gen_rkey: [max_devices]u32, // its registration on each device
     mac: [max_devices][6]u8, // TF_DS_RING_WAIT: the MAC of each device's network port (a DEVX queue pair is given its peer's, not resolved)
 };
 
@@ -83,6 +133,9 @@ pub const Kernels = struct {
     stage: cuda.Function,
     collect: cuda.Function,
     collect_into: cuda.Function,
+    collect_roci: ?cuda.Function = null,
+    collect_into_roci: ?cuda.Function = null,
+    collect_peers_roci: ?cuda.Function = null,
     stage_wait: ?cuda.Function = null,
     publish_wait: ?cuda.Function = null,
     await_send_wait: ?cuda.Function = null,
@@ -105,8 +158,43 @@ pub const Kernels = struct {
         return .{ .f = plain, .logging = false };
     }
 
+
+    /// Whether the generation-word path can run: the collecting kernels it waits in are in the fatbin.
+    pub fn hasRoci(k: Kernels) bool {
+        return k.collect_roci != null and k.collect_into_roci != null and k.collect_peers_roci != null;
     }
 };
+
+/// [world], the sequence word, the abort word and the probe (device addresses; probe 0: none), this rank and the
+/// world; with TF_DS_RING_WORD the generation words [peer][lane], the lanes toward each peer, the first expired
+/// wait's record and the wait's deadline instead of the flags.
+pub const CollectRing = struct {
+    recv: DevicePtr,
+    flags: DevicePtr,
+    seq: DevicePtr,
+    abort: DevicePtr,
+    probe: DevicePtr = 0,
+    rank: u32,
+    world: u32,
+    gen: DevicePtr = 0,
+    lanes: DevicePtr = 0,
+    fault: DevicePtr = 0,
+    deadline_ns: u64 = 0,
+    roci: Roci = .off,
+    /// This rank's own slice, copied by dsv41_rdma_collect_peers_roci instead of the publishing kernel (own_dst 0: none): where it is read from,
+    /// where it lands (rows of own_row4 float4, own_stride4 apart), and its float4.
+    own_src: DevicePtr = 0,
+    own_dst: DevicePtr = 0,
+    own_row4: u32 = 0,
+    own_stride4: u64 = 0,
+    own_n4: u32 = 0,
+};
+/// Whether a gather's copy-out waits on the lanes' generation words: the ring's own signal (CollectRing.roci), which is off when
+/// connect refused the setting, so no kernel is handed words that do not exist.
+fn collectsOnWords(s: Settings, ring: CollectRing) bool {
+    _ = s;
+    return ring.roci.on();
+}
 
 /// A diagnostic log's file (TF_DS_ROCI_XLOG, TF_DS_NACT_LOG): `text` to <dir named by the environment variable `dir_env`, else the folder's log
 /// directory $HOME/.cache/dsv41-tensorfold/logs>/<name>, the directory and its parents made if missing. True when written; a failure is a log
@@ -211,9 +299,62 @@ pub fn xlogRenderPub(gpa: std.mem.Allocator, rank: u32, world: u32, ring: []cons
     return out.toOwnedSlice(gpa);
 }
 
+/// gather_into's copy-out on `stream`, after the staging kernel: with `s.roci` the generation-word kernels (whose
+/// wait is the lanes' words, bounded); else dsv41_rdma_collect_peers when `s.collect_peers` and the fatbin has it (on
+/// peersGrid's grid; no probe), else dsv41_rdma_collect_into on the baseline grid (the float4 copied out, `copy4`, a block
+/// for each collect_grain x 256 of them, up to collect_blocks). Every path copies the same bytes.
+    if (collectsOnWords(s, ring)) {
+        const w = ring;
         const pr = Kernels.pick(k.collect_peers_roci, k.collect_peers_roci_x);
         if (s.collect_peers) if (pr.f) |f| {
+            var row4s: [max_ranks]u32 = @splat(0);
+            for (0..w.world) |p| row4s[p] = if (peerCopied(d, @intCast(p), w.rank)) @intCast(d.row4[p]) else 0;
+            const g = peersGrid(rows, row4s[0..w.world], w.rank, s.collect_blocks);
+            var b: cuda.Args = .{};
+            b.add(d);
+            b.add(@as(c_int, @intCast(rows)));
+            b.add(w.recv);
+            b.add(w.gen);
+            b.add(w.lanes);
+            b.add(w.seq);
+            b.add(@as(c_int, @intCast(w.rank)));
+            b.add(@as(c_int, @intCast(w.world)));
+            b.add(@as(c_int, @intCast(s.slots)));
+            b.add(@as(u64, s.max_bytes));
+            b.add(w.abort);
+            b.add(w.deadline_ns);
             b.add(w.fault | @intFromBool(pr.logging)); // (the logging variant takes the address tagged with bit 0 and strips it)
+            b.add(@as(c_int, @intFromBool(s.pdl)));
+            b.add(w.own_src);
+            b.add(w.own_dst);
+            b.add(@as(c_int, @intCast(w.own_row4)));
+            b.add(@as(c_longlong, @intCast(w.own_stride4)));
+            b.add(@as(c_int, @intCast(w.own_n4)));
+            if (b.count != 19) return error.BadInfo; // dsv41_rdma_collect_peers_roci's 19 parameters
+            return cuda.launch.launch(f, .{ .grid = .{ .x = g.x, .y = g.y, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = s.pdl }, stream, &b);
+        };
+        const f = k.collect_into_roci orelse return error.BadInfo;
+        var a: cuda.Args = .{};
+        a.add(d);
+        a.add(@as(c_int, @intCast(rows)));
+        a.add(w.recv);
+        a.add(w.gen);
+        a.add(w.lanes);
+        a.add(w.seq);
+        a.add(@as(c_int, @intCast(w.rank)));
+        a.add(@as(c_int, @intCast(w.world)));
+        a.add(@as(c_int, @intCast(s.slots)));
+        a.add(@as(u64, s.max_bytes));
+        a.add(w.probe);
+        a.add(w.abort);
+        a.add(w.deadline_ns);
+        a.add(w.fault);
+        a.add(@as(c_int, @intFromBool(s.pdl)));
+        if (a.count != 15) return error.BadInfo; // dsv41_rdma_collect_into_roci's 15 parameters
+        const per = collect_threads * s.collect_grain;
+        const blocks = std.math.clamp((copy4 + per - 1) / per, 1, s.collect_blocks);
+        return cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = s.pdl }, stream, &a);
+    }
 /// cuMemHostRegister / cuMemHostUnregister, which the runtime's driver table does not hold.
 const HostReg = struct {
     lib: std.DynLib,
@@ -265,13 +406,18 @@ const Nic = struct {
     cq: *vabi.Cq,
     mr_send: *vabi.Mr,
     mr_recv: *vabi.Mr,
+    mr_gen: ?*vabi.Mr = null, // TF_DS_RING_WORD: the generation words, written by the peers' NICs
     mr_meta: ?*vabi.Mr = null, // TF_DS_RING_WAIT: the doorbell's memory (the card's WAIT reads it)
+    mr_sink: ?*vabi.Mr = null, // TF_DS_RING_WAIT with the atomic signal: where the atomics' old values land
     mac: [6]u8 = @splat(0), // TF_DS_RING_WAIT: this port's MAC
     gid: [16]u8,
     gid_index: u8,
     mtu: c_int = mtu_4096, // the port's active MTU (ibv_query_port), capped at 4096: the QPs' path MTU
+    atomic_cap: c_int = vabi.atomic_glob, // ibv_query_device's ibv_atomic_cap
     max_rd_atom: c_int = 16, // ibv_query_device's max_qp_rd_atom (ATOMICs in flight a responder grants a queue pair) and max_qp_init_rd_atom (a requester)
     max_init_rd_atom: c_int = 16,
+    inline_ok: bool = true, // the queue pairs granted room for the 8-byte generation word
+    name: []const u8 = "",
     used: bool = false, // some route runs on it (the proxy polls its queue)
     qps: [max_ranks]?*vabi.Qp = @splat(null),
     psns: [max_ranks]u32 = @splat(0),
@@ -287,6 +433,8 @@ const Peer = struct {
     rkey: [max_devices]u32 = @splat(0),
     gid: [max_devices][16]u8 = @splat(@splat(0)),
     recv: u64 = 0,
+    gen: u64 = 0, // TF_DS_RING_WORD: the peer's generation-word region
+    gen_rkey: [max_devices]u32 = @splat(0), // its registration on the device of each lane
     mac: [max_devices][6]u8 = @splat(@splat(0)), // TF_DS_RING_WAIT: the MAC of its port on the device of each lane
     relayers: [max_ranks]u8 = @splat(0), // relayed: the relaying ranks, in rank order (relayer k carries half k)
     n_relayers: u32 = 0,
@@ -415,12 +563,38 @@ pub fn waitRefusalHead(buf: []u8, explicit: bool) []const u8 {
     return std.fmt.bufPrint(buf, "{s} refused", .{if (explicit) "TF_DS_RING_WAIT=1" else "TF_DS_RING_WAIT (unset: the default)"}) catch "TF_DS_RING_WAIT refused";
 }
 
+/// What a device answered about atomics.
+pub const AtomicCaps = struct { atomic_cap: c_int, max_qp_rd_atom: c_int, max_qp_init_rd_atom: c_int };
+
+/// Why the atomic signal cannot run on these devices (the first that cannot), for the start's fallback to the WRITE / inline word; null only when every
+/// device was opened, asked, and can. A device that cannot be opened or asked, or a verbs library that does not load, is a card that cannot: the
+/// reason names the device and the error. `src` answers `caps(name) !AtomicCaps` (the real verbs, or a card model in the tests).
+pub fn probeAtomicWith(buf: []u8, names: []const []const u8, src: anytype) ?[]const u8 {
     for (names) |name| {
+        const c = src.caps(name) catch |e|
+            return std.fmt.bufPrint(buf, "device {s} cannot be asked about atomics ({s})", .{ name, @errorName(e) }) catch "a device cannot be asked about atomics";
+        if (atomicRefusal(buf, name, c.atomic_cap, c.max_qp_rd_atom, c.max_qp_init_rd_atom)) |why| return why;
     }
     return null;
 }
 
+const VerbsCaps = struct {
+    v: *const Verbs,
+    fn caps(self: VerbsCaps, name: []const u8) !AtomicCaps {
+        const ctx = try self.v.openDevice(name);
+        defer _ = self.v.api.ibv_close_device(ctx);
+        var a: vabi.DeviceAttr = undefined;
+        if (self.v.api.ibv_query_device(ctx, &a) != 0) return error.QueryFailed;
+        return .{ .atomic_cap = a.atomic_cap, .max_qp_rd_atom = a.max_qp_rd_atom, .max_qp_init_rd_atom = a.max_qp_init_rd_atom };
+    }
 };
+
+pub fn probeAtomic(buf: []u8, names: []const []const u8) ?[]const u8 {
+    var v = Verbs.open(null) catch |e|
+        return std.fmt.bufPrint(buf, "the verbs library does not load ({s})", .{@errorName(e)}) catch "the verbs library does not load";
+    defer v.close();
+    return probeAtomicWith(buf, names, VerbsCaps{ .v = &v });
+}
 
 pub const Ring = struct {
     d: *const cuda.Driver,
@@ -434,10 +608,17 @@ pub const Ring = struct {
     send: Pinned,
     recv: Pinned,
     meta: Pinned,
+    gen: ?Pinned = null, // TF_DS_RING_WORD: the generation words [peer][lane] and the proxy's local word
+    lanes_dev: ?cuda.DeviceBuffer = null, // the lanes toward each peer, the waiting kernel's [world] u32
+    fault: ?cuda.DeviceBuffer = null, // the first expired generation-word wait: magic, seq, rank, peer/lane, seen, waited, when, why
+    roci_live: bool = false, // the switch is on and this ring can run it (a lane to every peer, the kernels, the atomics)
+    roci_why: [96]u8 = @splat(0), // why it cannot, when it was asked for
+    roci_order: c_int = -1, // ibv_query_qp_data_in_order(RDMA_WRITE) on the lanes, the most conservative answer (-1: not asked)
     mlx: ?mx.Mlx5 = null, // TF_DS_RING_WAIT: libmlx5, loaded by dlopen
     cd: ?*wait.Backend = null, // TF_DS_RING_WAIT: the queue pairs that wait in the card
     cd_tab: wait.CqTab = .{}, // TF_DS_RING_WAIT: the staging kernels' credit table (one wait.CqRef a lane), passed to them by value
     cd_n: u32 = 0, // its entries
+    cd_sink: ?Pinned = null, // the atomic signal's landing words [peer][lane] (host memory, local write): the old value of each lane's last atomic
     scalars: cuda.DeviceBuffer, // seq (u64), staged (u32), probe (8 x u64)
     nics: [max_devices]Nic = undefined,
     nd: u32 = 0,
@@ -446,6 +627,7 @@ pub const Ring = struct {
     n_jobs: u32 = 0,
     proxy: ?std.Thread = null,
     idle_gate: IdleGate = .{},
+    failure_peer: ?*Ring = null, // the ring whose failure this one follows (neighbor pairs): fail() fails both
     running: std.atomic.Value(bool) = .init(false),
     failed: std.atomic.Value(bool) = .init(false),
     why: [128]u8 = @splat(0),
@@ -466,6 +648,25 @@ pub const Ring = struct {
     fn abortWord(r: *const Ring) *u64 {
         return &r.sent()[r.s.slots];
     }
+        return @intFromBool(r.s.wc) | (@as(u32, @intFromBool(r.s.inplace)) << 1) |
+            (@as(u32, @intFromBool(r.s.roci.on())) << 2) | (@as(u32, @intFromBool(r.s.roci == .atomic)) << 3) | (@as(u32, @intFromBool(r.s.wait)) << 4) | (@as(u32, r.cdDepth()) << 8);
+    }
+
+    /// The generation words: `peer * max_devices + lane` for each sender's lane, then the proxy's local word (the
+    /// source of an inline write; the NICs of the peers never write it).
+    fn genWords(r: *const Ring) [*]u64 {
+        return @ptrCast(@alignCast(r.gen.?.mem.ptr));
+    }
+
+    /// The word the proxy writes inline: the sequence, written before the sequence's word writes are posted (the
+    /// provider copies inline data when the work request is posted).
+    fn rociWord(r: *const Ring) *u64 {
+        return &r.genWords()[max_ranks * max_devices];
+    }
+
+    fn rociWordBytes(r: *const Ring) []const u8 {
+        const p: [*]const u8 = @ptrCast(r.rociWord());
+        return p[0..8];
     fn metaDev(r: *const Ring, p: anytype) DevicePtr {
         return r.meta.dev + (@intFromPtr(p) - @intFromPtr(r.meta.mem.ptr));
     }
@@ -474,6 +675,11 @@ pub const Ring = struct {
     pub fn create(gpa: std.mem.Allocator, d: *const cuda.Driver, k: Kernels, devices: []const []const u8, rank: u32, world: u32, s: Settings) Error!*Ring {
         if (world < 2 or world > max_ranks or rank >= world or devices.len == 0 or devices.len > max_devices) return error.BadInfo;
         if (s.slots < 2 or s.slots > seqs.max_slots or s.max_bytes == 0 or s.max_bytes % 64 != 0) return error.BadInfo;
+        if (s.roci.on() and s.roci_deadline_ns == 0) return error.BadInfo; // a lost word must end, never wait forever
+        if (s.wait and (!s.roci.on() or !k.hasWait())) {
+            // the chains end in the generation word's signal (the inline WRITE or the atomic) and the kernels read the completion queues: the start's
+            // checks (Model.open) refuse first
+            std.log.err("TF_DS_RING_WAIT=1: needs TF_DS_RING_WORD=1 and the wait kernels in the fatbin", .{});
             return error.BadInfo;
         }
         const r = try gpa.create(Ring);
@@ -490,16 +696,35 @@ pub const Ring = struct {
             };
         }
         errdefer if (mlx) |*m| m.close();
+        var cd_sink: ?Pinned = null;
+        if (s.wait and s.roci == .atomic) cd_sink = try Pinned.alloc(d, &hr, max_ranks * max_devices * 8);
+        errdefer if (cd_sink) |*t| t.free(&hr);
         errdefer send.free(&hr);
         var recv = try Pinned.alloc(d, &hr, s.slots * world * s.max_bytes);
         errdefer recv.free(&hr);
         var meta = try Pinned.alloc(d, &hr, (s.slots * world + 1 + 2 * s.slots + 1) * 8);
         errdefer meta.free(&hr);
-        var scalars = try cuda.DeviceBuffer.alloc(d, 80);
+        var scalars = try cuda.DeviceBuffer.alloc(d, scalars_bytes);
         errdefer scalars.free();
         try scalars.fill8(0, null);
-        r.* = .{ .d = d, .verbs = verbs, .k = k, .s = s, .rank = rank, .world = world, .hr = hr, .send = send, .recv = recv, .meta = meta, .scalars = scalars };
+        var gen: ?Pinned = null;
+        if (s.roci.on()) {
+            gen = try Pinned.alloc(d, &hr, rociWords() * 8);
+            errdefer gen.?.free(&hr);
+        }
+        var lanes_dev: ?cuda.DeviceBuffer = null;
+        if (s.roci.on()) {
+            lanes_dev = try cuda.DeviceBuffer.alloc(d, world * 4);
+            errdefer lanes_dev.?.free();
+            try lanes_dev.?.fill8(0, null);
+        }
+        var fault: ?cuda.DeviceBuffer = null;
+        if (s.roci.on()) {
             fault = try cuda.DeviceBuffer.alloc(d, 64 + xlog_recv_records * 32 + xlog_records * 16);
+            errdefer fault.?.free();
+            try fault.?.fill8(0, null);
+        }
+        r.* = .{ .d = d, .verbs = verbs, .k = k, .s = s, .rank = rank, .world = world, .hr = hr, .send = send, .recv = recv, .meta = meta, .gen = gen, .lanes_dev = lanes_dev, .fault = fault, .scalars = scalars, .dead_ms = dead_ms, .mlx = mlx, .cd_sink = cd_sink };
         r.v = &r.verbs;
         errdefer for (r.nics[0..r.nd]) |*n| r.closeNic(n);
         for (devices) |name| {
@@ -527,14 +752,26 @@ pub const Ring = struct {
         errdefer _ = api.ibv_dereg_mr(mr_send);
         const mr_recv = api.ibv_reg_mr(pd, r.recv.mem.ptr, r.recv.mem.len, access) orelse return error.VerbsFailed;
         errdefer _ = api.ibv_dereg_mr(mr_recv);
-        const gid = try r.v.gid(ctx, 1, r.s.gid_index);
-        var nic: Nic = .{ .ctx = ctx, .pd = pd, .cq = cq, .mr_send = mr_send, .mr_recv = mr_recv, .gid = gid.raw };
+        var mr_gen: ?*vabi.Mr = null;
+        if (r.s.roci.on()) {
+            // the peers' NICs write these words: remote write, and with the atomic signal remote atomic
+            const ga = access | (if (r.s.roci == .atomic) @as(c_int, vabi.access_remote_atomic) else 0);
+            mr_gen = api.ibv_reg_mr(pd, r.gen.?.mem.ptr, r.gen.?.mem.len, ga) orelse return error.VerbsFailed;
+            errdefer _ = api.ibv_dereg_mr(mr_gen.?);
+        }
+        var mr_sink: ?*vabi.Mr = null;
+        if (r.s.wait and r.s.roci == .atomic) {
+            mr_sink = api.ibv_reg_mr(pd, r.cd_sink.?.mem.ptr, r.cd_sink.?.mem.len, vabi.access_local_write) orelse return error.VerbsFailed;
+            errdefer _ = api.ibv_dereg_mr(mr_sink.?);
+        }
         var mr_meta: ?*vabi.Mr = null;
         if (r.s.wait) {
             // the card's WAIT reads the doorbell word: its memory is registered on this device
             mr_meta = api.ibv_reg_mr(pd, r.meta.mem.ptr, r.meta.mem.len, access) orelse return error.VerbsFailed;
             errdefer _ = api.ibv_dereg_mr(mr_meta.?);
         }
+        var dev_attr: vabi.DeviceAttr = undefined;
+        if (api.ibv_query_device(ctx, &dev_attr) != 0) return error.VerbsFailed;
         const gi = try r.pickGid(ctx, name);
         const gid = try r.v.gid(ctx, port_num, gi);
         // Path MTU from the port's active MTU, capped at 4096 (enum 5), instead of a fixed 4096: on a fabric whose
@@ -556,10 +793,20 @@ pub const Ring = struct {
         }
         for (0..r.world) |p| {
             if (p == r.rank) continue;
-            var init: vabi.QpInitAttr = .{ .send_cq = cq, .recv_cq = cq, .cap = .{ .max_send_wr = send_depth, .max_recv_wr = recv_depth, .max_send_sge = 1, .max_recv_sge = 1, .max_inline_data = 0 }, .qp_type = vabi.qpt_rc };
+            // the generation word is 8 bytes and rides inline: ask the queue pair for room for it
+            const inline_data: u32 = if (r.s.roci.on()) 16 else 0;
+            var init: vabi.QpInitAttr = .{ .send_cq = cq, .recv_cq = cq, .cap = .{ .max_send_wr = send_depth, .max_recv_wr = recv_depth, .max_send_sge = 1, .max_recv_sge = 1, .max_inline_data = inline_data }, .qp_type = vabi.qpt_rc };
             const qp = api.ibv_create_qp(pd, &init) orelse return error.VerbsFailed;
             nic.qps[p] = qp;
-            var a: vabi.QpAttr = .{ .qp_state = vabi.qps_init, .port_num = 1, .qp_access_flags = vabi.access_remote_write };
+            if (r.s.roci.on()) {
+                // the granted inline capacity, not the requested one: an 8-byte word must fit whole
+                var qa: vabi.QpAttr = undefined;
+                var qia: vabi.QpInitAttr = undefined;
+                if (api.ibv_query_qp(qp, &qa, 0, &qia) != 0) return error.VerbsFailed;
+                if (qia.cap.max_inline_data < 8) nic.inline_ok = false;
+            }
+            const qp_access: c_uint = vabi.access_remote_write | (if (r.s.roci == .atomic) @as(c_uint, vabi.access_remote_atomic) else 0);
+            var a: vabi.QpAttr = .{ .qp_state = vabi.qps_init, .port_num = port_num, .qp_access_flags = qp_access };
             const m = vabi.mask;
             if (api.ibv_modify_qp(qp, &a, m.state | m.pkey_index | m.port | m.access_flags) != 0) return error.VerbsFailed;
             for (0..recv_depth) |_| try postRecv(ctx, qp);
@@ -588,7 +835,9 @@ pub const Ring = struct {
         for (n.qps) |q| if (q) |qp| {
             _ = api.ibv_destroy_qp(qp);
         };
+        if (n.mr_sink) |m| _ = api.ibv_dereg_mr(m);
         if (n.mr_meta) |m| _ = api.ibv_dereg_mr(m);
+        if (n.mr_gen) |m| _ = api.ibv_dereg_mr(m);
         _ = api.ibv_dereg_mr(n.mr_recv);
         _ = api.ibv_dereg_mr(n.mr_send);
         _ = api.ibv_destroy_cq(n.cq);
@@ -703,6 +952,8 @@ pub const Ring = struct {
                     .bell_lkey = nic.mr_meta.?.lkey,
                     .gen_va = peer.gen + (@as(u64, r.rank) * max_devices + @as(u64, @intCast(k))) * 8,
                     .gen_rkey = peer.gen_rkey[k],
+                    .sink_va = if (r.cd_sink) |sk| @intFromPtr(sk.mem.ptr) + (p * max_devices + k) * 8 else 0,
+                    .sink_lkey = if (nic.mr_sink) |m| m.lkey else 0,
                 }) catch return error.BadInfo;
             }
         }
@@ -723,6 +974,12 @@ pub const Ring = struct {
             init = @min(init, n.max_init_rd_atom);
         }
         return atomicDepth(r.s.slots, rd, init);
+    }
+
+    /// The ATOMICs in flight the card-waiting queue pairs were set up for (0: not the atomic signal or not waiting): part of the switch word the peers
+    /// compare, so two ranks that chose differently refuse each other at connect.
+    fn cdDepth(r: *const Ring) u8 {
+        return if (r.s.wait and r.s.roci == .atomic and r.cd != null) r.ringAtomicDepth() else 0;
     }
 
     fn failCb(owner: *anyopaque, why: []const u8) void {
@@ -776,6 +1033,7 @@ pub const Ring = struct {
 
     /// TF_DS_RING_WAIT's start line.
     pub fn waitLine(r: *const Ring, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "TF_DS_RING_WAIT: on: {s}: no proxy thread; {d} queue pair(s) wait in the card on the doorbell (big-endian word, WAIT >= the sequence), their chains written when an exchange launches, each ending in {s}; the staging kernel's credit is the card's completion of that last entry (one completion queue a queue pair); one janitor thread looks every {d} ms for a failure", .{ r.s.name, r.cd_n, if (r.s.roci == .atomic) "the RDMA atomic fetch-and-add of the peer's generation word (the guaranteed arrival signal)" else "the inline WRITE of the generation word", r.cd.?.p.sweep_ms }) catch "TF_DS_RING_WAIT=1: on";
     }
 
     pub fn destroy(r: *Ring, gpa: std.mem.Allocator) void {
@@ -783,7 +1041,11 @@ pub const Ring = struct {
         r.stop();
         r.waitClose();
         for (r.nics[0..r.nd]) |*n| r.closeNic(n);
+        if (r.cd_sink) |*t| t.free(&r.hr);
         if (r.mlx) |*m| m.close();
+        if (r.fault) |*b| b.free();
+        if (r.lanes_dev) |*b| b.free();
+        if (r.gen) |*g| g.free(&r.hr);
         r.scalars.free();
         r.meta.free(&r.hr);
         r.recv.free(&r.hr);
@@ -798,12 +1060,14 @@ pub const Ring = struct {
         var out: Info = std.mem.zeroes(Info);
         out.devices = r.nd;
         out.recv = @intFromPtr(r.recv.mem.ptr);
+        out.gen = if (r.gen) |g| @intFromPtr(g.mem.ptr) else 0;
         for (r.nics[0..r.nd], 0..) |n, d| {
             out.qpn[d] = if (r.cd) |c| (if (c.qps[d][p]) |q| q.qpn else 0) else if (n.qps[p]) |qp| qp.qp_num else 0;
             out.psn[d] = n.psns[p];
             out.mac[d] = n.mac;
             out.rkey[d] = n.mr_recv.rkey;
             out.gid[d] = n.gid;
+            out.gen_rkey[d] = if (n.mr_gen) |m| m.rkey else 0;
         }
         return out;
     }
@@ -823,11 +1087,14 @@ pub const Ring = struct {
         var all: [max_ranks]Info = undefined;
         for (0..r.world) |p| all[p] = if (p == r.rank) r.info(@intCast((r.rank + 1) % r.world)) else remote[p];
         for (remote, 0..) |ri, p| if (p != r.rank and (ri.devices == 0 or ri.devices > max_devices)) return error.BadInfo;
+        for (remote, 0..) |ri, p| if (p != r.rank and ri.flags != r.switchBits()) {
+            std.log.err("{s}: rank {d}'s ring switches 0x{x} differ from this rank's 0x{x} (bit 2 generation word, 3 atomic signal, 4 card WAIT, bits 8-15 the ATOMICs in flight): every rank must choose alike", .{ r.s.name, p, ri.flags, r.switchBits() });
+            return error.BadInfo;
+        };
         var mine_g: [max_devices][16]u8 = undefined;
         for (r.nics[0..r.nd], 0..) |n, d| mine_g[d] = n.gid;
         for (remote, 0..) |ri, p| {
             if (p == r.rank) continue;
-            if (ri.devices != r.nd) return error.BadInfo;
             const peer = &r.peers[p];
             peer.* = .{ .recv = ri.recv };
             var pairs: [max_devices][2]u8 = undefined;
@@ -838,12 +1105,14 @@ pub const Ring = struct {
                 break :blk r.nd;
             };
             peer.lanes = n;
+            peer.gen = ri.gen;
             for (pairs[0..n], 0..) |pr, k| {
                 peer.nic[k] = pr[0];
                 peer.qpn[k] = ri.qpn[pr[1]];
                 peer.psn[k] = ri.psn[pr[1]];
                 peer.rkey[k] = ri.rkey[pr[1]];
                 peer.gid[k] = ri.gid[pr[1]];
+                peer.gen_rkey[k] = ri.gen_rkey[pr[1]];
                 peer.mac[k] = ri.mac[pr[1]];
             }
             if (n == 0) {
@@ -858,11 +1127,61 @@ pub const Ring = struct {
                 if (peer.n_relayers == 0 or peer.n_relayers > max_devices) return error.BadInfo;
             }
         }
+        // TF_DS_RING_WORD: every peer's lane writes its generation word, so a relayed peer (a rank no device here
+        // reaches) cannot run it: its writes would come from a relaying rank that would have to wait on its own words
+        // first. The atomic signal also needs global atomics on every device it runs on.
+        r.roci_live = false;
+        r.roci_order = -1;
+        if (r.s.roci.on()) {
+            var ok = r.k.hasRoci();
+            if (!ok) r.rociNote("the rings' kernels have no dsv41_rdma_collect_roci / _into_roci / _peers_roci", .{});
+            if (ok) for (0..r.world) |p| {
+                if (p == r.rank) continue;
+                if (r.peers[p].lanes == 0) {
+                    ok = false;
+                    r.rociNote("the ring relays to node {d}, a rank no device here reaches: the generation word needs a lane to every peer", .{p});
+                    break;
+                }
+                if (r.peers[p].gen == 0 or r.peers[p].gen_rkey[0] == 0) {
+                    ok = false;
+                    r.rociNote("node {d}'s generation words are not registered (its build or start has none)", .{p});
+                    break;
+                }
+            };
+            // the devices the lanes run on (connect marks `used` only after this check)
+            if (ok and r.s.roci == .atomic) {
+                for (0..r.world) |p| {
+                    if (p == r.rank) continue;
+                    for (0..r.peers[p].lanes) |k| {
+                        const n = r.nics[r.peers[p].nic[k]];
                         // a generation word has one remote writer (the peer's queue pair for the lane) and the GPU only reads it: the atomic is there
                         // for its place after the earlier WRITEs, so the card's own atomics (HCA scope, the CX-7's) are enough, as for Rocinante's words
                         var rb: [300]u8 = undefined;
                         if (atomicRefusal(&rb, n.name, n.atomic_cap, n.max_rd_atom, n.max_init_rd_atom)) |why| {
+                            ok = false;
                             r.rociNote("{s}", .{why});
+                            break;
+                        }
+                    }
+                    if (!ok) break;
+                }
+            }
+            if (ok and r.s.roci == .word) {
+                for (0..r.world) |p| {
+                    if (p == r.rank) continue;
+                    for (0..r.peers[p].lanes) |k| {
+                        const n = r.nics[r.peers[p].nic[k]];
+                        if (!n.inline_ok) {
+                            ok = false;
+                            r.rociNote("device {s} granted less than 8 bytes of inline data: the generation word needs 8", .{n.name});
+                            break;
+                        }
+                    }
+                    if (!ok) break;
+                }
+            }
+            r.roci_live = ok;
+        }
         if (r.s.wait and !r.roci_live) {
             var hb: [200]u8 = undefined;
             std.log.err("{s}: the generation word cannot run on this ring: {s}", .{ waitRefusalHead(&hb, r.s.wait_explicit), std.mem.sliceTo(&r.roci_why, 0) });
@@ -897,14 +1216,28 @@ pub const Ring = struct {
                     continue;
                 }
                 const qp = n.qps[p].?;
-                var a: vabi.QpAttr = .{ .qp_state = vabi.qps_rtr, .path_mtu = mtu_4096, .dest_qp_num = ri.qpn[d], .rq_psn = ri.psn[d], .max_dest_rd_atomic = 1, .min_rnr_timer = 12 };
-                a.ah_attr = .{ .grh = .{ .dgid = .{ .raw = ri.gid[d] }, .sgid_index = r.s.gid_index, .hop_limit = 64 }, .is_global = 1, .port_num = 1 };
+                // the atomic signal may have a ring's slots of fetch-and-adds outstanding on one queue pair
+                const rd_atomic: u8 = if (r.s.roci == .atomic) @intCast(r.s.slots) else 1;
+                var a: vabi.QpAttr = .{ .qp_state = vabi.qps_rtr, .path_mtu = n.mtu, .dest_qp_num = peer.qpn[k], .rq_psn = peer.psn[k], .max_dest_rd_atomic = rd_atomic, .min_rnr_timer = 12 };
                 a.ah_attr = .{ .grh = .{ .dgid = .{ .raw = peer.gid[k] }, .sgid_index = n.gid_index, .hop_limit = 64 }, .is_global = 1, .port_num = port_num };
                 if (api.ibv_modify_qp(qp, &a, m.state | m.av | m.path_mtu | m.dest_qpn | m.rq_psn | m.max_dest_rd_atomic | m.min_rnr_timer) != 0) return error.VerbsFailed;
-                a = .{ .qp_state = vabi.qps_rts, .timeout = 14, .retry_cnt = 7, .rnr_retry = 7, .sq_psn = n.psns[p], .max_rd_atomic = 1 };
+                a = .{ .qp_state = vabi.qps_rts, .timeout = 14, .retry_cnt = 7, .rnr_retry = 7, .sq_psn = n.psns[p], .max_rd_atomic = rd_atomic };
                 if (api.ibv_modify_qp(qp, &a, m.state | m.timeout | m.retry_cnt | m.rnr_retry | m.sq_psn | m.max_qp_rd_atomic) != 0) return error.VerbsFailed;
             }
         }
+        // TF_DS_RING_WORD's ordering record: what the provider says about a WRITE's data, the most conservative
+        // answer over the lanes. The wait itself relies on the observed order, as the other arrival signals do.
+        if (r.roci_live) if (r.v.in_order) |f| {
+            var best: c_int = std.math.maxInt(c_int);
+            for (0..r.world) |p| {
+                if (p == r.rank) continue;
+                for (0..r.peers[p].lanes) |k| {
+                    const qp = r.nics[r.peers[p].nic[k]].qps[p] orelse continue;
+                    best = @min(best, f(qp, vabi.wr_rdma_write, 0));
+                }
+            }
+            if (best != std.math.maxInt(c_int)) r.roci_order = best;
+        };
         if (r.cd != null) {
             try r.waitLanes();
             r.roci_order = 1; // measured on both rails through DEVX: qpc.data_in_order = 1 (whole message), ENGINE-FACTS
@@ -922,7 +1255,16 @@ pub const Ring = struct {
 
     pub fn start(r: *Ring) Error!void {
         if (r.running.swap(true, .acq_rel)) return;
-        r.proxy = try std.Thread.spawn(.{}, proxyLoop, .{r});
+        if (r.s.roci.on()) {
+            if (r.roci_live) {
+                // the lanes toward each peer, as the waiting kernel reads them
+                var lanes: [max_ranks]u32 = @splat(0);
+                for (0..r.world) |p| lanes[p] = r.peers[p].lanes;
+                if (r.lanes_dev) |*b| try b.upload(0, std.mem.sliceAsBytes(lanes[0..r.world]));
+            }
+            var buf: [384]u8 = undefined;
+            r.logLine(r.rociLine(&buf));
+        }
         if (r.cd) |c| {
             // no proxy: the card runs the chains; one janitor thread looks for a failure
             r.napping = false;
@@ -945,19 +1287,33 @@ pub const Ring = struct {
         r.proxy = null;
     }
 
-    /// Every wait on this rank gives up from now on (a watchdog lost a peer); `failure` says why.
-    pub fn abort(r: *Ring, why: []const u8) void {
-        r.fail(why);
+    /// Why the generation-word switch cannot run on this ring, kept for its start line.
+    fn rociNote(r: *Ring, comptime fmt: []const u8, args: anytype) void {
+        const n = std.fmt.bufPrint(&r.roci_why, fmt, args) catch return;
+        if (n.len < r.roci_why.len) r.roci_why[n.len] = 0;
     }
 
-    pub fn failure(r: *const Ring) ?[]const u8 {
-        if (!r.failed.load(.acquire)) return null;
-        return std.mem.sliceTo(&r.why, 0);
+    /// TF_DS_RING_WORD's start line: on with its signal and what the in-order query said, or off and why.
+    pub fn rociLine(r: *const Ring, buf: []u8) []const u8 {
+        if (!r.s.roci.on()) return "";
+        if (!r.roci_live) return std.fmt.bufPrint(buf, "TF_DS_RING_WORD=1: off: {s}", .{std.mem.sliceTo(&r.roci_why, 0)}) catch "TF_DS_RING_WORD=1: off";
+        const order: []const u8 = switch (r.roci_order) {
+            1 => "whole message",
+            2 => "128-byte blocks",
+            else => "not promised",
+        };
+        const signal: []const u8 = if (r.s.roci == .word)
+            "an inline 8-byte RDMA WRITE after it on the same queue pair"
+        else
+            "an RDMA ATOMIC fetch-and-add after it on the same queue pair";
+        return std.fmt.bufPrint(buf, "TF_DS_RING_WORD=1: each lane's data is a plain RDMA WRITE and its 64-bit generation word {s}; the collecting kernel waits on every lane's word (>= the sequence, bounded by a deadline and the abort word; ibv_query_qp_data_in_order over the lanes: {s}): the same bytes", .{ signal, order }) catch "TF_DS_RING_WORD=1: on";
     }
 
-    fn fail(r: *Ring, why: []const u8) void {
-        r.failLocal(why);
-        if (r.failure_peer) |peer| peer.failLocal(why);
+    /// The first expired generation-word wait, if one wrote its record; call after the stream is synchronized. The
+    /// record: magic (tags a written record), sequence, this rank, peer and lane, the word seen, the wait's ns, when,
+    /// and why (1: the abort word, 2: the deadline).
+    pub const Fault = struct { seq: u64 = 0, rank: u32 = 0, peer: u32 = 0, lane: u32 = 0, seen: u64 = 0, waited_ns: u64 = 0, at_ns: u64 = 0, why: u64 = 0 };
+
     /// The exchange log (TF_DS_ROCI_XLOG): the records written so far, in ring order, empty slots left out; call after the stream is
     /// synchronized. Returns the count.
     pub fn xlogRead(r: *Ring, out: []XlogRec) usize {
@@ -998,6 +1354,15 @@ pub const Ring = struct {
         if (diagWriteFile("TF_DS_ROCI_XLOG_DIR", name, text)) std.log.info("TF_DS_ROCI_XLOG: {d} exchange records written ({s})", .{ n, name });
     }
 
+    pub fn faultRecord(r: *Ring, out: *Fault) bool {
+        const b = r.fault orelse return false;
+        var words: [8]u64 = undefined;
+        b.download(0, std.mem.sliceAsBytes(&words)) catch return false;
+        if (words[0] != fault_magic) return false;
+        out.* = .{ .seq = words[1], .rank = @truncate(words[2]), .peer = @truncate(words[3] >> 32), .lane = @truncate(words[3]), .seen = words[4], .waited_ns = words[5], .at_ns = words[6], .why = words[7] };
+        return true;
+    }
+
         const was_running = r.running.swap(false, .acq_rel);
         if (was_running and r.cd != null) {
             r.cd.?.stopJanitor(); // no proxy: the queue pairs stay armed until the ring is destroyed or fails
@@ -1022,6 +1387,25 @@ pub const Ring = struct {
     }
 
     pub fn failure(r: *const Ring) ?[]const u8 {
+        if (!r.failed.load(.acquire)) {
+            // TF_DS_RING_WORD: a waiting kernel's expiry sets the abort word (a system store into this memory); the
+            // next gather must refuse rather than post into a ring whose sequences are no longer trusted
+            if (@atomicLoad(u64, r.abortWord(), .acquire) != 0) return "a bounded generation-word wait ended: the ring is poisoned";
+            return null;
+        }
+        return std.mem.sliceTo(&r.why, 0);
+    }
+
+    fn fail(r: *Ring, why: []const u8) void {
+        r.failLocal(why);
+        if (r.failure_peer) |peer| peer.failLocal(why);
+    }
+
+    fn failLocal(r: *Ring, why: []const u8) void {
+        if (!r.failed.swap(true, .acq_rel)) {
+            const n = @min(why.len, r.why.len - 1);
+            @memcpy(r.why[0..n], why[0..n]);
+        }
         // TF_DS_RING_WAIT: the queue pairs leave the card first (an armed WAIT is flushed, not released), then the abort word
         if (r.cd) |c| c.fence();
         @atomicStore(u64, r.abortWord(), 1, .release);
@@ -1053,7 +1437,13 @@ pub const Ring = struct {
             };
             if (!r.running.load(.acquire)) break;
             const ring = @atomicLoad(u64, r.doorbell(), .acquire);
-            while (posted < ring) {
+            // TF_DS_RING_WORD: the doorbell is a counter whose every sequence must be posted; the GPU cannot ring
+            // more than the ring's slots ahead (the staging kernel waits on `sent`), so more pending than slots is a
+            // skipped sequence, and the peers would wait on a word that never comes. Fail stop here.
+            if (r.roci_live and ring -| posted > r.s.slots) {
+                r.fail("the doorbell holds more sequences than the ring's slots: a sequence was skipped");
+                return;
+            }
             // a relaying rank's own sequence q goes out once its relays of every sequence up to q - (slots - 1) are
             // done: an owner sends q + 1 (into the slot of q + 1 - slots) only after collecting this rank's q
             while (posted < ring and (r.n_jobs == 0 or relays.upto + r.s.slots >= posted + 2)) {
@@ -1067,6 +1457,10 @@ pub const Ring = struct {
                     for (0..r.world) |p| {
                         if (p == r.rank) continue;
                         const local = r.send.mem[slot * r.s.max_bytes + off ..][0..len];
+                // the inline word's source: one value for every lane of this sequence, copied when each WQE is posted
+                if (r.roci_live and r.s.roci == .word) @atomicStore(u64, r.rociWord(), ringWordSignalWord(q), .release);
+                for (0..r.world) |p| {
+                    if (p == r.rank) continue;
                     const peer = &r.peers[p];
                     for (0..peer.lanes) |k| {
                         const nic = &r.nics[peer.nic[k]];
@@ -1074,15 +1468,41 @@ pub const Ring = struct {
                         const off: usize = @intCast(pt.off);
                         const len: usize = @intCast(pt.len);
                         const at: u64 = @intCast((slot * r.world + r.rank) * r.s.max_bytes + off);
-                        postWrite(nic.ctx, nic.qps[p].?, local, nic.mr_send.lkey, r.peers[p].recv + at, r.peers[p].rkey[d], q) catch {
+                        if (r.roci_live) {
+                            const mr_gen = nic.mr_gen orelse {
+                                r.fail("a generation-word region without a registration");
+                                return;
+                            };
+                            // the word of the sender's lane k, in the receiver's [peer][lane] region (its pairing
+                            // gives both ends the same lane index)
+                            const gen_at = peer.gen + (@as(u64, r.rank) * max_devices + @as(u64, @intCast(k))) * 8;
+                            if (len > 0) postData(nic.ctx, nic.qps[p].?, local, nic.mr_send.lkey, peer.recv + at, peer.rkey[k], q) catch {
+                                r.fail("ibv_post_send failed");
+                                return;
+                            };
+                            if (r.s.roci == .word) {
+                                postWord(nic.ctx, nic.qps[p].?, r.rociWordBytes(), mr_gen.lkey, gen_at, peer.gen_rkey[k], q) catch {
+                                    r.fail("ibv_post_send (the generation word) failed");
+                                    return;
+                                };
+                            } else postFetchAdd(nic.ctx, nic.qps[p].?, gen_at, peer.gen_rkey[k], q) catch {
+                                r.fail("ibv_post_send (the generation word) failed");
+                                return;
+                            };
+                        } else postWrite(nic.ctx, nic.qps[p].?, local, nic.mr_send.lkey, peer.recv + at, peer.rkey[k], q, seqs.immediate(q, null)) catch {
                             r.fail("ibv_post_send failed");
                             return;
                         };
                     }
                 }
+                // (under TF_DS_RING_WORD no arrival reaches this proxy to close the sequence: the collecting kernel's deadline is the bound)
+                if (ring_watch.armed(!r.roci_live)) watch.posted(slot, post_t[slot]);
                 posted = q;
             }
             for (r.nics[0..nd], 0..) |nic, d| {
+                // with the generation word the receive side is passive: a sequence is quiet once its own word writes
+                // have completed (earlier data writes on the same queue pairs complete before them)
+                if (if (r.roci_live) inflight == 0 else nap.quiet(posted, ring, inflight, arrivals.published[0..r.world], r.rank)) {
             for (r.nics[0..r.nd], 0..) |nic, d| {
                 if (!nic.used) continue;
                 const k = nic.ctx.ops.poll_cq(nic.cq, wc.len, &wc);
@@ -1096,7 +1516,12 @@ pub const Ring = struct {
                         return;
                     }
                     if (w.opcode == wc_recv_rdma_with_imm) {
-                        const p = r.peerOf(nic, w.qp_num) orelse {
+                        if (r.roci_live) {
+                            // this path posts no receives and every peer runs it (the rings' switch word refuses a
+                            // peer that does not): an arrival here belongs to another path
+                            r.fail("a receive completion on a ring that waits on generation words");
+                            return;
+                        }
                         const from = r.peerOf(nic, w.qp_num) orelse {
                             r.fail("receive completion on an unknown QP");
                             return;
@@ -1138,6 +1563,11 @@ pub const Ring = struct {
                     }
                 }
             }
+                if (if (r.roci_live) inflight == 0 else nap.quiet(posted, ring, inflight, arrivals.published[0..r.world], r.rank)) r.napOn(posted, &naps_since_cpu);
+            }
+        }
+    }
+
         }
     /// Rank `src`'s sequence q (`n` bytes, all in this rank's receive slot) on to the ranks this one relays it to.
     fn relay(r: *Ring, src: usize, q: u64, n: u64) Error!void {
@@ -1181,16 +1611,16 @@ pub const Ring = struct {
         return r.scalars.ptr + offset;
     }
 
-    /// recv [world x n4 float4] <- every rank's send [n4 float4] (fp32, 16-byte aligned), on `stream`.
-    pub fn gather(r: *Ring, stream: cuda.Stream, send: DevicePtr, n4: u32, recv: DevicePtr) Error!void {
-        if (r.failure() != null) return error.Failed;
-        if (@as(usize, n4) * 16 > r.s.max_bytes) return error.TooLarge;
-        const own: DevicePtr = if (r.s.own_early) recv + @as(u64, r.rank) * n4 * 16 else 0;
-        try r.stage(stream, send, n4, own, n4, n4);
+    /// send_last [max_users] in device memory (see scalars_bytes); the metadata block's host words of the same name stay where they were and are not given to a kernel.
+    fn sendLastDev(r: *const Ring) DevicePtr {
+        return r.scalar(80);
+    }
+
         if (r.cd != null) {
             const fw = r.k.await_send_wait orelse return error.BadInfo;
             var w: cuda.Args = .{};
             w.add(r.cd_tab);
+            w.add(r.sendLastDev());
             w.add(@as(c_int, @intCast(u)));
             w.add(r.metaDev(r.abortWord()));
             w.add(@as(c_int, @intFromBool(r.s.pdl)));
@@ -1199,15 +1629,43 @@ pub const Ring = struct {
         }
         var a: cuda.Args = .{};
         a.add(send);
+        a.add(r.sendLastDev());
         const waiting = r.cd != null;
         if (waiting) try r.cdLaunch(stream, @as(u64, n4) * 16, @intCast(u));
         const pw = Kernels.pick(r.k.publish_wait, r.k.publish_wait_x);
         const f = (if (waiting) pw.f else r.k.publish) orelse return error.BadInfo;
+        a.add(r.sendLastDev());
         if (waiting) a.add(r.cd_tab) else a.add(r.metaDev(r.sent())); // the card's completions (by value), where the proxy path's `sent` words are
         a.add(if (waiting) r.probeOrPubLog(pw.logging) else r.probe());
         // dsv41_rdma_publish's 17 parameters (dsv41_rdma_publish_wait's 17 too: the completion table by value for `sent`); the driver reads
         // one argument address per parameter, so a short pack would read past the set ones
         if (a.count != 17) return error.BadInfo;
+        if (r.roci_live) {
+            const f = r.k.collect_roci orelse return error.BadInfo;
+            var b: cuda.Args = .{};
+            b.add(own_src);
+            b.add(recv);
+            b.add(@as(c_int, @intCast(n4)));
+            b.add(r.recv.dev);
+            b.add(r.gen.?.dev);
+            b.add(r.lanes_dev.?.ptr);
+            b.add(r.scalar(0));
+            b.add(@as(c_int, @intCast(r.rank)));
+            b.add(@as(c_int, @intCast(r.world)));
+            b.add(@as(c_int, @intCast(r.s.slots)));
+            b.add(@as(u64, r.s.max_bytes));
+            b.add(r.probe());
+            b.add(r.metaDev(r.abortWord()));
+            b.add(@as(c_int, @intFromBool(skip_own)));
+            b.add(@as(c_int, @intFromBool(r.s.unroll)));
+            b.add(r.s.roci_deadline_ns);
+            b.add(r.fault.?.ptr);
+            b.add(@as(c_int, @intFromBool(r.s.pdl)));
+            if (b.count != 18) return error.BadInfo; // dsv41_rdma_collect_roci's 18 parameters
+            const per = collect_threads * r.s.collect_grain;
+            const blocks = std.math.clamp((@as(u64, n4) * r.world + per - 1) / per, 1, r.s.collect_blocks);
+            return cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &b);
+        }
         a.add(recv);
         a.add(@as(c_int, @intCast(n4)));
         a.add(r.recv.dev);
@@ -1266,6 +1724,33 @@ pub const Ring = struct {
         const per = collect_threads * r.s.collect_grain;
         const blocks = std.math.clamp((copy4 + per - 1) / per, 1, r.s.collect_blocks);
         try cuda.launch.launch(r.k.collect_into, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
+        // With the generation-word peers kernel the copy-out copies this rank's own slice too (the publishing / staging kernel does not): its
+        // doorbell is not behind the copy
+        const fold_own = mine.ptr != 0 and r.roci_live and r.s.roci.on() and r.s.collect_peers and r.k.collect_peers_roci != null;
+        const post_own: DevicePtr = if (fold_own) 0 else mine.ptr;
+            try r.publish(stream, n4, post_own, own_row4n, own_stride);
+        } else try r.stage(stream, send, n4, post_own, own_row4n, own_stride);
+        try launchCollect(r.k, r.s, stream, dd, rows, .{
+            .recv = r.recv.dev,
+            .flags = r.metaDev(r.flags()),
+            .seq = r.scalar(0),
+            .abort = r.metaDev(r.abortWord()),
+            .probe = r.probe(),
+            .rank = r.rank,
+            .world = r.world,
+            .gen = if (r.roci_live) r.gen.?.dev else 0,
+            .lanes = if (r.roci_live) r.lanes_dev.?.ptr else 0,
+            .fault = if (r.roci_live) r.fault.?.ptr else 0,
+            .deadline_ns = r.s.roci_deadline_ns,
+            .roci = if (r.roci_live) r.s.roci else .off,
+            .own_src = if (fold_own) send else 0,
+            .own_dst = if (fold_own) mine.ptr else 0,
+            .own_row4 = own_row4n,
+            .own_stride4 = own_stride,
+            .own_n4 = n4,
+        }, copy4);
+    }
+
     /// `probe` for the card-WAIT staging / publishing kernels: with TF_DS_ROCI_XLOG on and no probe running, the doorbell log's address tagged with
     /// bit 0 (the kernels strip it and log each doorbell); else the probe as it is.
     fn probeOrPubLog(r: *const Ring, logging: bool) DevicePtr {
@@ -1352,10 +1837,186 @@ fn postWrite(ctx: *vabi.Context, qp: *vabi.Qp, local: []const u8, lkey: u32, rem
     if (ctx.ops.post_send(qp, &wr, &bad) != 0) return error.PostFailed;
 }
 
+/// TF_DS_RING_WORD's data: a plain RDMA WRITE, unsignalled (the lane's word write, posted after it on the same
+/// queue pair, carries the completion; reliable-connection sends complete in post order, so the word's completion
+/// also means the data has been read).
+fn postData(ctx: *vabi.Context, qp: *vabi.Qp, local: []const u8, lkey: u32, remote: u64, rkey: u32, wr_id: u64) Error!void {
+    var sge: vabi.Sge = .{ .addr = @intFromPtr(local.ptr), .length = @intCast(local.len), .lkey = lkey };
+    var wr: vabi.SendWr = .{ .wr_id = wr_id, .sg_list = @ptrCast(&sge), .num_sge = 1, .opcode = vabi.wr_rdma_write, .send_flags = 0, .remote_addr = remote, .rkey = rkey };
+    var bad: ?*vabi.SendWr = null;
+    if (ctx.ops.post_send(qp, &wr, &bad) != 0) return error.PostFailed;
+}
+
+/// TF_DS_RING_WORD's signal, `.word`: an 8-byte inline RDMA WRITE of `local` (the sequence) to the peer's word.
+fn postWord(ctx: *vabi.Context, qp: *vabi.Qp, local: []const u8, lkey: u32, remote: u64, rkey: u32, wr_id: u64) Error!void {
+    var sge: vabi.Sge = .{ .addr = @intFromPtr(local.ptr), .length = 8, .lkey = lkey };
+    var wr: vabi.SendWr = .{ .wr_id = wr_id, .sg_list = @ptrCast(&sge), .num_sge = 1, .opcode = vabi.wr_rdma_write, .send_flags = vabi.send_signaled | vabi.send_inline, .remote_addr = remote, .rkey = rkey };
+    var bad: ?*vabi.SendWr = null;
+    if (ctx.ops.post_send(qp, &wr, &bad) != 0) return error.PostFailed;
+}
+
+/// An RDMA ATOMIC fetch-and-add's work request: ibv_send_wr's atomic arm (the union begins where the RDMA arm's
+/// remote address and key do), `compare_add` the addend and `swap` unused.
+const AtomicWr = extern struct {
+    wr_id: u64 = 0,
+    next: ?*AtomicWr = null,
+    sg_list: ?[*]vabi.Sge = null,
+    num_sge: c_int = 0,
+    opcode: c_int = 0,
+    send_flags: c_uint = 0,
+    imm_data: u32 = 0,
+    remote_addr: u64 = 0,
+    compare_add: u64 = 0,
+    swap: u64 = 0,
+    rkey: u32 = 0,
+    _pad: [60]u8 = @splat(0),
+};
+comptime {
+    if (@sizeOf(AtomicWr) != 128 or @offsetOf(AtomicWr, "remote_addr") != 40 or @offsetOf(AtomicWr, "compare_add") != 48 or @offsetOf(AtomicWr, "swap") != 56 or @offsetOf(AtomicWr, "rkey") != 64) @compileError("AtomicWr must be ibv_send_wr's atomic arm");
+}
+
+/// TF_DS_RING_WORD's signal, `.atomic`: one fetch-and-add of 1 on the peer's 64-bit word (the signal the IB spec
+/// covers after a WRITE: a later ATOMIC is ordered after it and its memory element is visible).
+fn postFetchAdd(ctx: *vabi.Context, qp: *vabi.Qp, remote: u64, rkey: u32, wr_id: u64) Error!void {
+    var wr: AtomicWr = .{ .wr_id = wr_id, .opcode = vabi.wr_atomic_fetch_add, .send_flags = vabi.send_signaled, .remote_addr = remote, .compare_add = 1, .rkey = rkey };
+    var bad: ?*vabi.SendWr = null;
+    if (ctx.ops.post_send(qp, @ptrCast(&wr), &bad) != 0) return error.PostFailed;
+}
+
 test "every declaration compiles (the GPU and verbs paths run only on the nodes)" {
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(Ring);
     std.testing.refAllDecls(Kernels);
+}
+
+    words: [64]u64 = undefined, // an inline 8-byte write's value, in post order
+    n_words: usize = 0,
+    adds: [64]u64 = undefined, // an ATOMIC fetch-and-add's addend, in post order
+    n_adds: usize = 0,
+        _ = d.posts.fetchAdd(1, .acq_rel);
+        if (wr.opcode == vabi.wr_atomic_fetch_add) {
+            const aw: *const AtomicWr = @ptrCast(@alignCast(wr));
+            d.adds[d.n_adds] = aw.compare_add;
+            d.n_adds += 1;
+        } else if (wr.num_sge == 1 and wr.sg_list[0].length == 8) {
+            const p: *const u64 = @ptrFromInt(wr.sg_list[0].addr);
+            d.words[d.n_words] = p.*;
+            d.n_words += 1;
+        }
+        // an unsignalled work request completes without a completion queue entry (a plain data write)
+        if (wr.send_flags & vabi.send_signaled == 0) return 0;
+    gen_mem: ?[]align(std.heap.page_size_min) u8 = null,
+        t.gen_mem = null;
+    /// A ring with TF_DS_RING_WORD set and runnable: a generation-word region (the fakery writes and reads it as
+    /// the peers' NICs would) and every device's fake registration of it.
+    fn initRoci(wfe: ?bool, nap_us: u32, sig: Roci) !TestRing {
+        var t = try TestRing.init(wfe, nap_us);
+        const gpa = std.testing.allocator;
+        const page = comptime std.mem.Alignment.fromByteUnits(std.heap.page_size_min);
+        const mem = try gpa.alignedAlloc(u8, page, rociWords() * 8);
+        @memset(mem, 0);
+        t.gen_mem = mem;
+        t.r.gen = .{ .mem = mem, .dev = 0 };
+        t.r.s.roci = sig;
+        t.r.roci_live = true;
+        for (t.devs, 0..) |d, i| t.r.nics[i].mr_gen = &d.mr;
+        return t;
+    }
+
+        if (t.gen_mem) |g| gpa.free(g);
+test "TF_DS_RING_WORD's signals: the word is the sequence, the atomic counts, and a wait ends at or past it" {
+    try std.testing.expect(!Roci.off.on());
+    try std.testing.expect(Roci.word.on() and Roci.atomic.on());
+    try std.testing.expectEqual(@as(u64, 7), ringWordSignalWord(7));
+    try std.testing.expect(Roci.reached(7, 7));
+    try std.testing.expect(Roci.reached(8, 7));
+    try std.testing.expect(!Roci.reached(6, 7));
+    // the switch word a peer compares: the switch in bit 2, the atomic signal in bit 3
+    var r: Ring = undefined;
+    r.s = .{ .max_bytes = 64 };
+    r.s.roci = .word;
+    try std.testing.expectEqual(@as(u32, 0b0100), r.switchBits());
+    r.s.roci = .atomic;
+    try std.testing.expectEqual(@as(u32, 0b1100), r.switchBits());
+    r.s.roci = .off;
+    try std.testing.expectEqual(@as(u32, 0), r.switchBits());
+}
+
+test "TF_DS_RING_WORD refused at connect: the copy-out takes the flag kernels, not the generation-word kernels with null words" {
+    // a ring whose setting asks for the word but whose connect refused it (the card's atomic_cap, a peer without words) passes no
+    // gen / lanes / fault: the word kernels would read address 0 (CUDA_ERROR_ILLEGAL_ADDRESS)
+    const refused: CollectRing = .{ .recv = 1, .flags = 2, .seq = 3, .abort = 4, .rank = 0, .world = 4, .roci = .off };
+    for ([_]Roci{ .word, .atomic }) |signal| {
+        const s: Settings = .{ .max_bytes = 64, .roci = signal };
+        try std.testing.expect(!collectsOnWords(s, refused));
+        var live = refused;
+        live.roci = signal;
+        live.gen = 5;
+        live.lanes = 6;
+        live.fault = 7;
+        try std.testing.expect(collectsOnWords(s, live));
+    }
+    try std.testing.expect(!collectsOnWords(.{ .max_bytes = 64 }, refused));
+}
+
+test "TF_DS_RING_WORD: the proxy posts each lane's data, then its generation word, catching up every pending sequence" {
+    var t = try TestRing.initRoci(false, 2_000_000, .word); // spin: the test drives the doorbell
+    defer t.deinit();
+    try t.r.start();
+    defer t.r.stop();
+    t.ring(1);
+    t.ring(2);
+    t.ring(3);
+    try t.until(struct {
+        fn done(x: *TestRing) bool {
+            return x.sent(3) == 3;
+        }
+    }.done);
+    // three sequences, two lanes each, a data write and a word write a lane
+    try std.testing.expectEqual(@as(u32, 3 * 2 * 2), t.posts());
+    // the proxy catches up every sequence the doorbell names (a counter, never a level), and the word is the sequence
+    try std.testing.expectEqual(@as(u64, 3), t.sent(3));
+    for (t.devs) |d| {
+        try std.testing.expectEqual(@as(usize, 3), d.n_words);
+        try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, d.words[0..3]);
+    }
+}
+
+test "TF_DS_RING_WORD: a doorbell further ahead than the ring's slots fails the ring instead of skipping a sequence" {
+    var t = try TestRing.initRoci(false, 2_000_000, .word);
+    defer t.deinit();
+    // the staging kernel cannot ring more than slots ahead; a doorbell that does means a sequence was skipped
+    t.ring(t.r.s.slots + 1);
+    try t.r.start();
+    defer t.r.stop();
+    try t.until(struct {
+        fn failed(x: *TestRing) bool {
+            return x.r.failure() != null;
+        }
+    }.failed);
+    const why = t.r.failure().?;
+    try std.testing.expect(std.mem.indexOf(u8, why, "more sequences than the ring's slots") != null);
+}
+
+test "TF_DS_RING_WORD's atomic signal posts one fetch-and-add on each lane's word" {
+    var t = try TestRing.initRoci(false, 2_000_000, .atomic);
+    defer t.deinit();
+    try t.r.start();
+    defer t.r.stop();
+    t.ring(1);
+    t.ring(2);
+    try t.until(struct {
+        fn done(x: *TestRing) bool {
+            return x.sent(2) == 2;
+        }
+    }.done);
+    try std.testing.expectEqual(@as(u32, 2 * 2 * 2), t.posts());
+    for (t.devs) |d| {
+        try std.testing.expectEqual(@as(usize, 2), d.n_adds);
+        try std.testing.expectEqualSlices(u64, &.{ 1, 1 }, d.adds[0..2]);
+        // no inline word: the atomic carries the signal
+        try std.testing.expectEqual(@as(usize, 0), d.n_words);
+    }
 }
 
 test "the info a peer reads is a plain extern struct (it crosses the link as bytes)" {
@@ -1363,6 +2024,9 @@ test "the info a peer reads is a plain extern struct (it crosses the link as byt
     try std.testing.expectEqual(@as(usize, 176), @sizeOf(Info));
     try std.testing.expectEqual(@as(usize, 152), @offsetOf(Info, "mac"));
     try std.testing.expectEqual(@as(usize, 120), @offsetOf(Info, "recv"));
+    try std.testing.expectEqual(@as(usize, 128), @offsetOf(Info, "gen"));
+    try std.testing.expectEqual(@as(usize, 136), @offsetOf(Info, "gen_rkey"));
+}
 
 test "lanes pair each subnet's devices in list order; a peer across the ring has none" {
     const g = struct {
@@ -1389,6 +2053,7 @@ test "lanes pair each subnet's devices in list order; a peer across the ring has
     const ll = [_][16]u8{.{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8 }};
     try std.testing.expectEqual(@as(?u32, null), pairLanes(&ll, &s2, 24, &out));
 }
+    const publish_at2 = std.mem.indexOf(u8, gbody2, "try r.publish(stream, n4, post_own, own_row4n, own_stride);") orelse return error.TestUnexpectedResult;
 
 test "TF_DS_RING_WAIT: the Settings struct's own default is the proxy path (the engine's default is Model.open's, the card's WAIT); a ring's switch word carries it only when set, its info carries no MAC then, the proxy path's kernels and arguments are the ones they were" {
     const s: Settings = .{ .max_bytes = 64 };
@@ -1481,6 +2146,64 @@ test "a refused TF_DS_RING_WAIT names itself as it was set: 1 says 1, the defaul
     try std.testing.expect(std.mem.startsWith(u8, waitRefusalHead(&buf, true), "TF_DS_RING_WAIT=1 refused"));
     const d = waitRefusalHead(&buf, false);
     try std.testing.expect(std.mem.indexOf(u8, d, "unset") != null and std.mem.indexOf(u8, d, "TF_DS_RING_WAIT=1") == null);
+}
+
+const ModelCard = struct {
+    outcome: enum { ok, no_atomics, open_fails, query_fails },
+    fn caps(self: ModelCard, _: []const u8) !AtomicCaps {
+        return switch (self.outcome) {
+            .ok => .{ .atomic_cap = vabi.atomic_hca, .max_qp_rd_atom = 16, .max_qp_init_rd_atom = 16 },
+            .no_atomics => .{ .atomic_cap = 0, .max_qp_rd_atom = 16, .max_qp_init_rd_atom = 16 },
+            .open_fails => error.NoSuchDevice,
+            .query_fails => error.QueryFailed,
+        };
+    }
+};
+
+test "the atomic probe's outcomes on a card model: can is null; a card without atomics, a device that will not open and one that will not answer are each a reason naming the device (never 'can')" {
+    var buf: [300]u8 = undefined;
+    const names = [_][]const u8{ "mlx5_0", "mlx5_2" };
+    try std.testing.expect(probeAtomicWith(&buf, &names, ModelCard{ .outcome = .ok }) == null);
+    const na = probeAtomicWith(&buf, &names, ModelCard{ .outcome = .no_atomics }).?;
+    try std.testing.expect(std.mem.indexOf(u8, na, "mlx5_0") != null and std.mem.indexOf(u8, na, "atomic_cap 0") != null);
+    const of = probeAtomicWith(&buf, &names, ModelCard{ .outcome = .open_fails }).?;
+    try std.testing.expect(std.mem.indexOf(u8, of, "mlx5_0") != null and std.mem.indexOf(u8, of, "NoSuchDevice") != null);
+    const qf = probeAtomicWith(&buf, &names, ModelCard{ .outcome = .query_fails }).?;
+    try std.testing.expect(std.mem.indexOf(u8, qf, "QueryFailed") != null);
+}
+
+test "two ranks that set the card-waiting queue pairs up for different atomic depths (or one atomic and one word) have different switch words, so connect refuses them" {
+    var a = try TestRing.init(false, 1000);
+    defer a.deinit();
+    var b = try TestRing.init(false, 1000);
+    defer b.deinit();
+    for ([_]*TestRing{ &a, &b }) |t| {
+        t.r.s.wait = true;
+        t.r.s.roci = .atomic;
+    }
+    try std.testing.expectEqual(a.r.switchBits(), b.r.switchBits()); // (no queue pairs in the test ring: depth 0 on both)
+    try std.testing.expectEqual(@as(u32, 0), a.r.switchBits() >> 8);
+    // with queue pairs (a stand-in backend pointer; no devices, so the depth is the slots) the depth is in the word
+    const fake: *wait.Backend = @ptrFromInt(0x1000);
+    a.r.cd = fake;
+    b.r.cd = fake;
+    defer {
+        a.r.cd = null;
+        b.r.cd = null;
+    }
+    a.r.s.slots = 4;
+    b.r.s.slots = 2;
+    try std.testing.expectEqual(@as(u32, 4), a.r.switchBits() >> 8);
+    try std.testing.expect(a.r.switchBits() != b.r.switchBits());
+    b.r.s.slots = 4;
+    try std.testing.expectEqual(a.r.switchBits(), b.r.switchBits());
+    // one rank on the word signal against one on the atomic differ too
+    b.r.s.roci = .word;
+    try std.testing.expect(a.r.switchBits() != b.r.switchBits());
+    // the depth is in bits 8-15 whenever queue pairs exist
+    const src = @embedFile("rdma.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, "(@as(u32, r.cdDepth()) << 8)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "every rank must choose alike") != null);
 }
 
 test "the exchange log: device words decode to records in ring order, empty slots left out, and out.len bounds them" {

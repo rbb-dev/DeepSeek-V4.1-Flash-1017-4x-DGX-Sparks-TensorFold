@@ -236,6 +236,8 @@ pub const Settings = extern struct {
     fn sepIf(w: *const std.Io.Writer, sep: []const u8) []const u8 {
         return if (w.end > 0) sep else "";
     }
+pub const exch_ring_word: u32 = 1 << 25;
+pub const exch_ring_word_atomic: u32 = 1 << 26; // the switch's signal is the atomic fetch-and-add (unset: the inline word)
 pub const exch_ring_wait: u32 = 1 << 27; // TF_DS_RING_WAIT: the rings' queue pairs wait in the card (no proxy threads)
 /// A switch that is on unless set otherwise (TF_DS_ROCI_WAIT, TF_DS_RING_WAIT): unset or "1" is on; any other text, "0" included, is off (a typo
 /// takes the fallback path, never the new one by accident).
@@ -248,9 +250,23 @@ pub fn switchDefaultOn(text: ?[]const u8) bool {
 /// TF_DS_ROCI_ENGRAM_AHEAD as Model.open read it (switchAsked), once (Settings.exch; Two.engramAhead): an
 /// TF_DS_ROCI_SENT_FIRST as Model.open read it (switchAsked), once (Settings.exch; Two.sentFirst): wo_b runs in
 /// TF_DS_ROCI_COMBINE_DOOR as Model.open read it (switchAsked), once (Settings.exch; Two.combineDoor): the MoE's
+    if (ring_word_asked) x |= exch_ring_word;
+    if (ring_word_atomic_asked) x |= exch_ring_word_atomic;
     if (ring_wait_asked) x |= exch_ring_wait;
 };
 
+
+/// TF_DS_RING_WORD as Model.open read it (switchDefaultOn: on unless set to something but 1), once (Settings.exch, rdma.Settings.roci): each lane's data is
+/// a plain RDMA WRITE and its 64-bit generation word is written after it on the same queue pair, the collecting kernel
+/// waiting on the words.
+pub var ring_word_asked: bool = false;
+
+/// TF_DS_RING_WORD was set (to 1): not the default's silence (a start without a ring says nothing of a switch that is on by default).
+pub var ring_word_explicit: bool = false;
+
+/// TF_DS_RING_WORD_SIGNAL=atomic as Model.open read it, once (Settings.exch bit 25, rdma.Settings.roci == .atomic): the
+/// generation word is an RDMA ATOMIC fetch-and-add; unset or `word`: an inline 8-byte RDMA WRITE of the sequence.
+pub var ring_word_atomic_asked: bool = false;
 
 /// TF_DS_RING_WAIT as Model.open read it, once (Settings.exch bit 27, rdma.Settings.wait): the rings' queue pairs are Core Direct masters that wait
 /// in the card on the doorbell word, their chains written when an exchange launches, so no proxy thread runs. Needs TF_DS_RING_WORD with the

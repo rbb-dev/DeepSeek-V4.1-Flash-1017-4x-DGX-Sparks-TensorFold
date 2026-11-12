@@ -21,6 +21,13 @@
 //!                                               a rank that differs from rank 0 stops at the start, as one with
 //!                                               other graphs, graph cap, RDMA devices or drafter does
 //!   TF_RDMA_DEVICES                             the decode gathers over the RDMA ring on these devices (the rings are required)
+//!   TF_DS_RING_WORD=1                         (with TF_RDMA_DEVICES) each lane's data is a plain RDMA WRITE and its
+//!                                               64-bit generation word is written after it on the same queue pair (an
+//!                                               inline 8-byte WRITE, or with TF_DS_RING_WORD_SIGNAL=atomic an RDMA ATOMIC
+//!                                               fetch-and-add); the collecting kernel waits on every lane's word,
+//!                                               bounded by TF_DS_RING_WORD_DEADLINE_MS (default 120,000) and the abort word,
+//!                                               and a ring no sequence reaches is poisoned; the same bytes, one line at
+//!                                               the start; every rank alike
 //!   TF_DS_GRAPHS=1                              the rounds' stretches as CUDA graphs
 //!   TF_DS_GRAPH_CAP=N                           (with TF_DS_GRAPHS) the captured stretches kept at most, the least
 //!                                               recently replayed destroyed first (0 or unset: all); rank 1's
@@ -281,6 +288,8 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "--streams") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "--graph-cap") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_REPLAY_FLOOR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_RING_WORD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_RING_WORD_SIGNAL") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
 }
 

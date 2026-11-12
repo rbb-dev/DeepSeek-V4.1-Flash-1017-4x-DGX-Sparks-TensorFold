@@ -4,13 +4,21 @@
 //! the plain gather and the strided gather_into, and checks every float it received. One JSON line a rank and row count.
 //!   tf-dsv41-rdma-bench RANK WORLD MASTER_IP FATBIN DEVICES [--port P] [--rows 1,6,16,48] [--width 2560] [--reps 500]
 //!                       [--pdl 0|1] [--gid N]
+//! --roci word|atomic: TF_DS_RING_WORD's arrival signal (each lane's data a plain RDMA WRITE, then its 64-bit
+//! generation word as an inline 8-byte WRITE or an ATOMIC fetch-and-add on the same queue pair; the collecting kernel
+//! waits on the words in-kernel), against the baseline path when unset: the same bytes, timed here.
+//! --mixed K (needs --inplace 1 --wc 1): after the timed loops of the first row count, K exchanges back to back with no host wait between them,
+//! from three streams in one fixed order (in-place user 0, in-place user 1, a staged send; events keep the order the same on every rank), each
+//! exchange's payload stamped with its index and sender, every received part checked against the stamp it must carry. It is the replay the
+//! shortcuts on the in-place publish need: a send slot overwritten while the card still reads it, or a landing slot reused too early, shows as
+//! a wrong stamp. One JSON line: rank, K, exchanges checked, bad.
 const std = @import("std");
 const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
 const ring = dsv41.rdma;
 const posix = std.posix;
 
-const usage = "usage: tf-dsv41-rdma-bench RANK WORLD MASTER_IP FATBIN DEVICES [--port P] [--rows 1,6,16,48] [--width 2560] [--reps 500] [--pdl 0|1] [--gid N]\n";
+const usage = "usage: tf-dsv41-rdma-bench RANK WORLD MASTER_IP FATBIN DEVICES [--port P] [--rows 1,6,16,48] [--width 2560] [--reps 500] [--pdl 0|1] [--gid N] [--collect rank,peers] [--rounds N] [--stream GBPS] [--wc 0|1] [--inplace 0|1] [--roci word|atomic]\n";
 
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
@@ -29,11 +37,18 @@ pub fn main(init: std.process.Init) !u8 {
     var reps: u32 = 500;
     var pdl = true;
     var gid: ?u8 = null;
+    var mixed: u32 = 0;
+    var roci: ring.Roci = .off;
     var i: usize = 6;
     while (i + 1 < args.len) : (i += 2) {
         const k = args[i];
         const v = args[i + 1];
-        if (std.mem.eql(u8, k, "--port")) port = try std.fmt.parseInt(u16, v, 10) else if (std.mem.eql(u8, k, "--rows")) rows_text = v else if (std.mem.eql(u8, k, "--width")) width = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, k, "--reps")) reps = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, k, "--pdl")) pdl = !std.mem.eql(u8, v, "0") else if (std.mem.eql(u8, k, "--gid")) gid = try std.fmt.parseInt(u8, v, 10) else {
+        if (std.mem.eql(u8, k, "--port")) port = try std.fmt.parseInt(u16, v, 10) else if (std.mem.eql(u8, k, "--rows")) rows_text = v else if (std.mem.eql(u8, k, "--width")) width = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, k, "--reps")) reps = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, k, "--pdl")) pdl = !std.mem.eql(u8, v, "0") else if (std.mem.eql(u8, k, "--gid")) gid = try std.fmt.parseInt(u8, v, 10) else if (std.mem.eql(u8, k, "--collect")) collects_text = v else if (std.mem.eql(u8, k, "--rounds")) rounds = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, k, "--stream")) stream_gbps = try std.fmt.parseFloat(f64, v) else if (std.mem.eql(u8, k, "--wc")) wc = !std.mem.eql(u8, v, "0") else if (std.mem.eql(u8, k, "--inplace")) inplace = !std.mem.eql(u8, v, "0") else if (std.mem.eql(u8, k, "--mixed")) mixed = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, k, "--roci")) {
+            if (std.mem.eql(u8, v, "word")) roci = .word else if (std.mem.eql(u8, v, "atomic")) roci = .atomic else {
+                std.debug.print("{s}", .{usage});
+                return 2;
+            }
+        } else {
             std.debug.print("{s}", .{usage});
             return 2;
         }
@@ -45,6 +60,10 @@ pub fn main(init: std.process.Init) !u8 {
     var devices: std.ArrayList([]const u8) = .empty;
     var dit = std.mem.splitScalar(u8, args[5], ',');
     while (dit.next()) |t| try devices.append(a, t);
+    if (mixed > 0 and !inplace) {
+        std.debug.print("--mixed needs --inplace 1 --wc 1 (two in-place users and a staged send on one ring)\n", .{});
+        return 2;
+    }
     const per_graph = 50;
     const loops = @max(1, reps / per_graph);
     var most: u32 = 1;
@@ -58,6 +77,11 @@ pub fn main(init: std.process.Init) !u8 {
     var module = try cuda.Module.load(&driver, image);
     defer module.unload();
     const r = try ring.Ring.create(init.gpa, &driver, try ring.Kernels.load(module), devices.items, rank, world, .{ .max_bytes = std.mem.alignForward(usize, @as(usize, most) * width * 4, 64), .pdl = pdl, .gid_index = gid });
+    if (roci.on() and !kernels.hasRoci()) {
+        std.debug.print("--roci: the fatbin has no dsv41_rdma_collect_roci / _into_roci / _peers_roci\n", .{});
+        return 2;
+    }
+    const r = try ring.Ring.create(init.gpa, &driver, kernels, devices.items, rank, world, .{ .max_bytes = std.mem.alignForward(usize, @as(usize, most) * width * 4, 64), .pdl = pdl, .gid_index = gid, .wc = wc, .inplace = inplace, .roci = roci, .roci_deadline_ns = 120 * std.time.ns_per_s });
     defer r.destroy(init.gpa);
 
     // every rank's info(p) for every p, gathered by rank 0 and handed back whole; then a barrier once all are connected
@@ -110,30 +134,83 @@ pub fn main(init: std.process.Init) !u8 {
         var bad: usize = 0;
         for (0..world) |q| for (0..n) |j| {
             if (host[q * n + j] != value(@intCast(q), j)) bad += 1;
+            try out.interface.print("{{\"rank\": {d}, \"world\": {d}, \"rows\": {d}, \"bytes\": {d}, \"gathers\": {d}, \"pdl\": {d}, \"us_gather\": {d:.2}, \"us_into\": {d:.2}, \"bad\": {d}, \"bad_into\": {d}, \"collect\": \"{s}\", \"wc\": {d}, \"inplace\": {d}, \"roci\": \"{s}\", \"round\": {d}, \"stream_gbps\": {d:.0}, \"stream_ran_gbps\": [{d:.1}, {d:.1}], \"stream_outlasted\": [{}, {}], \"failure\": \"{s}\"}}\n", .{ rank, world, n_rows, n * 4, loops * per_graph, @intFromBool(pdl), us_gather, us_into, bad, bad_into, if (peers) "peers" else "rank", @intFromBool(wc), @intFromBool(inplace), if (roci.on()) roci.signalName() else "", round, stream_gbps, ran_gather.gbps, ran_into.gbps, ran_gather.outlasted, ran_into.outlasted, r.failure() orelse "" });
+            try out.interface.flush();
         };
-        for (0..20) |_| try r.gatherInto(stream, send.ptr, n_rows, width / 4, dsts[0..world]);
-        try stream.synchronize();
-        try cuda.graph.beginCapture(stream, .thread_local);
-        for (0..per_graph) |_| try r.gatherInto(stream, send.ptr, n_rows, width / 4, dsts[0..world]);
-        var g2 = try cuda.graph.endCapture(stream);
-        defer g2.deinit();
-        var e2 = try g2.instantiate();
-        defer e2.deinit();
-        try e2.launchOn(stream);
-        try stream.synchronize();
-        t0 = std.Io.Timestamp.now(io, .awake);
-        for (0..loops) |_| try e2.launchOn(stream);
-        try stream.synchronize();
-        const us_into = micros(t0, io) / @as(f64, @floatFromInt(loops * per_graph));
-        try into.download(0, std.mem.sliceAsBytes(host));
-        var bad_into: usize = 0;
-        for (0..n_rows) |row| for (0..world) |q| for (0..width) |c| {
-            if (host[row * world * width + q * width + c] != value(@intCast(q), row * width + c)) bad_into += 1;
-        };
-        try out.interface.print("{{\"rank\": {d}, \"world\": {d}, \"rows\": {d}, \"bytes\": {d}, \"gathers\": {d}, \"pdl\": {d}, \"us_gather\": {d:.2}, \"us_into\": {d:.2}, \"bad\": {d}, \"bad_into\": {d}, \"failure\": \"{s}\"}}\n", .{ rank, world, n_rows, n * 4, loops * per_graph, @intFromBool(pdl), us_gather, us_into, bad, bad_into, r.failure() orelse "" });
-        try out.interface.flush();
+        if (mixed > 0 and n_rows == rows.items[0]) {
+            const bad = try mixedReplay(init.gpa, &driver, r, stream, rank, world, n, mixed);
+            try out.interface.print("{{\"rank\": {d}, \"mixed\": {d}, \"exchanges_checked\": {d}, \"bad\": {d}}}\n", .{ rank, mixed, mixed * world, bad });
+            try out.interface.flush();
+            if (bad != 0) return 1;
+        }
     }
     return 0;
+}
+
+fn stamp(q: u32, k: u32, j: usize) f32 {
+    return @floatFromInt((k + 1) * 100_000 + q * 1_000 + @as(u32, @intCast(j % 1_000)));
+}
+
+/// `count` exchanges of `n` floats back to back from three streams in one fixed order (k % 3: in-place user 0 on `stream_a`, in-place user 1 on
+/// a second stream, a staged send on a third), ordered by events so every rank launches the same sequence; no host wait until all are queued.
+/// Every payload carries its exchange index and sender; the received parts are checked against what each sender stamped. Returns the parts wrong.
+fn mixedReplay(gpa: std.mem.Allocator, driver: *const cuda.Driver, r: *ring.Ring, stream_a: cuda.Stream, rank: u32, world: u32, n: usize, count: u32) !usize {
+    var sb = try cuda.Stream.init(driver, true);
+    defer sb.deinit();
+    var sc = try cuda.Stream.init(driver, true);
+    defer sc.deinit();
+    const streams = [3]cuda.Stream{ stream_a, sb, sc };
+    const n4: u32 = @intCast(n / 4);
+    const srcs = try gpa.alloc(cuda.DeviceBuffer, count);
+    defer gpa.free(srcs);
+    const recvs = try gpa.alloc(cuda.DeviceBuffer, count);
+    defer gpa.free(recvs);
+    const evs = try gpa.alloc(cuda.Event, count);
+    defer gpa.free(evs);
+    const host = try gpa.alloc(f32, n * world);
+    defer gpa.free(host);
+    var made: u32 = 0;
+    defer for (0..made) |i| {
+        srcs[i].free();
+        recvs[i].free();
+        evs[i].deinit();
+    };
+    while (made < count) : (made += 1) {
+        for (0..n) |j| host[j] = stamp(rank, made, j);
+        srcs[made] = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(host[0..n]));
+        recvs[made] = try cuda.DeviceBuffer.alloc(driver, n * world * 4);
+        try driver.check(driver.api.cuMemsetD8_v2(recvs[made].ptr, 0xff, n * world * 4), "cuMemsetD8");
+        evs[made] = try cuda.Event.init(driver, false);
+    }
+    // the two in-place users take their slots first, in the same order on every rank
+    const slot_a = (try r.sendSlotDev(streams[0], n * 4)) orelse return error.BadInplace;
+    const slot_b = (try r.sendSlotDev(streams[1], n * 4)) orelse return error.BadInplace;
+    for (0..count) |k| {
+        const which = k % 3;
+        const s = streams[which];
+        if (k > 0) try s.wait(evs[k - 1]);
+        if (which == 2) {
+            try r.gather(s, srcs[k].ptr, n4, recvs[k].ptr);
+        } else {
+            const slot = if (which == 0) slot_a else slot_b;
+            _ = try r.prepareSend(s);
+            try driver.check(driver.api.cuMemcpyDtoDAsync_v2(slot, srcs[k].ptr, n * 4, s.handle), "cuMemcpyDtoDAsync");
+            try r.gather(s, slot, n4, recvs[k].ptr);
+        }
+        try evs[k].record(s);
+    }
+    for (streams) |s| try s.synchronize();
+    var bad: usize = 0;
+    for (0..count) |k| {
+        try recvs[k].download(0, std.mem.sliceAsBytes(host));
+        for (0..world) |q| for (0..n) |j| {
+            if (host[q * n + j] != stamp(@intCast(q), @intCast(k), j)) {
+                bad += 1;
+                break;
+            }
+        };
+    }
+    return bad;
 }
 
 /// The float rank `q` sends at index `j`: exact in f32 (below 2^24).

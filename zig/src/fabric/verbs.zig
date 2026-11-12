@@ -42,6 +42,7 @@ pub const Api = struct {
     ibv_create_cq: *const fn (ctx: Ctx, cqe: c_int, user: ?*anyopaque, channel: ?*anyopaque, vector: c_int) callconv(.c) ?*abi.Cq,
     ibv_destroy_cq: *const fn (cq: *abi.Cq) callconv(.c) c_int,
     ibv_create_qp: *const fn (pd: *abi.Pd, attr: *abi.QpInitAttr) callconv(.c) ?*abi.Qp,
+    ibv_query_qp: *const fn (qp: *abi.Qp, attr: *abi.QpAttr, mask: c_int, init: *abi.QpInitAttr) callconv(.c) c_int,
     ibv_modify_qp: *const fn (qp: *abi.Qp, attr: *abi.QpAttr, mask: c_int) callconv(.c) c_int,
     ibv_destroy_qp: *const fn (qp: *abi.Qp) callconv(.c) c_int,
     ibv_wc_status_str: *const fn (status: c_int) callconv(.c) [*:0]const u8,

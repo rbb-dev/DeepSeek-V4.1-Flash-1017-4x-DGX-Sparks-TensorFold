@@ -209,6 +209,15 @@ const Mode = struct {
     hold_data: bool = false,
     /// Control: a rail's whole chain (word and bytes) held back the same way.
     hold_rail: ?u8 = null,
+    /// How the arrival is signalled: the word written whole, or the card's ATOMIC fetch-and-add of 1 on it.
+    signal: roci.Signal = .write,
+    /// The atomic's read-modify-write is torn open: the card reads the word, takes this long, then writes the old value + 1 back (an
+    /// atomic of the card that a CPU store in between does not see: atomic_cap 1), if the card still has the control block.
+    torn_ns: u64 = 0,
+    /// Control: a card that is never fenced off the control block (fail_fn returns with its atomics still landing).
+    no_fence: bool = false,
+    /// The fence takes this long (the queue pairs to error, the registration gone): atomics that land meanwhile still land, before fail_fn returns.
+    fence_ns: u64 = 0,
 };
 
 /// A copy a held post has not made yet.
@@ -226,6 +235,11 @@ const Net = struct {
     nodes: [roci.world]Node = undefined,
     mode: Mode = .{},
     failed_nic: [roci.world]std.atomic.Value(u32) = @splat(.init(0)),
+    /// Whether each node's card still has its control block (fail_fn fences it off).
+    card_open: [roci.world]std.atomic.Value(u32) = @splat(.init(1)),
+    /// Atomics whose returned old value was not the signal's count minus one (a signal sent twice or lost), and atomics posted.
+    atomic_off: std.atomic.Value(u32) = .init(0),
+    atomics: std.atomic.Value(u32) = .init(0),
     gate: std.atomic.Value(u32) = .init(0), // 1: the held posts have been released
     gate_lock: std.atomic.Value(u32) = .init(0),
     held: std.ArrayList(Held) = .empty,
@@ -280,6 +294,23 @@ const Net = struct {
         gpa.destroy(n);
     }
 
+    /// The arrival signal on `dst`'s word `w` as the card does it: a whole-word store of `word`, or an ATOMIC fetch-and-add of 1 whose
+    /// returned old value must be `word - 1` (the count of signals before it).
+    fn signalWord(me: *Node, dst: *Node, w: *u64, word: u64) void {
+        const m = me.net.mode;
+        if (m.signal == .write) {
+            @atomicStore(u64, w, word, .release);
+            return;
+        }
+        if (m.torn_ns == 0) {
+            const old = @atomicRmw(u64, w, .Add, 1, .acq_rel);
+            if (old != word - 1) _ = me.net.atomic_off.fetchAdd(1, .monotonic);
+            return;
+        }
+        const old = @atomicLoad(u64, w, .acquire);
+        if (dst.net.card_open[dst.me].load(.acquire) != 0) @atomicStore(u64, w, old +% 1, .release);
+    }
+
     fn post(ctx: *anyopaque, rail: u8, peer: u8, class: C, chain: *const roci.Chain, word: u64) roci.PostError!void {
         const me: *Node = @ptrCast(@alignCast(ctx));
         const m = me.net.mode;
@@ -299,6 +330,7 @@ const Net = struct {
             }
         }
         if (m.word_first) {
+            signalWord(me, dst, w, word);
             sleep(m.gap_ns);
             if (m.hold_data) {
                 me.net.lockGate();
@@ -310,11 +342,16 @@ const Net = struct {
             }
         }
         for (chain.slice()) |p| @memcpy(dst.arena[p.dst..][0..p.len], me.arena[p.src..][0..p.len]);
+        if (!m.word_first) signalWord(me, dst, w, word);
     }
 
     fn failNic(ctx: *anyopaque) void {
         const me: *Node = @ptrCast(@alignCast(ctx));
         me.net.failed_nic[me.me].store(1, .release);
+        // the contract: fail_fn returns when the card can no longer write the control block
+        if (me.net.mode.no_fence) return;
+        sleep(me.net.mode.fence_ns);
+        me.net.card_open[me.me].store(0, .release);
     }
 
     fn reap(ctx: *anyopaque, rail: u8) roci.PostError!void {
@@ -543,6 +580,106 @@ test "a peer that never answers: the watchdog names it, every queued wait is rel
     try std.testing.expect(@as(i64, @bitCast(roci.abort_value -% 1_000_000)) >= 0);
 }
 
+// -- the atomic arrival signal --------------------------------------------------------------------------------------
+
+test "TF_DS_ROCI_SIGNAL's text: unset, empty and atomic are the fetch-and-add (the guaranteed arrival signal), write the second WRITE, anything else is refused" {
+    try std.testing.expectEqual(@as(?roci.Signal, .atomic), roci.signalFrom(null));
+    try std.testing.expectEqual(@as(?roci.Signal, .atomic), roci.signalFrom(""));
+    try std.testing.expectEqual(@as(?roci.Signal, .write), roci.signalFrom("write"));
+    try std.testing.expectEqual(@as(?roci.Signal, .atomic), roci.signalFrom("atomic"));
+    try std.testing.expectEqual(@as(?roci.Signal, .atomic), roci.signalFrom(" atomic "));
+    for ([_][]const u8{ "Atomic", "word", "1", "atomics", "cas" }) |bad| try std.testing.expectEqual(@as(?roci.Signal, null), roci.signalFrom(bad));
+    // what a start without the setting runs is the atomic (D79); the Settings structs' own default stays the WRITE (the host tests' fake cards)
+    try std.testing.expectEqual(roci.Signal.atomic, roci.env_default_signal);
+    try std.testing.expectEqual(roci.Signal.write, roci.default_signal);
+}
+
+test "the start line names the arrival signal" {
+    var buf: [1024]u8 = undefined;
+    for ([_]roci.Signal{ .write, .atomic }) |sig| {
+        var w = std.Io.Writer.fixed(&buf);
+        try roci.startLine(&w, 2, "mlx5_0,mlx5_2", 3, .{}, sig);
+        const want = if (sig == .write) "arrival signal an 8-byte RDMA WRITE after the data" else "arrival signal an RDMA ATOMIC fetch-and-add after the data";
+        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), want) != null);
+    }
+}
+
+test "atomic signal, four nodes: every byte lands, each word advances by one a use (the old value an atomic returns is the count before it), both caps and orders" {
+    for ([_]roci.Order{ roci.identity, perm }) |order| {
+        const net = try Net.open(.{ .signal = .atomic }, .{ .nap = false }, order);
+        defer net.close();
+        try net.start();
+        const classes = [_]C{ .own1, .own2, .wob, .gm, .gf };
+        const gens: u64 = 4;
+        const run = try runProgram(net, &classes, gens, order, false);
+        for (run.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+        for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+        var words: u64 = 0;
+        for (&net.nodes) |*nd| {
+            const c = nd.t.counters();
+            words += c.words;
+            try std.testing.expectEqual(@as(?@TypeOf(nd.t.failure().?), null), nd.t.failure());
+            // a word is the number of uses of its class: exactly one atomic each, none lost, none twice
+            for (classes) |cl| {
+                var srcs: [roci.world]u8 = undefined;
+                for (roci.sourcesOf(cl, nd.me, &srcs)) |src| for (0..roci.rails) |r| try std.testing.expectEqual(gens, nd.ctl.recv[@backingInt(cl)][src][r].v);
+            }
+        }
+        // every word a proxy counted went out as an atomic, and each returned the count before it
+        try std.testing.expectEqual(words, net.atomics.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 0), net.atomic_off.load(.acquire));
+    }
+}
+
+test "atomic signal, six generations of an owner sum and a gather: the words keep their order and the bytes land" {
+    const net = try Net.open(.{ .signal = .atomic }, .{ .nap = false }, roci.identity);
+    defer net.close();
+    try net.start();
+    const run = try runProgram(net, &.{ .own1, .gm }, 6, roci.identity, false);
+    for (run.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+    for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+    try std.testing.expectEqual(@as(u32, 0), net.atomic_off.load(.acquire));
+}
+
+test "control: an atomic the card does before the data lets a consumer read stale bytes" {
+    const net = try Net.open(.{ .signal = .atomic, .word_first = true, .hold_data = true }, .{ .nap = false }, roci.identity);
+    defer net.close();
+    try net.start();
+    const run = try runProgram(net, &.{.own2}, 1, roci.identity, false);
+    var bad: u64 = 0;
+    for (run.bad) |b| bad += b;
+    try std.testing.expect(bad > 0);
+}
+
+/// Node 0 sends class own1 to its partner while the partner's card has the atomic open (read, `torn_ns`, write back old + 1);
+/// once both cards have read their word, the partner fails (its fence takes `fence_ns`: the atomic lands inside it). Returns the partner's words of that class after the card has finished.
+fn failDuringAtomic(mode: Mode, cap_ns: u64) ![roci.rails]u64 {
+    defer net.close();
+    try net.start();
+    const e = roci.buildEvent(.own1, 4096, 0, roci.identity);
+    const p = e.peerSlice()[0];
+    const s: FakeStream = .{};
+    try net.nodes[0].t.send(s, .own1, 0);
+    var spins: u32 = 0; // the atomics are open (torn_ns) on both rails: each card has read its word
+    while (net.atomics.load(.acquire) < roci.rails and spins < 5_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    try std.testing.expect(net.atomics.load(.acquire) >= roci.rails);
+    net.nodes[p].t.fail(.refused, .own1, 0);
+    sleep(cap_ns); // the card finishes what it had begun
+    var out: [roci.rails]u64 = undefined;
+    for (&out, 0..) |*o, r| o.* = @atomicLoad(u64, &net.nodes[p].ctl.recv[@backingInt(C.own1)][0][r].v, .acquire);
+    return out;
+}
+
+test "a failure with atomics in flight: the card is fenced off before the abort values are stored, so none lands over them and every wait is released" {
+    const got = try failDuringAtomic(.{ .signal = .atomic, .torn_ns = 100 * std.time.ns_per_ms, .fence_ns = 100 * std.time.ns_per_ms }, 300 * std.time.ns_per_ms);
+    for (got) |v| try std.testing.expectEqual(roci.abort_value, v);
+}
+
+test "control: a card that is never fenced finishes its atomic over the abort value, and the wait of the failed rank is not released" {
+    const got = try failDuringAtomic(.{ .signal = .atomic, .torn_ns = 100 * std.time.ns_per_ms, .fence_ns = 100 * std.time.ns_per_ms, .no_fence = true }, 300 * std.time.ns_per_ms);
+    for (got) |v| try std.testing.expectEqual(@as(u64, 1), v); // the atomic's old + 1 over the abort value: a count of one, below the generations a later wait names
+}
+
 test "a post that fails stops the transport naming the class and the peer" {
     const net = try Net.open(.{ .broken = 0 }, .{ .nap = false }, roci.identity);
     defer net.close();
@@ -668,6 +805,7 @@ test "the device chain: a stream memset into write-combined host memory, the doo
 
 test "the start line names the Rocinante transport, the arena and the layout hash" {
     var w = std.Io.Writer.fixed(&buf);
+    try roci.startLine(&w, 2, "mlx5_0,mlx5_2", 3, .{}, .write);
     const text = w.buffered();
 test "the start line says what the transport carries: the owner sums, and the codes and the gathers where the arena holds their regions; the event counts follow" {
     try std.testing.expectEqualStrings("the owner sums of full passes (attention, MoE, Engram)", roci.carriesText(&buf, false, false));

@@ -113,6 +113,12 @@ pub const Chain = struct {
     word_dst: u64,
     word_rkey: u32,
     word: u64,
+    /// The atomic signal: the third entry is an RDMA ATOMIC fetch-and-add of 1 on `word_dst` (the peer's generation word, which then counts the
+    /// exchanges: the first is 1, so after exchange q it holds q) instead of the inline WRITE of `word`; the old value it returns lands in
+    /// `sink_va` (this lane's own word, keyed by `sink_lkey`).
+    atomic: bool = false,
+    sink_va: u64 = 0,
+    sink_lkey: u32 = 0,
 };
 
 /// The send-queue entries a chain takes (a WAIT, the data WRITE if any, the word).
@@ -245,6 +251,8 @@ pub const Lane = struct {
     bell_lkey: u32,
     gen_va: u64, // the peer's generation word of this rank's lane
     gen_rkey: u32,
+    sink_va: u64 = 0, // the atomic signal's landing of the old value: this lane's own word (host address), and its key
+    sink_lkey: u32 = 0,
 };
 
 /// The ring's geometry as the chains need it.
@@ -254,6 +262,7 @@ pub const Geometry = struct {
     slots: u32,
     max_bytes: u64,
     send_va: u64, // the host address of the send region (slot 0)
+    atomic: bool = false, // the chains end in the RDMA atomic, not the inline word
     atomic_depth: u8 = 0, // the ATOMICs in flight its queue pairs are set up for (the ring's slots, capped by the card's limits)
 };
 
@@ -269,6 +278,9 @@ pub fn laneChain(g: Geometry, l: Lane, q: u64, n: u64, send_slot: usize) Chain {
         .word_dst = l.gen_va,
         .word_rkey = l.gen_rkey,
         .word = q,
+        .atomic = g.atomic,
+        .sink_va = l.sink_va,
+        .sink_lkey = l.sink_lkey,
     };
 }
 
@@ -289,6 +301,9 @@ pub const Verdict = union(enum) {
     cqe: struct { rail: u8, peer: u8, err: CqeError },
     /// The doorbell holds a sequence nobody posted a chain for.
     bell_ahead: struct { bell: u64, posted: u64 },
+    /// The atomic signal returned an old value that cannot be a count of this lane's exchanges (more than were posted): the card's atomics are not
+    /// host-endian counts on this queue pair, and a peer's word would run ahead of every sequence.
+    sink: struct { peer: u8, lane: u8, value: u64, posted: u64 },
 };
 
 pub const Backend = struct {
@@ -374,14 +389,18 @@ pub const Backend = struct {
     /// RESET to INIT to RTR to RTS against the peer's queue pair.
     pub fn connectQp(b: *Backend, r: usize, peer: usize, remote: mx.Remote, gid_index: u8, udp_sport: u16, mtu: u8) !void {
         const q = &b.qps[r][peer].?;
+        // the atomic signal: the responder accepts atomics and both ends allow as many outstanding as the ring has slots
         const depth: u8 = if (b.geo.atomic) b.geo.atomic_depth else 0;
         var in: [mx.qp_msg_bytes]u8 = undefined;
         var out: [mx.small_msg_bytes]u8 = undefined;
         mx.rst2initIn(&in, q.qpn);
+        if (depth > 0) mx.atomicQp(&in, .rst2init, depth);
         try b.command(q, &in, &out, "RST2INIT");
         mx.init2rtrIn(&in, q.qpn, remote, gid_index, udp_sport, mtu);
+        if (depth > 0) mx.atomicQp(&in, .init2rtr, depth);
         try b.command(q, &in, &out, "INIT2RTR");
         mx.rtr2rtsIn(&in, q.qpn);
+        if (depth > 0) mx.atomicQp(&in, .rtr2rts, depth);
         try b.command(q, &in, &out, "RTR2RTS");
     }
 
@@ -444,6 +463,9 @@ pub const Backend = struct {
             mx.writeWqe(q.slot(pi), @truncate(pi), q.qpn, false, d.dst, d.rkey, d.lkey, d.src, d.len);
             pi +%= 1;
         }
+        if (c.atomic) {
+            mx.atomicFaWqe(q.slot(pi), @truncate(pi), q.qpn, true, c.word_dst, c.word_rkey, 1, c.sink_lkey, c.sink_va);
+        } else mx.inlineWordWqe(q.slot(pi), @truncate(pi), q.qpn, true, c.word_dst, c.word_rkey, c.word);
         pi +%= 1;
         q.ends[@intCast(q.chains & (q.ends.len - 1))] = pi;
         q.chains += 1;
@@ -505,6 +527,10 @@ pub const Backend = struct {
         const bell = std.mem.bigToNative(u64, @atomicLoad(u64, b.bell, .acquire));
         const posted = b.posted.load(.acquire);
         if (bell > posted) return .{ .bell_ahead = .{ .bell = bell, .posted = posted } };
+        if (b.geo.atomic) for (b.lanes.items) |l| {
+            const v = @atomicLoad(u64, @as(*const u64, @ptrFromInt(l.sink_va)), .monotonic);
+            if (v > posted) return .{ .sink = .{ .peer = l.peer, .lane = l.lane, .value = v, .posted = posted } };
+        };
         return .ok;
     }
 
@@ -520,6 +546,7 @@ pub const Backend = struct {
         return switch (v) {
             .ok => "ok",
             .cqe => |c| std.fmt.bufPrint(buf, "RING_WAIT: an error completion on the queue pair toward rank {d} (rail {d}): opcode 0x{x}, syndrome 0x{x}, vendor 0x{x}, queue pair {d}, entry {d}", .{ c.peer, c.rail, c.err.opcode, c.err.syndrome, c.err.vendor, c.err.qpn, c.err.wqe }) catch "RING_WAIT: an error completion",
+            .sink => |x| std.fmt.bufPrint(buf, "RING_WAIT: the atomic signal toward rank {d} lane {d} returned {d} as the word's old value with {d} exchanges posted: not a count (the card's atomics on this queue pair are not host-endian adds): the peer's word would release every wait", .{ x.peer, x.lane, x.value, x.posted }) catch "RING_WAIT: the atomic signal returned a value that is not a count",
             .bell_ahead => |x| std.fmt.bufPrint(buf, "RING_WAIT: the doorbell holds sequence {d} and only {d} were posted: an exchange was launched that the ring did not see (a graph launched without its plan)", .{ x.bell, x.posted }) catch "RING_WAIT: the doorbell is ahead of the posts",
         };
     }
@@ -754,6 +781,7 @@ const Card = struct {
     cons: u32 = 0,
     cqe_n: u64 = 0,
     reads_big_endian: bool = true,
+    atomic_be: bool = false, // the atomics see memory as big-endian numbers
     fired: u32 = 0,
     wrote: u32 = 0,
 
@@ -785,6 +813,18 @@ const Card = struct {
             if (opc == mx.opcode_wait) {
                 if (!c.cond(w)) return;
                 c.fired += 1;
+            } else if (opc == mx.opcode_atomic_fa) {
+                // an ATOMIC fetch-and-add: the old value of the 64-bit word lands at the local address; host-endian arithmetic by default (what
+                // the kernel's verbs queue pairs get), big-endian when `atomic_be` plays the other mode
+                const raddr = std.mem.readInt(u64, w[16..24], .big);
+                const add = std.mem.readInt(u64, w[32..40], .big);
+                const laddr = std.mem.readInt(u64, w[56..64], .big);
+                const e: std.builtin.Endian = if (c.atomic_be) .big else builtin.cpu.arch.endian();
+                const old = std.mem.readInt(u64, c.mem[raddr - c.base ..][0..8], e);
+                std.mem.writeInt(u64, c.mem[raddr - c.base ..][0..8], old +% (if (c.atomic_be) add else add), e);
+                std.mem.writeInt(u64, c.mem[laddr - c.base ..][0..8], old, e);
+                c.wrote += 1;
+                if (w[11] & mx.ctrl_cq_update != 0) c.complete(q, 0x0);
             } else {
                 // a WRITE: remote address, then the data (segment) or the inline word
                 const raddr = std.mem.readInt(u64, w[16..24], .big);
@@ -1296,8 +1336,12 @@ const CreateMlx = struct {
         mx.put(o[0..16], mx.msg.create_out_qpn, 0x1234);
         return @ptrCast(&obj_byte);
     }
+    var sent: [8][mx.qp_msg_bytes]u8 = undefined;
+    fn modify(_: *mx.DevxObj, in: *const anyopaque, inlen: usize, out: *anyopaque, _: usize) callconv(.c) c_int {
         const b: *const [2]u8 = @ptrCast(in);
         modified[nm] = std.mem.readInt(u16, b, .big);
+        const src: [*]const u8 = @ptrCast(in);
+        @memcpy(sent[nm][0..@min(inlen, mx.qp_msg_bytes)], src[0..@min(inlen, mx.qp_msg_bytes)]);
         nm += 1;
         _ = out;
         return 0;
@@ -1386,5 +1430,100 @@ test "the posting counters: entries and rings counted as written, the exchange's
 fn ringQpTest(q: *Qp) void {
     Backend.ringQp(q);
 }
+
+fn atomicChain(q: u64, sink_va: u64) Chain {
+    var c = testChain(q, true);
+    c.atomic = true;
+    c.sink_va = sink_va;
+    c.sink_lkey = 21;
+    c.word_dst = 0x2100;
+    return c;
+}
+
+test "an atomic-ended chain: the third entry is one fetch-and-add block (opcode 0x12, the only signalled entry), the peer's word counts the exchanges, the old value lands in the lane's sink, the credit is the atomic's completion" {
+    var mem: [0x4000]u8 = @splat(0);
+    var cqbuf: [64 * 8 + 64]u8 align(64) = undefined;
+    var q = try testQp(64, testCq(&cqbuf, 8));
+    defer freeQp(&q);
+    var card: Card = .{ .mem = &mem, .base = 0 };
+    @memcpy(mem[0x3000..][0..16], "0123456789abcdef");
+    Backend.writeChain(&q, atomicChain(1, 0x3800));
+    Backend.writeChain(&q, atomicChain(2, 0x3800));
+    try testing.expectEqual(@as(u32, 6), q.pi); // the same three blocks a chain as the word's
+    try testing.expectEqual(@as(u8, mx.opcode_atomic_fa), q.slot(2)[3]);
+    try testing.expectEqual(@as(u8, mx.ctrl_cq_update), q.slot(2)[11]);
+    try testing.expectEqual(@as(u8, 0), q.slot(1)[11]); // the data WRITE is not signalled
+    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, q.slot(2)[32..40], .big)); // the addend
+    q.rung = q.pi;
+    std.mem.writeInt(u64, mem[0x1000..][0..8], 2, .big); // the doorbell says 2: both chains go
+    card.run(&q);
+    try testing.expectEqual(@as(u32, 4), card.wrote);
+    try testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, mem[0x2100..][0..8], builtin.cpu.arch.endian())); // the word counts: 2 after the second
+    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, mem[0x3800..][0..8], builtin.cpu.arch.endian())); // the old value of the last
+    // one completion an exchange, entry q - 1: the credit is theirs
+    try testing.expectEqual(CqeState.ready, cqeState(cqeOwn(&q.cq, cqeIndexOf(2)), cqeIndexOf(2), q.cq.cnt));
+    try testing.expectEqual(CqeState.empty, cqeState(cqeOwn(&q.cq, cqeIndexOf(3)), cqeIndexOf(3), q.cq.cnt));
+}
+
+test "NEGATIVE CONTROL for the atomic: a card whose atomics are big-endian numbers makes the old value a non-count, and the janitor fails the ring by name" {
+    var mem: [0x4000]u8 = @splat(0);
+    var cqbuf: [64 * 16 + 64]u8 align(64) = undefined;
+    var q = try testQp(64, testCq(&cqbuf, 16));
+    defer freeQp(&q);
+    var zero: u64 = 0;
+    var mlx = mx.Mlx5.fake(FakeMlx.api());
     var b = try Backend.init(testing.allocator, &mlx, .{ .lag = 2 }, .{ .rank = 0, .world = 2, .slots = 4, .max_bytes = 4096, .send_va = 0x4000, .atomic = true, .atomic_depth = 4 }, &zero, &zero, undefined, undefined);
+    defer {
+        b.lanes.deinit(testing.allocator);
+        testing.allocator.destroy(b);
+    }
+    for ([_]bool{ false, true }) |be| {
+        @memset(&mem, 0);
+        q.pi = 0;
+        q.rung = 0;
+        q.chains = 0;
+        q.done = 0;
+        for (0..16) |i| cqbuf[i * 64 + 63] = 0xf1;
+        var card: Card = .{ .mem = &mem, .base = 0, .atomic_be = be };
+        b.lanes.clearRetainingCapacity();
+        try b.lanes.append(testing.allocator, .{ .qp = &q, .peer = 1, .lane = 0, .lanes = 1, .peer_recv = 0x6000, .recv_rkey = 1, .lkey_send = 2, .bell_va = 0x1000, .bell_lkey = 3, .gen_va = 0x2100, .gen_rkey = 4, .sink_va = @intFromPtr(&mem[0x3800]), .sink_lkey = 5 });
+        b.posted.store(3, .release);
+        b.q = 3;
+        std.mem.writeInt(u64, mem[0x1000..][0..8], 3, .big);
+        for (1..4) |k| Backend.writeChain(&q, atomicChain(k, 0x3800));
+        q.rung = q.pi;
+        card.run(&q);
+        // (the model's sink address is the model's own offset: the lane's host pointer names the same bytes)
+        const v = b.sweep();
+        if (!be) {
+            try testing.expect(v == .ok);
+        } else switch (v) {
+            .sink => |x| try testing.expect(x.value > x.posted),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "the atomic queue pair: with the atomic signal every transition carries the atomic enable, the plain WRITE queue pair's bytes are what they were" {
+    var a: mx.Api = undefined;
+    a.mlx5dv_devx_obj_modify = CreateMlx.modify;
+    const mlx = mx.Mlx5.fake(a);
+    var zero: u64 = 0;
+    var cqbuf: [64 * 8 + 64]u8 align(64) = undefined;
+    for ([_]bool{ false, true }) |atomic| {
         var b = try Backend.init(testing.allocator, &mlx, .{ .lag = 2 }, .{ .rank = 0, .world = 2, .slots = 4, .max_bytes = 4096, .send_va = 0, .atomic = atomic, .atomic_depth = 4 }, &zero, &zero, undefined, undefined);
+        b.qps[0][1] = .{ .obj = @ptrCast(&CreateMlx.obj_byte), .qpn = 9, .cq = testCq(&cqbuf, 8) };
+        CreateMlx.nm = 0;
+        try b.connectQp(0, 1, .{ .qpn = 0x55, .gid = @splat(1), .mac = .{ 0, 1, 2, 3, 4, 5 } }, 3, 50000, 5);
+        for (0..3) |i| {
+            const bytes = CreateMlx.sent[i][mx.msg.qpc_at..];
+            try testing.expectEqual(@as(u64, @intFromBool(atomic)), mx.get(bytes, mx.qpc.rae));
+        }
+        // the RTR and RTS commands size the outstanding atomics by the ring's slots (4: log 2)
+        try testing.expectEqual(@as(u64, if (atomic) 2 else 0), mx.get(CreateMlx.sent[1][mx.msg.qpc_at..], mx.qpc.log_rra_max));
+        try testing.expectEqual(@as(u64, if (atomic) 2 else 0), mx.get(CreateMlx.sent[2][mx.msg.qpc_at..], mx.qpc.log_sra_max));
+        b.qps[0][1] = null;
+        b.lanes.deinit(testing.allocator);
+        testing.allocator.destroy(b);
+    }
+}

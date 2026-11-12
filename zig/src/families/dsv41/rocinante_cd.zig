@@ -1,6 +1,10 @@
 //! Rocinante's NIC that waits in the card: one reliable-connected queue pair a peer on each of the two rails, made through DEVX as a
 //! Core Direct master (mlx5_devx.zig), its send queue and doorbell record in host memory. The engine thread writes every chain into the
 //! queue when it reserves the send, behind a WAIT-on-data entry for the doorbell word the GPU's stream write sets, and rings the queue; the
+//! card runs the WAIT, then the data WRITEs and the arrival signal, with no proxy thread (Settings.wait_qp, TF_DS_ROCI_WAIT=1). The arrival
+//! signal is the word's inline WRITE, or with TF_DS_ROCI_SIGNAL=atomic an RDMA ATOMIC fetch-and-add of 1 on the word, the entry rdma-core posts
+//! for IBV_WR_ATOMIC_FETCH_AND_ADD (mlx5_devx.zig atomicFaWqe): the card places an ATOMIC after the WRITEs before it on the queue pair, which two
+//! WRITEs do only as the card happens to run them (rocinante.zig Signal). The receiver reads the same words either way.
 //!
 //! The arena and the control block are registered again under the DEVX context (every object of a queue pair belongs to one), so this
 //! backend and the verbs one are never open together. A queue pair that holds a WAIT cannot carry anything else, so the failure's abort
@@ -52,6 +56,10 @@ pub const Settings = struct {
     abort_wait_ms: u32 = 10,
     /// The wait for the card to settle after a control block registration that is refused.
     settle_ms: u32 = 100,
+    /// The arrival signal (TF_DS_ROCI_SIGNAL). Every node must run the same one (compared at connect).
+    signal: roci.Signal = roci.default_signal,
+    /// The most ATOMICs a queue pair keeps in flight (its requester's and responder's depth), capped by what the card grants.
+    atomic_depth: u8 = 16,
     /// The MAC of the network device behind an RDMA device (the host tests give their own).
     mac_of: *const fn (device: []const u8) error{NoMac}![6]u8 = netdevMac,
 };
@@ -59,8 +67,35 @@ pub const Settings = struct {
 /// Whether an error completion is logged (the host tests that provoke one turn it off: a logged error fails a test).
 pub var log_errors: bool = true;
 
+pub const Error = error{ DevxUnavailable, DevxOpenFailed, NoSuchDevice, NoDeviceList, NoMac, QpCreateFailed, CommandFailed };
 
+/// What an entry of the queue is: one block (every entry, the ATOMIC's four units too, fills at most the 64 bytes of one: mx.blocks), at most this
+/// many entries a chain (WAIT, four data WRITEs, the signal).
 const max_chain_entries = roci.max_pieces + 2;
+
+comptime {
+    // every entry of a chain is one block: the producer index and the doorbell's BlueFlame write (the last entry's first 8 bytes, `ring`) rely on it
+    std.debug.assert(mx.blocks(mx.ds_units) == 1 and mx.blocks(mx.atomic_ds_units) == 1);
+}
+
+/// The blocks the arrival signal's entry takes: the inline word WRITE's 3 units or the ATOMIC's 4, one block each. The room arithmetic counts them
+/// so that an entry that ever grew past a block would be counted, not assumed.
+pub fn signalBlocks(sig: roci.Signal) u32 {
+    return mx.blocks(switch (sig) {
+        .write => mx.ds_units,
+        .atomic => mx.atomic_ds_units,
+    });
+}
+
+/// The blocks a chain takes: its WAIT (when there is one), its data WRITEs (one entry each, 3 units) and its signal.
+pub fn chainBlocks(sig: roci.Signal, data: u32, waits: bool) u32 {
+    return @as(u32, @intFromBool(waits)) * mx.blocks(mx.ds_units) + data * mx.blocks(mx.ds_units) + signalBlocks(sig);
+}
+
+/// The most blocks a chain takes (the margin the room wait keeps for the chains of one signalled stretch).
+pub fn maxChainBlocks(sig: roci.Signal) u32 {
+    return chainBlocks(sig, roci.max_pieces, true);
+}
 
 const Qp = struct {
     obj: ?*mx.DevxObj,
@@ -90,6 +125,10 @@ const Rail = struct {
     uar: ?*mx.DevxUar = null,
     mr_arena: ?*vabi.Mr = null,
     mr_ctl: ?*vabi.Mr = null, // null once fenced off: the card can no longer touch the control block
+    /// Where the card puts the old value an ATOMIC returns (the atomic signal only): the node's sink, local write.
+    mr_sink: ?*vabi.Mr = null,
+    /// The ATOMICs in flight this rail's queue pairs are set up for (0: the WRITE signal).
+    rd_atomic: u8 = 0,
     mtu: u8 = 5,
     mac: [6]u8 = @splat(0),
     qps: [roci.world]?Qp = @splat(null),
@@ -110,6 +149,8 @@ pub const CdNic = struct {
     rail: [roci.rails]Rail = @splat(.{}),
     peers: [roci.world]Info = @splat(.{}),
     layout_hash: u64 = 0,
+    /// The returned old values of the ATOMICs: one 64-byte line a (rail, peer), 64-byte aligned, registered per rail (atomic signal only).
+    sink: []align(64) u8 = &.{},
     /// Held by whoever reads a completion queue (the engine thread for room, the janitor for errors) and by the fence while it takes the
     /// queue pairs away.
     lock: std.atomic.Value(u32) = .init(0),
@@ -125,6 +166,10 @@ pub const CdNic = struct {
             gpa.destroy(n);
         }
         if (@intFromPtr(ctl.ptr) % roci.line != 0) return error.Misaligned;
+        if (set.signal == .atomic) {
+            n.sink = try gpa.alignedAlloc(u8, .@"64", roci.line * roci.rails * roci.world);
+            @memset(n.sink, 0);
+        }
         for (0..roci.rails) |r| try n.openRail(r);
         n.opened = true;
         return n;
@@ -137,6 +182,16 @@ pub const CdNic = struct {
         rl.ctx = ctx;
         const port = try n.v.port(ctx, 1);
         if (port.state != vabi.port_active) return error.PortDown;
+        if (n.set.signal == .atomic) {
+            // the ATOMIC signal's start-up check, the verbs path's: the card does ATOMICs and grants a queue pair at least one in flight
+            const dev = try n.v.device(ctx);
+            var why: [256]u8 = undefined;
+            if (rv.signalRefusal(&why, n.set.signal, n.set.devices[r], dev.atomic_cap, dev.max_qp_rd_atom, dev.max_qp_init_rd_atom)) |text| {
+                if (rv.log_refusals) std.log.err("{s}", .{text});
+                return error.AtomicUnsupported;
+            }
+            rl.rd_atomic = rv.atomicDepth(n.set.signal, n.set.atomic_depth, dev.max_qp_rd_atom, dev.max_qp_init_rd_atom);
+        }
         rl.mtu = @intCast(@min(port.active_mtu, @as(c_int, @intCast(mx.mtu_4k))));
         rl.pd = api.ibv_alloc_pd(ctx) orelse return error.VerbsFailed;
         const depth: u32 = @as(u32, 1) << @intCast(n.set.log_sq_size);
@@ -154,7 +209,10 @@ pub const CdNic = struct {
         rl.view = .{ .buf = @ptrCast(dcq.buf.?), .dbrec = dcq.dbrec.?, .cqe_cnt = dcq.cqe_cnt, .cqe_size = dcq.cqe_size };
         rl.uar = n.mlx.api.mlx5dv_devx_alloc_uar(ctx, mx.uar_type_bf) orelse n.mlx.api.mlx5dv_devx_alloc_uar(ctx, mx.uar_type_nc) orelse return error.DevxUnavailable;
         rl.mac = try n.set.mac_of(n.set.devices[r]);
+        // the arena takes WRITEs only; the control block's words are what the signal writes or adds to
         rl.mr_arena = api.ibv_reg_mr(rl.pd.?, n.arena.ptr, n.arena.len, vabi.access_local_write | vabi.access_remote_write) orelse return error.VerbsFailed;
+        rl.mr_ctl = api.ibv_reg_mr(rl.pd.?, n.ctl.ptr, n.ctl.len, rv.remoteAccess(n.set.signal)) orelse return error.VerbsFailed;
+        if (n.set.signal == .atomic) rl.mr_sink = api.ibv_reg_mr(rl.pd.?, n.sink.ptr, n.sink.len, vabi.access_local_write) orelse return error.VerbsFailed;
         rl.abort_cq = api.ibv_create_cq(ctx, @intCast(roci.world * 4), null, null, 0) orelse return error.VerbsFailed;
         for (0..roci.world) |p| {
             if (p == n.me) continue;
@@ -197,8 +255,10 @@ pub const CdNic = struct {
     }
 
     pub fn info(n: *CdNic) !Info {
+        var i: Info = .{ .arena_base = @intFromPtr(n.arena.ptr), .ctl_base = @intFromPtr(n.ctl.ptr), .layout_hash = n.layout_hash, .signal = @backingInt(n.set.signal), .wait = 1 };
         for (0..roci.rails) |r| {
             const rl = &n.rail[r];
+            i.rd_atomic[r] = rl.rd_atomic;
             i.gid[r] = (try n.v.gid(rl.ctx.?, 1, n.set.gid_index)).raw;
             i.rkey_arena[r] = rl.mr_arena.?.rkey;
             i.rkey_ctl[r] = rl.mr_ctl.?.rkey;
@@ -229,11 +289,14 @@ pub const CdNic = struct {
             var in: [mx.qp_msg_bytes]u8 = undefined;
             var out: [mx.small_msg_bytes]u8 = undefined;
             mx.rst2initIn(&in, q.qpn);
+            if (n.set.signal == .atomic) mx.atomicQp(&in, .rst2init, rl.rd_atomic);
             try n.command(r, q.obj.?, &in, &out, "RST2INIT");
             const remote: mx.Remote = .{ .qpn = theirs.qpn[r][n.me], .gid = theirs.gid[r], .mac = theirs.mac[r][0..6].* };
             mx.init2rtrIn(&in, q.qpn, remote, n.set.gid_index, udpSport(q.qpn, r, p), rl.mtu);
+            if (n.set.signal == .atomic) mx.atomicQp(&in, .init2rtr, rl.rd_atomic);
             try n.command(r, q.obj.?, &in, &out, "INIT2RTR");
             mx.rtr2rtsIn(&in, q.qpn);
+            if (n.set.signal == .atomic) mx.atomicQp(&in, .rtr2rts, rl.rd_atomic);
             try n.command(r, q.obj.?, &in, &out, "RTR2RTS");
             // the abort pair: the verbs path's transitions
             const aq = rl.abort_qps[p].?;
@@ -287,6 +350,8 @@ pub const CdNic = struct {
         return error.PostFailed;
     }
 
+    /// Writes the chain of (rail, peer) into the send queue, `[WAIT doorbell][data WRITEs][arrival signal]` (no WAIT when `wait_for` is 0; the
+    /// signal an inline word WRITE, or an ATOMIC fetch-and-add of 1 on the word: both one block), and rings the queue once. Room is counted in entries: when the queue is short of room the thread reads the completion queue until a
     /// signalled completion frees some, as the verbs post waits.
     fn prepostFn(ctx: *anyopaque, rail: u8, peer: u8, class: roci.Class, chain: *const roci.Chain, word: u64, wait_for: u64) roci.PostError!void {
         const n: *CdNic = @ptrCast(@alignCast(ctx));
@@ -296,6 +361,8 @@ pub const CdNic = struct {
         const mr_ctl = rl.mr_ctl orelse return error.PostFailed;
         const mr_arena = rl.mr_arena.?;
         const theirs = &n.peers[peer];
+        const need: u32 = chainBlocks(n.set.signal, chain.n, wait_for != 0);
+        const margin: u32 = n.set.signal_every * maxChainBlocks(n.set.signal);
         if (q.pi -% @atomicLoad(u32, &q.retired, .acquire) +% need +% margin > q.depth) {
             const t0 = nowNs();
             var spins: u32 = 0;
@@ -322,6 +389,12 @@ pub const CdNic = struct {
         q.chains +%= 1;
         const signal = q.chains % n.set.signal_every == 0;
         const cell = @offsetOf(roci.Control, "recv") + ((@as(usize, @backingInt(class)) * roci.world + n.me) * roci.rails + rail) * @sizeOf(roci.Word);
+        switch (n.set.signal) {
+            .write => mx.inlineWordWqe(q.slot(pi), @truncate(pi), q.qpn, signal, theirs.ctl_base + cell, theirs.rkey_ctl[rail], word),
+            // the fetch-and-add of 1 on the same word (the verbs path's: rocinante_verbs.zig buildWrs), its old value into this node's line for (rail, peer)
+            .atomic => mx.atomicFaWqe(q.slot(pi), @truncate(pi), q.qpn, signal, theirs.ctl_base + cell, theirs.rkey_ctl[rail], 1, rl.mr_sink.?.lkey, @intFromPtr(n.sink.ptr) + (@as(usize, rail) * roci.world + peer) * roci.line),
+        }
+        pi +%= @intCast(signalBlocks(n.set.signal));
         q.pi = pi;
         ring(rl, q);
     }
@@ -418,6 +491,7 @@ pub const CdNic = struct {
                 mx.qp2errIn(&in, q.qpn);
                 _ = n.mlx.api.mlx5dv_devx_obj_modify(obj, &in, in.len, &out, out.len);
             };
+            if (rl.cq != null) n.drain(r); // (a rail that failed to open before its completion queue has none to read)
             for (&rl.qps) |*qo| if (qo.*) |*q| if (q.obj) |obj| {
                 _ = n.mlx.api.mlx5dv_devx_obj_destroy(obj);
                 q.obj = null;
@@ -465,6 +539,7 @@ pub const CdNic = struct {
                 qo.* = null;
             };
             if (rl.abort_cq) |c| _ = api.ibv_destroy_cq(c);
+            if (rl.mr_sink) |m| _ = api.ibv_dereg_mr(m);
             if (rl.mr_arena) |m| _ = api.ibv_dereg_mr(m);
             if (rl.cq) |c| _ = api.ibv_destroy_cq(c);
             if (rl.uar) |u| n.mlx.api.mlx5dv_devx_free_uar(u);
@@ -472,6 +547,8 @@ pub const CdNic = struct {
             if (rl.ctx) |c| _ = api.ibv_close_device(c);
             rl.* = .{};
         }
+        if (n.sink.len != 0) n.gpa.free(n.sink);
+        n.sink = &.{};
     }
 
     pub fn close(n: *CdNic) void {

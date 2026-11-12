@@ -94,6 +94,10 @@ pub const qpc = struct {
     pub const cd_master: Field = .{ .off = 1183, .bits = 1 }; // :3552
     pub const log_page_size: Field = .{ .off = 163, .bits = 5 }; // :3501
     pub const rwe: Field = .{ .off = 1169, .bits = 1 }; // :3544
+    /// The atomic bits (mlx5_ifc.h, struct mlx5_ifc_qpc_bits: log_rra_max at reserved_at_480 + 8, then atomic_mode[4], rre, rwe, rae one bit each):
+    /// rae lets the responder run ATOMICs, atomic_mode picks the operand size (IB_SPEC, 1, is the 8-byte IB compare-swap and fetch-add).
+    pub const atomic_mode: Field = .{ .off = 1164, .bits = 4 };
+    pub const rae: Field = .{ .off = 1170, .bits = 1 };
     pub const next_rcv_psn: Field = .{ .off = 1192, .bits = 24 }; // :3556
     pub const remote_qpn: Field = .{ .off = 168, .bits = 24 }; // :3502
     pub const log_msg_max: Field = .{ .off = 67, .bits = 5 }; // :3481
@@ -140,6 +144,12 @@ pub const small_msg_bytes: usize = 16;
 /// The `opt_param_mask` bit that lets RTR2RTS set `min_rnr_nak`: PRIV_DOCA_MLX5_QP_OPT_PARAM_MIN_RNR_NAK = bit 6
 /// (GPUNetIO doca_verbs_qp.cpp, as m19c_wait.cu:143 uses it).
 pub const opt_min_rnr_nak: u64 = 1 << 6;
+/// The RAE optional-parameter bit (rdma-core-independent: DOCA GPUNetIO's doca_verbs_qp.cpp:68 PRIV_DOCA_MLX5_QP_OPT_PARAM_RAE = 1 << 2, set
+/// for ATOMIC_MODE on the transitions after RST2INIT).
+pub const opt_rae: u64 = 1 << 2;
+/// atomic_mode IB_SPEC (DOCA doca_verbs.h:315 DOCA_VERBS_QP_ATOMIC_MODE_IB_SPEC = 1; the kernel's MLX5_ATOMIC_MODE_IB_COMP = 1 where a card has no
+/// extended atomics).
+pub const atomic_mode_ib_spec: u64 = 1;
 
 /// What creating a Core Direct master queue pair needs: the objects it is made on.
 pub const QpCreate = struct {
@@ -237,6 +247,31 @@ pub fn rtr2rtsIn(buf: *[qp_msg_bytes]u8, qpn: u32) void {
     put(buf, msg.opt_param_mask, opt_min_rnr_nak);
 }
 
+/// Which transition a message is.
+pub const Transition = enum { rst2init, init2rtr, rtr2rts };
+
+/// Makes a built transition message the one of an atomic-capable queue pair, as DOCA GPUNetIO's doca_verbs_qp.cpp does it (:866-869, :922-925,
+/// :1097, :1164): `rae` and `atomic_mode` IB_SPEC on every transition, the responder's depth `log_rra_max` at INIT2RTR and the requester's
+/// `log_sra_max` at RTR2RTS (log2 of `depth`, at most 7: the fields are 3 bits), and the RAE bit of the optional-parameter mask where there is one
+/// to carry it (not RST2INIT). The WRITE queue pair never calls this, so its messages are the ones the builders wrote.
+pub fn atomicQp(buf: *[qp_msg_bytes]u8, t: Transition, depth: u8) void {
+    const q = buf[msg.qpc_at..];
+    put(q, qpc.rae, 1);
+    put(q, qpc.atomic_mode, atomic_mode_ib_spec);
+    const log: u64 = if (depth <= 1) 0 else @min(7, std.math.log2_int_ceil(u8, depth));
+    switch (t) {
+        .rst2init => {},
+        .init2rtr => {
+            put(q, qpc.log_rra_max, log);
+            put(buf, msg.opt_param_mask, get(buf, msg.opt_param_mask) | opt_rae);
+        },
+        .rtr2rts => {
+            put(q, qpc.log_sra_max, log);
+            put(buf, msg.opt_param_mask, get(buf, msg.opt_param_mask) | opt_rae);
+        },
+    }
+}
+
 /// 2ERR_QP: the queue pair to the error state (every outstanding work request flushes).
 pub fn qp2errIn(buf: *[small_msg_bytes]u8, qpn: u32) void {
     @memset(buf, 0);
@@ -260,12 +295,23 @@ pub const wqebb: usize = 64;
 pub const opcode_rdma_write: u8 = 0x08;
 pub const opcode_wait: u8 = 0x0f;
 pub const opmod_wait_data: u8 = 1;
+/// rdma-core mlx5dv.h:1084 MLX5_OPCODE_ATOMIC_FA (fetch-and-add; ATOMIC_CS is 0x11).
+pub const opcode_atomic_fa: u8 = 0x12;
 /// mlx5dv.h:34689 MLX5_WQE_CTRL_CQ_UPDATE (= 2 << 2): a completion for this entry.
 pub const ctrl_cq_update: u8 = 2 << 2;
 /// mlx5dv.h:34909 MLX5_INLINE_SEG: the top bit of an inline segment's byte count.
 pub const inline_seg: u32 = 0x8000_0000;
 /// Every entry this transport writes is a control segment and two more: 3 sixteen-byte units, 48 bytes, one block.
 pub const ds_units: u8 = 3;
+/// The ATOMIC entry: control 16 + raddr segment 16 + atomic segment 16 + the data segment of the landing 16 = 4 units = 64 bytes, still one block
+/// (rdma-core qp.c:898-915 posts the raddr and atomic segments, then the sge's data segment, the byte count 8 at :411).
+pub const atomic_ds_units: u8 = 4;
+
+/// The blocks an entry of `ds` sixteen-byte units takes in the send queue: the producer index counts blocks, so the room arithmetic uses this and
+/// not a constant 1 (an entry of more than 4 units would take more).
+pub fn blocks(ds: u8) u32 {
+    return @intCast((@as(usize, ds) * 16 + wqebb - 1) / wqebb);
+}
 
 /// A WAIT's compare of the memory word with its value (DPDK mlx5_prm.h, `enum mlx5_wait_cond`): ALWAYS_TRUE 0, EQUAL 1, BIGGER 2,
 /// SMALLER 3, CYCLIC_BIGGER 4, CYCLIC_SMALLER 5, INVERT 0x10 as a flag.
@@ -313,6 +359,22 @@ pub fn inlineWordWqe(w: *[wqebb]u8, pi: u16, qpn: u32, signal: bool, raddr: u64,
     std.mem.writeInt(u32, w[24..28], rkey, .big);
     std.mem.writeInt(u32, w[32..36], 8 | inline_seg, .big);
     std.mem.writeInt(u64, w[36..44], word, builtin.cpu.arch.endian());
+}
+
+/// An RDMA ATOMIC fetch-and-add of `add` onto the 8 bytes at the remote address, the old value landing in the 8 bytes at the local address: the
+/// entry rdma-core posts for IBV_WR_ATOMIC_FETCH_AND_ADD (qp.c:898-915 and the sge's data segment): control segment (opcode 0x12), raddr segment
+/// {raddr be64, rkey be32, reserved 0} (set_raddr_seg :202-208), atomic segment {swap_add = htobe64(add), compare 0} (_set_atomic_seg :235-246),
+/// data segment {byte_count 8, lkey, addr} (mlx5_wqe_data_seg; byte count always 8 for an atomic, :411). 4 units, one block. The remote address
+/// is 8-byte aligned (the card refuses a misaligned atomic).
+pub fn atomicFaWqe(w: *[wqebb]u8, pi: u16, qpn: u32, signal: bool, raddr: u64, rkey: u32, add: u64, lkey: u32, laddr: u64) void {
+    ctrlSeg(w, pi, opcode_atomic_fa, 0, qpn, if (signal) ctrl_cq_update else 0, atomic_ds_units);
+    std.debug.assert(raddr % 8 == 0 and laddr % 8 == 0);
+    std.mem.writeInt(u64, w[16..24], raddr, .big);
+    std.mem.writeInt(u32, w[24..28], rkey, .big);
+    std.mem.writeInt(u64, w[32..40], add, .big);
+    std.mem.writeInt(u32, w[48..52], 8, .big);
+    std.mem.writeInt(u32, w[52..56], lkey, .big);
+    std.mem.writeInt(u64, w[56..64], laddr, .big);
 }
 
 // -- the completion queue read by hand -------------------------------------------------------------------------------
@@ -616,4 +678,75 @@ test "the completion reader: an empty slot, an owner bit that flips with each la
     try std.testing.expect(cq.pollOne() == null);
     ring[63] = 0x01;
     try std.testing.expect(cq.pollOne() != null);
+}
+
+test "an ATOMIC fetch-and-add entry: opcode 0x12 (rdma-core's MLX5_OPCODE_ATOMIC_FA), 4 units = one 64-byte block, {raddr, rkey} then {swap_add = the addend big endian, compare 0} then the data segment of the 8-byte landing" {
+    var w: [wqebb]u8 = undefined;
+    @memset(&w, 0xee);
+    atomicFaWqe(&w, 0x0abc, 0x123456, false, 0x7f00_0000_1238, 0xcafe, 1, 0x4242, 0x5000_0040);
+    try std.testing.expectEqual(@as(u8, 0), w[0]); // no opmod
+    try std.testing.expectEqual(@as(u8, 0x12), w[3]);
+    try std.testing.expectEqual(@as(u16, 0x0abc), @as(u16, @intCast((std.mem.readInt(u32, w[0..4], .big) >> 8) & 0xffff)));
+    try std.testing.expectEqual(@as(u32, 0x123456 << 8 | 4), std.mem.readInt(u32, w[4..8], .big));
+    try std.testing.expectEqual(@as(u8, 0), w[11]);
+    // raddr segment (mlx5dv.h mlx5_wqe_raddr_seg: raddr be64, rkey be32, reserved 0)
+    try std.testing.expectEqual(@as(u64, 0x7f00_0000_1238), std.mem.readInt(u64, w[16..24], .big));
+    try std.testing.expectEqual(@as(u32, 0xcafe), std.mem.readInt(u32, w[24..28], .big));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, w[28..32], .big));
+    // atomic segment (qp.c _set_atomic_seg: for fetch-and-add swap_add = htobe64(add), compare untouched = 0)
+    try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, w[32..40], .big));
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, w[40..48], .big));
+    // data segment (mlx5_wqe_data_seg: byte_count be32 = 8, lkey be32, addr be64): where the old value lands
+    try std.testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, w[48..52], .big));
+    try std.testing.expectEqual(@as(u32, 0x4242), std.mem.readInt(u32, w[52..56], .big));
+    try std.testing.expectEqual(@as(u64, 0x5000_0040), std.mem.readInt(u64, w[56..64], .big));
+    // the signal bit only where asked; the units fill exactly one block
+    atomicFaWqe(&w, 1, 2, true, 8, 3, 1, 4, 8);
+    try std.testing.expectEqual(@as(u8, ctrl_cq_update), w[11]);
+    try std.testing.expectEqual(@as(usize, 64), @as(usize, atomic_ds_units) * 16);
+    try std.testing.expectEqual(@as(u32, 1), blocks(atomic_ds_units));
+    try std.testing.expectEqual(@as(u32, 1), blocks(ds_units));
+    try std.testing.expectEqual(@as(u32, 2), blocks(5)); // (the arithmetic is not a constant 1: a 5-unit entry takes two blocks)
+}
+
+test "the atomic queue pair: rae and atomic_mode IB_SPEC on all three transitions, the depth as log2 in log_rra_max (RTR) and log_sra_max (RTS), the RAE optional-parameter bit where the transition takes one; the WRITE queue pair's bytes are untouched" {
+    var plain: [qp_msg_bytes]u8 = undefined;
+    var b: [qp_msg_bytes]u8 = undefined;
+    const gid: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 255, 0, 34 };
+    // rst2init
+    rst2initIn(&plain, 9);
+    rst2initIn(&b, 9);
+    try std.testing.expectEqual(@as(u64, 0), get(plain[msg.qpc_at..], qpc.rae));
+    atomicQp(&b, .rst2init, 16);
+    try std.testing.expectEqual(@as(u64, 1), get(b[msg.qpc_at..], qpc.rae));
+    try std.testing.expectEqual(@as(u64, atomic_mode_ib_spec), get(b[msg.qpc_at..], qpc.atomic_mode));
+    try std.testing.expectEqual(@as(u64, 1), get(b[msg.qpc_at..], qpc.rwe)); // (still there)
+    // init2rtr: log_rra_max = log2(16) = 4
+    init2rtrIn(&plain, 9, .{ .qpn = 5, .gid = gid, .mac = .{ 2, 0, 0, 0, 0, 1 } }, 3, 50000, 5);
+    @memcpy(&b, &plain);
+    atomicQp(&b, .init2rtr, 16);
+    try std.testing.expectEqual(@as(u64, 4), get(b[msg.qpc_at..], qpc.log_rra_max));
+    try std.testing.expectEqual(@as(u64, 1), get(b[msg.qpc_at..], qpc.rae));
+    try std.testing.expectEqual(@as(u64, atomic_mode_ib_spec), get(b[msg.qpc_at..], qpc.atomic_mode));
+    try std.testing.expectEqual(@as(u64, opt_rae), get(&b, msg.opt_param_mask));
+    // everything else equals the plain message's
+    var same = plain;
+    atomicQp(&same, .init2rtr, 1);
+    try std.testing.expectEqual(@as(u64, 0), get(same[msg.qpc_at..], qpc.log_rra_max)); // depth 1 = log 0
+    // rtr2rts: log_sra_max = 4, the RNR bit stays beside the RAE bit
+    rtr2rtsIn(&plain, 9);
+    @memcpy(&b, &plain);
+    atomicQp(&b, .rtr2rts, 16);
+    try std.testing.expectEqual(@as(u64, 4), get(b[msg.qpc_at..], qpc.log_sra_max));
+    try std.testing.expectEqual(@as(u64, 1), get(b[msg.qpc_at..], qpc.rae));
+    try std.testing.expectEqual(@as(u64, atomic_mode_ib_spec), get(b[msg.qpc_at..], qpc.atomic_mode));
+    try std.testing.expectEqual(@as(u64, opt_min_rnr_nak | opt_rae), get(&b, msg.opt_param_mask));
+    // the field offsets: mlx5_ifc.h's qpc has log_rra_max at reserved_at_480 + 8, atomic_mode 4 after it, then rre, rwe, rae (one bit each)
+    try std.testing.expectEqual(@as(u16, 0x480 + 8), qpc.log_rra_max.off);
+    try std.testing.expectEqual(@as(u16, 0x480 + 12), qpc.atomic_mode.off);
+    try std.testing.expectEqual(@as(u16, 0x480 + 16), qpc.rwe.off - 1);
+    try std.testing.expectEqual(@as(u16, 0x480 + 18), qpc.rae.off);
+    // a depth of 255 does not overflow the 3-bit field: capped at log 7
+    atomicQp(&b, .init2rtr, 255);
+    try std.testing.expectEqual(@as(u64, 7), get(b[msg.qpc_at..], qpc.log_rra_max));
 }

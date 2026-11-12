@@ -98,6 +98,20 @@ pub const Roci = struct {
         r.verbs = try fabric.verbs.Verbs.open(null);
         errdefer r.verbs.close();
         const t0 = nowNs();
+        const sigtext: ?[]const u8 = if (std.c.getenv("TF_DS_ROCI_SIGNAL")) |v| std.mem.span(v) else null;
+        const wanted = roci.signalFrom(sigtext) orelse {
+            std.log.err("TF_DS_ROCI_SIGNAL={s}: neither write nor atomic", .{sigtext.?});
+            return error.BadSignal;
+        };
+        var ab: [300]u8 = undefined;
+        const atomic_why: ?[]const u8 = if (wanted == .atomic) rdma.probeAtomic(&ab, devices[0..]) else null;
+        const sm = signalMode(sigtext, atomic_why).?;
+        if (sm.refuse) {
+            std.log.err("TF_DS_ROCI_SIGNAL=atomic: {s}: the arrival signal stays a WRITE with TF_DS_ROCI_SIGNAL=write", .{sm.why.?});
+            return error.AtomicUnsupported;
+        }
+        if (sm.warn) std.log.warn("TF_DS_ROCI_SIGNAL: {s}: {s}", .{ sm.note, sm.why.? }) else std.log.info("TF_DS_ROCI_SIGNAL: {s}", .{sm.note});
+        const signal = sm.signal;
         const wtext: ?[]const u8 = if (std.c.getenv("TF_DS_ROCI_WAIT")) |v| std.mem.span(v) else null;
         // libmlx5 is probed only when the card's WAIT is wanted; the probe is the library the lanes then use
         var probe: ?mx.Mlx5 = if (prompt2d.switchDefaultOn(wtext)) (mx.Mlx5.open() catch null) else null;
@@ -117,6 +131,7 @@ pub const Roci = struct {
         if (in_card) {
             r.mlx = probe;
             probe = null;
+            r.nic = .{ .cd = try cd.CdNic.open(gpa, &r.verbs, &r.mlx.?, .{ .devices = devices, .gid_index = gid, .signal = signal }, r.g, r.arena.bytes, r.ctl_mem.bytes[0..@sizeOf(roci.Control)], r.layout.hash()) };
         } else r.nic = .{ .verbs = try rv.VerbsNic.open(gpa, &r.verbs, .{ .devices = devices, .gid_index = gid, .signal = signal }, r.g, r.arena.bytes, r.ctl_mem.bytes[0..@sizeOf(roci.Control)], r.layout.hash()) };
         errdefer r.nic.close();
         const mine = try r.nic.info();
@@ -139,6 +154,7 @@ pub const Roci = struct {
         var w = std.Io.Writer.fixed(&buf);
         const rails_text = try std.fmt.allocPrint(gpa, "{s},{s}", .{ devices[0], devices[1] });
         defer gpa.free(rails_text);
+        roci.startLine(&w, r.g, rails_text, gid, set, signal) catch {};
         return r;
     }
 
@@ -191,6 +207,25 @@ pub const Roci = struct {
     }
 };
 
+/// `TF_DS_ROCI_SIGNAL`: `write` (unset: the baseline) or `atomic`; other text is refused by name (null).
+/// The arrival signal a start runs and why (the start's line says it): `refuse` the atomic was asked for outright and the card cannot, `warn` it was
+/// not asked for (the default) and the card cannot, so the WRITE runs; `why` is the card's reason.
+pub const SignalMode = struct { signal: roci.Signal, refuse: bool = false, warn: bool = false, why: ?[]const u8 = null, note: []const u8 };
+
+/// `TF_DS_ROCI_SIGNAL`: unset or atomic is the fetch-and-add (D79: the card executes it only after the data WRITEs are placed), write the second
+/// WRITE. `atomic_why` is the device check's reason the card cannot do atomics (null: it can). Unset on a card that cannot falls back to the WRITE
+/// with a warning; `atomic` set outright refuses there. Null for text no signal has. Every rank alike (the nodes compare it at connect).
+pub fn signalMode(text: ?[]const u8, atomic_why: ?[]const u8) ?SignalMode {
+    const sig = roci.signalFrom(text) orelse return null;
+    const explicit = if (text) |t| std.mem.trim(u8, t, " \t").len != 0 else false;
+    if (sig == .write) return .{ .signal = .write, .note = "write: the arrival word is a second RDMA WRITE after the data" };
+    if (atomic_why) |why| {
+        if (explicit) return .{ .signal = .atomic, .refuse = true, .why = why, .note = "" };
+        return .{ .signal = .write, .warn = true, .why = why, .note = "unset (the default is the atomic) but the card cannot, so the arrival word is a second RDMA WRITE" };
+    }
+    return .{ .signal = .atomic, .note = if (explicit) "atomic: an RDMA ATOMIC fetch-and-add after the data (the guaranteed arrival)" else "unset: an RDMA ATOMIC fetch-and-add after the data (the default, the guaranteed arrival; =write for the WRITE)" };
+}
+
 test "wait mode: a lane opens and closes on either NIC (the whole of openLane is type-checked here, not only by an engine build)" {
     _ = &Roci.openLane;
     _ = &Roci.close;
@@ -201,6 +236,9 @@ test "wait mode: a lane opens and closes on either NIC (the whole of openLane is
 pub const WaitMode = struct { on: bool, refuse: bool = false, note: []const u8 };
 
 /// `TF_DS_ROCI_WAIT`: unset or 1 is the card's WAIT, the default; 0 (or any other text) is the verbs path with the proxies. Unset (the default)
+/// falls back to the verbs path, with its reason in the line, where the card's WAIT cannot run (libmlx5 not loadable); 1 asked for outright
+/// refuses there, by name. Either arrival signal runs in the card (the chain ends in the word's WRITE or in an ATOMIC fetch-and-add entry), so
+/// `signal` only decides what the line says. Every rank alike (the nodes compare it at connect).
 pub fn waitMode(text: ?[]const u8, signal: roci.Signal, mlx_ok: bool) WaitMode {
     const explicit = text != null;
     if (!prompt2d.switchDefaultOn(text)) return .{ .on = false, .note = "off (set to something but 1): the verbs queue pairs and the proxy threads" };
@@ -208,6 +246,10 @@ pub fn waitMode(text: ?[]const u8, signal: roci.Signal, mlx_ok: bool) WaitMode {
         if (explicit) return .{ .on = true, .refuse = true, .note = "" };
         return .{ .on = false, .note = "unset (the default is the card's WAIT) but libmlx5.so.1 does not load: the verbs queue pairs and the proxy threads run" };
     }
+    return switch (signal) {
+        .write => .{ .on = true, .note = if (explicit) "1: the queue pairs wait in the card (no proxy threads)" else "unset: the queue pairs wait in the card (the default; =0 for the proxy threads)" },
+        .atomic => .{ .on = true, .note = if (explicit) "1: the queue pairs wait in the card (no proxy threads); each chain ends in an ATOMIC fetch-and-add (TF_DS_ROCI_SIGNAL=atomic)" else "unset: the queue pairs wait in the card (the default; =0 for the proxy threads); each chain ends in an ATOMIC fetch-and-add (TF_DS_ROCI_SIGNAL=atomic)" },
+    };
 }
 
 /// `TF_DS_ROCI_CPUS_B=a,b`: the second lane's two proxy cores (default 1,2: small cores that neither the decode rings' proxies nor the
@@ -262,10 +304,40 @@ test "TF_DS_ROCI_WAIT: unset and 1 are the card's WAIT, 0 is the proxies; unset 
         const m = waitMode(t, .write, true);
         try std.testing.expect(!m.on and !m.refuse);
     }
+    // the atomic signal runs in the card too (the chain ends in an ATOMIC entry): unset and 1 are on, neither falls back nor refuses, and the
+    // line says the signal; 0 is just the proxies
     const a = waitMode(null, .atomic, true);
+    try std.testing.expect(a.on and !a.refuse and std.mem.indexOf(u8, a.note, "ATOMIC") != null);
+    const a1 = waitMode("1", .atomic, true);
+    try std.testing.expect(a1.on and !a1.refuse and std.mem.indexOf(u8, a1.note, "ATOMIC") != null);
     try std.testing.expect(!waitMode("0", .atomic, true).on);
+    // the write signal's line does not mention one
+    try std.testing.expect(std.mem.indexOf(u8, d.note, "ATOMIC") == null and std.mem.indexOf(u8, one.note, "ATOMIC") == null);
+    // the libmlx5 fallback is kept for the atomic signal as for the write one: unset falls back with its reason, 1 refuses
+    const am = waitMode(null, .atomic, false);
+    try std.testing.expect(!am.on and !am.refuse and std.mem.indexOf(u8, am.note, "libmlx5") != null);
+    try std.testing.expect(waitMode("1", .atomic, false).refuse);
     // no libmlx5: the same
     const n = waitMode(null, .write, false);
     try std.testing.expect(!n.on and !n.refuse and std.mem.indexOf(u8, n.note, "libmlx5") != null);
     try std.testing.expect(waitMode("1", .write, false).refuse);
+}
+
+test "TF_DS_ROCI_SIGNAL: unset is the atomic where the card can; unset on a card without atomics is the WRITE with a warning; atomic set outright refuses there; write is always the WRITE" {
+    // a card that can: unset and atomic are the atomic, write the WRITE
+    const d = signalMode(null, null).?;
+    try std.testing.expect(d.signal == .atomic and !d.refuse and !d.warn and std.mem.indexOf(u8, d.note, "default") != null);
+    try std.testing.expect(signalMode("", null).?.signal == .atomic);
+    try std.testing.expect(signalMode("atomic", null).?.signal == .atomic);
+    try std.testing.expect(signalMode("write", null).?.signal == .write);
+    // a card that cannot (the reason from the device check)
+    const why = "device mlx5_0 reports atomic_cap 0: it does no ATOMIC operations";
+    const f = signalMode(null, why).?;
+    try std.testing.expect(f.signal == .write and !f.refuse and f.warn and std.mem.eql(u8, f.why.?, why));
+    const e = signalMode("atomic", why).?;
+    try std.testing.expect(e.refuse and !f.refuse and std.mem.eql(u8, e.why.?, why));
+    const w = signalMode("write", why).?;
+    try std.testing.expect(w.signal == .write and !w.refuse and !w.warn);
+    // text no signal has
+    try std.testing.expect(signalMode("cas", null) == null);
 }

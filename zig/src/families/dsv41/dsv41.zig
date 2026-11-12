@@ -127,4 +127,5 @@ test {
     _ = @import("rocinante_test.zig");
     _ = @import("rocinante_cd_test.zig");
     refAll(replay_runner);
+    _ = @import("ring_hotpath_test.zig");
 }

@@ -1,3 +1,10 @@
+//!   - TF_DS_RING_WORD: the generation-word collecting kernel (dsv41_rdma_collect_into_roci) on a receive ring's
+//!     slots against the baseline dsv41_rdma_collect_into on the same slots, a host thread writing the lanes' words after
+//!     the launch: the word signal (the sequence inline) and the atomic signal (one fetch-and-add a lane) give the baseline
+//!     bytes (also out of write-combined landing slots); one landing byte changed differs; words written 20 ms late
+//!     still collect under the deadline; a lane's
+//!     word that never arrives ends in the failure record within the deadline (the ring's abort word set, nothing
+//!     copied); the abort word alone ends a wait with the record's abort reason, far under the deadline.
 //!   - TF_DS_ROCI's two-block readers (_hc_mix_pf_2b, _hc_post_2b, _engram_gate_2b): the blocks as the transport lands them against
 //!     widenPairs + the baseline readers (the fp32 planes), byte for byte, at 1 to 1,024 rows with NaN, +-0, subnormals and infinities
 //!     in the sums; a sum changed must change each output.
@@ -15,6 +22,219 @@
 //!     every slab of a window, the two-block readers in the extra set), with a control the check must refuse.
             r.report(try std.fmt.bufPrint(&line, "pf_split {s} control: one code of row 700 changed ({s})", .{ sh.name, config_names[@backingInt(cfg_on) - 2] }), differs(want, got), false);
         for (names, want, got) |nm, w, g| r.report(try std.fmt.bufPrint(&line, "idx_proj_owned q={d} (pf_split {s}): {s} at every owned block against the whole chunk's", .{ q, mx.PfSplit.name(@backingInt(sw)).?, nm }), differs(w, g), true);
+    /// The generation-word copy-out (dsv41_rdma_collect_into_roci) of both ranks' slots into `dst`, the signal the
+    /// waiting kernel sees and the failure record it writes, through the same launch the rings use.
+    fn collectRoci(g: *RingRig, recv_dev: u64, dst: u64, n4: usize, gen: u64, lanes: u64, fault: u64, deadline_ns: u64, sig: dsv41.rdma.Roci) !void {
+        var dd: dsv41.rdma.Dsts = .{};
+        for (0..world) |p| {
+            dd.ptr[p] = dst + p * n4 * 16;
+            dd.row4[p] = @intCast(n4);
+            dd.stride4[p] = @intCast(n4);
+        }
+        var copy4: u64 = 0;
+        for (0..world) |p| if (p != rank) {
+            copy4 += n4;
+        };
+        const ring: dsv41.rdma.CollectRing = .{ .recv = recv_dev, .flags = g.metaDev(0), .seq = g.seq.ptr, .abort = g.metaDev(abort_w), .rank = rank, .world = world, .gen = gen, .lanes = lanes, .fault = fault, .deadline_ns = deadline_ns, .roci = sig };
+        try dsv41.rdma.launchCollect(g.k, .{ .max_bytes = max_bytes, .slots = slots, .roci = sig }, g.s, dd, 1, ring, copy4);
+    }
+
+// -- TF_DS_RING_WORD: the generation word wakes the collecting kernel ----------------------------------------------
+
+/// A host writer, standing in for the sending NIC: it stores (or fetch-adds) one lane's 64-bit generation word after
+/// the collecting kernel is queued, so the kernel's wait is what the test exercises. A separate thread, because the
+/// kernel only returns once the word is in.
+const WordWriter = struct {
+    fn store(io: std.Io, p: *u64, delay_ms: i64, value: u64) void {
+        std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake) catch {};
+        @atomicStore(u64, p, value, .release);
+    }
+    fn add(io: std.Io, p: *u64, delay_ms: i64) void {
+        std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake) catch {};
+        _ = @atomicRmw(u64, p, .Add, 1, .release);
+    }
+    fn abort(io: std.Io, p: *u64, delay_ms: i64) void {
+        std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake) catch {};
+        @atomicStore(u64, p, 1, .release);
+    }
+};
+
+/// TF_DS_RING_WORD's collecting kernel against the baseline on the same slots: the word signal and the atomic signal
+/// (the host thread writes the words after the launch), a changed landing byte, a late word, a lane that never arrives
+/// (the failure record, the poison and the untouched destination, within the deadline) and the abort word ending a wait
+/// early. The bytes are the baseline collect kernel's from the same receive ring.
+fn ringWord(r: *Run, rng_in: std.Random) !void {
+    _ = rng_in;
+    var g = try RingRig.init(r.d, r.s, r.io orelse return error.NoIo);
+    defer g.deinit();
+    r.note("ring_word: the rings' fatbin has the generation-word kernels (dsv41_rdma_collect_roci, _into_roci, _peers_roci)", g.k.hasRoci());
+    if (!g.k.hasRoci()) {
+        for (0..7) |_| r.note("ring_word: no generation-word kernel to run", false);
+        return;
+    }
+    var prng = std.Random.DefaultPrng.init(0x0c1dec);
+    const rng = prng.random();
+    const n4: usize = 192;
+    const nbytes = n4 * 16;
+    const peer = try r.a.alloc(u8, nbytes);
+    defer r.a.free(peer);
+    for (peer) |*b| b.* = rng.int(u8);
+    const slot = RingRig.q % RingRig.slots;
+    const peer_off = @as(usize, @intCast(slot)) * RingRig.world * RingRig.max_bytes + RingRig.max_bytes;
+
+    // the generation words (ordinary pinned memory: the CPU and the peers' NICs read-modify-write them), the lanes
+    // toward each peer, and the first expired wait's record
+    var gen = try dsv41.rdma.Pinned.alloc(r.d, &g.hr, dsv41.rdma.rociWords() * 8);
+    defer gen.free(&g.hr);
+    var lanes_buf = try cuda.DeviceBuffer.alloc(r.d, 2 * 4);
+    defer lanes_buf.free();
+    const lane_counts = [2]u32{ 0, 2 };
+    var fault = try cuda.DeviceBuffer.alloc(r.d, 64);
+    defer fault.free();
+    try fault.fill8(0, null);
+    const words: [*]u64 = @ptrCast(@alignCast(gen.mem.ptr));
+    const lane_at = 1 * dsv41.rdma.max_devices; // the sender is peer 1; rank 0 reads its words
+    var dst_today = try cuda.DeviceBuffer.alloc(r.d, 2 * nbytes);
+    defer dst_today.free();
+    var dst = try cuda.DeviceBuffer.alloc(r.d, 2 * nbytes);
+    defer dst.free();
+
+    // the baseline collecting kernel: the peer's slot in, its flag at q, into the reference bytes
+    g.reset();
+    try g.setSeq(RingRig.q);
+    @memcpy(g.recv.mem[peer_off..][0..nbytes], peer);
+    g.words()[@as(usize, @intCast(slot)) * RingRig.world + 1] = RingRig.q;
+    try poison(dst_today.ptr, 2 * nbytes, r.d, r.s);
+    try g.collect(g.recv.dev, dst_today.ptr, n4);
+    try r.s.synchronize();
+    const want = try get(dst_today.ptr, 2 * nbytes, r.d);
+    defer free(want);
+
+    const deadline_ns: u64 = 500 * std.time.ns_per_ms;
+
+    // the word signal: the same slot, the host thread writing both lanes' words after the launch
+    g.reset();
+    try g.setSeq(RingRig.q);
+    @memcpy(g.recv.mem[peer_off..][0..nbytes], peer);
+    try poison(dst.ptr, 2 * nbytes, r.d, r.s);
+    try g.collectRoci(g.recv.dev, dst.ptr, n4, gen.dev, lanes_buf.ptr, fault.ptr, deadline_ns, .word);
+    var w0 = try std.Thread.spawn(.{}, WordWriter.store, .{ g.io, &words[lane_at], 2, RingRig.q });
+    var w1 = try std.Thread.spawn(.{}, WordWriter.store, .{ g.io, &words[lane_at + 1], 2, RingRig.q });
+    w0.join();
+    w1.join();
+    try r.s.synchronize();
+    const got = try get(dst.ptr, 2 * nbytes, r.d);
+    defer free(got);
+
+    // the same signal out of write-combined landing slots (TF_DS_RING_WC's memory), against the baseline collect there
+    g.reset();
+    try g.setSeq(RingRig.q);
+    @memcpy(g.recv_wc.mem[peer_off..][0..nbytes], peer);
+    g.words()[@as(usize, @intCast(slot)) * RingRig.world + 1] = RingRig.q;
+    try poison(dst_today.ptr, 2 * nbytes, r.d, r.s);
+    try g.collect(g.recv_wc.dev, dst_today.ptr, n4);
+    try r.s.synchronize();
+    const want_wc = try get(dst_today.ptr, 2 * nbytes, r.d);
+    defer free(want_wc);
+    @memset(gen.mem, 0);
+    g.reset();
+    try g.setSeq(RingRig.q);
+    @memcpy(g.recv_wc.mem[peer_off..][0..nbytes], peer);
+    try poison(dst.ptr, 2 * nbytes, r.d, r.s);
+    try g.collectRoci(g.recv_wc.dev, dst.ptr, n4, gen.dev, lanes_buf.ptr, fault.ptr, deadline_ns, .word);
+    var wc0 = try std.Thread.spawn(.{}, WordWriter.store, .{ g.io, &words[lane_at], 2, RingRig.q });
+    var wc1 = try std.Thread.spawn(.{}, WordWriter.store, .{ g.io, &words[lane_at + 1], 2, RingRig.q });
+    wc0.join();
+    wc1.join();
+    try r.s.synchronize();
+    const got_wc = try get(dst.ptr, 2 * nbytes, r.d);
+    defer free(got_wc);
+
+    // the atomic signal: the host fetch-adds one per lane; the word the kernel waits on counts to the sequence
+    @memset(gen.mem, 0);
+    g.reset();
+    try g.setSeq(RingRig.q);
+    @memcpy(g.recv.mem[peer_off..][0..nbytes], peer);
+    try poison(dst.ptr, 2 * nbytes, r.d, r.s);
+    try g.collectRoci(g.recv.dev, dst.ptr, n4, gen.dev, lanes_buf.ptr, fault.ptr, deadline_ns, .atomic);
+    var a0 = try std.Thread.spawn(.{}, WordWriter.add, .{ g.io, &words[lane_at], 2 });
+    var a1 = try std.Thread.spawn(.{}, WordWriter.add, .{ g.io, &words[lane_at + 1], 2 });
+    a0.join();
+    a1.join();
+    try r.s.synchronize();
+    const atomic_got = try get(dst.ptr, 2 * nbytes, r.d);
+    defer free(atomic_got);
+
+    // the control: one landing byte changed differs
+    var peer2 = try r.a.dupe(u8, peer);
+    defer r.a.free(peer2);
+    peer2[0] ^= 0xff;
+    @memset(gen.mem, 0);
+    g.reset();
+    try g.setSeq(RingRig.q);
+    @memcpy(g.recv.mem[peer_off..][0..nbytes], peer2);
+    try poison(dst.ptr, 2 * nbytes, r.d, r.s);
+    try g.collectRoci(g.recv.dev, dst.ptr, n4, gen.dev, lanes_buf.ptr, fault.ptr, deadline_ns, .word);
+    var c0 = try std.Thread.spawn(.{}, WordWriter.store, .{ g.io, &words[lane_at], 2, RingRig.q });
+    var c1 = try std.Thread.spawn(.{}, WordWriter.store, .{ g.io, &words[lane_at + 1], 2, RingRig.q });
+    c0.join();
+    c1.join();
+    try r.s.synchronize();
+    const ctl = try get(dst.ptr, 2 * nbytes, r.d);
+    defer free(ctl);
+    r.report("ring_word: one landing byte changed differs the collected bytes", differs(want, ctl), false);
+
+    // a late word (20 ms) still collects under a 500 ms deadline: the wait is bounded, not a fixed sleep
+    @memset(gen.mem, 0);
+    g.reset();
+    try g.setSeq(RingRig.q);
+    @memcpy(g.recv.mem[peer_off..][0..nbytes], peer);
+    try poison(dst.ptr, 2 * nbytes, r.d, r.s);
+    try g.collectRoci(g.recv.dev, dst.ptr, n4, gen.dev, lanes_buf.ptr, fault.ptr, deadline_ns, .word);
+    var l0 = try std.Thread.spawn(.{}, WordWriter.store, .{ g.io, &words[lane_at], 20, RingRig.q });
+    var l1 = try std.Thread.spawn(.{}, WordWriter.store, .{ g.io, &words[lane_at + 1], 20, RingRig.q });
+    l0.join();
+    l1.join();
+    try r.s.synchronize();
+    const late = try get(dst.ptr, 2 * nbytes, r.d);
+    defer free(late);
+
+    // one lane's word never arrives: the deadline ends the wait with the record, the ring poisoned, nothing copied
+    @memset(gen.mem, 0);
+    g.reset();
+    try g.setSeq(RingRig.q);
+    @memcpy(g.recv.mem[peer_off..][0..nbytes], peer);
+    try poison(dst.ptr, 2 * nbytes, r.d, r.s);
+    try fault.fill8(0, null);
+    const short_deadline: u64 = 50 * std.time.ns_per_ms;
+    try g.collectRoci(g.recv.dev, dst.ptr, n4, gen.dev, lanes_buf.ptr, fault.ptr, short_deadline, .word);
+    var n0 = try std.Thread.spawn(.{}, WordWriter.store, .{ g.io, &words[lane_at], 2, RingRig.q });
+    n0.join();
+    try r.s.synchronize();
+    var rec: [8]u64 = undefined;
+    const dead = try get(dst.ptr, 2 * nbytes, r.d);
+    defer free(dead);
+    var untouched: usize = 0;
+    for (dead) |b| untouched += @intFromBool(b != 0xa5);
+    const record_ok = rec[0] == 0x524f_4349_0000_0001 and rec[1] == RingRig.q and (rec[3] >> 32) == 1 and
+        (rec[3] & 0xffff_ffff) == 1 and rec[4] == 0 and rec[7] == 2 and g.words()[RingRig.abort_w] == 1;
+    r.note("ring_word: a lane's word that never arrives ends in the failure record (magic, sequence, peer 1 lane 1, the word seen 0, the deadline) with the ring's abort word set and the destination untouched", record_ok and untouched == 0);
+    r.note("ring_word: the expired wait ended within its deadline and well before the replay would give up", rec[5] >= 45 * std.time.ns_per_ms and rec[5] < 5 * std.time.ns_per_s);
+
+    // the abort word alone ends a wait early (why 1), with a deadline far away
+    @memset(gen.mem, 0);
+    g.reset();
+    try g.setSeq(RingRig.q);
+    @memcpy(g.recv.mem[peer_off..][0..nbytes], peer);
+    try poison(dst.ptr, 2 * nbytes, r.d, r.s);
+    try fault.fill8(0, null);
+    try g.collectRoci(g.recv.dev, dst.ptr, n4, gen.dev, lanes_buf.ptr, fault.ptr, std.time.ns_per_s, .word);
+    var ab = try std.Thread.spawn(.{}, WordWriter.abort, .{ g.io, &g.words()[RingRig.abort_w], 2 });
+    ab.join();
+    try r.s.synchronize();
+    r.note("ring_word: the abort word ends a waiting kernel well before its 1 s deadline (the record's why is the abort)", rec[0] == 0x524f_4349_0000_0001 and rec[7] == 1 and rec[5] < 900 * std.time.ns_per_ms);
+}
+
 // -- TF_DS_ROCI's two-block readers ----------------------------------------------------------------------------------
 
 /// bf16 [2, rows, w] sums with the special values the identity argument names scattered in (quiet NaN, +-0, subnormals,
@@ -808,6 +1028,7 @@ fn rociDecKset(r: *Run, rng_in: std.Random) !void {
 
 /// three that landed out to their rows: every array of every node must hold the bytes the in-place gather leaves, the groups around
                 r.report(try std.fmt.bufPrint(&line, "roci_boundary {s}: four nodes' cache arrays after the staged gather against the in-place gather's layout (rows around the chunk untouched)", .{nm}), bad, true);
+    .{ "ring_word", ringWord, 9 },
     .{ "roci_readers", rociReaders, 1 + 7 * 3 + 3 },
     .{ "roci_stage", rociStage, 2 * 4 + 1 },
     .{ "roci_collect", rociCollect, 3 },

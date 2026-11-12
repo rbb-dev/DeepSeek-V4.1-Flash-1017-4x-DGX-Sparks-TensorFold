@@ -796,9 +796,42 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         // never captured RB above 2. Off (RB=1, today's behavior) unless set; validate on your own ring first.
         if (std.c.getenv("TF_DS_IDX_RB")) |v| tri_index.idx_rb = std.fmt.parseInt(usize, std.mem.span(v), 10) catch tri_index.idx_rb;
         if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
+        const ring_word_text: ?[]const u8 = if (std.c.getenv("TF_DS_RING_WORD")) |v| std.mem.span(v) else null;
+        prompt2d.ring_word_asked = prompt2d.switchDefaultOn(ring_word_text); // on unless set to something but 1; every rank alike (Settings)
+        prompt2d.ring_word_explicit = ring_word_text != null;
+        if (!prompt2d.ring_word_asked) std.log.info("TF_DS_RING_WORD: off (set to something but 1): each lane's arrival is the proxy's flag, not a generation word", .{});
+        const ring_sig_text: ?[]const u8 = if (std.c.getenv("TF_DS_RING_WORD_SIGNAL")) |v| std.mem.span(v) else null;
+        var ring_sig: ?rdma.Roci = ringWordSignal(ring_sig_text);
+        if (prompt2d.ring_word_asked and ring_sig == null) {
+            std.log.info("TF_DS_RING_WORD: off: TF_DS_RING_WORD_SIGNAL={s} is neither word nor atomic", .{ring_sig_text.?});
+            prompt2d.ring_word_asked = false;
+        }
+        if (prompt2d.ring_word_asked and ring_sig == .atomic and o.rdma_devices != null) {
+            // the signal is the atomic (the default): the cards must do ATOMICs. Unset falls back to the word with a warning; set outright refuses.
+            var names: [8][]const u8 = undefined;
+            var nn: usize = 0;
+            var it = std.mem.splitScalar(u8, o.rdma_devices.?, ',');
+            while (it.next()) |x| if (nn < names.len) {
+                names[nn] = std.mem.trim(u8, x, " ");
+                nn += 1;
+            };
+            var ab: [300]u8 = undefined;
+            const sm = ringWordSignalMode(ring_sig_text, rdma.probeAtomic(&ab, names[0..nn])).?;
+            if (sm.refuse) {
+                std.log.err("TF_DS_RING_WORD_SIGNAL=atomic: {s}: set TF_DS_RING_WORD_SIGNAL=word for the inline word", .{sm.why.?});
+                return error.AtomicUnsupported;
+            }
+            if (sm.warn) std.log.warn("TF_DS_RING_WORD_SIGNAL: unset (the default is the atomic) but {s}: the rings' arrival word is the inline WRITE", .{sm.why.?});
+            ring_sig = sm.roci;
+        }
+        prompt2d.ring_word_atomic_asked = prompt2d.ring_word_asked and ring_sig == .atomic; // every rank alike (Settings)
         const ring_wait_text: ?[]const u8 = if (std.c.getenv("TF_DS_RING_WAIT")) |v| std.mem.span(v) else null;
         prompt2d.ring_wait_asked = prompt2d.switchDefaultOn(ring_wait_text); // on unless set to something but 1; every rank alike (Settings)
         if (!prompt2d.ring_wait_asked) std.log.info("TF_DS_RING_WAIT: off (set to something but 1): the rings run their proxy threads", .{});
+        if (prompt2d.ring_wait_asked and !prompt2d.ring_word_asked) {
+            // the chains end in the generation word's signal (the inline WRITE, or the atomic when TF_DS_RING_WORD_SIGNAL asks for it): without
+            // TF_DS_RING_WORD the card's WAIT cannot run, so the proxies do
+            std.log.info("TF_DS_RING_WAIT: {s}: off: it needs TF_DS_RING_WORD=1 (each chain ends in the generation word's signal), so the rings run their proxy threads", .{if (ring_wait_text == null) "unset (the default is the card's WAIT)" else "1"});
             prompt2d.ring_wait_asked = false;
         }
         prompt2d.ring_wait_explicit = ring_wait_text != null;
@@ -915,6 +948,9 @@ pub fn startSettings(o: Options) prompt2d.Settings {
             {
                 try Two.require(d, &m.comm, m.stream, "the decode exchanges on the rings", decodeOff(m.two.?.rings != null, shape));
                 std.log.info("{s}", .{decodeLine(o.rank, rankOrderText(&m.two.?.rank_of))});
+            // (the switches are on by default: only one that was set says it changed nothing)
+            if (ringNoRingNote(prompt2d.ring_word_asked, prompt2d.ring_word_explicit)) std.log.info("TF_DS_RING_WORD=1: off: no RDMA ring (TF_RDMA_DEVICES unset)", .{});
+            if (ringNoRingNote(prompt2d.ring_wait_asked, prompt2d.ring_wait_explicit)) std.log.info("TF_DS_RING_WAIT=1: off: no RDMA ring (TF_RDMA_DEVICES unset)", .{});
         prompt.hc_stride = prompt2d.hc_stride_asked and m.two != null;
         logPdlControls(m.comm.rank);
         std.log.info("transport: Rocinante carries every exchange between the Sparks; no NCCL is loaded or made (rank {d})", .{o.rank});
@@ -1007,6 +1043,41 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         return true;
     }
 
+    /// TF_DS_RING_WORD_SIGNAL's text when TF_DS_RING_WORD runs: unset or `atomic`: the RDMA ATOMIC fetch-and-add (D79, the guaranteed arrival),
+    /// `word`/`1`: the inline 8-byte RDMA WRITE; any other text: null, a value this build does not know (the switch then
+    /// stays off and its line says so).
+    pub fn ringWordSignal(text: ?[]const u8) ?rdma.Roci {
+        const v = text orelse return .atomic;
+        if (std.mem.eql(u8, v, "word") or std.mem.eql(u8, v, "1")) return .word;
+        if (std.mem.eql(u8, v, "atomic")) return .atomic;
+        return null;
+    }
+
+    pub const RingSignal = struct { roci: rdma.Roci, refuse: bool = false, warn: bool = false, why: ?[]const u8 = null };
+
+    /// The rings' arrival signal and why: unset or atomic is the fetch-and-add where the cards can (`atomic_why` null), unset on a card that cannot is
+    /// the inline word with a warning, atomic set outright refuses there; word is always the word. Null for text no signal has.
+    pub fn ringWordSignalMode(text: ?[]const u8, atomic_why: ?[]const u8) ?RingSignal {
+        const sig = ringWordSignal(text) orelse return null;
+        if (sig != .atomic) return .{ .roci = sig };
+        if (atomic_why) |why| {
+            if (text != null) return .{ .roci = .atomic, .refuse = true, .why = why };
+            return .{ .roci = .word, .warn = true, .why = why };
+        }
+        return .{ .roci = .atomic };
+    }
+
+    /// The rings' generation-word mode after the start's checks.
+    pub fn ringWordOf() rdma.Roci {
+        if (!prompt2d.ring_word_asked) return .off;
+        return if (prompt2d.ring_word_atomic_asked) .atomic else .word;
+    }
+
+    /// Whether a start without an RDMA ring says a ring switch changed nothing: only when it was set (they are on by default).
+    pub fn ringNoRingNote(asked: bool, explicit: bool) bool {
+        return asked and explicit;
+    }
+
     /// Why the card's WAIT cannot run on the rings when it is wanted, for the fallback to the proxy threads when TF_DS_RING_WAIT is unset (the
     /// default); null when it can. Asked for with 1 it is never a fallback: Ring.create refuses by name.
     pub fn ringWaitFallback(explicit: bool, has_kernels: bool, mlx_ok: bool, atomic_why: ?[]const u8) ?[]const u8 {
@@ -1035,6 +1106,13 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         }
         std.log.info("TF_DS_RING_WAIT: {s}: the rings' queue pairs wait in the card (no proxy threads; =0 for the proxy threads)", .{if (prompt2d.ring_wait_explicit) "1" else "unset (the default)"});
         return true;
+    }
+
+    /// TF_DS_RING_WORD_DEADLINE_MS: a lane's generation-word wait's bound in ms (default 120,000). 0 or unparsable: the
+    /// default, because a wait that never ends is the hang the switch avoids.
+    pub fn ringWordDeadlineNs() u64 {
+        const ms: u64 = if (std.c.getenv("TF_DS_RING_WORD_DEADLINE_MS")) |v| std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0 else 0;
+        return (if (ms == 0) 120_000 else ms) * std.time.ns_per_ms;
     }
 
     /// TF_DS_RDMA_GID: the RDMA rings' GID index on every device; unset, each device's first RoCE v2 IPv4 GID.
@@ -1255,6 +1333,20 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         }
         return true;
     const open = std.mem.indexOf(u8, code, "m.rdma_rings = try ring2d.Rings.open(gpa, d, rk, devices.items, role, ord, .{ .max_bytes = ring_bytes, .gid_index = rdmaGid(), .pdl = rdmaPdl(), .collect_peers = peers and rk.collect_peers != null, .wc = sw.wc, .inplace = sw.inplace, .roci = ringWordOf(), .roci_deadline_ns = ringWordDeadlineNs(), .wait = ring_wait_on, .wait_explicit = prompt2d.ring_wait_explicit }, &m.comm, m.stream, !weights.draft_4way);") orelse return error.TestUnexpectedResult;
+test "TF_DS_RING_WORD_SIGNAL: unset and atomic name the fetch-and-add (the guaranteed arrival), word the inline word, other text is refused" {
+    try std.testing.expectEqual(@as(?rdma.Roci, .atomic), Model.ringWordSignal(null));
+    try std.testing.expectEqual(@as(?rdma.Roci, .word), Model.ringWordSignal("word"));
+    try std.testing.expectEqual(@as(?rdma.Roci, .word), Model.ringWordSignal("1"));
+    try std.testing.expectEqual(@as(?rdma.Roci, .atomic), Model.ringWordSignal("atomic"));
+    try std.testing.expectEqual(@as(?rdma.Roci, null), Model.ringWordSignal("atomics"));
+    try std.testing.expectEqual(@as(?rdma.Roci, null), Model.ringWordSignal("0"));
+    // without TF_DS_RING_WORD the signal changes nothing
+    const keep = prompt2d.ring_word_asked;
+    defer prompt2d.ring_word_asked = keep;
+    prompt2d.ring_word_asked = false;
+    try std.testing.expectEqual(rdma.Roci.off, Model.ringWordOf());
+}
+
     }
 
     /// fillChunk's pass of n > wave_rows rows with TF_DS_WAVES: wave A (rows [start, start + wave_rows), in ch2) and
@@ -1538,6 +1630,30 @@ test "TF_DS_RING_WAIT's fallback to the proxy threads is for the default only: u
     const src = @embedFile("model.zig");
     try std.testing.expect(std.mem.indexOf(u8, src, "prompt2d.ring_wait_asked = prompt2d.switchDefaultOn(ring_wait_text);") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "unset (the default)") != null);
+}
+
+test "TF_DS_RING_WORD is on unless set to something but 1; a start without an RDMA ring says nothing of a default, and of a switch only when it was set" {
+    const src = @embedFile("model.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, "prompt2d.ring_word_asked = prompt2d.switchDefaultOn(ring_word_text);") != null);
+    try std.testing.expect(!Model.ringNoRingNote(true, false)); // the default, no ring: quiet
+    try std.testing.expect(Model.ringNoRingNote(true, true)); // set to 1, no ring: the switch changed nothing
+    try std.testing.expect(!Model.ringNoRingNote(false, true)); // set to 0: nothing to say
+    try std.testing.expect(!Model.ringNoRingNote(false, false));
+    // the explicit flag follows the environment's presence
+    try std.testing.expect(std.mem.indexOf(u8, src, "prompt2d.ring_word_explicit = ring_word_text != null;") != null);
+}
+
+test "TF_DS_RING_WORD_SIGNAL's decision: unset is the atomic where the cards can, else the word with a warning; atomic set outright refuses there; word is always the word" {
+    const why = "device mlx5_0 reports atomic_cap 0: it does no ATOMIC operations";
+    const d = Model.ringWordSignalMode(null, null).?;
+    try std.testing.expect(d.roci == .atomic and !d.refuse and !d.warn);
+    try std.testing.expect(Model.ringWordSignalMode("atomic", null).?.roci == .atomic);
+    const f = Model.ringWordSignalMode(null, why).?;
+    try std.testing.expect(f.roci == .word and !f.refuse and f.warn and std.mem.eql(u8, f.why.?, why));
+    try std.testing.expect(Model.ringWordSignalMode("atomic", why).?.refuse);
+    const w = Model.ringWordSignalMode("word", why).?;
+    try std.testing.expect(w.roci == .word and !w.refuse and !w.warn);
+    try std.testing.expect(Model.ringWordSignalMode("atomics", null) == null);
 }
     }
 

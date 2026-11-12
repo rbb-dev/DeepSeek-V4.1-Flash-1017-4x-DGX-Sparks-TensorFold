@@ -304,6 +304,32 @@ pub fn sourcesOf(class: Class, g: usize, out: *[world]u8) []const u8 {
 
 // -- the control block -----------------------------------------------------------------------------------------------
 
+/// How a part's arrival is told to the receiver, on the data's own queue pair after the data WRITEs: `write`, a second RDMA WRITE
+/// of the generation (the receiver's stream wait takes it as reached when it is at least the count); `atomic`, an RDMA ATOMIC
+/// fetch-and-add of 1 on the same word. The InfiniBand ordering rules and PCIe's place an atomic (non-posted) after the writes
+/// before it; two WRITEs are ordered only as the card happens to do them (the verbs promise order within one work request). In
+/// both the word of a (class, source, rail) is at generation N after N events, so the wait is the same. The atomic is the NIC's:
+/// a card that reports atomics only against its own atomics (IBV_ATOMIC_HCA) does not order a CPU or GPU store to the word
+/// against one in flight, so with `atomic` nothing stores to a word the card updates but after the card has been fenced off the
+/// control block (`Nic.fail_fn`).
+pub const Signal = enum(u8) { write, atomic };
+
+/// The signal the Settings structs of the NICs start from (the host tests' fake cards have no atomics).
+pub const default_signal: Signal = .write;
+
+/// The signal a start without TF_DS_ROCI_SIGNAL takes: the atomic, which the card executes only after the data WRITEs are placed (D79); a card without
+/// atomics takes the WRITE with a warning (roci_engine.signalMode).
+pub const env_default_signal: Signal = .atomic;
+
+/// TF_DS_ROCI_SIGNAL's text: unset, empty or `atomic`: the fetch-and-add; `write`: the second WRITE; anything else null (refused).
+pub fn signalFrom(text: ?[]const u8) ?Signal {
+    const t = std.mem.trim(u8, text orelse return env_default_signal, " \t");
+    if (t.len == 0) return env_default_signal;
+    if (std.mem.eql(u8, t, "write")) return .write;
+    if (std.mem.eql(u8, t, "atomic")) return .atomic;
+    return null;
+}
+
 /// A word alone on its cache line: the monitor of a nap, a stream write and a NIC write never share one.
 pub const Word = extern struct {
     v: u64 align(line) = 0,
@@ -344,6 +370,9 @@ pub const PostError = error{ PostFailed, QpError };
 pub const Nic = struct {
     ctx: *anyopaque,
     post_fn: *const fn (ctx: *anyopaque, rail: u8, peer: u8, class: Class, chain: *const Chain, word: u64) PostError!void,
+    /// Failure path: tell the peers (best effort), move every queue pair to error, and return only when the card can no longer
+    /// write the control block (the abort values are stored into the words after it: a store racing a card's update of the same
+    /// word could be overwritten by it, and a wait on that word would never end).
     fail_fn: *const fn (ctx: *anyopaque) void,
     /// The proxy's chance to reap completions: an error completion fails the transport.
     reap_fn: *const fn (ctx: *anyopaque, rail: u8) PostError!void,
@@ -402,7 +431,16 @@ pub const Wire = struct { n: u64 = 0, sum_ns: u64 = 0, max_ns: u64 = 0 };
 const Pending = struct { class: u8, t_ns: u64, want: u64 };
 const pending_len = 512;
 
+/// What the start line says of a signal.
+pub fn signalText(signal: Signal) []const u8 {
+    return switch (signal) {
+        .write => "an 8-byte RDMA WRITE after the data",
+        .atomic => "an RDMA ATOMIC fetch-and-add after the data",
+    };
+}
+
 /// The start line (once, on every rank): the name, the arena, the rails and the plan hash.
+pub fn startLine(w: *std.Io.Writer, g: usize, rails_text: []const u8, gid_index: u8, s: Settings, signal: Signal) !void {
     const l = layout();
     try w.print("{s} (Roci) on: node {d}, arena {d} bytes in {d} regions, control block {d} bytes, rails {s} (GID {d}), layout hash {x}, watchdog {d} ms, backstop {d} us, idle park {d} us, housekeeping every {d} turns, arrival signal {s}, carrying {s}{s}\n", .{ transport_name, g, l.total, n_regions, @sizeOf(Control), rails_text, gid_index, l.hash(), s.dead_ms, s.backstop_us, s.idle_park_us, s.housekeep_every, signalText(signal), carriesText(&cb, s.codes, s.gathers), if (s.wait_qp) ", waiting in the card (TF_DS_ROCI_WAIT, the default; =0 for the proxy threads: every chain pre-posted behind a WAIT on the doorbell, no proxy threads, one janitor)" else "" });
 }
@@ -651,6 +689,10 @@ pub const Transport = struct {
         return .{ .reason = @fromBackingInt(@intCast(r)), .class = @fromBackingInt(@intCast(t.fail_class.load(.monotonic))), .peer = t.fail_peer.load(.monotonic) };
     }
 
+    /// The failure reaction, in order: set the abort word; tell the peers and move the queue pairs to error and fence the card
+    /// off the control block (so no late genuine word, WRITE or atomic, can overwrite the abort value); then store the abort
+    /// value into every awaited word and the doorbell, which releases every queued wait. Whoever gets here first wins; the
+    /// engine exits and restarts.
     pub fn fail(t: *Transport, reason: FailReason, class: Class, peer: u8) void {
         if (t.failed.cmpxchgStrong(0, @backingInt(reason), .acq_rel, .acquire) != null) return;
         t.fail_class.store(@backingInt(class), .monotonic);

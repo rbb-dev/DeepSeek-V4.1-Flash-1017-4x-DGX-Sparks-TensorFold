@@ -1,7 +1,38 @@
+   "default": "1",
+   "doc": "On by default: each ring lane's data goes as a plain RDMA write and a 64-bit generation word is written after it to say it has arrived; the collecting kernel waits on those words. Set 0 for the flag-based arrival (the proxy publishes each lane's flag). The card's wait for the decode rings needs this on, with either arrival signal. Every node must agree.",
+   "first_use": "families/dsv41/model.zig:1858",
+   "default": "atomic",
+   "doc": "How the generation word is sent: by default an RDMA atomic add, which the card executes only after the data writes are placed (the guaranteed arrival); word sends an 8-byte RDMA write instead. Every node must agree. A card without atomics: left unset, the rings send the write and say why in a warning; set to atomic, the start refuses by name.",
+   "first_use": "families/dsv41/model.zig:1895",
    "name": "tf_ds_bf16_rows",
    "env": "TF_DS_BF16_ROWS",
    "unit": "rows",
    "first_use": "families/dsv41/model.zig:1685",
+  },
+  {
+   "id": 921,
+   "name": "tf_ds_roci_signal",
+   "env": "TF_DS_ROCI_SIGNAL",
+   "group": "transport",
+   "tab": "Transport",
+   "kind": "enum",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "atomic",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "doc": "How Rocinante tells a receiver a part has arrived: by default atomic (an RDMA atomic add, which InfiniBand orders after the data: the guaranteed arrival) or write (an 8-byte RDMA write of a generation word). A card without atomics: left unset, Rocinante sends the write and says why in a warning; set to atomic, the start refuses by name. Every node must agree.",
+   "values": [
+    "write",
+    "atomic"
+   ],
+   "seed": "name",
+   "first_use": "families/dsv41/roci_engine.zig:188",
+   "secret": false
   },
   {
    "id": 923,

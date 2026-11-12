@@ -72,6 +72,12 @@ const FQp = struct {
     remote_qpn: u32,
     ci: u16,
     flushed: bool,
+    /// What the transitions said about atomics (the qpc's rae, atomic_mode, log_rra_max at RTR, log_sra_max at RTS) and the opt-param masks.
+    rae: bool = false,
+    atomic_mode: u8 = 0,
+    log_rra: u8 = 0,
+    log_sra: u8 = 0,
+    opt_masks: [3]u32 = @splat(0),
 };
 const FVqp = struct { qp: vabi.Qp, used: bool, node: u8, rail: u8, remote: u32, cq: *FCq, state: c_int };
 
@@ -100,7 +106,10 @@ const Fx = struct {
     max_log_sq: u8 = 15,
     bf_uar_fails: bool = false,
     drop_cqes: bool = false,
+    atomic_cap: c_int = vabi.atomic_hca,
+    rd_atom: c_int = 16,
     // what happened
+    atomics: u64 = 0,
     writes: u64 = 0,
     words: u64 = 0,
     waits_released: u64 = 0,
@@ -276,6 +285,57 @@ fn doWrite(q: *FQp, w: *const [64]u8) bool {
     return true;
 }
 
+/// The ATOMIC fetch-and-add entry as the card runs it: the requester must have been given depth (log_sra_max is 4 bits of depth in the model:
+/// any value), the responder's queue pair must have rae set with atomic_mode IB_SPEC (1) and its registration ATOMIC access, the remote address
+/// 8-byte aligned, the data segment an 8-byte local-write landing. The add is the WQE's big-endian addend onto the host-endian word (the
+/// card's host-endianness atomics mode), the old value goes to the landing.
+fn doAtomic(q: *FQp, w: *const [64]u8) bool {
+    const raddr: usize = @intCast(be64(w[16..24]));
+    const rkey = be32(w[24..28]);
+    const add = be64(w[32..40]);
+    const bc = be32(w[48..52]);
+    const lkey = be32(w[52..56]);
+    const laddr: usize = @intCast(be64(w[56..64]));
+    if (bc != 8 or raddr % 8 != 0 or laddr % 8 != 0 or be32(w[28..32]) != 0 or be64(w[40..48]) != 0) {
+        fx.violations += 1;
+        failQp(q, q.ci, 2);
+        return false;
+    }
+    const lm = mrOfKey(lkey) orelse {
+        fx.violations += 1;
+        failQp(q, q.ci, 4);
+        return false;
+    };
+    if (lm.node != q.node or lm.rail != q.rail or lm.access & vabi.access_local_write == 0 or !covers(lm, laddr, 8)) {
+        fx.violations += 1;
+        failQp(q, q.ci, 4);
+        return false;
+    }
+    const dest = qpByQpn(q.remote_qpn);
+    const live = if (dest) |d| (d.state == 2 or d.state == 3) and d.rail == q.rail else false;
+    if (!live) {
+        failQp(q, q.ci, 0x15);
+        return false;
+    }
+    const rm = mrOfKey(rkey) orelse {
+        failQp(q, q.ci, 0x13);
+        return false;
+    };
+    if (!dest.?.rae or dest.?.atomic_mode != 1 or rm.node != dest.?.node or rm.rail != q.rail or rm.access & vabi.access_remote_atomic == 0 or !covers(rm, raddr, 8)) {
+        fx.violations += 1;
+        failQp(q, q.ci, 0x13); // remote access: the responder's queue pair or registration does not grant atomics
+        return false;
+    }
+    if (rm.ctl) {
+        const cell = (raddr - fx.ctl_addr[rm.node] - @offsetOf(roci.Control, "recv")) / @sizeOf(roci.Word);
+        if (cell % rails != q.rail or (cell / rails) % world != q.node) fx.violations += 1;
+    }
+    const old = @atomicRmw(u64, @as(*u64, @ptrFromInt(raddr)), .Add, add, .acq_rel);
+    @atomicStore(u64, @as(*u64, @ptrFromInt(laddr)), old, .release);
+    fx.atomics += 1;
+    return true;
+}
+
 fn stepQp(q: *FQp) void {
     if (!q.used or q.dead) return;
     if (q.state == 6) {
@@ -289,6 +349,8 @@ fn stepQp(q: *FQp) void {
         const w0 = be32(w[0..4]);
         const w1 = be32(w[4..8]);
         const opcode: u8 = @truncate(w0);
+        const want_ds: u32 = if (opcode == mx.opcode_atomic_fa) mx.atomic_ds_units else mx.ds_units;
+        if (((w0 >> 8) & 0xffff) != q.ci or (w1 >> 8) != q.qpn or (w1 & 0x3f) != want_ds) {
             fx.violations += 1;
             failQp(q, q.ci, 2);
             return;
@@ -309,6 +371,7 @@ fn stepQp(q: *FQp) void {
                 fx.waits_released += 1;
             },
             mx.opcode_rdma_write => if (!doWrite(q, w)) return,
+            mx.opcode_atomic_fa => if (!doAtomic(q, w)) return,
             else => {
                 fx.violations += 1;
                 failQp(q, q.ci, 2);
@@ -357,6 +420,12 @@ fn vQueryGid(c: *vabi.Context, _: u8, _: c_int, g: *vabi.Gid) callconv(.c) c_int
     g.raw[13] = 255;
     g.raw[14] = x.rail;
     g.raw[15] = 33 + x.node;
+    return 0;
+}
+fn vQueryDevice(_: *vabi.Context, a: *vabi.DeviceAttr) callconv(.c) c_int {
+    a.atomic_cap = fx.atomic_cap;
+    a.max_qp_rd_atom = fx.rd_atom;
+    a.max_qp_init_rd_atom = fx.rd_atom;
     return 0;
 }
 fn vAllocPd(c: *vabi.Context) callconv(.c) ?*vabi.Pd {
@@ -546,6 +615,19 @@ fn mObjModify(obj: *mx.DevxObj, in: *const anyopaque, inlen: usize, out: *anyopa
         fx.n_tr += 1;
     }
     const qq = if (inlen > mx.msg.qpc_at) b[mx.msg.qpc_at..] else b[0..0];
+    const step: usize = switch (opc) {
+        mx.op.rst2init_qp => 0,
+        mx.op.init2rtr_qp => 1,
+        mx.op.rtr2rts_qp => 2,
+        else => 3,
+    };
+    if (step < 3 and inlen > mx.msg.qpc_at) {
+        q.opt_masks[step] = @intCast(mx.get(b, mx.msg.opt_param_mask));
+        if (mx.get(qq, mx.qpc.rae) == 1) {
+            q.rae = true;
+            q.atomic_mode = @intCast(mx.get(qq, mx.qpc.atomic_mode));
+        }
+    }
     switch (opc) {
         mx.op.rst2init_qp => {
             if (q.state != 0 or mx.get(b, mx.msg.qpn) != q.qpn) return bad(o);
@@ -558,10 +640,12 @@ fn mObjModify(obj: *mx.DevxObj, in: *const anyopaque, inlen: usize, out: *anyopa
             for (qq[mx.qpc.pap_rgid_rip_byte..][0..16]) |c| any |= c;
             if (any == 0 or mx.get(qq, mx.qpc.pap_rmac_31_0) == 0 or mx.get(qq, mx.qpc.mtu) != 5) return bad(o);
             q.remote_qpn = @intCast(mx.get(qq, mx.qpc.remote_qpn));
+            q.log_rra = @intCast(mx.get(qq, mx.qpc.log_rra_max));
             q.state = 2;
         },
         mx.op.rtr2rts_qp => {
             if (q.state != 2) return bad(o);
+            q.log_sra = @intCast(mx.get(qq, mx.qpc.log_sra_max));
             q.state = 3;
         },
         mx.op.qp_2err => {
@@ -624,6 +708,7 @@ fn fakeVerbs() Verbs {
     v.api.ibv_close_device = vCloseDev;
     v.api.ibv_query_port = vQueryPort;
     v.api.ibv_query_gid = vQueryGid;
+    v.api.ibv_query_device = vQueryDevice;
     v.api.ibv_alloc_pd = vAllocPd;
     v.api.ibv_dealloc_pd = vDeallocPd;
     v.api.ibv_reg_mr = vRegMr;
@@ -668,6 +753,9 @@ const Opts = struct {
     start: bool = true,
     max_log_sq: u8 = 15,
     bf_uar_fails: bool = false,
+    signal: roci.Signal = .write,
+    atomic_cap: c_int = vabi.atomic_hca,
+    rd_atom: c_int = 16,
 };
 
 const Nd = struct {
@@ -687,6 +775,8 @@ const Fab = struct {
         fxReset();
         fx.max_log_sq = o.max_log_sq;
         fx.bf_uar_fails = o.bf_uar_fails;
+        fx.atomic_cap = o.atomic_cap;
+        fx.rd_atom = o.rd_atom;
         const f = try gpa.create(Fab);
         f.* = .{ .nd = undefined, .verbs = fakeVerbs(), .mlx = fakeMlx(), .opts = o };
         const total = roci.layoutOf(if (o.host) .host else .prompt).total;
@@ -701,6 +791,7 @@ const Fab = struct {
         for (&f.nd, 0..) |*nd, g| {
             fx.cur_node = @intCast(g);
             const ctl_bytes = std.mem.asBytes(nd.ctl);
+            nd.nic = try cd.CdNic.open(gpa, &f.verbs, &f.mlx, .{ .log_sq_size = o.log_sq, .signal_every = o.signal_every, .sq_wait_ms = o.sq_wait_ms, .settle_ms = o.settle_ms, .mac_of = fakeMac, .signal = o.signal }, @intCast(g), nd.arena, ctl_bytes, 77);
             all[g] = try nd.nic.info();
         }
         for (&f.nd) |*nd| try nd.nic.connect(&all);
@@ -950,13 +1041,24 @@ test "wait mode: a queue pair create the card refuses is retried one size down; 
     try std.testing.expectEqual(mx.uar_type_nc, fx.last_uar_type);
 }
 
+test "wait mode: nodes that disagree about waiting, about the arrival signal or about the ATOMICs in flight refuse to connect, by name" {
     var all: [world]rv.Info = @splat(.{ .layout_hash = 7, .signal = 0, .wait = 1 });
     const mine = all[0];
     try rv.checkPeers(&all, mine);
     all[3].wait = 0; // a node on the verbs path
     try std.testing.expectError(error.WaitMismatch, rv.checkPeers(&all, mine));
+    all[3].wait = 1;
+    all[2].signal = @backingInt(roci.Signal.atomic); // a node that signals with ATOMICs into a block the others write
+    try std.testing.expectError(error.SignalMismatch, rv.checkPeers(&all, mine));
 }
 
+/// The words a part's arrival signal writes as WRITEs: one for the write signal, none for the ATOMIC one (its word is added to by the card).
+fn wordWrites(sig: roci.Signal) u64 {
+    return if (sig == .write) 1 else 0;
+}
+
+fn chainBehindWait(sig: roci.Signal) !void {
+    const f = try Fab.open(.{ .signal = sig });
     defer f.close();
     const a = &f.nd[0];
     const s: FakeStream = .{};
@@ -986,6 +1088,8 @@ test "wait mode: a queue pair create the card refuses is retried one size down; 
     sleepNs(30 * std.time.ns_per_ms);
     fx.lockIt();
     try std.testing.expectEqual(@as(u64, 2), fx.waits_released);
+    try std.testing.expectEqual(2 * (1 + wordWrites(sig)), fx.writes);
+    try std.testing.expectEqual(2 * (1 - wordWrites(sig)), fx.atomics);
     fx.unlockIt();
     try std.testing.expectEqual(@as(u64, 1), peer.ctl.recv[@backingInt(roci.Class.own1)][0][0].v);
     // the doorbell at 3 (a stream write that skipped 2) releases the other two at once: the compare is "reached", not "equal"
@@ -1000,6 +1104,16 @@ test "wait mode: a queue pair create the card refuses is retried one size down; 
     try std.testing.expectEqual(@as(u64, 3), peer.ctl.recv[@backingInt(roci.Class.own1)][0][1].v);
 }
 
+test "wait mode: a chain is in the queue behind its WAIT and the card sends nothing until the doorbell reaches the ticket; chains released in order, a later one waiting for its own ticket (the write signal)" {
+    try chainBehindWait(.write);
+}
+
+test "wait mode, ATOMIC signal: a chain is in the queue behind its WAIT and the card sends nothing until the doorbell reaches the ticket; the receiver reads the same words, 1, 2, 3, as with the write signal" {
+    try chainBehindWait(.atomic);
+}
+
+fn fourNodes(sig: roci.Signal) !u64 {
+    const f = try Fab.open(.{ .signal = sig });
     defer f.close();
     const classes = [_]roci.Class{ .own1, .own2, .eng1, .eng2, .wob, .pack, .ga, .gf };
     const run = try runProgram(f, &classes, 3);
@@ -1007,12 +1121,29 @@ test "wait mode: a queue pair create the card refuses is retried one size down; 
     fx.lockIt();
     defer fx.unlockIt();
     try std.testing.expectEqual(@as(u32, 0), fx.violations);
+    try std.testing.expect(fx.waits_released > 0 and fx.writes + fx.atomics > fx.waits_released);
     for (&f.nd) |*nd| {
         const c = nd.t.counters();
         try std.testing.expect(c.events == 3 * classes.len and c.stream_writes == 3 * classes.len);
     }
+    // the arrival signals the card ran: the word WRITEs, or the ATOMICs
+    return if (sig == .write) fx.words else fx.atomics;
 }
 
+test "wait mode: four nodes, owner sums, codes and gathers: every byte lands, generation after generation, both caps, with no proxy thread" {
+    const signals = try fourNodes(.write);
+    try std.testing.expect(signals > 0);
+}
+
+test "wait mode, ATOMIC signal: four nodes, owner sums, codes and gathers: every byte lands as with the write signal, the same number of arrival signals are run, none of them a word WRITE" {
+    const want = try fourNodes(.write);
+    const got = try fourNodes(.atomic);
+    try std.testing.expectEqual(want, got);
+    try std.testing.expectEqual(@as(u64, 0), fx.words);
+}
+
+fn hostRecords(sig: roci.Signal) !void {
+    const f = try Fab.open(.{ .host = true, .signal = sig });
     defer f.close();
     const a = &f.nd[0];
     const lo = roci.layoutOf(.host);
@@ -1027,12 +1158,22 @@ test "wait mode: a queue pair create the card refuses is retried one size down; 
     fx.lockIt();
     defer fx.unlockIt();
     try std.testing.expectEqual(@as(u64, 0), fx.waits_released); // (no WAIT was ever in the queue)
+    try std.testing.expect(fx.writes >= 2 + 2 * wordWrites(sig));
+    try std.testing.expectEqual(2 * (1 - wordWrites(sig)), fx.atomics);
     var got: [3 * roci.host_rec]u8 = undefined;
     const slot_at = lo.at(.rec_land) + 2 * roci.host_slot_bytes;
     @memcpy(&got, partner.arena[slot_at..][0..got.len]);
     var want: [3 * roci.host_rec]u8 = undefined;
     pattern(&want, 5);
     try std.testing.expectEqualSlices(u8, want[0 .. want.len / 8 * 8], got[0 .. got.len / 8 * 8]);
+}
+
+test "wait mode: the host lane's record events are posted at once with no WAIT, and land with no stream write" {
+    try hostRecords(.write);
+}
+
+test "wait mode, ATOMIC signal: the host lane's record events are posted at once with no WAIT (the chain ends in the ATOMIC), and land with no stream write" {
+    try hostRecords(.atomic);
 }
 
 /// Node 0 with two events reserved and never rung, so each of its queue pairs to the peers holds an armed WAIT.
@@ -1055,6 +1196,8 @@ fn peersUntouched(f: *Fab) !void {
     }
 }
 
+fn failureOrder(sig: roci.Signal) !void {
+    const f = try Fab.open(.{ .signal = sig });
     defer f.close();
     fx.err_delay_ns = 5 * std.time.ns_per_ms; // (the ERR command takes real time: the card runs meanwhile)
     try armed(f);
@@ -1074,6 +1217,15 @@ fn peersUntouched(f: *Fab) !void {
     // then the rail's control block released (M); the arena's registration stays until close
     try std.testing.expectEqualStrings("EEEQQQAAAM" ++ "EEEQQQAAAM", fx.events[0..fx.n_ev]);
     try std.testing.expectEqual(@as(u32, 0), fx.violations);
+    try std.testing.expectEqual(@as(u64, 0), fx.atomics);
+}
+
+test "wait mode: a failure takes the queue pairs from the card before the doorbell can hold the abort value: no armed chain is released, the peers hear of it over the abort pairs, the registration goes after the queue pairs" {
+    try failureOrder(.write);
+}
+
+test "wait mode, ATOMIC signal: the same failure order: no armed chain (no ATOMIC either) is released, the peers hear of it over the abort pairs, the control block is released after the queue pairs" {
+    try failureOrder(.atomic);
 }
 
 test "control: with the abort value stored into the doorbell first, the armed chains are released and unproduced data and arrival words land in the peers (the ordering test can fail)" {
@@ -1158,6 +1310,8 @@ test "wait mode: stop with chains armed: the queue pairs are taken from the card
     gpa.destroy(f);
 }
 
+fn roomThrough(sig: roci.Signal) !void {
+    const f = try Fab.open(.{ .log_sq = 6, .signal_every = 4, .signal = sig });
     defer f.close();
     const classes = [_]roci.Class{ .own1, .own2 };
     const run = try runProgram(f, &classes, 20);
@@ -1167,6 +1321,14 @@ test "wait mode: stop with chains armed: the queue pairs are taken from the card
     fx.lockIt();
     defer fx.unlockIt();
     try std.testing.expectEqual(@as(u32, 0), fx.violations);
+}
+
+test "wait mode: the send queue's room is counted in entries and a signalled completion retires them: a hundred events through a 64-entry queue all arrive" {
+    try roomThrough(.write);
+}
+
+test "wait mode, ATOMIC signal: the send queue's room counts the ATOMIC entry's blocks (one) and a signalled ATOMIC's completion retires the entries before it: a hundred events through a 64-entry queue all arrive" {
+    try roomThrough(.atomic);
 }
 
 test "wait mode: a queue pair whose completions never come stops the transport after the room wait, naming the post" {
@@ -1291,4 +1453,196 @@ test "wait mode: a transport asked to wait in the card refuses a NIC that cannot
     try std.testing.expectError(error.NicCannotWait, roci.Transport.init(gpa, 0, roci.identity, ctl, @intFromPtr(ctl), nic, .{ .wait_qp = true }));
     const t = try roci.Transport.init(gpa, 0, roci.identity, ctl, @intFromPtr(ctl), nic, .{});
     t.deinit();
+}
+
+// -- the ATOMIC arrival signal ---------------------------------------------------------------------------------------
+
+test "wait mode, ATOMIC signal: the queue pairs are set up for atomics (rae, atomic_mode IB_SPEC, depth 16 both ends, the RAE optional-parameter bit), the control block and a landing line are registered for them, and the write signal's queue pairs and registrations are what they were" {
+    for ([_]roci.Signal{ .write, .atomic }) |sig| {
+        const f = try Fab.open(.{ .signal = sig });
+        defer f.close();
+        const atomic = sig == .atomic;
+        try std.testing.expectEqual(@as(u32, 24), fx.created_cd_master);
+        for (fx.qps[0..24]) |q| {
+            try std.testing.expectEqual(atomic, q.rae);
+            try std.testing.expectEqual(@as(u8, if (atomic) 1 else 0), q.atomic_mode);
+            try std.testing.expectEqual(@as(u8, if (atomic) 4 else 0), q.log_rra);
+            try std.testing.expectEqual(@as(u8, if (atomic) 4 else 0), q.log_sra);
+            try std.testing.expectEqual(@as(u32, 0), q.opt_masks[0]);
+            try std.testing.expectEqual(@as(u32, if (atomic) @intCast(mx.opt_rae) else 0), q.opt_masks[1]);
+            try std.testing.expectEqual(@as(u32, @intCast(mx.opt_min_rnr_nak | (if (atomic) mx.opt_rae else 0))), q.opt_masks[2]);
+        }
+        // registrations: arena + control block per rail and node (16), and with atomics one landing line each (24)
+        try std.testing.expectEqual(@as(usize, if (atomic) 24 else 16), fx.n_registered_under_devx);
+        var ctl_n: usize = 0;
+        var sink_n: usize = 0;
+        for (fx.mrs[0..fx.n_mr]) |m| {
+            if (m.ctl) {
+                ctl_n += 1;
+                try std.testing.expectEqual(atomic, m.access & vabi.access_remote_atomic != 0);
+                try std.testing.expect(m.access & vabi.access_remote_write != 0);
+            } else {
+                // the arena and the landing line grant no ATOMIC to anyone
+                try std.testing.expect(m.access & vabi.access_remote_atomic == 0);
+                if (m.len == roci.line * roci.rails * roci.world) {
+                    sink_n += 1;
+                    try std.testing.expectEqual(@as(c_int, vabi.access_local_write), m.access);
+                }
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 8), ctl_n);
+        try std.testing.expectEqual(@as(usize, if (atomic) 8 else 0), sink_n);
+        // the Info a node gives its peers
+        const info = try f.nd[1].nic.info();
+        try std.testing.expectEqual(@as(u64, @backingInt(sig)), info.signal);
+        try std.testing.expectEqual(@as(u32, if (atomic) 16 else 0), info.rd_atomic[0]);
+        try std.testing.expectEqual(@as(u32, if (atomic) 16 else 0), info.rd_atomic[1]);
+        try std.testing.expectEqual(@as(u64, 1), info.wait);
+        try std.testing.expectEqual(@as(u32, 0), fx.violations);
+    }
+}
+
+test "wait mode, ATOMIC signal: a chain's entries are [WAIT][data WRITE][ATOMIC fetch-and-add] in consecutive blocks, the ATOMIC at the peer's word of (class, source, rail) with the control block's key, landing in this node's own line; the queue's producer index counts blocks" {
+    const f = try Fab.open(.{ .signal = .atomic });
+    defer f.close();
+    const a = &f.nd[0];
+    const lo = roci.layout();
+    pattern(a.arena[lo.at(.psum)..][0..4096], 11);
+    _ = try a.t.reserve(.own1, 0);
+    sleepNs(30 * std.time.ns_per_ms);
+    // node 0's queue pair on rail 0 to node 1
+    const peer: usize = 1;
+    var q: ?*FQp = null;
+    for (fx.qps[0..fx.n_qp]) |*c| {
+        if (c.node != 0 or c.rail != 0) continue;
+        if (qpByQpn(c.remote_qpn).?.node == peer) q = c;
+    }
+    const qp = q.?;
+    const be = std.mem.readInt;
+    const blk = struct {
+        fn at(x: *FQp, i: usize) *const [64]u8 {
+            return @ptrFromInt(x.sq + i * 64);
+        }
+    }.at;
+    // [WAIT] opcode 0x0f, opmod 1, 3 units
+    try std.testing.expectEqual(@as(u32, 0x0f), be(u32, blk(qp, 0)[0..4], .big) & 0xff);
+    try std.testing.expectEqual(@as(u32, 3), be(u32, blk(qp, 0)[4..8], .big) & 0x3f);
+    // [WRITE] opcode 0x08, 3 units
+    try std.testing.expectEqual(@as(u32, 0x08), be(u32, blk(qp, 1)[0..4], .big) & 0xff);
+    try std.testing.expectEqual(@as(u32, 3), be(u32, blk(qp, 1)[4..8], .big) & 0x3f);
+    // [ATOMIC] opcode 0x12, 4 units, index 2, this queue pair's number
+    const at = blk(qp, 2);
+    try std.testing.expectEqual(@as(u32, 0x12), be(u32, at[0..4], .big) & 0xff);
+    try std.testing.expectEqual(@as(u32, 2), (be(u32, at[0..4], .big) >> 8) & 0xffff);
+    try std.testing.expectEqual(@as(u32, qp.qpn << 8 | 4), be(u32, at[4..8], .big));
+    const cell = @offsetOf(roci.Control, "recv") + ((@as(usize, @backingInt(roci.Class.own1)) * roci.world + 0) * roci.rails + 0) * @sizeOf(roci.Word);
+    try std.testing.expectEqual(@as(u64, fx.ctl_addr[peer] + cell), be(u64, at[16..24], .big));
+    const rm = mrOfKey(be(u32, at[24..28], .big)).?;
+    try std.testing.expect(rm.ctl and rm.node == peer and rm.rail == 0);
+    try std.testing.expectEqual(@as(u64, 1), be(u64, at[32..40], .big));
+    try std.testing.expectEqual(@as(u32, 8), be(u32, at[48..52], .big));
+    const lm = mrOfKey(be(u32, at[52..56], .big)).?;
+    try std.testing.expect(lm.node == 0 and lm.rail == 0 and lm.access == vabi.access_local_write);
+    // the landing is node 0's line for (rail 0, peer 1): inside the sink, 8-byte aligned, a line of its own
+    const land: usize = @intCast(be(u64, at[56..64], .big));
+    try std.testing.expect(covers(lm, land, 8) and land % 8 == 0);
+    try std.testing.expectEqual(@as(usize, lm.addr + (0 * roci.world + peer) * roci.line), land);
+    // the producer index the card was told: three blocks (not 2 + the atomic's four units)
+    try std.testing.expectEqual(@as(u32, 3), std.mem.bigToNative(u32, @as(*u32, @ptrFromInt(qp.dbr + 4)).*));
+    try std.testing.expectEqual(@as(u32, 3), a.nic.rail[0].qps[peer].?.pi);
+    // nothing ran: the WAIT is armed
+    fx.lockIt();
+    defer fx.unlockIt();
+    try std.testing.expectEqual(@as(u64, 0), fx.atomics + fx.writes);
+    try std.testing.expectEqual(@as(u32, 0), fx.violations);
+}
+
+test "wait mode, ATOMIC signal: the ATOMIC adds 1 to the peer's word after the data is placed, and the old value lands in the sender's line for (rail, peer)" {
+    const f = try Fab.open(.{ .signal = .atomic });
+    defer f.close();
+    const a = &f.nd[0];
+    const peer = &f.nd[1];
+    const s: FakeStream = .{};
+    const lo = roci.layout();
+    pattern(a.arena[lo.at(.psum)..][0..4096], 21);
+    _ = try a.t.reserve(.own1, 0);
+    _ = try a.t.reserve(.own1, 0);
+    try s.writeValue64(a.t.doorbellAddr(), a.t.go(2));
+    const t0 = nowNs();
+    const w0 = &peer.ctl.recv[@backingInt(roci.Class.own1)][0][0];
+    while (@atomicLoad(u64, &w0.v, .acquire) < 2 or @atomicLoad(u64, &peer.ctl.recv[@backingInt(roci.Class.own1)][0][1].v, .acquire) < 2) {
+        if (nowNs() - t0 > 3 * std.time.ns_per_s) return error.TestUnexpectedResult;
+        sleepNs(100_000);
+    }
+    try std.testing.expectEqual(@as(u64, 2), @atomicLoad(u64, &w0.v, .acquire));
+    fx.lockIt();
+    defer fx.unlockIt();
+    try std.testing.expectEqual(@as(u64, 4), fx.atomics); // 2 events x 2 rails
+    try std.testing.expectEqual(@as(u64, 0), fx.words);
+    try std.testing.expectEqual(@as(u32, 0), fx.violations);
+    // the sender's lines hold the old values the card returned: the sources of the two events, 0 then 1 (the last one to land wins: it is 1)
+    for (0..roci.rails) |r| {
+        const line = f.nd[0].nic.sink[(r * roci.world + 1) * roci.line ..][0..8];
+        try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, line, builtin.cpu.arch.endian()));
+    }
+}
+
+test "wait mode, ATOMIC signal: the start refuses by name where the card does no ATOMICs or grants none in flight, and the write signal does not ask" {
+    rv.log_refusals = false;
+    defer rv.log_refusals = true;
+    const cases = [_]struct { cap: c_int, rd: c_int }{
+        .{ .cap = vabi.atomic_none, .rd = 16 }, // no ATOMIC operations
+        .{ .cap = vabi.atomic_hca, .rd = 0 }, // none in flight
+    };
+    for (cases) |c| {
+        fxReset();
+        fx.atomic_cap = c.cap;
+        fx.rd_atom = c.rd;
+        var verbs = fakeVerbs();
+        var mlx = fakeMlx();
+        const arena = try std.posix.mmap(null, roci.layoutOf(.prompt).total, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+        defer std.posix.munmap(arena);
+        const ctl = try gpa.create(roci.Control);
+        defer gpa.destroy(ctl);
+        ctl.* = .{};
+        fx.ctl_addr[0] = @intFromPtr(ctl);
+        fx.cur_node = 0;
+        try std.testing.expectError(error.AtomicUnsupported, cd.CdNic.open(gpa, &verbs, &mlx, .{ .mac_of = fakeMac, .signal = .atomic }, 0, arena, std.mem.asBytes(ctl), 77));
+        // the write signal never asks the card about atomics
+        const n = try cd.CdNic.open(gpa, &verbs, &mlx, .{ .mac_of = fakeMac, .signal = .write }, 0, arena, std.mem.asBytes(ctl), 77);
+        n.close();
+    }
+}
+
+test "wait mode, ATOMIC signal, control: a responder queue pair without rae (or a control block registered without ATOMIC access) gives an error completion on the first ATOMIC, and the transport fails (reason qp): the model's checks can fail" {
+    const Case = enum { no_rae, no_mr_access };
+    for ([_]Case{ .no_rae, .no_mr_access }) |c| {
+        const f = try Fab.open(.{ .janitor_ms = 5, .signal = .atomic });
+        defer f.close();
+        cd.log_errors = false;
+        defer cd.log_errors = true;
+        const a = &f.nd[0];
+        const s: FakeStream = .{};
+        fx.lockIt();
+        switch (c) {
+            .no_rae => for (fx.qps[0..fx.n_qp]) |*q| {
+                q.rae = false;
+            },
+            .no_mr_access => for (fx.mrs[0..fx.n_mr]) |*m| if (m.ctl) {
+                m.access &= ~@as(c_int, vabi.access_remote_atomic);
+            },
+        }
+        fx.unlockIt();
+        try a.t.send(s, .own1, 0);
+        const t0 = nowNs();
+        while (a.t.failure() == null) {
+            if (nowNs() - t0 > 3 * std.time.ns_per_s) return error.TestUnexpectedResult;
+            sleepNs(1_000_000);
+        }
+        try std.testing.expectEqual(roci.FailReason.qp, a.t.failure().?.reason);
+        fx.lockIt();
+        defer fx.unlockIt();
+        try std.testing.expect(fx.violations > 0 and fx.err_cqes > 0);
+        try std.testing.expectEqual(@as(u64, 0), fx.atomics);
+    }
 }

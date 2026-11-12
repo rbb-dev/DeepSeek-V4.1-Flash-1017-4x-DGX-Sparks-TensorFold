@@ -204,6 +204,17 @@ pub const SendWr = extern struct {
     _tail: [52]u8 = @splat(0),
 };
 
+/// An RDMA ATOMIC fetch-and-add's work request, one SGE (`result`: where the card puts the word's old value, 8 bytes, local write): ibv_send_wr's
+/// atomic arm, where the RDMA arm's key is the addend. Unsignaled and not inline: the caller sets `send_flags`.
+pub fn fetchAddWr(result: [*]Sge, remote_addr: u64, add: u64, rkey: u32, wr_id: u64) SendWr {
+    var wr: SendWr = .{ .wr_id = wr_id, .sg_list = result, .num_sge = 1, .opcode = wr_atomic_fetch_add, .send_flags = 0, .remote_addr = remote_addr };
+    const raw = std.mem.asBytes(&wr);
+    std.mem.writeInt(u64, raw[48..56], add, .little);
+    std.mem.writeInt(u64, raw[56..64], 0, .little);
+    std.mem.writeInt(u32, raw[64..68], rkey, .little);
+    return wr;
+}
+
 pub const RecvWr = extern struct { wr_id: u64 = 0, next: ?*RecvWr = null, sg_list: ?[*]Sge = null, num_sge: c_int = 0 };
 
 pub const Wc = extern struct {
@@ -235,9 +246,16 @@ pub const qps_err = 6;
 pub const access_local_write = 1;
 pub const access_remote_write = 2;
 pub const access_remote_read = 4;
+pub const access_remote_atomic = 8;
 pub const wr_rdma_write = 0;
 pub const wr_rdma_write_imm = 1;
 pub const wr_send = 2;
+pub const wr_atomic_fetch_add = 6;
+/// ibv_atomic_cap: no atomics, atomics only against other atomics through the same card (a CPU or GPU store to the word is not
+/// ordered against them), atomics against every writer.
+pub const atomic_none = 0;
+pub const atomic_hca = 1;
+pub const atomic_glob = 2;
 pub const send_signaled = 2;
 pub const send_inline = 8;
 pub const wc_success = 0;
@@ -301,4 +319,37 @@ test "the ABI matches verbs.h" {
     try t.expectEqual(48, @sizeOf(Wc));
     try t.expectEqual(36, @offsetOf(Wc, "wc_flags"));
     try t.expectEqual(32, @sizeOf(GidEntry));
+}
+
+test "an ATOMIC fetch-and-add's work request is ibv_send_wr's atomic arm: remote address, addend, swap, key at 40, 48, 56, 64" {
+    // verbs.h's union wr { rdma { remote_addr; rkey }; atomic { remote_addr; compare_add; swap; rkey }; ... } laid out by hand
+    const Arm = extern struct {
+        wr_id: u64,
+        next: ?*SendWr,
+        sg_list: [*]Sge,
+        num_sge: c_int,
+        opcode: c_int,
+        send_flags: c_uint,
+        imm_data: u32,
+        remote_addr: u64,
+        compare_add: u64,
+        swap: u64,
+        rkey: u32,
+        pad: [60]u8,
+    };
+    comptime {
+        std.debug.assert(@sizeOf(Arm) == @sizeOf(SendWr) and @offsetOf(Arm, "compare_add") == 48 and @offsetOf(Arm, "swap") == 56 and @offsetOf(Arm, "rkey") == 64);
+    }
+    var sge: Sge = .{ .addr = 0x1000, .length = 8, .lkey = 7 };
+    var wr = fetchAddWr(@ptrCast(&sge), 0x7f00_0000_1040, 1, 0xabcd, 0x55);
+    const arm: *const Arm = @ptrCast(&wr);
+    try std.testing.expectEqual(@as(c_int, wr_atomic_fetch_add), arm.opcode);
+    try std.testing.expectEqual(@as(u64, 0x7f00_0000_1040), arm.remote_addr);
+    try std.testing.expectEqual(@as(u64, 1), arm.compare_add);
+    try std.testing.expectEqual(@as(u64, 0), arm.swap);
+    try std.testing.expectEqual(@as(u32, 0xabcd), arm.rkey);
+    try std.testing.expectEqual(@as(u64, 0x55), arm.wr_id);
+    try std.testing.expectEqual(@as(c_int, 1), arm.num_sge);
+    // nothing of the RDMA arm's key survives in the addend, and the tail (the queue-pair-type union) is zero
+    try std.testing.expect(std.mem.allEqual(u8, arm.pad[4..], 0));
 }
