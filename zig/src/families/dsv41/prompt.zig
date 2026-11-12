@@ -33,6 +33,7 @@ const where = @import("where.zig");
 const engram = @import("engram.zig");
 const engram_io = @import("engram_io.zig");
 const engram_aio = @import("engram_aio.zig");
+const engram_rows = @import("engram_rows.zig");
 const exact = @import("exact.zig");
 const tri_index = @import("tri_index.zig");
 const idx_spread = @import("idx_spread.zig");
@@ -2463,6 +2464,7 @@ pub const EngramHost = struct {
     s: []u8, // their E8M0 scales
     rows: []u16, // bf16 [cap, (hi - lo) * head_dim]
     aio: ?*engram_aio.Aio = null, // a round's reads by Linux AIO on the tables' O_DIRECT descriptors (else the pool)
+    pk: ?*engram_rows.Rows = null, // TF_DS_ENGRAM_PACKED: rows staged as packed records and decoded on the GPU
     paio: ?*engram_aio.Aio = null, // a prompt chunk's reads the same way, on a ring of its own (else the pool)
     // the rounds' Engram host time (ns, summed; a profile reads it): hashing, the table reads, the decode, the upload
     io: ?std.Io = null,
@@ -2599,6 +2601,12 @@ fn engramAhead1(eh: *EngramHost, c: *const Config, seq: []const i32, start: usiz
     const cols = eh.hasher.cols();
     const k = eh.hi - eh.lo;
     if (j == 0) eh.hasher.hashes(seq, start, n, eh.hashes[0 .. n * eh.hasher.layers * cols]);
+    if (eh.pk) |pr| {
+        // packed shards: the records staged in this layer's read-ahead buffer (decoded on the GPU when applied)
+        try pr.chunkRead(&pr.ahead[j], j, eh.hashes[0 .. n * eh.hasher.layers * cols], n, eh.hasher.layers);
+        eh.ahead_ready[j] = true;
+        return;
+    }
     for (0..n) |r| {
         for (0..k) |q| eh.ahead_flat[j][r * k + q] = eh.hashes[(r * eh.hasher.layers + j) * cols + eh.lo + q];
     }
@@ -2773,6 +2781,7 @@ pub fn engramWorker(eh: *EngramHost, c: *const Config, seq: []const i32, start: 
     }
 }
 
+fn workerRows(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize, n: usize, j: usize, cols: usize, k: usize, out: []u16, slot: usize) !void {
     const li = c.engram_layers.slice()[j];
     const t = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
     _ = eh.inst_steps.fetchAdd(1, .monotonic);
@@ -2781,6 +2790,7 @@ pub fn engramWorker(eh: *EngramHost, c: *const Config, seq: []const i32, start: 
         eh.hasher.hashes(seq, start, n, eh.wk_hashes[slot][0 .. n * eh.hasher.layers * cols]);
         _ = eh.inst_hash_ns.fetchAdd(@intCast(nowNs() - th), .monotonic);
     }
+    // packed shards: the chunk's records staged in the worker's slot, decoded on the GPU when applied
     if (eh.pk) |pr| {
         const tg = nowNs();
         _ = eh.inst_gather_ns.fetchAdd(@intCast(nowNs() - tg), .monotonic);
@@ -2837,7 +2847,19 @@ pub fn engramWorkerRows(eh: *EngramHost, j: usize, start: usize, chunk: usize) !
     return eh.wk_rows[ci % eh.wk_slots][j];
 }
 
+/// With packed shards: the worker's records of Engram layer j for the chunk at `start` (waiting for them), for
+/// engramApply, as engramWorkerRows gives its rows.
+pub fn engramWorkerStage(eh: *EngramHost, j: usize, start: usize, chunk: usize) !*engram_rows.Stage {
+    const pr = eh.pk orelse return error.NoPackedRows;
+    _ = try engramWorkerRows(eh, j, start, chunk);
     return &pr.wk[((start - eh.wk_start) / chunk) % eh.wk_slots][j];
+}
+
+/// Layer li's Engram on the chunk (engram_apply, no image span), as _forward_k runs it before the attention mixes: a
+/// pending MoE post into the streams first (hc_post), then the rows of each position's n-grams (hashed on the host from
+/// `seq`, the whole sequence's ids so far; read from the tables; decoded to bf16 as Engram._decode does), their
+/// projection summed over the ranks in rank order, rounded to bf16, and the gate into the streams.
+pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq: []const i32) !void {
     try engramPending(e, ch, li);
     try engramProject(e, ch, eh, li, seq);
     try engramFinish(e, ch, eh, li, false);
@@ -2876,6 +2898,7 @@ pub fn engramProject(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, s
     const m = n * k;
     const prof = eh.io != null;
     var tq = if (prof) pstamp(e, eh) else 0;
+    if (m * t.row_w != n * ew.k) return error.EngramShape;
     if (eh.use_n > 0) {
         // the fill's worker's resume units of the pass in order, each at its rows: its decoded rows, or its records
         // (packed shards) decoded on the GPU
@@ -2890,7 +2913,19 @@ pub fn engramProject(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, s
     } else if (eh.pk) |pr| {
         // packed shards: the chunk's records (read ahead when they are this chunk's, else read here), decoded on the GPU
         const st = if (l < 2 and eh.ahead_ready[l] and eh.ahead_start == ch.start and eh.ahead_n == n) blk: {
+            eh.ahead_ready[l] = false;
+            break :blk &pr.ahead[l];
+        } else blk: {
+            eh.hasher.hashes(seq, ch.start, n, eh.hashes[0 .. n * eh.hasher.layers * cols]);
+            try pr.chunkRead(&pr.chunk, l, eh.hashes[0 .. n * eh.hasher.layers * cols], n, eh.hasher.layers);
+            break :blk &pr.chunk;
+        };
+        if (prof) eh.p_rows += lap(e, eh, &tq);
         try pr.chunkApply(st, n, e.s, ch.eb);
+        if (prof) eh.p_upload += lap(e, eh, &tq);
+    } else {
+        // the rows read ahead (fillChunk's thread) when they are this chunk's, else read here
+        var rows: []u16 = eh.rows;
         if (l < 2 and eh.ahead_ready[l] and eh.ahead_start == ch.start and eh.ahead_n == n) {
             rows = eh.ahead_rows[l];
             eh.ahead_ready[l] = false;
@@ -2905,6 +2940,9 @@ pub fn engramProject(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, s
         if (prof) eh.p_rows += lap(e, eh, &tq);
         try upload(e, ch.eb, rows.ptr, m * t.row_w * 2);
         if (prof) eh.p_upload += lap(e, eh, &tq);
+    }
+    try mm(e, ch, ew, ch.eb, ew.k, ch.ek, .fp32, ew.n);
+    if (prof) eh.p_mm += lap(e, eh, &tq);
 }
 
 /// Whether layer li's Engram sums run on the transport at owned rows (TF_DS_ROCI_ENGRAM_AHEAD hoists those alone).

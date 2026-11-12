@@ -40,6 +40,7 @@ const draft_vocab = @import("draft_vocab.zig");
 const engram = @import("engram.zig");
 const engram_io = @import("engram_io.zig");
 const engram_aio = @import("engram_aio.zig");
+const engram_rows = @import("engram_rows.zig");
 const exl3_prefill = @import("exl3_prefill.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const exl3_experts = @import("exl3_experts.zig");
@@ -1555,6 +1556,13 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     aio: ?*engram_aio.Aio = null,
     paio: ?*engram_aio.Aio = null, // the prompt chunks' Engram reads, on a ring of their own
     eh: ?prompt.EngramHost = null,
+    erows: ?*engram_rows.Rows = null, // TF_DS_ENGRAM_PACKED: Engram's rows from packed shards (engram_rows.zig)
+    host_pos: []i64,
+    ids64: []i64,
+    vocab: usize,
+    logits: []f32, // round.max_rows rows of logits on the host
+    amax: u64, // u32 [round.max_rows]: a round's greedy tokens on the device (roundArgmax)
+    amax_host: [round.max_rows]u32 = undefined,
     // Track B (TF_DS_SAMPLE_CAND=1): a round's candidates on the device (vals f32, ids i64, flags i32; max_rows rows of
     // sampling.max_candidates) and on the host
     cand: u64 = 0,
@@ -1807,6 +1815,11 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         m.aio = null;
         m.paio = null;
         m.eh = null;
+        m.erows = null;
+        m.rdma_mod = null;
+        m.ring = null;
+        m.graphs = null;
+        m.pgraphs = null;
         m.graph_fallbacks = .init(0);
         m.vocab_stats = .{};
         m.two = null;
@@ -2229,11 +2242,39 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             };
             m.tables = try engram_io.Tables.open(gpa, io, edir);
             m.epool = try engram_io.Pool.init(gpa, io, 64);
+            // TF_DS_ENGRAM_PACKED (a folder of tf-dsv41-engram-pack's shards): a row is one read, kept in a row cache
+            // (TF_DS_ENGRAM_CACHE_MIB, default 2048, 0 none) and decoded on the GPU; TF_DS_ENGRAM_OWNED=1: each node
+            // reads only its range of the rows and a byte max over the nodes fills the rest; TF_DS_ENGRAM_INSTREAM=1:
+            // a round's landing as a host step on the stream (with TF_DS_ENGRAM_AIO)
+            if (std.c.getenv("TF_DS_ENGRAM_PACKED")) |pd| {
                 const owned = false; // (TF_DS_ENGRAM_OWNED is a retired name: the whole tables are on every node)
+                const eh = &m.eh.?;
+                const cols = eh.hasher.cols();
+                const k = eh.hi - eh.lo;
+                const sl = if (owned) cols else k;
+                const rec = c.engram_head_dim + c.engram_head_dim / 32;
+                const mib: usize = if (std.c.getenv("TF_DS_ENGRAM_CACHE_MIB")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 2048;
+                m.erows = try engram_rows.Rows.open(gpa, d, &m.tables.?, m.epool.?, m.aio, m.paio, .{
+                    .dir = std.mem.span(pd),
+                    .owned = owned,
+                    .node = role,
+                    .nodes = o.world,
+                    .lo = eh.lo,
+                    .k = k,
+                    .cols = cols,
+                    .dim = c.engram_head_dim,
+                    .layer_ids = c.engram_layers.slice(),
+                    .round_rows = round.max_rows,
                     .chunk_rows = m.pass_rows,
+                    .cache_bytes = mib << 20,
+                    .instream = engram_rows.envOn("TF_DS_ENGRAM_INSTREAM"),
+                    .round_dev = try m.arena.take(round.max_rows * sl * rec),
                     .chunk_dev = try m.arena.take(m.pass_rows * sl * rec),
                     .chunk_dev_b = if (prompt2d.roci_stagger_asked) try m.arena.take(m.pass_rows * sl * rec) else 0,
                     .chunk_dev_c = if (prompt2d.roci_stagger_asked and prompt2d.roci_stagger_lanes >= 3) try m.arena.take(m.pass_rows * sl * rec) else 0,
+                });
+                eh.pk = m.erows;
+            }
         if (c.vision and c.format == .exl3) { // (Format.native: the checkpoint's own gate.bias_vl, loaded with the weights)
             const path = o.vision_bias orelse try std.fs.path.join(a, &.{ o.kit_dir, "vision", "gate_bias_vl.safetensors" });
             m.loadVisionBias(path) catch |err| if (o.vision_bias != null or err != error.FileNotFound) return err;
@@ -2298,6 +2339,13 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         m.rd.dropSide(&m.eng);
         m.rd.dropPrefetch();
         m.rd.dropPar();
+        if (m.erows) |r| r.close();
+        if (m.aio) |x| x.deinit();
+        if (m.paio) |x| x.deinit();
+        if (m.epool) |p| p.deinit(m.gpa);
+        if (m.tables) |*t| t.close();
+        if (m.rdma_rings) |*r| r.close(m.gpa);
+        m.blas.close();
         if (m.mxk) |*x| x.unload();
         m.ex.unload();
         m.ops.unload();

@@ -10,6 +10,10 @@ const dio = @import("core").direct_io;
 /// files through O_DIRECT (-1 where the file system refuses it: the buffered ones serve).
 pub const Table = struct { fd_w: std.c.fd_t, base_w: u64, row_w: usize, fd_s: std.c.fd_t, base_s: u64, row_s: usize, rows: u64, fd_wd: std.c.fd_t = -1, fd_sd: std.c.fd_t = -1 };
 
+/// One layer's packed shard (engram_pack.zig): table rows [lo, hi) of `rows`, each a record of its weights then its
+/// scales, `rec` bytes at base + (id - lo) * rec, so a row is one read; fd_d the same file through O_DIRECT (-1: none).
+pub const Packed = struct { fd: std.c.fd_t, fd_d: std.c.fd_t = -1, base: u64, rec: usize, rows: u64, lo: u64, hi: u64 };
+
 pub const Tables = struct {
     gpa: std.mem.Allocator,
     fds: std.ArrayList(std.c.fd_t) = .empty,
@@ -124,7 +128,7 @@ fn readDirect(fd: std.c.fd_t, bounce: []align(dio.alignment) u8, out: []u8, at: 
     @memcpy(out, try f.read(bounce, at, out.len));
 }
 
-fn preadAll(fd: std.c.fd_t, out: []u8, at: u64) !void {
+pub fn preadAll(fd: std.c.fd_t, out: []u8, at: u64) !void {
     var done: usize = 0;
     while (done < out.len) {
         const n = std.c.pread(fd, out.ptr + done, out.len - done, @intCast(at + done));
@@ -159,6 +163,9 @@ pub const Pool = struct {
         finished: std.atomic.Value(usize) = .init(0),
         failed: std.atomic.Value(bool) = .init(false),
         direct: bool = false,
+        // a packed shard's records instead (gatherRecords): ids[i]'s record into dsts[i]
+        pk: ?Packed = null,
+        dsts: []const [*]u8 = &.{},
     };
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, n: usize) !*Pool {
@@ -220,8 +227,15 @@ pub const Pool = struct {
             const i = j.next.fetchAdd(1, .monotonic);
             if (i >= j.ids.len) return;
             const id: u64 = @intCast(j.ids[i]);
-            const ok = id < j.t.rows;
-            if (ok) {
+            if (j.pk) |pk| {
+                if (id >= pk.lo and id < pk.hi) {
+                    const dst = j.dsts[i][0..pk.rec];
+                    const at = pk.base + (id - pk.lo) * pk.rec;
+                    if (pk.fd_d >= 0) {
+                        readDirect(pk.fd_d, &bounce, dst, at) catch j.failed.store(true, .monotonic);
+                    } else preadAll(pk.fd, dst, at) catch j.failed.store(true, .monotonic);
+                } else j.failed.store(true, .monotonic);
+            } else if (id < j.t.rows) {
                 const w = j.out_w[i * j.t.row_w ..][0..j.t.row_w];
                 const s = j.out_s[i * j.t.row_s ..][0..j.t.row_s];
                 if (j.direct and j.t.fd_wd >= 0) {
@@ -250,18 +264,30 @@ pub const Pool = struct {
         return p.run(t, ids, out_w, out_s, true);
     }
 
+    /// Records of `ids` from packed shard `pk` (each id in [pk.lo, pk.hi)), ids[i]'s into dsts[i] (pk.rec bytes).
+    pub fn gatherRecords(p: *Pool, pk: Packed, ids: []const i64, dsts: []const [*]u8) !void {
+        if (dsts.len != ids.len or pk.rec > direct_row_max) return error.BadSize;
+        if (ids.len == 0) return;
+        var job: Job = .{ .t = undefined, .ids = ids, .out_w = &.{}, .out_s = &.{}, .pk = pk, .dsts = dsts };
+        return p.runJob(&job);
+    }
+
     fn run(p: *Pool, t: Table, ids: []const i64, out_w: []u8, out_s: []u8, direct: bool) !void {
         if (out_w.len != ids.len * t.row_w or out_s.len != ids.len * t.row_s) return error.BadSize;
         if (ids.len == 0) return;
         var job: Job = .{ .t = t, .ids = ids, .out_w = out_w, .out_s = out_s, .direct = direct };
+        return p.runJob(&job);
+    }
+
+    fn runJob(p: *Pool, job: *Job) !void {
         p.mutex.lockUncancelable(p.io);
-        p.job = &job;
+        p.job = job;
         p.gen += 1;
         p.cond.broadcast(p.io);
         p.mutex.unlock(p.io);
-        p.work(&job);
+        p.work(job);
         p.mutex.lockUncancelable(p.io);
-        while (job.finished.load(.acquire) < ids.len or p.active > 0) p.done_cond.waitUncancelable(p.io, &p.mutex);
+        while (job.finished.load(.acquire) < job.ids.len or p.active > 0) p.done_cond.waitUncancelable(p.io, &p.mutex);
         p.job = null;
         p.mutex.unlock(p.io);
         if (job.failed.load(.monotonic)) return error.ReadFailed;

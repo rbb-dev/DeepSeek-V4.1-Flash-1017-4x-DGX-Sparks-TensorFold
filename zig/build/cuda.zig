@@ -64,6 +64,7 @@ const kernels = [_]Kernel{
     .{ .name = "dsv41_experts_par", .src = "dsv41/experts_par", .flags = &.{ "-O3", "-lineinfo" } }, // ours: the exl3 extension's gate / up with the parity split's rest in its grid (tensorfold_exl3_experts_v19's flags)
     .{ .name = "dsv41_native", .src = "dsv41/native", .flags = &.{"-O3"} }, // DeepSeek's own FP8 / MXFP4 checkpoint (mx.zig)
     .{ .name = "dsv41_native_sf", .src = "dsv41/native_sf", .flags = &.{"-O3"}, .arch_specific = true }, // its FP8 GEMMs on the block-scaled MMA (TF_DS_MMA_SF; sm_121a)
+    .{ .name = "dsv41_engram", .src = "dsv41/engram", .flags = torch_ops }, // Engram's packed records to bf16 rows (engram_gpu.zig)
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
@@ -239,6 +240,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const ds_engram = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/engram_check_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     ds_engram.addImport("dsv41", ds_check.import_table.get("dsv41").?);
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-engram-check", .root_module = ds_engram }));
+    // each node's packed Engram shards (a row's values and scales in one record) from the checkpoint's tables
+    const ds_engram_pack = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/engram_pack_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    ds_engram_pack.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-engram-pack", .root_module = ds_engram_pack }));
     // the vision tower's input of each image as the served lane makes it (picture.zig), by sha256 against the fixtures
     const ds_picture = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/picture_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     ds_picture.addImport("dsv41", ds_check.import_table.get("dsv41").?);

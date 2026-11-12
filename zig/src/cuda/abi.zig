@@ -177,6 +177,9 @@ const Ptr = ?*anyopaque;
 const CPtr = ?*const anyopaque;
 const Params = ?[*]?*anyopaque;
 
+/// CUhostFn: run on a driver thread in a stream's order; it must make no CUDA call.
+pub const HostFn = *const fn (?*anyopaque) callconv(.c) void;
+
 /// Each field is the exact exported symbol, so the ABI is the one that symbol version documents.
 pub const Api = struct {
     cuInit: *const fn (c_uint) callconv(.c) R,
@@ -220,6 +223,7 @@ pub const Api = struct {
     cuStreamQuery: *const fn (Stream) callconv(.c) R,
     cuStreamWriteValue64_v2: *const fn (Stream, DevicePtr, u64, c_uint) callconv(.c) R,
     cuStreamBatchMemOp_v2: *const fn (Stream, c_uint, [*]const BatchMemOp, c_uint) callconv(.c) R,
+    cuLaunchHostFunc: *const fn (Stream, HostFn, Ptr) callconv(.c) R,
     cuEventCreate: *const fn (*Event, c_uint) callconv(.c) R,
     cuEventDestroy_v2: *const fn (Event) callconv(.c) R,
     cuEventRecord: *const fn (Event, Stream) callconv(.c) R,

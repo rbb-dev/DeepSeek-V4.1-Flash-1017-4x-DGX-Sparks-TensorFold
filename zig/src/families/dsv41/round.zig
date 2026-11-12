@@ -1451,6 +1451,12 @@ fn engramAhead(e: *const Engine, eh: *prompt.EngramHost, seq: []const i32, rows:
         eh.hasher.hashes(w.seq, start, w.n, eh.hashes[w.row * per .. (w.row + w.n) * per]);
     }
     ah.* = .{ .aio = eh.aio != null, .R = R };
+    if (eh.pk) |pr| {
+        // packed shards: each layer's records staged now, their misses submitted (engram_rows.zig)
+        for (0..c.engram_layers.slice().len) |j| try pr.roundAhead(j, eh.hashes[0 .. R * eh.hasher.layers * cols], R, eh.hasher.layers);
+        if (eh.io != null) eh.t_hash += stamp(eh) - t0;
+        return;
+    }
     for (c.engram_layers.slice(), 0..) |li, j| {
         const tbl = eh.tables.layers.get(li) orelse return error.MissingEngramTable;
         const f0 = aheadRow(j) * k;
@@ -1468,7 +1474,16 @@ fn engramAhead(e: *const Engine, eh: *prompt.EngramHost, seq: []const i32, rows:
 fn engramLand(e: *const Engine, rd: *Round, eh: *prompt.EngramHost, ah: *const Ahead, li: usize) !void {
     const c = e.c;
     const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)) orelse return error.NotAnEngramLayer;
+    if (eh.pk) |pr| {
+        // packed shards: landed (a host step on the stream in stream mode), uploaded, combined, decoded into rd.e_in
+        const tp = stamp(eh);
         try pr.roundLand(j, ah.R, e.s, rd.e_in);
+        if (eh.io != null) {
+            eh.t_read += stamp(eh) - tp;
+            eh.calls += 1;
+        }
+        return;
+    }
     const tbl = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
     const k = eh.hi - eh.lo;
     const f0 = aheadRow(j) * k;

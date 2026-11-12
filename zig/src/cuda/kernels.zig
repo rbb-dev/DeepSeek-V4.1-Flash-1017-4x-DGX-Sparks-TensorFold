@@ -52,6 +52,7 @@ pub const dsv41_rdma: []const u8 = if (available) &Blob("fatbin_dsv41_rdma").byt
 pub const dsv41_experts_par: []const u8 = if (available) &Blob("fatbin_dsv41_experts_par").bytes else &.{};
 pub const dsv41_native: []const u8 = if (available) &Blob("fatbin_dsv41_native").bytes else &.{};
 pub const dsv41_native_sf: []const u8 = if (available) &Blob("fatbin_dsv41_native_sf").bytes else &.{};
+pub const dsv41_engram: []const u8 = if (available) &Blob("fatbin_dsv41_engram").bytes else &.{};
 pub const nemotron_norms: []const u8 = if (available) &Blob("fatbin_nemotron_norms").bytes else &.{};
 pub const nemotron_route: []const u8 = if (available) &Blob("fatbin_nemotron_route").bytes else &.{};
 pub const nemotron_mamba: []const u8 = if (available) &Blob("fatbin_nemotron_mamba").bytes else &.{};
