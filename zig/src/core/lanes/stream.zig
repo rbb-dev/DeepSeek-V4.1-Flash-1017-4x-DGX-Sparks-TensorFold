@@ -106,10 +106,28 @@ pub const Next = enum { same, round, other, idle };
 /// `decoding`, another stream decodes; `filling`, another prompt than this one fills (its fill started and not
 /// finished); `waiting`, a request other than this one is queued, parked, woken, or admitted and not yet started;
 /// `step_rows`, the most prompt rows the step may run before the host's next round (under the default cadence the
+/// family's resume rows while a stream decodes, maxInt(u32) while nothing decodes); `rounds_beside`, the rounds the host
+/// runs after each long step while a stream decodes (TF_DS_ROUNDS_BESIDE; 0: unset, one round).
+pub const Facts = struct { decoding: bool, filling: bool, waiting: bool, step_rows: u32, rounds_beside: u32 = 0 };
 
 /// The most rows a prompt's step at `start` may pass, from the host's facts alone: `resume_rows` with no facts (a host
+/// without them), below `pass_from`, while another request waits or, with `filling_pass` off, another prompt fills; else
+/// `pass_rows` when nothing decodes or the host's step rows reach them; else the step rows in whole resume units (besideRows). With `filling_pass` on
+/// another prompt filling does not cut the pass (prompts filling together take turns at whole passes); a waiting
+/// request still does, and a decoding stream still leaves the pass to the host's step rows.
+pub fn passRows(f: ?Facts, start: usize, pass_from: usize, pass_rows: u32, resume_rows: u32, filling_pass: bool) u32 {
     const x = f orelse return resume_rows;
+    if (start < pass_from or x.waiting or (x.filling and !filling_pass)) return resume_rows;
     if (!x.decoding or x.step_rows >= pass_rows) return pass_rows;
+    return besideRows(x.step_rows, pass_rows, resume_rows);
+}
+
+/// A step beside a decoding stream: the host's step rows in whole resume units, never above the pass rows and never below
+/// one unit (a pass is a whole number of units; the step rows between two sizes run the lower).
+pub fn besideRows(step_rows: u32, pass_rows: u32, resume_rows: u32) u32 {
+    if (resume_rows == 0) return pass_rows;
+    const units = step_rows / resume_rows;
+    return @min(pass_rows, @max(1, units) * resume_rows);
 }
 
 /// Whether the step at `start` is a whole pass of the booted `pass_rows` by the host's facts alone, and may be the first of a pair:
@@ -249,6 +267,8 @@ pub const Stream = struct {
     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
     fill_at: std.atomic.Value(u32) = .init(0), // prompt tokens the pass has prefilled; the engine thread writes
     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
+    settle_step: bool = false, // the lane host bills this prompt step's time to decoders: end it on the device
+    step_pair: bool = false, // the backend's last prompt step ran as a pair of passes (the host owes the streams twice the rounds)
     context: std.ArrayList(u32) = .empty,
     pending: ?u32 = null,
     force: std.ArrayList(u32) = .empty,
@@ -620,19 +640,84 @@ test "loop guard fires, closes thinking, and latches once" {
 test "passRows gives resume rows below pass_from, while a request waits, while another prompt fills and with no hook, else pass rows when nothing decodes or step_rows reaches them" {
     const quiet: Facts = .{ .decoding = false, .filling = false, .waiting = false, .step_rows = std.math.maxInt(u32) };
     // no hook: the resume rows
+    try std.testing.expectEqual(@as(u32, 2048), passRows(null, 16384, 8192, 4096, 2048, false));
     // nothing decodes, fills or waits: the pass rows, from pass_from on
+    try std.testing.expectEqual(@as(u32, 4096), passRows(quiet, 16384, 8192, 4096, 2048, false));
+    try std.testing.expectEqual(@as(u32, 4096), passRows(quiet, 8192, 8192, 4096, 2048, false));
+    try std.testing.expectEqual(@as(u32, 2048), passRows(quiet, 6144, 8192, 4096, 2048, false));
+    try std.testing.expectEqual(@as(u32, 4096), passRows(quiet, 0, 0, 4096, 2048, false));
     // another request waits, or another prompt fills
     var f = quiet;
     f.waiting = true;
+    try std.testing.expectEqual(@as(u32, 2048), passRows(f, 16384, 8192, 4096, 2048, false));
     f = quiet;
     f.filling = true;
+    try std.testing.expectEqual(@as(u32, 2048), passRows(f, 16384, 8192, 4096, 2048, false));
     // a stream decodes: the resume rows at the default cadence's step rows, the pass rows once a plan's step rows reach them
     f = quiet;
     f.decoding = true;
     f.step_rows = 2048;
+    try std.testing.expectEqual(@as(u32, 2048), passRows(f, 16384, 8192, 4096, 2048, false));
     f.step_rows = 4096;
+    try std.testing.expectEqual(@as(u32, 4096), passRows(f, 16384, 8192, 4096, 2048, false));
     f.step_rows = 6144;
+    try std.testing.expectEqual(@as(u32, 4096), passRows(f, 16384, 8192, 4096, 2048, false));
     // pass rows equal to the resume rows: always the resume rows
+    try std.testing.expectEqual(@as(u32, 2048), passRows(quiet, 16384, 8192, 2048, 2048, false));
+}
+
+test "passRows with TF_DS_PASS_FILLING: another prompt filling keeps the pass rows, while a waiting request or a decoding stream keeps the resume rows" {
+    const quiet: Facts = .{ .decoding = false, .filling = false, .waiting = false, .step_rows = std.math.maxInt(u32) };
+    // another prompt fills and nothing else: the baseline cuts to the resume rows; the switch keeps the pass rows
+    var f = quiet;
+    f.filling = true;
+    try std.testing.expectEqual(@as(u32, 2048), passRows(f, 16384, 8192, 4096, 2048, false));
+    try std.testing.expectEqual(@as(u32, 4096), passRows(f, 16384, 8192, 4096, 2048, true));
+    // below pass_from, or with no facts: the resume rows either way
+    try std.testing.expectEqual(@as(u32, 2048), passRows(f, 6144, 8192, 4096, 2048, true));
+    try std.testing.expectEqual(@as(u32, 2048), passRows(null, 16384, 8192, 4096, 2048, true));
+    // a request waits: the resume rows, as in the baseline, whatever the switch says
+    f = quiet;
+    f.waiting = true;
+    f.filling = true;
+    try std.testing.expectEqual(@as(u32, 2048), passRows(f, 16384, 8192, 4096, 2048, true));
+    // a stream decodes: the switch follows the host's step rows as the plain rule does: the resume rows at the default
+    // cadence's step rows, the pass rows once the host's step rows reach them
+    f = quiet;
+    f.decoding = true;
+    f.step_rows = 2048;
+    try std.testing.expectEqual(@as(u32, 2048), passRows(f, 16384, 8192, 4096, 2048, true));
+    f.step_rows = 4096;
+    try std.testing.expectEqual(@as(u32, 4096), passRows(f, 16384, 8192, 4096, 2048, false));
+    try std.testing.expectEqual(@as(u32, 4096), passRows(f, 16384, 8192, 4096, 2048, true));
+    // ... and a waiting request still cuts the pass, whatever the host's step rows are
+    f.waiting = true;
+    try std.testing.expectEqual(@as(u32, 2048), passRows(f, 16384, 8192, 4096, 2048, true));
+    try std.testing.expectEqual(@as(u32, 2048), passRows(f, 16384, 8192, 4096, 2048, false));
+    // nothing else: the pass rows
+    try std.testing.expectEqual(@as(u32, 4096), passRows(quiet, 16384, 8192, 4096, 2048, true));
+}
+
+test "passRows over every combination: the switch changes a pass only for another prompt filling, and the host's step rows decide a decoding stream's pass alike with it" {
+    const rows = [_]u32{ 0, 2048, 4096, std.math.maxInt(u32) };
+    for ([_]bool{ false, true }) |decoding| for ([_]bool{ false, true }) |filling| for ([_]bool{ false, true }) |waiting| for (rows) |step_rows| {
+        const f: Facts = .{ .decoding = decoding, .filling = filling, .waiting = waiting, .step_rows = step_rows };
+        const plain = passRows(f, 16384, 8192, 4096, 2048, false);
+        const switched = passRows(f, 16384, 8192, 4096, 2048, true);
+        if (waiting) {
+            try std.testing.expectEqual(@as(u32, 2048), plain);
+            try std.testing.expectEqual(@as(u32, 2048), switched);
+            continue;
+        }
+        const decoding_rows: u32 = if (step_rows >= 4096) 4096 else 2048;
+        // a stream decoding: the host's step rows say, with the switch on or off; another prompt filling cuts only the plain rule
+        if (decoding) try std.testing.expectEqual(decoding_rows, switched);
+        if (decoding and !filling) try std.testing.expectEqual(decoding_rows, plain);
+        if (!decoding) try std.testing.expectEqual(@as(u32, 4096), switched);
+        if (!decoding and !filling) try std.testing.expectEqual(@as(u32, 4096), plain);
+        if (!decoding and filling) try std.testing.expectEqual(@as(u32, 2048), plain);
+        if (decoding and filling) try std.testing.expectEqual(@as(u32, 2048), plain);
+    };
 }
 
 test "wholePass: the facts of a pass at the booted rows, from pass_from on, with nothing decoding; the rows alone cannot tell it from a cut pass" {
@@ -675,6 +760,30 @@ test "a stream asks its host's hook for the facts and the plan, and has neither 
     try std.testing.expectEqual(@as(?Facts, H.facts(&token)), s.hostFacts());
     try std.testing.expectEqual(@as(?Next, .other), s.hostNext());
 }
+
+test "a step beside a decoding stream is the host's step rows in whole resume units, at most the pass rows, at least one unit" {
+    const quiet: Facts = .{ .decoding = false, .filling = false, .waiting = false, .step_rows = std.math.maxInt(u32) };
+        var f = quiet;
+        f.decoding = true;
+        f.step_rows = beside;
+        const want = @min(pass, beside);
+        try std.testing.expectEqual(want, passRows(f, 16384, 8192, pass, 2048, false));
+        try std.testing.expectEqual(want, passRows(f, 16384, 8192, pass, 2048, true));
+        // nothing decoding: the pass, whatever the setting; a waiting request: one unit
+        try std.testing.expectEqual(pass, passRows(quiet, 16384, 8192, pass, 2048, false));
+        f.waiting = true;
+        try std.testing.expectEqual(@as(u32, 2048), passRows(f, 16384, 8192, pass, 2048, false));
+    };
+    // a step between two sizes runs the lower; under one unit still one unit
+    var f = quiet;
+    f.decoding = true;
+    f.step_rows = 5000;
+    try std.testing.expectEqual(@as(u32, 4096), passRows(f, 0, 0, 8192, 2048, false));
+    f.step_rows = 100;
+    try std.testing.expectEqual(@as(u32, 2048), passRows(f, 0, 0, 8192, 2048, false));
+    try std.testing.expectEqual(@as(u32, 6144), besideRows(6144, 8192, 2048));
+}
+
 const reference = @import("novelty.zig").reference;
 
 /// Commit `tokens` `batch` at a time as the lane core's rounds do, cut where loopCut cuts, until the guard fires or the

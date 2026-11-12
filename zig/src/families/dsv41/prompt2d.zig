@@ -376,6 +376,7 @@ pub var qgate_canary_asked: Qgate = .off;
 pub var pass_rows_asked: u32 = 2048;
 
 /// TF_DS_PASS_FROM as rank 0's Model.open read it (passFromSetting), once (Settings.pass_from, the pass rule's
+/// pass_from): no pass longer than the resume rows starts below it (0: from the prompt's first row; unset: four units).
 pub var pass_from_asked: u32 = 8192;
 
 /// The resume grid (model.chunk_rows): every pass but a merged final one runs whole units of it, and every kept state
@@ -387,13 +388,78 @@ pub const chunk_rows: usize = 2048;
 /// units on the resume grid.
 pub var pass_tail_asked: bool = false;
 
+/// TF_DS_PASS_FILLING as rank 0's Model.open read it (switchAsked), once (the pass rule's filling passage): another
+/// prompt filling does not cut a pass to the resume rows, so prompts filling together take turns at whole passes; a
+/// request waiting for admission or a stream decoding still keeps the resume rows. Rank 0 decides every pass size and
+/// the followers run its frames, so the setting is not compared at the start; every rank's allocations come from
+/// TF_DS_PASS_ROWS, which is.
+pub var pass_filling_asked: bool = false;
+
+/// The start line TF_DS_PASS_FILLING=1 prints once (Model.open).
+pub const pass_filling_line = "TF_DS_PASS_FILLING=1: while nothing decodes and no request waits, a prompt's pass stays up to the pass rows when another prompt fills, so prompts filling together take turns at whole passes";
+
+/// Read TF_DS_PASS_FILLING once at start (Model.open), rank 0's: "1" asks for it, any other text or unset does not.
+pub fn readPassFillingEnv() void {
+    pass_filling_asked = switchAsked(if (std.c.getenv("TF_DS_PASS_FILLING")) |v| std.mem.span(v) else null);
+    if (pass_filling_asked) std.log.info("{s}", .{pass_filling_line});
+}
+
+/// The prompt-step order as rank 0's Model.open read it, once (TF_DS_PROMPT_ORDER, TF_DS_PROMPT_QOS and TF_DS_PROMPT_MAX_WAIT_S; engine_api.fill_order):
+/// unset, both: the rotation, one step each in turn. Rank 0's host chooses the order and the followers run its frames, so
+/// the setting is not compared at the start.
+pub var prompt_order: @import("engine_api").fill_order.Policy = .{};
+
+/// Read TF_DS_PROMPT_ORDER (`serial` or `turns`), TF_DS_PROMPT_QOS (`size:class:overtakes[:max_wait_s],...`) and
+/// TF_DS_PROMPT_MAX_WAIT_S (whole seconds, every class's longest wait for a step; 30 unset) once at start
+/// (Model.open), rank 0's. A text that is no setting refuses the start by name (a typo never becomes the default unseen);
+/// a setting that is on prints its line, which names TF_DS_PROMPT_ORDER.
+pub fn readPromptOrderEnv() error{BadPromptOrder}!void {
+    const fill_order = @import("engine_api").fill_order;
+    const order_text: ?[]const u8 = if (std.c.getenv("TF_DS_PROMPT_ORDER")) |v| std.mem.span(v) else null;
+    const qos_text: ?[]const u8 = if (std.c.getenv("TF_DS_PROMPT_QOS")) |v| std.mem.span(v) else null;
+    const wait_text: ?[]const u8 = if (std.c.getenv("TF_DS_PROMPT_MAX_WAIT_S")) |v| std.mem.span(v) else null;
+    const r = fill_order.parse(order_text, qos_text, wait_text);
+    if (!@import("builtin").is_test and !r.wait_ok) std.log.err("TF_DS_PROMPT_MAX_WAIT_S={s} is not whole seconds from 1 to 86400 (unset: {d} s)", .{ wait_text.?, fill_order.default_max_wait_s });
+    if (!@import("builtin").is_test and !r.order_ok) std.log.err("TF_DS_PROMPT_ORDER={s} is not serial or turns (unset: the rotation)", .{order_text.?});
+    if (!@import("builtin").is_test and !r.qos_ok) std.log.err("TF_DS_PROMPT_QOS={s} is refused ({s}); a table is size:class:overtakes[:max_wait_s],... smallest first, sizes ascending, classes not falling", .{ qos_text.?, r.qos_why });
+    if (!r.wait_ok or !r.order_ok or !r.qos_ok) return error.BadPromptOrder;
+    prompt_order = r.policy;
+    if (r.policy.on) {
+        var buf: [512]u8 = undefined;
+        std.log.info("TF_DS_PROMPT_ORDER={s}: {s}", .{ @tagName(r.policy.order), fill_order.describe(&r.policy, &buf) });
+    }
+}
+
     const t = text orelse return resume_rows;
     const v = std.fmt.parseInt(u32, t, 10) catch return null;
 }
 
+/// TF_DS_PASS_BESIDE as Model.open read it, once: the rows a prompt's pass may run while a stream decodes (the host's step
+/// rows, engine_api.Info.beside_rows); the resume rows when unset, which is the rule before the setting existed. Rank 0's
+/// host decides every pass size and the followers run its frames, so the setting is not compared at the start.
+pub var pass_beside_asked: u32 = 2048;
+
+/// TF_DS_ROUNDS_BESIDE as Model.open read it, once (engine_api.Info.rounds_beside): the Token Generation rounds that follow
+/// each long prompt step while a stream generates, 2N after a stagger pair; 0: unset (the share's and the pass rule's
+/// own cadence). Rank 0's host runs the rounds and decides the pair, so the setting is not compared at the start.
+pub var rounds_beside_asked: u32 = 0;
+
+/// TF_DS_PASS_BESIDE's setting for a resume grid of `resume_rows` under booted pass rows of `pass_rows`: the resume rows
+/// (unset), or any whole number of units by number, never above the pass rows (a step between two pass sizes runs whole
+/// units: lanes.stream.besideRows); null: no setting.
+pub fn passBesideSetting(text: ?[]const u8, resume_rows: u32, pass_rows: u32) ?u32 {
+    const t = text orelse return resume_rows;
+    const v = std.fmt.parseInt(u32, t, 10) catch return null;
+    return if (v >= resume_rows and v % resume_rows == 0 and v <= pass_rows) v else null;
+}
+
+/// TF_DS_PASS_FROM's setting for a resume grid of `resume_rows`: four units (unset), or any multiple of the unit from 0
+/// on (0: a pass of more units may start at the prompt's first row; a multiple from one unit on says where one may);
+/// null: no setting.
 pub fn passFromSetting(text: ?[]const u8, resume_rows: u32) ?u32 {
     const t = text orelse return 4 * resume_rows;
     const v = std.fmt.parseInt(u32, t, 10) catch return null;
+    return if (v % resume_rows == 0) v else null;
 }
 
 /// TF_DS_2D_ORDER: the 2D node (role) each rank serves, "g0,g1,g2,g3" (rank 0 must serve node 0: it serves the
@@ -1725,6 +1791,8 @@ test "a follower runs rank 0's indexer score rows, or says to set the same on ev
     inline for (@typeInfo(Settings).@"struct".field_names) |name| sum += @sizeOf(@FieldType(Settings, name));
     try std.testing.expectEqual(sum, @sizeOf(Settings));
     try std.testing.expectEqual(@as(u32, 11), frame_protocol);
+}
+
 test "a follower runs rank 0's TF_DS_PASS_ROWS, or says to set the same on every rank; rank 0's TF_DS_PASS_FROM travels and is never compared" {
     const lead: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 1, .pass_rows = 4096, .pass_from = 8192 };
     var buf: [256]u8 = undefined;
@@ -1736,6 +1804,8 @@ test "a follower runs rank 0's TF_DS_PASS_ROWS, or says to set the same on every
     try std.testing.expectEqualStrings("rank 1 has TF_DS_PASS_ROWS=2048 and rank 0 4096: set the same on every rank", mine.differ(lead, 1, &buf));
     try std.testing.expectEqualStrings("rank 3 has TF_DS_PASS_ROWS=4096 and rank 0 2048: set the same on every rank", lead.differ(mine, 3, &buf));
     // every field whole 4- or 8-byte words: no padding travels
+}
+
     const lead: Settings = .{ .world = 4, .streams = 8, .round_rows = 16, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 20, .replay_floor = 0, .idx_rb = 1, .land_slots = 2 };
     try std.testing.expectEqual(@as(u32, 11), frame_protocol); // kind 16 (cfg) after kind 15 (snap_sync), the Rocinante-only Settings; 11: fill_pair carries the third pass's rows
     older.protocol = 5; // a follower whose image lacks fill_pair

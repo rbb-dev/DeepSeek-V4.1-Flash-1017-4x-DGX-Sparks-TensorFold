@@ -71,6 +71,9 @@ pub const Fake = struct {
     last_rows: usize = 0, // the last verify's rows, for test clocks
     last_sampled: bool = false, // and whether one of its streams drew keyed samples
 
+    /// The fake's pass rule: its grid, the cap and pass_from, and whether another prompt filling keeps whole passes
+    /// (TF_DS_PASS_FILLING's passage of stream.passRows).
+    pub const PassRule = struct { resume_rows: u32, pass_rows: u32, pass_from: usize = 0, filling_pass: bool = false };
     /// One logged step: the stream's prompt length (which request), where it started, its rows, the host's facts at its
     /// start and next at its end, and the decode calls (verify or queue: a round's) served before it.
     pub const StepSeen = struct { prompt_len: usize, start: usize, rows: usize, facts: ?stream_mod.Facts, next: ?stream_mod.Next, decodes: u64 };
@@ -128,6 +131,7 @@ pub const Fake = struct {
         var facts: ?stream_mod.Facts = null;
         if (x.pass_rule) |r| {
             facts = s.hostFacts();
+            rows = passLen(begin, s.prompt_len, stream_mod.passRows(facts, begin, r.pass_from, r.pass_rows, r.resume_rows, r.filling_pass), r.resume_rows);
         }
         const end = @min(begin + rows, s.prompt_len);
         for (s.prompt()[begin..end], begin + 1..) |t, at| {

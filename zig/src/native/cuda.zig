@@ -492,22 +492,16 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     }
     errdefer if (h.recording) |r| r.free(gpa);
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
-    try h.serve(io, loaded.facts, loaded.rows, .{
-        .lanes = streams,
-        .context_window = @intCast(window),
-        .startup = h.startup,
-        .prompt_cache = h.store != null and !own_snaps, // (its rewind: a snap_* family's)
-        .warm_turns = h.store != null and !own_snaps and @hasDecl(F, "warm_quiet"),
-        .logprobs = loaded.backend.vtable.first_row != null,
-        .prompt_logprobs = loaded.backend.vtable.prompt_rows,
-        .structures = loaded.backend.vtable.first_masked != null,
-        .vision = if (@hasField(@TypeOf(loaded), "vision")) vision_offer.offer(loaded.vision) else null,
-        .lane_vision = if (@hasField(@TypeOf(loaded), "lane_vision")) loaded.lane_vision else null,
-        .fill_rounds = if (@hasField(@TypeOf(loaded), "fill_rounds")) loaded.fill_rounds else 0,
-        .efforts = familyEfforts(F),
-    }, .{ .ctx = loaded.ctx, .text = F.explain });
+    const vision: ?api.LaneVision = if (@hasField(@TypeOf(loaded), "lane_vision")) loaded.lane_vision else null;
     // the family's resume grid: a prompt step's rows between two rounds at the default cadence (the scheduling facts)
     const resume_rows: u32 = if (@hasField(@TypeOf(loaded), "grid")) loaded.grid else 0;
+    // the rows a prompt step may run between two rounds while a stream decodes (0: the resume rows)
+    const beside_rows: u32 = if (@hasField(@TypeOf(loaded), "beside")) loaded.beside else 0;
+    // the rounds that follow each long prompt step while a stream decodes (0: unset)
+    const rounds_beside: u32 = if (@hasField(@TypeOf(loaded), "rounds")) loaded.rounds else 0;
+    // the family's prompt-step order while several prompts fill together (a family that schedules none: the rotation)
+    const fill: api.fill_order.Policy = if (@hasField(@TypeOf(loaded), "fill")) loaded.fill else .{};
+    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(usable), .prompt_cache = h.cache != null, .startup = h.startup, .efforts = familyEfforts(F), .lane_vision = vision, .structures = loaded.backend.vtable.first_masked != null, .spill = shown_spill, .resume_rows = resume_rows, .beside_rows = beside_rows, .rounds_beside = rounds_beside, .fill = fill }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }

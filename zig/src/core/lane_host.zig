@@ -3,14 +3,7 @@ const std = @import("std");
 const lanes = @import("lanes");
 const api = @import("engine_api.zig");
 const pc = @import("prompt_cache.zig");
-const status = @import("lane_host_status.zig");
-const learn = @import("lane_host_learn.zig");
-const lone = @import("lane_host_lone.zig");
-const fill = @import("lane_host_fill.zig");
-const admit = @import("lane_host_admit.zig");
-const recalls = @import("lane_host_recall.zig");
-const ends = @import("lane_host_end.zig");
-const rows_host = @import("lane_host_rows.zig");
+const share_mod = @import("lane_host_share.zig");
 const Allocator = std.mem.Allocator;
 const Id = api.Id;
 const Request = api.Request;
@@ -70,6 +63,15 @@ pub const LaneHost = struct {
     // Python lane's fills leave decoding its share
     finish_until: ?i96 = null,
     fill_next: usize = 0, // next admitted prompt to advance by one chunk
+    /// Prompt steps' share of wall time beside decoding streams (TENSORFOLD_PREFILL_SHARE; lane_host_share.zig): with
+    /// a share below 1, the rounds that repay a long prompt's step run before its next one. 1: one step, one round.
+    share: share_mod.Share = .{},
+    /// The clock the share times its steps and rounds with; null: the host's. A test's.
+    share_clock: ?ShareClock = null,
+    fill_slots: std.ArrayList(api.fill_order.Slot) = .empty, // the fill order's reading of the admitted prompts (engine thread)
+    /// TF_DS_PROMPT_TRACE=1: one log line per prompt step the host serves or holds back, with the order's reading of every
+    /// admitted prompt, so a prompt that waited can be read off the engine log. Off: nothing is read or written.
+    trace_fill: bool = false,
 
     const Lesson = struct { request: *const api.LearnRequest, sink: api.LearnSink };
     const full_retry_ns: i96 = std.time.ns_per_s;
@@ -78,6 +80,9 @@ pub const LaneHost = struct {
     const finish_left: i64 = 256;
 
     pub const Job = struct {
+    /// A clock for the share's timing: awake nanoseconds.
+    pub const ShareClock = struct { ctx: *anyopaque, now: *const fn (ctx: *anyopaque) i96 };
+
         host: *LaneHost,
         id: Id,
         request: *const Request,
@@ -90,8 +95,9 @@ pub const LaneHost = struct {
         prefill_sent: bool = false, // a lone driver's prefilled event went out
         fill_began: bool = false, // its first prompt chunk ran
         began: i96 = 0,
-        /// The engine thread says the prompt pass is going: status readers may count this job's fill atomics.
-        fill_on: std.atomic.Value(bool) = .init(false),
+        rows_est: u64 = 0, // the rows its pass computes, as the cache stood when it was admitted (the fill order, before its pass starts)
+        overtaken: u32 = 0, // prompt steps that went to a smaller prompt since this one's last step (the fill order's bound)
+        stepped_at: i96 = 0, // when its last prompt step began, or when it was admitted (the fill order's maximum wait)
         prefilled: ?i96 = null,
         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
@@ -147,10 +153,19 @@ pub const LaneHost = struct {
     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
         var enforced = info_;
         enforced.loop_guard = true;
-        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced };
+        var share = share_mod.Share.fromEnv();
+        share.rounds = info_.rounds_beside;
     }
 
     pub fn start(h: *LaneHost) !void {
+        if (share_mod.Share.refusal(h.share)) |why| {
+            noteErr("{s}", .{why});
+            return error.RoundsBesideWithShare;
+        }
+        if (h.core.fills()) {
+            var line: [640]u8 = undefined;
+            std.log.info("{s}", .{share_mod.startLine(&line, h.share.p, h.besideRows(), h.share.rounds, h.info_.resume_rows)});
+        }
         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
     }
 
@@ -163,7 +178,7 @@ pub const LaneHost = struct {
         h.lessons.deinit(h.gpa);
         h.queued.deinit(h.gpa);
         h.admitted.deinit(h.gpa);
-        h.filling.deinit(h.gpa);
+        h.fill_slots.deinit(h.gpa);
         h.cancels.deinit(h.gpa);
         h.decoded.deinit(h.gpa);
         h.live_tokens.deinit(h.gpa);
@@ -254,6 +269,10 @@ pub const LaneHost = struct {
     /// The hook's plan for this job's step just issued, at the default cadence (one prompt step a turn in rotation, then
     /// one round while a stream decodes; `ready` is `.round`): a round while a stream decodes; else another prompt's
     /// step when another admitted prompt fills or waits for its first step, or a request is queued or woken with a lane
+    /// free (the stepping host only); else this prompt's next step, or nothing once its pass has ended. With the fill
+    /// order the plan is the order's pick: this prompt's next step while the order picks it (and that step is charged
+    /// to the prompts it passes over), another's when it does not; a request waiting for a lane is admitted first, so
+    /// the order sees it.
     fn betweenNext(ctx: *anyopaque) lanes.stream.Next {
         const job: *Job = @ptrCast(@alignCast(ctx));
         const h = job.host;
@@ -261,6 +280,17 @@ pub const LaneHost = struct {
         if (h.core.fills()) {
             h.lock();
             defer h.unlock();
+            if (h.info_.fill.on) {
+                if (h.queued.items.len + h.ready.items.len > 0 and h.admitted.items.len < h.info_.lanes) return .other;
+                const me = for (h.admitted.items, 0..) |other, i| {
+                    if (other == job) break i;
+                } else null;
+                // (no stream is active here, so the share owes nothing: every prompt may step)
+                const next = h.pickFill(0, false) orelse return .idle;
+                if (me == null or next != me.?) return .other;
+                h.chargeFill(next);
+                return .same;
+            }
             for (h.admitted.items) |other| if (other != job and other.prefilled == null) return .other;
             if (h.queued.items.len + h.ready.items.len > 0 and h.admitted.items.len < h.info_.lanes) return .other;
         }
@@ -270,35 +300,44 @@ pub const LaneHost = struct {
     /// The hook's facts for this job's next step (lanes.stream.Facts; passRows reads them alone): another stream decodes;
     /// another admitted prompt is past its first step and not prefilled (filling); a request is queued, parked, woken,
     /// or admitted and not yet started (waiting); the family's resume rows as the step rows while a stream decodes (one
+    /// step between two rounds), else no bound. With the fill order an admitted prompt waiting its turn fills beside
+    /// this one: it is not a request waiting for a lane, and its passes keep the pass rows as one filling does.
     fn betweenFacts(ctx: *anyopaque) lanes.stream.Facts {
         const job: *Job = @ptrCast(@alignCast(ctx));
         const h = job.host;
         const decoding = h.core.activeCount() > 0;
+        const ordered = h.info_.fill.on;
         h.lock();
         defer h.unlock();
         var fills = false;
         var waits = h.queued.items.len > 0 or h.waitingCount() > 0;
+        var unstarted = false;
         for (h.admitted.items) |other| {
             if (other == job) continue;
             if (!other.started) {
+                // under the fill order an admitted prompt waiting its turn fills beside this one, not waits for a lane,
+                // unless the order serves it before this one: then it waits as the rotation's arrival does
+                if (ordered) unstarted = true else waits = true;
             } else if (other.prefilled == null) fills = true;
         }
-    }
-
-    /// A foreground request is queued (they queue ahead of every background one); the caller holds the lock.
-    pub fn foregroundWaiting(h: *const LaneHost) bool {
-        return h.queued.items.len > 0 and !h.queued.items[0].request.background;
-    }
-
-    /// Waits `warm_quiet` for other work (a request, a decoding stream, a cancel): true if none came.
-    fn quiet(h: *LaneHost, job: *const Job) bool {
-        const until: std.Io.Timeout = .{ .deadline = .fromNow(h.io, .{ .raw = .fromNanoseconds(h.warm_quiet), .clock = .awake }) };
-        h.lock();
-        defer h.unlock();
-        while (!h.closing and !h.foregroundWaiting() and h.core.activeCount() == 0 and std.mem.indexOfScalar(Id, h.cancels.items, job.id) == null) {
-            h.wake.waitTimeout(h.io, &h.mutex, until) catch |e| return e == error.Timeout;
+        if (unstarted) {
+            if (h.servesUnstartedFirst(job)) waits = true else fills = true;
         }
-        return false;
+        return .{ .decoding = decoding, .filling = fills, .waiting = waits, .step_rows = if (decoding) h.besideRows() else std.math.maxInt(u32), .rounds_beside = h.share.rounds };
+    }
+
+    /// Whether the fill order's pick now is an admitted prompt that has not started its first step, not `job`: that
+    /// prompt takes the next step, so `job`'s step must not run long ahead of it (the pass rule cuts a step to the resume
+    /// rows while a request waits, and lets two passes form a pair, twice the rows, when none does).
+    fn servesUnstartedFirst(h: *LaneHost, job: *const Job) bool {
+        const next = h.pickFill(0, false) orelse return false;
+        const other = h.admitted.items[next];
+        return other != job and !other.started;
+    }
+
+    /// The rows a prompt step may run between two rounds while a stream decodes: the family's beside rows, else its resume rows.
+    fn besideRows(h: *const LaneHost) u32 {
+        return if (h.info_.beside_rows != 0) h.info_.beside_rows else h.info_.resume_rows;
     }
 
     }
@@ -396,7 +435,10 @@ pub const LaneHost = struct {
             h.finish(job, .failed, "out of memory");
             return true;
         };
+        job.overtaken = 0;
+        job.stepped_at = h.clockNs();
         h.unlock();
+        if (h.info_.fill.on) job.rows_est = h.estimateRows(job);
         if (h.core.fills()) return true;
         if (!h.setup(job)) return true;
         const began = job.began;
@@ -510,19 +552,30 @@ pub const LaneHost = struct {
         return true;
     }
 
-    /// The next filling job's next prompt chunk: the other streams' rounds run between chunks, not after the prompt.
-    /// A pass that began waits out Info.fill_rounds of those rounds between two of its steps (none when none decodes).
+    /// One prompt step per turn, the prompt the host's fill order picks (fill_order.zig; the rotation by default).
+    /// With a share below 1 and decode time owed to the streams, only a short prompt steps, the one the order picks
+    /// among the short ones (a long prompt's next step waits for the rounds that repay the last one), and a long
+    /// prompt's step beside decoders is timed and billed.
     fn fillOne(h: *LaneHost) void {
         if (!h.core.fills()) return;
+        const shared = h.share.active();
+        const decoders: usize = if (shared) h.runnable() else 0;
+        if (shared and decoders == 0) h.share.forgive(); // owed to streams that ended or paused: no one's
+        var i = h.pickFill(h.fill_next, false) orelse {
+            if (shared) h.share.forgive();
             return;
         };
-        if (!done) return;
-        _ = h.filling.orderedRemove(at);
-        h.prefilled(job, job.began);
-        _ = h.deliver(job);
+        if (h.share.owes()) i = h.pickFill(h.fill_next, true) orelse return h.traceFill(null, decoders);
         const job = h.admitted.items[i];
+        h.traceFill(i, decoders);
+        h.chargeFill(i);
         h.fill_next = i + 1;
         const first = !job.started;
+        // a long prompt's step beside decoders is the share's to bill (a short prompt's never is)
+        const long = shared and decoders > 0 and h.fillRows(job) > h.share.short;
+        const billed = long and h.share.p < 1; // (a count of rounds times nothing)
+        job.stream.settle_step = billed; // timed on the host, so a step owed to decoders ends on the device; none left marked
+        const t0: i96 = if (billed) h.shareNow() else 0;
             if (e == error.Cancelled) {
                 _ = h.cancel(job);
             } else if (e == error.ContextFull and h.admitted.items.len > 1) {
@@ -532,10 +585,100 @@ pub const LaneHost = struct {
             }
             return;
         };
+        if (billed) h.share.stepped(@intCast(@max(0, h.shareNow() - t0)), true);
+        if (long) h.share.stepRounds(true, job.stream.step_pair);
         job.reported(); // the first step restored it; no dangling cache entry across another prompt's keep
         if (done) {
             h.prefilled(job, job.began);
         }
+    }
+
+    /// The TF_DS_PROMPT_TRACE line for a step served to admitted prompt `at`, or (null) held back because the share owes
+    /// decoders time and no prompt is short. Each admitted prompt that has not prefilled shows as id:rows-left:overtaken
+    /// (s: started, f: fills beside, w: not yet started), the picked one marked with an arrow.
+    fn traceFill(h: *LaneHost, at: ?usize, decoders: usize) void {
+        if (!h.trace_fill or @import("builtin").is_test) return;
+        var buf: [512]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        for (h.admitted.items, 0..) |j, k| {
+            if (j.prefilled != null) continue;
+            w.print(" {s}{d}:{d}:{d}{s}", .{ if (at != null and at.? == k) ">" else "", j.id, if (j.started) rowsLeft(j) else j.rows_est, j.overtaken, if (j.started) "s" else "w" }) catch break;
+        }
+        std.log.info("prompt step {s}: share debt {d} us, decoders {d}, prompts{s}", .{ if (at == null) "held" else "served", @divTrunc(h.share.debt_ns, 1000), decoders, w.buffered() });
+    }
+
+    /// Streams the next round runs: unfinished and not paused.
+    fn runnable(h: *const LaneHost) usize {
+        var n: usize = 0;
+        for (h.core.live.items) |s| n += @intFromBool(!s.finished and !s.paused);
+        return n;
+    }
+
+    /// The prompt rows an admitted job's whole pass computes: its prompt less the rows a kept state restored. Before its
+    /// first step that is the fill order's estimate of the kept state (the same rows its class is judged by), and the
+    /// whole prompt when no order is on. A long prompt's last rows stay long: it is the prompt that is short or not, not
+    /// what is left of it.
+    fn fillRows(h: *const LaneHost, job: *const Job) u64 {
+        if (!job.started) return if (h.info_.fill.on) job.rows_est else job.request.prompt.len;
+        return @as(u64, job.stream.prompt_len) -| job.stream.cached;
+    }
+
+    /// The share's clock: awake nanoseconds on the host's, or a test's.
+    fn shareNow(h: *const LaneHost) i96 {
+        if (h.share_clock) |c| return c.now(c.ctx);
+        return h.clockNs();
+    }
+
+    /// The rows a not-yet-started job's pass will compute: its prompt less the kept state the cache holds for it now
+    /// (what its setup will find, barring a keep or an eviction by another pass in between).
+    fn estimateRows(h: *LaneHost, job: *Job) u64 {
+        const r = job.request;
+        const hit: u64 = if (cacheable(r)) if (h.cache) |store| (if (store.findKeyed(keyOf(r), r.chunks, .none)) |e| e.at else 0) else 0 else 0;
+        return r.prompt.len -| hit;
+    }
+
+    /// The rows a job has still to compute: its prompt less what its pass restored and has passed (the backend stores
+    /// the rows it passed after each chunk), or its estimate before the pass starts.
+    fn rowsLeft(job: *const Job) u64 {
+        if (!job.started) return job.rows_est;
+        const passed = @max(job.stream.cached, job.progress.read().at);
+        return job.request.prompt.len -| passed;
+    }
+
+    /// The admitted index whose step is served next, or null when every admitted prompt has prefilled (the lock held, or
+    /// the engine thread). `rotate_from` is where the rotation looks first. `short_only`: the share owes decoders time, so
+    /// only a prompt the share counts as short may step (the order picks among those); null when there is none.
+    fn pickFill(h: *LaneHost, rotate_from: usize, short_only: bool) ?usize {
+        const jobs = h.admitted.items;
+        const now = h.clockNs();
+        h.fill_slots.clearRetainingCapacity();
+        for (jobs) |job| h.fill_slots.append(h.gpa, .{
+            .prefilled = job.prefilled != null,
+            .eligible = !short_only or h.fillRows(job) <= h.share.short,
+            .background = job.request.background,
+            .rows = rowsLeft(job),
+            .overtaken = job.overtaken,
+            .waited_ns = @intCast(@max(0, @min(now - job.stepped_at, std.math.maxInt(i64)))),
+        }) catch {
+            // no room for the reading: the first prompt that has not prefilled (and is short, when only those may step)
+            for (jobs, 0..) |j, i| if (j.prefilled == null and (!short_only or h.fillRows(j) <= h.share.short)) return i;
+            return null;
+        };
+        return api.fill_order.pick(&h.info_.fill, h.fill_slots.items, rotate_from);
+    }
+
+    /// A step is served to admitted prompt `at`: its own count and wait start over and every prompt it passes over counts it
+    /// when the order says so (fill_slots holds the reading pickFill took).
+    fn chargeFill(h: *LaneHost, at: usize) void {
+        const jobs = h.admitted.items;
+        if (!h.info_.fill.on or h.fill_slots.items.len != jobs.len) return;
+        const picked = h.fill_slots.items[at];
+        const now = h.clockNs();
+        for (jobs, h.fill_slots.items, 0..) |j, slot, i| {
+            if (i == at) {
+                j.overtaken = 0;
+                j.stepped_at = now;
+            } else if (api.fill_order.overtakes(&h.info_.fill, picked, slot)) j.overtaken +|= 1;
         }
     }
 
@@ -637,6 +780,9 @@ pub const LaneHost = struct {
         job.started = false;
         job.fill_began = false;
         job.began = 0;
+        job.rows_est = 0;
+        job.overtaken = 0;
+        job.stepped_at = 0;
         job.prefilled = null;
         job.delivered = 0;
         job.prefill_sent = false;
@@ -756,6 +902,10 @@ pub const LaneHost = struct {
             }
             lone.reclaim(h);
         }
+        // with a share below 1 the round's time pays the debt a long prompt's step left
+        const shared = h.share.p < 1; // (the round's time pays a debt of time; a count of rounds needs no clock)
+        const r0: i96 = if (shared) h.shareNow() else 0;
+        defer if (shared) h.share.rounded(@intCast(@max(0, h.shareNow() - r0))) else h.share.rounded(0);
     }
 };
 
@@ -767,8 +917,70 @@ fn depthsOf(s: *const lanes.Stream) [api.draft_depths]api.DraftDepth {
         o.drafted += d.drafted;
         o.reached += d.reached;
         o.kept += d.kept;
+test "under the fill order an admitted prompt the order serves first makes the stepping prompt's step wait, as a rotation's arrival does; one it serves later does not" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    const long_prompt: [200]u32 = @splat(3);
+    const short_prompt: [12]u32 = @splat(4);
+    const big_prompt: [500]u32 = @splat(5);
+    const rl: Request = .{ .prompt = &long_prompt, .max_tokens = 4, .drafts = false };
+    const rs: Request = .{ .prompt = &short_prompt, .max_tokens = 4, .drafts = false };
+    const rb: Request = .{ .prompt = &big_prompt, .max_tokens = 4, .drafts = false };
+    for ([_]bool{ true, false }) |ordered| {
+        var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 4, .resume_rows = 4, .fill = if (ordered) api.fill_order.parse("serial", null, null).policy else .{} });
+        defer host.stop();
+        var me: LaneHost.Job = .{ .host = &host, .id = 1, .request = &rl, .sink = undefined, .started = true };
+        me.stream = try lanes.Stream.init(gpa, .{ .id = "m", .prompt = &long_prompt, .max_new = 4, .eos = &.{96} });
+        defer me.stream.deinit(gpa);
+        var small: LaneHost.Job = .{ .host = &host, .id = 2, .request = &rs, .sink = undefined, .rows_est = 12 };
+        var large: LaneHost.Job = .{ .host = &host, .id = 3, .request = &rb, .sink = undefined, .rows_est = 500 };
+        // (admitted just now: none has waited its maximum, so the order ranks them by rows)
+        const now = host.clockNs();
+        me.stepped_at = now;
+        small.stepped_at = now;
+        large.stepped_at = now;
+        try host.admitted.append(gpa, &me);
+        try host.admitted.append(gpa, &small);
+        // a smaller prompt waiting for its first step: the rotation and the order both make this step wait
+        var f = LaneHost.betweenFacts(&me);
+        try std.testing.expect(f.waiting);
+        // a larger one: the rotation waits as before; the order serves this prompt first, so it fills beside it
+        host.admitted.items[1] = &large;
+        f = LaneHost.betweenFacts(&me);
+        try std.testing.expectEqual(!ordered, f.waiting);
+        try std.testing.expectEqual(ordered, f.filling);
     }
-    return out;
+}
+
+test "the share's decoders are the streams a round runs: a paused or finished stream is no decoder" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+    defer host.stop(); // (never started: frees the lists)
+    try std.testing.expectEqual(@as(usize, 0), host.runnable());
+    var d = try lanes.Stream.init(gpa, .{ .id = "d", .prompt = &.{ 3, 1, 4, 1 }, .max_new = 8, .eos = &.{96} });
+    defer d.deinit(gpa);
+    try core.addStream(&d);
+    defer core.backend.release(&d);
+    try std.testing.expectEqual(@as(usize, 1), host.runnable());
+    d.paused = true;
+    try std.testing.expectEqual(@as(usize, 0), host.runnable());
+    try std.testing.expectEqual(@as(usize, 1), core.activeCount()); // (paused ones are active, not decoders)
+    d.paused = false;
+    d.finished = true;
+    try std.testing.expectEqual(@as(usize, 0), host.runnable());
 }
 
 test {

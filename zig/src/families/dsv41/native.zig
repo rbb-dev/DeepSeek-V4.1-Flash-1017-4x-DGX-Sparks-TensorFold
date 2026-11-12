@@ -112,6 +112,13 @@ pub const Loaded = struct {
     snaps: ?Snaps = null,
     /// Images in requests (the server renders their placeholders; the tower runs on this rank).
     lane_vision: ?lanes.stream.LaneVision = null,
+    /// The rows a prompt pass may run while a stream decodes (TF_DS_PASS_BESIDE; the host's step rows). 0: the grid.
+    beside: u32 = 0,
+    /// The rounds that follow each long prompt step while a stream decodes (TF_DS_ROUNDS_BESIDE; 0: unset).
+    rounds: u32 = 0,
+    /// The host's order for prompt passes while several prompts fill together (the family's switches, applied by rank
+    /// 0's lane host).
+    fill: api.fill_order.Policy = .{},
     /// The other streams' rounds between two pieces of a prompt pass (TF_FILL_ROUNDS; 0 while passes run whole).
     fill_rounds: u32 = 0,
 };
@@ -163,6 +170,7 @@ pub fn weightBytes(io: std.Io, dir: []const u8) u64 {
 /// Loads rank 0 and links rank 1 (which must start against TF_TP_MASTER:TF_TP_PORT); the pool holds TF_DS_WINDOW
 /// positions (else `o.context`), a stream at most `o.context`. Needs `ctx` current.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
+pub fn applyFamilyDefaults() void {
     api.speed_defaults.applyFamily();
 }
 
@@ -235,7 +243,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     try st.lanes.idleRdma(); // park even before the first API request
     // a follower that stops stops this server too, with a line that names it, instead of a wait on it for good
     st.m.watchPeers() catch |err| std.log.warn("dsv41: rank 0 cannot watch its followers: {s}", .{@errorName(err)});
-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .lane_vision = if (st.vision) |v| v.hook() else null, .fill_rounds = if (st.lanes.fill_chunks > 0) fill_rounds else 0 };
+    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .lane_vision = if (st.vision) |v| v.hook() else null, .usable_window = @as(u32, @intCast(rows_mod.usableRows(st.m.ctx_cap, st.m.eng.round_rows, model.chunk_rows))), .tier = tier, .grid = model.chunk_rows, .beside = prompt2d.pass_beside_asked, .rounds = prompt2d.rounds_beside_asked, .replay = @intCast(st.m.cfg.window), .spill_state = st.spill_state, .spill_info = st.spill_info, .fill = prompt2d.prompt_order, .quiet = quietFn, .finish = finishFn };
 /// The math switches in effect for the SSD tier's store name: the 2D node's agreed flags (all off without one), the
     return .{
         // the switches that no longer exist keep the values the shipped settings gave them, so a store written before the NCCL

@@ -227,6 +227,7 @@ pub fn passPlan(len: usize, at: usize, pass_rows: usize, pass_from: usize, caps:
         if (p.len == max_passes) return error.TooManyPasses;
         const quiet: lanes.stream.Facts = .{ .decoding = false, .filling = false, .waiting = false, .step_rows = std.math.maxInt(u32) };
         const asked: u32 = caps[@min(p.len, caps.len - 1)];
+        const cap = if (asked > r) lanes.stream.passRows(quiet, start, pass_from, @intCast(pass_rows), r, prompt2d.pass_filling_asked) else r;
         const n = passRowsAt(start, len, cap, tail, marks, last_end, replay);
         if (n == 0) return error.EmptyPass;
         p.list[p.len] = .{ .start = start, .n = n, .cap = cap };
@@ -1239,6 +1240,12 @@ pub const Lanes = struct {
             if (n3 != 0) try m.meterGroup(lane.slot, &.{ f.start - n3 - n2, f.start - n3, f.start }) else if (n2 != 0) try m.meterPair(lane.slot, f.start - n2, f.start) else try m.meterChunk(lane.slot, f.start);
             p.reach(f.start);
         }
+        // the host bills this step's time to decoders (TENSORFOLD_PREFILL_SHARE below 1, a stream decoding): fillChunk
+        // never waits, so the last layers still run on the device here, and their tail would land in the next round's time
+        if (s.settle_step) {
+            try m.pairJoin();
+            try m.stream.synchronize();
+        }
         if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and
             (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
         if (f.start < len) {
@@ -1445,6 +1452,7 @@ pub const Lanes = struct {
         // more streams than 128 / block (25 at the 5-row block) draft in passes of that many, each its own wire message
         const per = @max(1, pass_rows / block);
         // a pass runs block rows a stream through the decode window's linears (prompt.grouped: 128 rows at most), so more
+        // (TensorFold ba03026c; the followers are unchanged)
         var g0: usize = 0;
         while (g0 < n) : (g0 += per) {
             const g1 = @min(n, g0 + per);
@@ -2235,6 +2243,23 @@ test "a prefix two conversations share: the second one resuming it in place woul
     m.watch = .{}; // (finish and deinit end the watch)
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "            c.m.verify(rows, c.built.absorb[0..nw], head) catch |err| try refusedExchange(c.m, err);"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "                const n: usize = try r.int(u32);\n                c.m.headWhole(n) catch |err| try refusedExchange(c.m, err);"));
+
+    const src = @embedFile("lanes.zig");
+    const step = std.mem.indexOf(u8, src, "fn prefillStep(") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rule < pair);
+}
+
+test "a prompt step the host bills to decoders ends on the device before prefillStep returns" {
+    const src = @embedFile("lanes.zig");
+    const step = std.mem.indexOf(u8, src, "fn prefillStep(") orelse return error.TestUnexpectedResult;
+    const issued = std.mem.indexOfPos(u8, src, step, "} else try m.fillChunk(") orelse return error.TestUnexpectedResult;
+    const settle = std.mem.indexOfPos(u8, src, step, "if (s.settle_step) {\n            try m.pairJoin();\n            try m.stream.synchronize();\n        }") orelse return error.TestUnexpectedResult;
+    const leave = std.mem.indexOfPos(u8, src, step, "if (f.start < len) {") orelse return error.TestUnexpectedResult;
+    // after the chunk or the pair was issued, before the step hands back to the host
+    try std.testing.expect(issued < settle and settle < leave);
+    // (a pair's second pass runs on its own stream: pairJoin makes the model's stream wait for its end before the host waits on the stream,
+    // or the second pass's tail would land in the next round's time)
+}
     try std.testing.expect(std.mem.indexOf(u8, src, "if (self.spill) |t| t.bump(lane.base + f.start, lane.base + f.start + n + n2 + n3);\n        self.instr.chunk(m.now() / std.time.ns_per_us, n);") != null);
 
 test "every wait that can hold a host names itself, and each rank journals the frames it sends and takes" {

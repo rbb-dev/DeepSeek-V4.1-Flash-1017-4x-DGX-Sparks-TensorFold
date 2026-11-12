@@ -244,6 +244,9 @@ pub const Sink = struct {
 /// A reasoning effort name and the number a family's chat template takes for it (DeepSeek-V4.1's: "medium" -> 62).
 pub const Effort = struct { name: []const u8, value: i64 };
 
+/// The order prompt steps are served in while several prompts fill together (fill_order.zig).
+pub const fill_order = @import("fill_order.zig");
+
 /// What the engine serves, fixed once it has loaded.
 pub const Info = struct {
     name: []const u8 = "lanes",
@@ -267,6 +270,13 @@ pub const Info = struct {
     /// The family's resume grid (its prompt chunk): the rows a prompt step runs between two rounds at the default
     /// cadence, the host's step rows while a stream decodes (lanes.stream.Facts). 0: the host plans none.
     resume_rows: u32 = 0,
+    /// The rows a prompt step may run between two rounds while a stream decodes (the host's step rows): a multiple of
+    /// the resume rows, no more than the family's pass rows. 0: the resume rows.
+    beside_rows: u32 = 0,
+    /// TF_DS_ROUNDS_BESIDE: the rounds that follow each long prompt step while a stream decodes (0: unset; the share's rule).
+    rounds_beside: u32 = 0,
+    /// The order prompt steps are served in while several prompts fill together (off: one step each in turn).
+    fill: fill_order.Policy = .{},
     /// The live streams' rounds the lane host runs between two steps of a prompt pass (0: a step every turn of its
     /// loop, a round between); none waits while no stream decodes.
     fill_rounds: u32 = 0,
@@ -609,6 +619,9 @@ pub const LoneHooks = struct {
 /// The lane core served to the HTTP threads (lane_host.zig).
 pub const LaneHost = @import("lane_host.zig").LaneHost;
 
+/// The host's share and round-count settings (lane_host_share.zig): the family reads TF_DS_ROUNDS_BESIDE's text through it.
+pub const share = @import("lane_host_share.zig");
+
 /// Exact prompt reuse between requests, for any family (prompt_cache.zig).
 pub const prompt_cache = @import("prompt_cache.zig");
 
@@ -637,9 +650,12 @@ pub const keepalive = @import("keepalive.zig");
 pub const originals = @import("originals.zig");
 
 test {
+    _ = @import("fill_order.zig");
     _ = @import("lane_host.zig");
     _ = @import("lane_host_fill_test.zig");
     _ = @import("lane_host_reuse_test.zig");
+    _ = @import("lane_host_share.zig");
+    _ = @import("lane_host_share_test.zig");
     _ = @import("prompt_cache.zig");
     _ = @import("prompt_radix.zig");
     _ = @import("prompt_imprint.zig");

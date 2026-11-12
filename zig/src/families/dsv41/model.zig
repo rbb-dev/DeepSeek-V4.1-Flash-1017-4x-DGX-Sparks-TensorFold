@@ -7,6 +7,7 @@
 //! path (prompt.zig, round.zig, draft.zig) with no checks.
 const std = @import("std");
 const cuda = @import("cuda");
+const engine_api = @import("engine_api");
 const Config = @import("config.zig").Config;
 const rank_cache = @import("rank_cache.zig");
 
@@ -278,23 +279,40 @@ const pass_rows_default_floor: usize = 96 << 30;
     return rows;
 }
 
-        // a vision checkpoint's image routing bias (without it a prompt with images is refused; text runs as ever)
-        if (c.vision) {
-            const path = o.vision_bias orelse try std.fs.path.join(a, &.{ o.kit_dir, "vision", "gate_bias_vl.safetensors" });
-            m.loadVisionBias(path) catch |err| if (o.vision_bias != null or err != error.FileNotFound) return err;
-        }
+/// TF_DS_PASS_BESIDE's setting (prompt2d.passBesideSetting) under the booted pass rows: the rows a prompt's pass may run
+/// while a stream decodes. Text that is no setting, or rows above TF_DS_PASS_ROWS (the passes' buffers are sized by it),
+/// refuses the start, and says so.
+fn readPassBeside(pass_rows: u32) !u32 {
+    const v: ?[]const u8 = if (std.c.getenv("TF_DS_PASS_BESIDE")) |x| std.mem.span(x) else null;
+    return prompt2d.passBesideSetting(v, chunk_rows, pass_rows) orelse {
+        std.log.err("TF_DS_PASS_BESIDE={s}: not a setting (a whole number of {d}-row units, and not above TF_DS_PASS_ROWS={d})", .{ v.?, chunk_rows, pass_rows });
+        return error.BadPassBeside;
+    };
+}
 
-        m.host_pos = try a.alloc(i64, chunk_rows);
-        m.ids64 = try a.alloc(i64, chunk_rows);
-        m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
-        m.logits = try a.alloc(f32, round.max_rows * m.vocab);
-        return m;
+/// TF_DS_ROUNDS_BESIDE's setting (engine_api.share.roundsFromText): a whole number of rounds from 1, or 0 for unset. Text
+/// that is no number of rounds, or any setting beside TENSORFOLD_PREFILL_SHARE below 1 (one control, not two fighting),
+/// refuses the start, and says so, before any weight loads.
+fn readRoundsBeside() !u32 {
+    const v: ?[]const u8 = if (std.c.getenv("TF_DS_ROUNDS_BESIDE")) |x| std.mem.span(x) else null;
+    const rounds = engine_api.share.roundsFromText(v) orelse {
+        std.log.err("TF_DS_ROUNDS_BESIDE={s}: not a setting (a whole number of Token Generation rounds, 1 or more)", .{v.?});
+        return error.BadRoundsBeside;
+    };
+    var s = engine_api.share.Share.fromEnv();
+    s.rounds = rounds;
+    if (engine_api.share.Share.refusal(s)) |why| {
+        std.log.err("{s}", .{why});
+        return error.RoundsBesideWithShare;
     }
+    return rounds;
+}
 
 /// TF_DS_PASS_FROM's setting (prompt2d.passFromSetting); text that is no setting runs the default, said once.
 fn readPassFrom() u32 {
     const v: ?[]const u8 = if (std.c.getenv("TF_DS_PASS_FROM")) |x| std.mem.span(x) else null;
     return prompt2d.passFromSetting(v, chunk_rows) orelse {
+        std.log.info("TF_DS_PASS_FROM={s}: not a setting (a multiple of {d}, 0 included): {d}", .{ v.?, chunk_rows, 4 * chunk_rows });
         return 4 * chunk_rows;
     };
 }
@@ -877,8 +895,12 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             prompt2d.roci_stagger3_asked = prompt2d.roci_stagger_lanes == 3; // every rank alike (Settings)
         }
         prompt2d.pass_from_asked = readPassFrom(); // rank 0's (Settings.pass_from: never compared)
+        prompt2d.pass_beside_asked = try readPassBeside(prompt2d.pass_rows_asked); // rank 0's host decides it (never compared)
         rocinante_mod.setCap(prompt2d.pass_rows_asked); // (the transport's arenas and plans follow the pass rows, before any layout is read)
+        prompt2d.rounds_beside_asked = try readRoundsBeside(); // rank 0's host runs the rounds (never compared)
         prompt2d.pass_tail_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_PASS_TAIL")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.readPassFillingEnv(); // rank 0's TF_DS_PASS_FILLING (the pass sizes are its frames'; its start line prints here)
+        try prompt2d.readPromptOrderEnv(); // rank 0's TF_DS_PROMPT_ORDER and TF_DS_PROMPT_QOS (the host's prompt-step order; its start line prints here)
         prompt2d.ring_wc_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_RING_WC")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.ring_inplace_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_RING_INPLACE")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         const ring_word_text: ?[]const u8 = if (std.c.getenv("TF_DS_RING_WORD")) |v| std.mem.span(v) else null;
@@ -2097,6 +2119,24 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     /// its positions below q0), `steps` drafts each (the drafter's drafts and confidences on the host).
     pub fn pass(m: *Model, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize) !void {
         try m.pairJoin();
+
+test "TF_DS_PASS_BESIDE is read after TF_DS_PASS_ROWS, refuses a bad start, and reaches the host as its beside rows" {
+    const src = @embedFile("model.zig");
+    const beside = std.mem.indexOf(u8, src, "prompt2d.pass_beside_asked = try readPassBeside(prompt2d.pass_rows_asked)") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rows < beside);
+    try std.testing.expect(std.mem.indexOf(u8, src, "return error.BadPassBeside;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, @embedFile("native.zig"), ".beside = prompt2d.pass_beside_asked") != null);
+}
+
+test "TF_DS_ROUNDS_BESIDE is read after TF_DS_PASS_BESIDE, refuses a bad value or the share beside it at the start, and reaches the host" {
+    const src = @embedFile("model.zig");
+    const beside = std.mem.indexOf(u8, src, "prompt2d.pass_beside_asked = try readPassBeside(") orelse return error.TestUnexpectedResult;
+    const rounds = std.mem.indexOf(u8, src, "prompt2d.rounds_beside_asked = try readRoundsBeside()") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(beside < rounds);
+    try std.testing.expect(std.mem.indexOf(u8, src, "return error.BadRoundsBeside;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "return error.RoundsBesideWithShare;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, @embedFile("native.zig"), ".rounds = prompt2d.rounds_beside_asked") != null);
+}
 
     for ([_]prompt2d.Qgate{ .head, .body_fp8, .body_ulp }) |q| {
         prompt2d.qgate_canary_asked = q;

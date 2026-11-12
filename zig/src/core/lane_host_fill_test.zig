@@ -178,14 +178,22 @@ const Cadence = struct {
     decoding: std.ArrayList(bool) = .empty,
     lens: std.ArrayList(usize) = .empty,
     reasons: [4]?api.Reason = @splat(null),
+    tokens: [4]std.ArrayList(u32) = @splat(.empty), // the tokens each request's sink heard
     done: std.atomic.Value(u32) = .init(0),
     want: u32 = 0,
+    /// The fake's pass rule keeps whole passes while only other prompts fill (TF_DS_PASS_FILLING's rule).
+    filling_pass: bool = false,
+    /// The host's fill order (TF_DS_PROMPT_ORDER and TF_DS_PROMPT_QOS); off: the rotation.
+    fill: api.fill_order.Policy = .{},
+    /// Milliseconds each prompt step takes (the hook sleeps), so the order's seconds rule has time to pass.
+    step_ms: u32 = 0,
 
     const Later = struct { id: api.Id, request: *const api.Request, on_len: usize, at: usize };
 
     fn hook(ctx: *anyopaque, s: *lanes.Stream, _: usize) void {
         const x: *Cadence = @ptrCast(@alignCast(ctx));
         const i = x.lens.items.len;
+        if (x.step_ms > 0) std.Io.sleep(std.testing.io, .fromMilliseconds(x.step_ms), .awake) catch {};
         x.decoding.append(gpa, x.core.activeCount() > 0) catch unreachable;
         var before: usize = 0;
         for (x.lens.items) |l| before += @intFromBool(l == s.prompt_len);
@@ -201,6 +209,7 @@ const Cadence = struct {
     fn event(ctx: *anyopaque, id: api.Id, e: *const api.Event) void {
         const x: *Cadence = @ptrCast(@alignCast(ctx));
         switch (e.*) {
+            .tokens => |t| x.tokens[@intCast(id - 1)].appendSlice(gpa, t) catch unreachable,
             .finished => |f| {
                 x.reasons[@intCast(id - 1)] = f.reason;
                 _ = x.done.fetchAdd(1, .release);
@@ -220,6 +229,7 @@ const Cadence = struct {
     fn deinit(x: *Cadence) void {
         x.decoding.deinit(gpa);
         x.lens.deinit(gpa);
+        for (&x.tokens) |*t| t.deinit(gpa);
     }
 
     /// The `first` requests submitted before the host of `n_lanes` lanes starts, the `later` ones from the hook; the fake
@@ -227,11 +237,13 @@ const Cadence = struct {
     fn run(x: *Cadence, target: *lanes.fake.Fake, first: []const *const api.Request, n_lanes: u32) !void {
         var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
         defer cfg.deinit(gpa);
+        target.pass_rule = .{ .resume_rows = 4, .pass_rows = 8, .filling_pass = x.filling_pass };
         target.prefill_hook = hook;
         target.prefill_hook_ctx = x;
         var clock: lanes.fake.FixedClock = .{};
         var core = lanes.Engine.init(gpa, &cfg, target.chunkedBackend(), clock.clock());
         defer core.deinit();
+        var host = api.LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = n_lanes, .resume_rows = 4, .fill = x.fill });
         x.engine = host.engine();
         x.core = &core;
         x.want = @intCast(first.len + x.later.len);
@@ -256,6 +268,10 @@ const Cadence = struct {
                 const sub = at orelse continue;
                 if (len == st.prompt_len) continue;
                 const span = spanOf(steps, len);
+                if (sub <= i and (span == null or span.?[0] > i)) {
+                    // the fill order: an admitted prompt waiting its turn fills beside this one, it does not wait for a lane
+                    if (x.fill.on) filling = true else waiting = true;
+                }
                 if (span) |sp| if (sp[0] < i and sp[1] > i) {
                     filling = true;
                 };
@@ -379,12 +395,274 @@ test "a second prompt filling beside a lone one: both step by the resume rows" {
     };
     try std.testing.expect(beside >= 15);
 }
+
+test "TF_DS_PASS_FILLING: two prompts filling together alternate whole passes, never while one waits or a stream decodes" {
+    // both admitted before the host starts: the first prompt's first step waits for the second to start, then each
+    // turn is a whole pass while the other only fills
+    const pb: [32]u32 = @splat(3);
+    const pc: [33]u32 = @splat(4);
+    const rb: api.Request = .{ .prompt = &pb, .max_tokens = 4, .drafts = false };
+    const rc: api.Request = .{ .prompt = &pc, .max_tokens = 4, .drafts = false };
+    var run: Cadence = .{ .filling_pass = true };
+    defer run.deinit();
+    run.prompt_lens = .{ 32, 33, 0, 0 };
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    try run.run(&target, &.{ &rb, &rc }, 2);
+    const steps = target.steps.items;
+    try run.expectFacts(steps);
+    // the first step waits for the other prompt's first step: the resume rows, as in the baseline
+    try std.testing.expect(steps[0].facts.?.waiting);
+    try std.testing.expectEqual(@as(usize, 4), steps[0].rows);
+    var whole: usize = 0;
+    var beside: usize = 0;
+    for (steps) |st| {
+        const f = st.facts.?;
+        if (f.waiting or f.decoding) {
+            // a request waiting for admission, or a stream decoding: the resume rows, whatever fills beside
+            try std.testing.expect(st.rows <= 4);
+        } else {
+            if (f.filling) beside += 1;
+            if (st.rows == 8) whole += 1;
+            // the pass rule's remainder under the resume rows alone, as in the baseline
+            try std.testing.expect(st.rows == 8 or st.rows <= 4);
+        }
     }
-    try std.testing.expectEqualSlices(Id, &.{ 2, 1 }, &order.prefilled);
+    try std.testing.expect(whole >= 6);
+    try std.testing.expect(beside >= 5);
+    // the two prompts take turns at their whole passes: each of the first eight steps is the other prompt's
+    try std.testing.expect(steps.len >= 8);
+    for (1..8) |i| try std.testing.expect(steps[i].prompt_len != steps[i - 1].prompt_len);
 }
 
-test "status reads a filling prompt's tokens while its pass runs, and none once it ends" {
-    const gpa = std.testing.allocator;
+test "TF_DS_PASS_FILLING: a third request waiting cuts both filling prompts back to the resume rows" {
+    // the third request arrives at the first prompt's second step; until it has started, every other step waits
+    const pb: [32]u32 = @splat(3);
+    const pc: [33]u32 = @splat(4);
+    const pd: [16]u32 = @splat(5);
+    const rb: api.Request = .{ .prompt = &pb, .max_tokens = 4, .drafts = false };
+    const rc: api.Request = .{ .prompt = &pc, .max_tokens = 4, .drafts = false };
+    const rd: api.Request = .{ .prompt = &pd, .max_tokens = 4, .drafts = false };
+    var run: Cadence = .{ .filling_pass = true, .later = &.{.{ .id = 3, .request = &rd, .on_len = 32, .at = 1 }} };
+    defer run.deinit();
+    run.prompt_lens = .{ 32, 33, 16, 0 };
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    try run.run(&target, &.{ &rb, &rc }, 3);
+    const steps = target.steps.items;
+    try run.expectFacts(steps);
+    var waited: usize = 0;
+    var whole: usize = 0;
+    for (steps) |st| {
+        const f = st.facts.?;
+        if (f.waiting or f.decoding) {
+            waited += 1;
+            try std.testing.expect(st.rows <= 4);
+        } else if (st.rows == 8) whole += 1;
+    }
+    try std.testing.expect(waited >= 1); // the arrival, before its first step
+    try std.testing.expect(whole >= 6); // and the two long prompts' whole passes after it
+}
+
+test "TF_DS_PASS_FILLING: a decoding stream beside a long prompt keeps every pass at the resume rows" {
+    // the same shape as the test above, with the switch's rule: its rounds keep the passes at the resume rows
+    const pa: [4]u32 = @splat(5);
+    const pb: [64]u32 = @splat(3);
+    const ra: api.Request = .{ .prompt = &pa, .max_tokens = 40, .drafts = false };
+    const rb: api.Request = .{ .prompt = &pb, .max_tokens = 4, .drafts = false };
+    var run: Cadence = .{ .filling_pass = true, .later = &.{.{ .id = 2, .request = &rb, .on_len = 4, .at = 0 }} };
+    defer run.deinit();
+    run.prompt_lens = .{ 4, 64, 0, 0 };
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    try run.run(&target, &.{&ra}, 2);
+    const steps = target.steps.items;
+    try run.expectFacts(steps);
+    var long: usize = 0;
+    for (steps) |st| {
+        if (st.prompt_len != 64) continue;
+        long += 1;
+        try std.testing.expect(st.facts.?.decoding);
+        try std.testing.expect(st.rows <= 4);
+    }
+    try std.testing.expectEqual(@as(usize, 16), long);
+}
+
+fn firstStep(steps: []const Step, len: usize) ?usize {
+    for (steps, 0..) |st, i| if (st.prompt_len == len) return i;
+    return null;
+}
+
+fn lastStep(steps: []const Step, len: usize) ?usize {
+    var r: ?usize = null;
+    for (steps, 0..) |st, i| if (st.prompt_len == len) {
+        r = i;
+    };
+    return r;
+}
+
+test "the serial order: two prompts admitted together fill one after the other, the smaller first" {
+    // 33 rows against 32: the 32-row prompt has fewer rows left, so its four passes come first
+    const pb: [33]u32 = @splat(3);
+    const pc: [32]u32 = @splat(4);
+    const rb: api.Request = .{ .prompt = &pb, .max_tokens = 4, .drafts = false };
+    const rc: api.Request = .{ .prompt = &pc, .max_tokens = 4, .drafts = false };
+    var run: Cadence = .{ .filling_pass = true, .fill = api.fill_order.parse("serial", null, null).policy };
+    defer run.deinit();
+    run.prompt_lens = .{ 33, 32, 0, 0 };
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    try run.run(&target, &.{ &rb, &rc }, 2);
+    const steps = target.steps.items;
+    try run.expectFacts(steps);
+    const last32 = lastStep(steps, 32).?;
+    try std.testing.expectEqual(@as(usize, 0), firstStep(steps, 32).?);
+    try std.testing.expect(firstStep(steps, 33).? > last32);
+    for (steps[0 .. last32 + 1]) |st| try std.testing.expectEqual(@as(usize, 32), st.prompt_len);
+}
+
+test "the serial order: a short prompt arriving during a long one's pass takes the next pass" {
+    const pl: [64]u32 = @splat(3);
+    const ps: [4]u32 = @splat(4);
+    const rl: api.Request = .{ .prompt = &pl, .max_tokens = 4, .drafts = false };
+    const rs: api.Request = .{ .prompt = &ps, .max_tokens = 4, .drafts = false };
+    var run: Cadence = .{ .filling_pass = true, .fill = api.fill_order.parse("serial", null, null).policy, .later = &.{.{ .id = 2, .request = &rs, .on_len = 64, .at = 2 }} };
+    defer run.deinit();
+    run.prompt_lens = .{ 64, 4, 0, 0 };
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    try run.run(&target, &.{&rl}, 2);
+    const steps = target.steps.items;
+    const sub = run.submitted_at[1].?;
+    // the long prompt had passed two steps when the short one came: its first step is the very next one served
+    try std.testing.expectEqual(sub + 1, firstStep(steps, 4).?);
+    try std.testing.expect(firstStep(steps, 4).? < lastStep(steps, 64).?);
+}
+
+test "a table bounds the overtaking: a larger prompt due takes a pass between smaller ones" {
+    // class 1: up to 8 rows, never due; class 2: the rest, overtaken at most once. The large prompt (64 rows) fills beside
+    // three small prompts: it is served after at most one small prompt's step each time it is passed over.
+    const pl: [64]u32 = @splat(3);
+    const p1: [8]u32 = @splat(4);
+    const p2: [7]u32 = @splat(5);
+    const p3: [6]u32 = @splat(6);
+    const rl: api.Request = .{ .prompt = &pl, .max_tokens = 2, .drafts = false };
+    const r1: api.Request = .{ .prompt = &p1, .max_tokens = 2, .drafts = false };
+    const r2: api.Request = .{ .prompt = &p2, .max_tokens = 2, .drafts = false };
+    const r3: api.Request = .{ .prompt = &p3, .max_tokens = 2, .drafts = false };
+    var run: Cadence = .{ .filling_pass = true, .fill = api.fill_order.parse("serial", "8:1:0,*:2:1", null).policy };
+    defer run.deinit();
+    run.prompt_lens = .{ 64, 8, 7, 6 };
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    try run.run(&target, &.{ &rl, &r1, &r2, &r3 }, 4);
+    const steps = target.steps.items;
+    // never two steps in a row of the small prompts before the large one's first (its bound is one overtake)
+    const first_large = firstStep(steps, 64).?;
+    try std.testing.expect(first_large <= 2);
+    // and the large prompt is not left to the end: a small prompt's step still follows its first
+    try std.testing.expect(lastStep(steps, 64).? > first_large);
+}
+
+test "a background prompt takes a step only while no foreground prompt fills" {
+    const pb: [32]u32 = @splat(3);
+    const pf: [64]u32 = @splat(4);
+    const rb: api.Request = .{ .prompt = &pb, .max_tokens = 2, .drafts = false, .background = true };
+    const rf: api.Request = .{ .prompt = &pf, .max_tokens = 2, .drafts = false };
+    var run: Cadence = .{ .filling_pass = true, .fill = api.fill_order.parse("serial", null, null).policy };
+    defer run.deinit();
+    run.prompt_lens = .{ 32, 64, 0, 0 };
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    // the background prompt is the smaller and the first submitted
+    try run.run(&target, &.{ &rb, &rf }, 2);
+    const steps = target.steps.items;
+    try run.expectFacts(steps);
+    try std.testing.expect(firstStep(steps, 32).? > lastStep(steps, 64).?);
+    try std.testing.expectEqual(@as(usize, 64), steps[0].prompt_len);
+}
+
+test "the prompt order leaves every reply's tokens as the rotation's" {
+    const pb: [32]u32 = @splat(3);
+    const pc: [33]u32 = @splat(4);
+    const rb: api.Request = .{ .prompt = &pb, .max_tokens = 4, .drafts = false };
+    const rc: api.Request = .{ .prompt = &pc, .max_tokens = 4, .drafts = false };
+    var rot: Cadence = .{ .filling_pass = true };
+    defer rot.deinit();
+    rot.prompt_lens = .{ 32, 33, 0, 0 };
+    var rot_target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer rot_target.deinit();
+    try rot.run(&rot_target, &.{ &rb, &rc }, 2);
+    var ord: Cadence = .{ .filling_pass = true, .fill = api.fill_order.parse("serial", "8:1:0,*:2:2", null).policy };
+    defer ord.deinit();
+    ord.prompt_lens = .{ 32, 33, 0, 0 };
+    var ord_target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer ord_target.deinit();
+    try ord.run(&ord_target, &.{ &rb, &rc }, 2);
+    try std.testing.expectEqual(api.Reason.length, rot.reasons[0].?);
+    try std.testing.expectEqual(api.Reason.length, ord.reasons[0].?);
+    try std.testing.expectEqualSlices(u32, rot.tokens[0].items, ord.tokens[0].items);
+    try std.testing.expectEqualSlices(u32, rot.tokens[1].items, ord.tokens[1].items);
+    // the control: one prompt token changed, the same order, and the reply differs
+    var other = pc;
+    other[32] = 9;
+    const rc2: api.Request = .{ .prompt = &other, .max_tokens = 4, .drafts = false };
+    var ctl: Cadence = .{ .filling_pass = true, .fill = ord.fill };
+    defer ctl.deinit();
+    ctl.prompt_lens = .{ 32, 33, 0, 0 };
+    var ctl_target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer ctl_target.deinit();
+    try ctl.run(&ctl_target, &.{ &rb, &rc2 }, 2);
+    try std.testing.expect(!std.mem.eql(u32, ord.tokens[1].items, ctl.tokens[1].items));
+}
+
+test "the seconds rule: a larger prompt passed over by a stream of small ones takes a step once it waited its maximum" {
+    // class 1 up to 8 rows, class 2 the rest with no step bound; every step takes 600 ms and the maximum wait is 1 s. The
+    // large prompt (16 rows, two passes) would otherwise wait for all three small prompts.
+    const pl: [16]u32 = @splat(3);
+    const p1: [4]u32 = @splat(4);
+    const p2: [3]u32 = @splat(5);
+    const p3: [2]u32 = @splat(6);
+    const rl: api.Request = .{ .prompt = &pl, .max_tokens = 2, .drafts = false };
+    const r1: api.Request = .{ .prompt = &p1, .max_tokens = 2, .drafts = false };
+    const r2: api.Request = .{ .prompt = &p2, .max_tokens = 2, .drafts = false };
+    const r3: api.Request = .{ .prompt = &p3, .max_tokens = 2, .drafts = false };
+    var run: Cadence = .{ .filling_pass = true, .step_ms = 600, .fill = api.fill_order.parse("serial", "8:1:0,*:2:inf", "1").policy };
+    defer run.deinit();
+    run.prompt_lens = .{ 16, 4, 3, 2 };
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    try run.run(&target, &.{ &rl, &r1, &r2, &r3 }, 4);
+    const steps = target.steps.items;
+    // two small steps (1.2 s), then the large prompt is past its maximum and goes before the third small prompt
+    try std.testing.expectEqual(@as(usize, 2), steps[0].prompt_len);
+    try std.testing.expectEqual(@as(usize, 3), steps[1].prompt_len);
+    try std.testing.expectEqual(@as(usize, 16), steps[2].prompt_len);
+}
+
+test "the seconds rule: a background prompt takes a step once it waited its maximum, ahead of foreground prompts" {
+    const pd: [1]u32 = @splat(3);
+    const pa: [4]u32 = @splat(4);
+    const pb: [3]u32 = @splat(5);
+    const pc: [2]u32 = @splat(6);
+    const rd: api.Request = .{ .prompt = &pd, .max_tokens = 2, .drafts = false, .background = true };
+    const ra: api.Request = .{ .prompt = &pa, .max_tokens = 2, .drafts = false };
+    const rb: api.Request = .{ .prompt = &pb, .max_tokens = 2, .drafts = false };
+    const rc: api.Request = .{ .prompt = &pc, .max_tokens = 2, .drafts = false };
+    // the foreground prompt of 4 rows arrives during the 3-row prompt's step, so it has waited less than the maximum
+    // when the background prompt (waiting since the start) has waited more
+    var run: Cadence = .{ .later = &.{.{ .id = 4, .request = &ra, .on_len = 3, .at = 0 }}, .filling_pass = true, .step_ms = 600, .fill = api.fill_order.parse("serial", null, "1").policy };
+    defer run.deinit();
+    run.prompt_lens = .{ 1, 2, 3, 4 };
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    try run.run(&target, &.{ &rd, &rc, &rb }, 4);
+    const steps = target.steps.items;
+    try std.testing.expectEqual(@as(usize, 2), steps[0].prompt_len);
+    try std.testing.expectEqual(@as(usize, 3), steps[1].prompt_len);
+    try std.testing.expectEqual(@as(usize, 1), steps[2].prompt_len); // the background prompt, due
+    try std.testing.expectEqual(@as(usize, 4), steps[3].prompt_len);
+}
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
     defer cfg.deinit(gpa);
     var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 4 };

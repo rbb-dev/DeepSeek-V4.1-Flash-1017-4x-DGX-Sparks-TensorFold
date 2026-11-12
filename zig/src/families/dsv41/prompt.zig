@@ -2470,6 +2470,10 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
         eh.hasher.hashes(seq, ch.start, n, eh.hashes[0 .. n * eh.hasher.layers * cols]);
         for (0..n) |r| {
             for (0..k) |j| eh.flat[r * k + j] = eh.hashes[(r * eh.hasher.layers + l) * cols + eh.lo + j];
+/// `filling_pass` is the rule's filling switch, which changes nothing under these facts.
+fn workerRuleRows(at: usize, pass_from: usize, pass_rows: usize, chunk: usize, filling_pass: bool) usize {
+    return lanes.stream.passRows(quiet, at, pass_from, @intCast(pass_rows), @intCast(chunk), filling_pass);
+    filling_pass: bool = false, // the pass rule's filling switch (TF_DS_PASS_FILLING)
     group: usize = 0, // chunks a pass-major group takes from pass_from on, whatever the pass rule says (0: the rule): two passes in flight read both passes' layer 0, then both layer 1
             const rows = if (self.group != 0 and at >= self.pass_from) self.group * self.chunk else if (self.pass_rows <= self.chunk) self.chunk else workerRuleRows(at, self.pass_from, self.pass_rows, self.chunk, self.filling_pass);
         }
@@ -2583,6 +2587,7 @@ pub fn engramWorker(eh: *EngramHost, c: *const Config, seq: []const i32, start: 
     const nl = @min(2, c.engram_layers.slice().len);
     const cols = eh.hasher.cols();
     const k = eh.hi - eh.lo;
+        .filling_pass = prompt2d.pass_filling_asked,
         .group = eh.wk_group,
         const n = @min(chunk, seq.len - at);
         workerRows(eh, c, seq, at, n, j, cols, k, eh.wk_rows[step.chunk % eh.wk_slots][j], step.chunk % eh.wk_slots) catch |err| {
@@ -3325,6 +3330,30 @@ test "a pass's view: its own rows when whole, the resume rows under them" {
     try std.testing.expectEqual(@as(usize, 4096), viewRows(4096, 2048));
     try std.testing.expectEqual(@as(usize, 2048), viewRows(2047, 2048));
     try std.testing.expectEqual(@as(usize, 2048), viewRows(1, 2048));
+}
+
+test "TF_DS_PASS_FILLING: two fills alternating 4,096-row passes read each pass two chunks a layer, its own slots" {
+    // a fill from the prompt's first row and one resumed at 4,096 (an alternating prompt's next pass): each pass is
+    // two units, layer-major from its own start, and a pass's two chunks take the worker's two ring slots (wk_rows[2])
+    for ([_]usize{ 0, 4096 }) |start| {
+        var order: WorkerOrder = .{ .start = start, .chunks = 4, .chunk = 2048, .layers = 2, .pass_from = 0, .pass_rows = 4096, .filling_pass = true };
+        var seen: [2][2]bool = @splat(@splat(false));
+        var i: usize = 0;
+        while (i < 8) : (i += 1) {
+            const step = order.next().?;
+            const pass = i / 4;
+            const layer = (i % 4) / 2;
+            const k = i % 2;
+            try std.testing.expectEqual(layer, step.layer);
+            try std.testing.expectEqual(pass * 2 + k, step.chunk);
+            // a pass's two chunks sit in the two slots, per layer
+            const slot = step.chunk % 2;
+            try std.testing.expect(!seen[step.layer][slot]);
+            seen[step.layer][slot] = true;
+            if (k == 1) seen[step.layer] = @splat(false);
+        }
+        try std.testing.expect(order.next() == null);
+    }
 }
 
 /// The worker (greedy, blocked by its slot guard) against the host consuming a pair's units in the pair's issue order: A's layer-1
