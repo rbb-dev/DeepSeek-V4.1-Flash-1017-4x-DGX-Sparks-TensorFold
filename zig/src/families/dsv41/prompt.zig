@@ -1153,9 +1153,11 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     }
     try e.exact.bf16Scale(e.s, ch.wl, ch.iw, n * ih, exact.indexScale(id, ih));
     const kk = @min(c.index_topk, n_comp_end);
-    // rows in blocks so the [rows, n_comp] keys stay bounded at long contexts
-    const rb = @max(16, @min(n, (@as(usize, 1) << 26) / (4 * @max(n_comp_end, 1))));
-    if (rb * n_comp_end > key_elems) return error.ChunkTooLong;
+    // rows in blocks so the [rows, n_comp] keys stay bounded at long contexts; a block a multiple of 16 rows, so every
+    // block's views (vis + r0 * 8 and the rest) start on a 16-byte boundary, the alignment the kit's index kernels were
+    // captured for (a 137,612-token prompt gave 121-row blocks: MissingTritonVariant at the second). A row's scores and
+    // picks are its own, so the block size changes no bits.
+    const rb = @max(16, @min(n, (@as(usize, 1) << 26) / (4 * @max(n_comp_end, 1)) / 16 * 16));
     const keyed = li != c.candidate_source and !(c.candidate_source < li) and kk & (kk - 1) == 0;
     const k: tri_index.IndexK = .{ .fp4 = .{ .codes = cs.idx_codes[src], .scales = cs.idx_scales[src] } };
     const torch_topk: tri_index.TopK = .{ .top = ch.ktop, .ctx = @ptrCast(@constCast(e)), .run = torchTopk };
