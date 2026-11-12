@@ -270,6 +270,7 @@ const Generation = struct {
     streamed: reply_text.Shown = .{}, // what content streamed, kept apart from the decode buffer that grows under slices
     streamed_reasoning: reply_text.Shown = .{},
     streaming_done: bool = false,
+    wrote_ns: ?i96 = null,
     first_ns: ?i96 = null,
     last_ns: ?i96 = null,
     reason: ?[]const u8 = null, // the server ended the reply (a stop string, the length) before the engine said so
@@ -374,6 +375,7 @@ const Generation = struct {
             g.cancel();
             return error.Cancelled;
         };
+        g.wrote_ns = nowNs(g.srv.io);
         if (g.srv.config.sse_keepalive_ms > 0) g.sent_ns = nowNs(g.srv.io);
     }
 
@@ -411,6 +413,10 @@ const Generation = struct {
 
     /// Takes rounds until the reply ends; a client that leaves cancels it.
     fn loop(g: *Generation, gone: anytype) Failure!void {
+        const Gone = switch (@typeInfo(@TypeOf(gone))) {
+            .pointer => |p| p.child,
+            else => @TypeOf(gone),
+        };
         const m = g.box;
         while (true) {
             m.mutex.lockUncancelable(m.io);
@@ -435,6 +441,15 @@ const Generation = struct {
             if (gone.check()) {
                 g.cancel();
                 return error.Cancelled;
+            }
+                // Queueing and long prefills send no tokens; keep the connection alive through those gaps.
+                const now = nowNs(g.srv.io);
+                const since = g.wrote_ns orelse now;
+                if (g.wrote_ns == null) g.wrote_ns = now;
+                if (gone.beat(now - since) catch {
+                    g.cancel();
+                    return error.Cancelled;
+                }) g.wrote_ns = now;
             }
             const tokens = chunk orelse {
                 try g.keepAlive();

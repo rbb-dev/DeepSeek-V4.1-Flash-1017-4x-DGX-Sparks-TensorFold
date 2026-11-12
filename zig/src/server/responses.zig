@@ -203,7 +203,7 @@ const Wire = struct {
     payload: Value = .null,
 
     fn out(w: *Wire) openai.Out {
-        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .comment = comment } };
+        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .comment = comment, .keepalive = keepalive } };
     }
 
     fn comment(ctx: *anyopaque) error{Closed}!void {
@@ -221,6 +221,11 @@ const Wire = struct {
     fn event(ctx: *anyopaque, payload: ?Value) error{Closed}!void {
         const w: *Wire = @ptrCast(@alignCast(ctx));
         return w.reply.chunk(payload);
+    }
+
+    fn keepalive(ctx: *anyopaque) error{Closed}!void {
+        const w: *Wire = @ptrCast(@alignCast(ctx));
+        try sse.comment(w.reply.conn);
     }
 
     fn whole(ctx: *anyopaque, status: u16, payload: Value) void {
