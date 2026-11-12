@@ -199,13 +199,39 @@ const Host = struct {
 
     /// The family's backend, each call made with the context current on the calling thread.
     fn backend(h: *Host) lanes.backend.Backend {
-        h.vtable = lane_backend.vtable(Host, h.inner.vtable.*);
+        const v = h.inner.vtable;
+        h.vtable = .{
+            .prefill = struct {
+                fn f(p: *anyopaque, s: *lanes.Stream) anyerror!void {
+                    const x = bind(p);
+                    return x.inner.vtable.prefill(x.inner.ptr, s);
+                }
+            }.f,
             .prefill_step = if (v.prefill_step != null) struct {
                 fn f(p: *anyopaque, s: *lanes.Stream) anyerror!bool {
                     const x = bind(p);
                     return x.inner.vtable.prefill_step.?(x.inner.ptr, s);
                 }
             }.f else null,
+            .first_masked = if (v.first_masked != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
+                    const x = bind(p);
+                    return x.inner.vtable.first_masked.?(x.inner.ptr, s, position, mask);
+                }
+            }.f else null,
+            .held = if (v.held != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
+                    const x = bind(p);
+                    return x.inner.vtable.held.?(x.inner.ptr, s, out);
+                }
+            }.f else null,
+            .release = struct {
+                fn f(p: *anyopaque, s: *lanes.Stream) void {
+                    const x = bind(p);
+                    x.inner.vtable.release(x.inner.ptr, s);
+                }
+            }.f,
+        };
         return .{ .ptr = h, .vtable = &h.vtable };
     }
 };

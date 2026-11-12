@@ -583,22 +583,10 @@ pub const LaneHost = struct {
     /// false: nothing more is admitted now.
     fn requeueFull(h: *LaneHost, job: *Job) bool {
         h.core.discard(&job.stream);
-        h.lock();
-        for (h.admitted.items, 0..) |j, i| if (j == job) {
-            _ = h.admitted.orderedRemove(i);
-            break;
-        };
-        h.queued.insert(h.gpa, 0, job) catch {
-            h.unlock();
-            h.finish(job, .failed, "out of memory");
-            return true;
-        };
-        h.full_wait = h.core.activeCount();
-        h.full_retry = std.Io.Clock.awake.now(h.io).toNanoseconds() + full_retry_ns;
-        h.unlock();
-        job.fill_on.store(false, .release); // off the lists before the teardown, as requeue does
-        job.reported(); // the entry it looked up goes back: its next admission looks it up again
-        if (job.stream.grammar) |g| g.deinit(h.gpa);
+        job.entry = null; // nothing was restored: the store keeps the entry for the next lookup
+        h.gpa.free(job.marks);
+        job.marks = &.{};
+        if (job.stream.grammar) |g| g.deinit(h.gpa); // the next admission compiles its own
         job.stream.deinit(h.gpa);
         job.proposer.deinit();
         recalls.release(job);

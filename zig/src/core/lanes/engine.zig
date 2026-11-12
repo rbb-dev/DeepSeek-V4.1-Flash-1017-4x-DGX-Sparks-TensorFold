@@ -112,6 +112,36 @@ pub const Engine = struct {
         s.pending = null;
         s.cache_len = s.prompt_len;
         const position: u64 = s.prompt_len;
+        const drawn = try e.drawFirst(s, position);
+        var feed: Feed = .{ .handle = drawn };
+        if (try e.forcedNext(s)) |t| feed = .{ .value = t };
+        var asked: ?u32 = null;
+        if (e.cfg.family_mtp and s.drafts) {
+            // the head reads the prompt's last row and the first token, and drafts the one after it
+            const d: u32 = @intCast(try e.rule.depth(win.who(s)));
+            asked = d;
+            try e.backend.draft(&.{.{ .stream = s, .follow = &.{}, .first = feed, .rows = null, .start = s.prompt_len, .position = position + 1, .depth = d }});
+            s.dropHeld(e.gpa);
+            s.next = .{ .count = d };
+        } else if (e.cfg.pipelined and s.grammar == null) {
+            try e.queueNext(s, feed);
+        }
+        const value = try e.readFeed(feed);
+        if (asked) |d| try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(d)), f("position", int(position + 1)), f("follow", .{ .u32s = &.{value} }), f("rows", .null) });
+        if (e.log != null) {
+            const first = if (feed == .handle) value else try e.backend.read(drawn);
+            try trail.event(e, &.{ f("ev", str("first")), f("stream", str(s.id)), f("position", int(position)), f("drawn", int(first)), f("token", int(value)) });
+        }
+        _ = try s.commit(e.gpa, &.{value}, &.{});
+        s.pending = value;
+        try trail.resolve(e);
+        if (s.finished) {
+            try trail.finish(e, s);
+            e.release(s);
+            return;
+        }
+        try e.live.append(e.gpa, s);
+    }
 
     /// Take over a stream another driver decoded so far: its cache settled, `pending` and `cache_len` set, no drafts held.
     pub fn adopt(e: *Engine, s: *Stream) !void {

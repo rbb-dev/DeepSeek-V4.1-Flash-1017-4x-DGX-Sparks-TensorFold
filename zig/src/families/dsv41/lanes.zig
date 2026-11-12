@@ -920,12 +920,45 @@ pub const Lanes = struct {
         m.joinAhead();
         m.fill_seq = &.{};
         if (!head) return error.NoPromptLogits;
+        // a stream with a grammar: the row stays for its first token's draw among the grammar's tokens
+        if (s.grammar != null) {
+            self.first_row = try self.gpa.realloc(self.first_row, logits.len);
+            @memcpy(self.first_row, logits);
+            self.first_of = s;
+        }
         f.deinit(gpa);
         self.fills[lane.slot] = null;
         if (self.prof) |*p| p.prefills += 1;
         return true;
     }
 
+    /// `first` among a grammar's tokens: the prompt's last row (the prompt pass kept it for the stream) drawn again
+    /// with the other tokens at -inf, at the same keyed position.
+    fn firstMaskedFn(ptr: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
+        const self = of(ptr);
+        _ = self.streams.getPtr(s) orelse return error.UnknownStream;
+        if (position != s.prompt_len) return error.PositionMismatch;
+        if (self.first_of != s) return error.NoPromptRow;
+        return self.take(try self.drawAllowed(self.first_row, position, s.sampling, mask));
+    }
+
+    /// The held drafts as host tokens in window order (a grammar walks them): draft holds them when its pass ends.
+    fn heldFn(ptr: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
+        const self = of(ptr);
+        const l = self.streams.getPtr(s) orelse return error.UnknownStream;
+        if (out.len > l.nheld) return error.HeldMismatch;
+        @memcpy(out, l.held[0..out.len]);
+    }
+
+    /// drawMasked into the backend's row.
+    fn drawAllowed(self: *Lanes, row: []const f32, position: u64, s: ?lanes.Sampling, mask: []const u32) !u32 {
+        self.masked = try self.gpa.realloc(self.masked, row.len);
+        return drawMasked(self.masked, row, position, s, mask);
+    }
+
+    fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
+        _ = .{ ptr, s, feed, position };
+        return error.NotPipelined;
     }
 
     fn readFn(ptr: *anyopaque, handle: u64) anyerror!u32 {
@@ -960,9 +993,17 @@ pub const Lanes = struct {
             for (w.tokens, 0..) |t, j| ids[k][1 + w.held + j] = @intCast(t);
             wins[k] = .{ .slot = l.slot, .base = l.base, .end = l.end, .start = start, .absorb = m.drafting() and w.stream.drafts, .ids = ids[k][0..rows] };
         }
+        // every row greedy and none masked: the device's argmax (R tokens back); else the logits for the host's draws
+        var greedy = !masked;
+        for (windows) |w| {
+            if (w.stream.sampling) |sm| if (sm.temperature > 0) {
+                greedy = false;
+            };
+        }
         // Track B (TF_DS_SAMPLE_CAND=1): a sampled round's rows as their first candidates from the GPU (the host's
         // draws read only those; sampling.sampleCandidates), the whole logits only when a row needs them
         var cand_count: usize = 0;
+        if (!greedy and !masked and candOn()) { // a masked row is drawn from its whole row
             cand_count = 1;
             for (windows) |w| if (w.stream.sampling) |sm| if (sm.temperature > 0) {
                 if (sm.top_k == 0 or sampling.candidateCount(m.vocab, .{ .seed = sm.seed, .temperature = sm.temperature, .top_k = sm.top_k, .top_p = sm.top_p, .min_p = sm.min_p }) > sampling.max_candidates) {
@@ -1018,6 +1059,7 @@ pub const Lanes = struct {
             const row0 = self.built.wins[k].row;
             for (0..w.rows()) |r| o.sampled[r] = if (greedy)
                 tokens[row0 + r]
+            else if (w.masks.len > 0)
                 try self.drawAllowed(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling, w.masks[r * words ..][0..words])
             else if (!whole)
                 try drawCandidates(cand.?.vals[(row0 + r) * cand_count ..][0..cand_count], cand.?.ids[(row0 + r) * cand_count ..][0..cand_count], V, w.positions[r], w.stream.sampling)
@@ -1258,10 +1300,7 @@ pub const Lanes = struct {
 
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
-        if (self.fillOf(s)) |f| {
-            self.m.joinAhead();
-            self.m.fill_seq = &.{};
-            self.dropFill(f.slot);
+        if (self.first_of == s) self.first_of = null;
         if (self.streams.fetchRemove(s)) |kv| {
             const slot = kv.value.slot;
             if (self.fills[slot]) |*f| {
@@ -1708,7 +1747,8 @@ test "a masked draw is the row's draw with the other tokens at -inf, and never a
 
 test "a stream with a grammar draws its first token from the kept prompt row, and its held drafts read back as host tokens" {
     const gpa = std.testing.allocator;
-    var ln: Lanes = .{ .gpa = gpa, .m = undefined, .peer = null };
+    // no model here: rdma_idle set, so release (0034) has no RDMA proxies to park
+    var ln: Lanes = .{ .gpa = gpa, .m = undefined, .peer = null, .rdma_idle = true };
     defer ln.deinit();
     const b = ln.backend();
     try std.testing.expect(b.vtable.first_masked != null and b.vtable.held != null);
