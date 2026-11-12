@@ -79,8 +79,7 @@ pub fn main(init: std.process.Init) !u8 {
     var comm = dsv41.comm.Comm.init(rank, 4);
     comm.host = .{ .star = .{ .links = &vfan.links, .rank = rank, .world = 4, .busy = &star_busy } };
     defer comm.deinit();
-    if (std.c.getenv("TF_DS_TWO_HOP")) |v| dsv41.comm.two_hop = std.mem.eql(u8, std.mem.span(v), "1"); // a ring of four
-    var rings = try ring2d.Rings.open(gpa, io, &driver, try rdma.Kernels.load(module), devices.items, g, .{ .max_bytes = 4456448, .gid_index = gid }, &comm, stream);
+    var rings = try ring2d.Rings.open(gpa, &driver, try rdma.Kernels.load(module), devices.items, g, ord, .{ .max_bytes = 4456448, .gid_index = gid }, &comm, stream, true);
     defer rings.close(gpa);
 
     var all_ok = true;

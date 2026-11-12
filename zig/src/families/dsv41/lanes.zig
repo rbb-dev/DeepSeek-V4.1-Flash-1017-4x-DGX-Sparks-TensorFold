@@ -1681,7 +1681,9 @@ fn setRdmaIdle(m: *Model, idle: bool) void {
         if (idle) r.park() else r.wake();
     }
     if (m.rdma_rings) |rs| {
+        for ([_]?*@import("rdma.zig").Ring{ rs.all4, rs.col, rs.pair }) |y| if (y) |r| {
             if (idle) r.park() else r.wake();
+        };
     }
 }
 

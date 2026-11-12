@@ -69,6 +69,9 @@ pub const Attn = struct {
     parts: Parts = .{ .pm = 0, .pl = 0, .po = 0 },
     /// a small prompt chunk run as a large one (one split, out directly: the prompt chunks' variant)
     one_split: bool = false,
+    /// the key-split part's variant from the kit's extra set (Tri.runExtra: the four-way drafter's stages, whose head
+    /// count the base set lacks); the merge and every other launch from the base set
+    extra: bool = false,
     /// TF_DS_ATTN_U (a prompt chunk's call, `attn_u`) or TF_DS_ATTN_U_DECODE (a decode round's, `attn_u_decode`): with
     /// packed latents the part from its twin _sparse_attn_part_u (Tri.runTwin: the hardware unpack, the same keys), else
     /// from _sparse_attn_part

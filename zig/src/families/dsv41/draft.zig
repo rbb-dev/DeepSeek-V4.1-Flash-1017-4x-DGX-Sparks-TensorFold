@@ -16,6 +16,7 @@ const prompt = @import("prompt.zig");
 const comm_mod = @import("comm.zig");
 const weights = @import("weights.zig");
 const plan = @import("plan.zig");
+const ring2d = @import("ring2d.zig");
 const tri_basic = @import("tri_basic.zig");
 const tri_hc = @import("tri_hc.zig");
 const tri_norm = @import("tri_norm.zig");
@@ -31,6 +32,7 @@ const graph_fallback = @import("graph_fallback.zig");
 
 const Engine = prompt.Engine;
 const Chunk = prompt.Chunk;
+const Config = @import("config.zig").Config;
 
 /// MultiDecoder's stream slots in the served lane (--parallel 4): the pool's streams.
 pub const max_streams = 32; // the most streams any stream setting (Model.streams) gives the pool
@@ -139,6 +141,12 @@ fn ddHost(name: []const u8, bytes: []const u8) void {
 /// A dumped pass's buffer (only inside the dumped pass).
 fn dd(e: *const Engine, name: []const u8, stage: usize, ptr: u64, bytes: usize) void {
     if (ddump_on) ddWrite(e, name, stage, ptr, bytes, false);
+}
+
+/// An absorb's main_proj rows (whole, after a four-way absorb's gather), appended until the dumped pass.
+fn ddMain(e: *const Engine, ay: u64, bytes: usize) void {
+    if (ddump == null or ddump_count > ddump_pass) return;
+    ddWrite(e, "main_y", 0, ay, bytes, true);
 }
 
 /// Absorbed taps rows and their positions (host), appended until the dumped pass.
@@ -435,6 +443,18 @@ pub const Drafter = struct {
     ao: u64,
     apos: u64,
     arows: u64,
+    // TF_DS_DRAFT_4WAY (weights.draft_4way): the stages split four ways like the backbone (the loaded blocks hold the
+    // node's 2D parts); their exchanges the backbone's (catRank, the parity packs, quartersDecode)
+    four: bool = false,
+    // TF_DS_DRAFT_MAIN_4WAY (weights.draft_main_4way): main_proj holds the node's quarter of its columns
+    // (weights.mainProjCols); an absorb's main_proj rows go to aq, the four quarters gathered into ag ([2, n, hidden / 2]:
+    // quartersDecode's layout), each plane copied into its half of ay's rows
+    main4: bool = false,
+    aq: u64 = 0,
+    ag: u64 = 0,
+    // TF_DS_DRAFT_LOG: each stage's active experts (the grouping's count) copied out by the pass, and the passes so far
+    nacts: u64 = 0,
+    passes: u64 = 0,
     // the pass's graphs (BatchDraftGraph: one a streams and steps; null: eager)
     graphs: ?*PassGraphs = null,
     // the last pass on the host: each stream's drafts and confidences (`steps` of them)
@@ -454,8 +474,25 @@ pub const Drafter = struct {
         const hd = c.head_dim;
         const R = max_rows;
         const b0 = ds.blocks[0];
-        const hl = b0.wq_b.n / hd; // the blocks' heads (TP2's on a 2D node too: TP2 inside the pair)
+        const hl = b0.wq_b.n / hd; // the blocks' heads (TP2's on a 2D node, the node's own four ways)
         var dr: Drafter = undefined;
+        dr.four = if (e.two) |tw| hl == tw.heads else false;
+        // TF_DS_DRAFT_MAIN_4WAY: main_proj's quarter, gathered over the 2D view's quarters
+        dr.main4 = ds.main_proj.n * 4 == c.hidden and e.two != null;
+        if (ds.main_proj.n != c.hidden and !dr.main4) return error.WeightsNotThisSplit;
+        if (dr.four) {
+            // four ways: every stage's parts are the backbone's widths (its exchanges move them), Format.native only
+            const tw = e.two.?;
+            if (e.mx == null) return error.WeightsNotThisSplit;
+            for (ds.blocks) |blk| {
+                const x = blk.experts;
+                const ir: usize = if (x.rest) |r| r.width else 0;
+                if (blk.groups * blk.wo_a[0].n != tw.uw[tw.p] or blk.wo_b.n != tw.ow[tw.p] or x.width != tw.gu[tw.p] or
+                    x.down_n != tw.dw[tw.p] or ir != tw.ir) return error.WeightsNotThisSplit;
+            }
+        }
+        dr.passes = 0;
+        dr.nacts = if (dlog != null and e.mx != null) try a.take(max_stages * 4) else 0;
         dr.ds = ds;
         dr.n = c.dspark_block;
         dr.noise = c.dspark_noise;
@@ -517,6 +554,9 @@ pub const Drafter = struct {
             var zf: usize = 0;
             for (ds.blocks) |blk| zf = @max(zf, mx.decodeZFloats(blk, c.hidden, ne, c.index_heads, R, dr.slots_moe));
             dr.mxe.z = .{ .ptr = try a.take(zf * 4), .floats = zf };
+            // gate / up's pack (a parity split's four-way stage: every entry's main columns, then every entry's rest)
+            const pack = ex.width + if (ex.rest) |r| r.width else 0;
+            dr.nxh = try a.take(R * dr.slots_moe * pack * 2);
             dr.xsd = std.mem.zeroes(exl3_experts.DecodeScratch);
             dr.xs = std.mem.zeroes(exl3_experts.Scratch);
         } else dr.xsd = try prompt.decodeScratch(e, a, b0.experts, dr.slots_moe);
@@ -587,6 +627,10 @@ pub const Drafter = struct {
         dr.em_host = &.{};
         errdefer dr.deinit();
         dr.confw_host = try std.heap.page_allocator.alloc(f32, d + rank);
+        // (the parts start at multiples of 16 in a 16-aligned block: the casts check what the types cannot see)
+        dr.ho_host = @alignCast(std.mem.bytesAsSlice(i64, pb[0..ho_bytes]));
+        dr.xc_host = @alignCast(std.mem.bytesAsSlice(u16, pb[ho_bytes..][0 .. R * d * 2]));
+        dr.em_host = @alignCast(std.mem.bytesAsSlice(u16, pb[ho_bytes + xc_bytes ..][0 .. R * rank * 2]));
         try e.s.synchronize();
         try e.d.check(e.d.api.cuMemcpyDtoH_v2(dr.confw_host.ptr, dr.confw, (d + rank) * 4), "cuMemcpyDtoH");
         // absorbs
@@ -594,6 +638,12 @@ pub const Drafter = struct {
         dr.at = try a.take(ring * dr.taps_w * 2);
         dr.ay = try a.take(ring * d * 2);
         dr.ax = try a.take(ring * d * 2);
+        dr.aq = 0;
+        dr.ag = 0;
+        if (dr.main4) {
+            dr.aq = try a.take(ring * (d / 4) * 2);
+            dr.ag = try a.take(ring * d * 2);
+        }
         dr.ak = @splat(0);
         for (0..ds.blocks.len) |j| dr.ak[j] = try a.take(ring * hd * 2);
         dr.ao = try a.take(ring * hd * 2);
@@ -671,6 +721,16 @@ pub const Drafter = struct {
         const d = c.hidden;
         const hd = c.head_dim;
         // (decode-size absorbs, a round's window rows: the GEMV; a prompt chunk's: the GEMM)
+        if (dr.main4) {
+            // the node's quarter of the columns, the four gathered as the stages' partials are, each plane into its
+            // half of the rows (plane r: quarters 2r and 2r + 1, weights.mainProjCols)
+            const tw = e.two.?;
+            const q = d / 4;
+            try prompt.groupedDecode(e, ch, n, &.{dr.ds.main_proj}, &.{taps}, &.{dr.taps_w}, &.{dr.aq}, &.{q}, &.{.bf16});
+            try tw.quartersDecode(e, dr.aq, dr.ag, n, .{ q, q }, 2);
+            for (0..2) |r| try e.ops.copyRows(e.s, dr.ag + r * n * 2 * q * 2, 2 * q * 2, dr.ay + r * 2 * q * 2, d * 2, 2 * q * 2, n);
+        } else try prompt.groupedDecode(e, ch, n, &.{dr.ds.main_proj}, &.{taps}, &.{dr.taps_w}, &.{dr.ay}, &.{d}, &.{.bf16});
+        ddMain(e, dr.ay, n * d * 2);
         try tri_basic.rmsnorm(e.t, dr.ay, d, dr.ds.main_norm, dr.ax, d, c.eps, n, d);
         const S = dr.ds.blocks.len;
         var ls: [max_stages]weights.Linear = undefined;
@@ -754,14 +814,23 @@ pub const Drafter = struct {
         };
         dr.streams = N;
         dr.steps = steps;
+        dr.passes += 1;
         if (dlog) |path| if (ddump_node == 0) {
+            // TF_DS_DRAFT_LOG: a line a stream of the pass: slot q0 token, its drafts, its confidences, then the pass's
+            // number, its streams and steps, and each stage's active experts (passes matched by their composition)
+            var na: [max_stages]i32 = @splat(0);
+            const S = dr.ds.blocks.len;
+            if (dr.nacts != 0) try e.d.check(e.d.api.cuMemcpyDtoH_v2(&na, dr.nacts, S * 4), "cuMemcpyDtoH");
             if (std.c.fopen(path.ptr, "ab")) |f| {
                 defer _ = std.c.fclose(f);
                 for (0..N) |i| {
+                    var lb: [640]u8 = undefined;
                     var at: usize = 0;
                     at += (std.fmt.bufPrint(lb[at..], "{d} {d} {d}", .{ slots[i], q0[i], tokens[i] }) catch break).len;
                     for (0..steps) |j| at += (std.fmt.bufPrint(lb[at..], " {d}", .{dr.drafts[i][j]}) catch break).len;
                     for (0..steps) |j| at += (std.fmt.bufPrint(lb[at..], " {d:.4}", .{dr.confs[i][j]}) catch break).len;
+                    at += (std.fmt.bufPrint(lb[at..], " | pass {d} streams {d} steps {d} experts", .{ dr.passes, N, steps }) catch break).len;
+                    for (na[0..S]) |x| at += (std.fmt.bufPrint(lb[at..], " {d}", .{x}) catch break).len;
                     lb[at] = '\n';
                     _ = std.c.fwrite(&lb, 1, at + 1, f);
                 }
@@ -814,7 +883,7 @@ pub const Drafter = struct {
             try Probe.check(probe, .attn_ring, j, pool.rings[j]);
             try dr.attention(e, ch, pool, j, R);
             try Probe.check(probe, .attn_out, j, dr.pa);
-            if (e.two) |tw| try tw.pairGather(e, dr.pa, dr.ga, R, d, 4) else try e.gatherF32(dr.pa, dr.ga, R * d);
+            try dr.stageGather(e, dr.pa, dr.ga, R, .attn);
             pmark(e, if (j == 0) .gather_a0 else .gather_a);
             try Probe.check(probe, .attn_gather, j, dr.ga);
             pending = dr.ga;
@@ -825,7 +894,8 @@ pub const Drafter = struct {
             try Probe.check(probe, .moe_in, j, dr.x);
             try dr.moe(e, j, R);
             try Probe.check(probe, .moe_out, j, dr.pm);
-            if (e.two) |tw| try tw.pairGather(e, dr.pm, dr.gm, R, d, 4) else try e.gatherF32(dr.pm, dr.gm, R * d);
+            if (dr.nacts != 0) try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(dr.nacts + j * 4, dr.mxe.nact, 4, e.s.handle), "cuMemcpyDtoDAsync");
+            try dr.stageGather(e, dr.pm, dr.gm, R, .moe);
             pmark(e, if (j == 0) .gather_m0 else .gather_m);
             try Probe.check(probe, .moe_gather, j, dr.gm);
             pending = dr.gm;
@@ -862,6 +932,14 @@ pub const Drafter = struct {
         pmark(e, .conf);
     }
 
+    /// A stage's sublayer partials gathered into dst [2, R, D] in TP2 rank order: four ways, the backbone's quarters of
+    /// a decode exchange (the node's columns, wo_b's or down's, from every node); else the pair gather.
+    fn stageGather(dr: *const Drafter, e: *const Engine, src: u64, dst: u64, R: usize, part: enum { attn, moe }) !void {
+        if (dr.four) {
+            const tw = e.two.?;
+            return tw.quartersDecode(e, src, dst, R, if (part == .attn) tw.ow else tw.dw, 4);
+        }
+        return pairGather(e, src, dst, R, e.c.hidden);
     }
 
     /// pre_mix of _stages_fused: hc_pre2 of the streams h with the pending gathered partials posted in (into the spare
@@ -878,48 +956,45 @@ pub const Drafter = struct {
     }
 
     /// BatchDraftGraph._attention (fused): stage j's attention partial pa [R, D] fp32 from its mixed rows x.
-    fn attention(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, j: usize, R: usize) !void {
-        const c = e.c;
-        const t = e.t;
-        const lay = dr.ds.blocks[j];
-        const hd = c.head_dim;
-        const rd = c.rope_dim;
-        const hl = lay.wq_b.n / hd; // the block's heads (TP2's on a 2D node too)
-        const rope = e.plain; // a window-only stage (Model._cs: ratio 0)
-        const pos = dr.row(1);
-        // attn_in(comp=False): wq_a and wkv, one group
-        try prompt.grouped(e, ch, R, &.{ lay.wq_a, lay.wkv }, &.{ dr.x, dr.x }, &.{ c.hidden, c.hidden }, &.{ dr.qa, dr.ykv }, &.{ lay.wq_a.n, hd }, &.{ .bf16, .bf16 });
-        // q_proj with rope (rot_q): q's RMSNorm writes wq_b's rotated rows; wq_b's epilogue applies q's RoPE
-        const rot = [_]tri_norm.Rot{.{ .suh = lay.wq_b.suh, .h = dr.xhq }};
-        try tri_norm.rmsnormRot(t, dr.qa, lay.wq_a.n, lay.q_norm, c.eps, &rot, dr.qr, lay.wq_a.n, R, lay.wq_a.n);
-        var qc = [_]exl3_linear.Call{.{ .layer = lay.wq_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = dr.xhq, .y = dr.q, .ldy = @intCast(lay.wq_b.n), .y_dtype = .bf16, .counters = 0, .rope = .{ .cos = rope.cos, .sin = rope.sin, .pos = pos, .hd = @intCast(hd), .rd = @intCast(rd) } }};
-        try prompt.groupedRotated(e, ch, R, &qc);
-        // the block rows' keys: normed and roped, stored nowhere (ring row -1)
-        const plane_rows = pool.slots * pool.ring;
-        try tri_norm.kvNormRope(t, dr.ykv, lay.kv_norm, rope.cos, rope.sin, pos, pool.rings[j], plane_rows, dr.row(5), c.eps, true, rd, dr.kvb, R, hd);
-        // each row sees its stream's 128 newest absorbed positions (to q0 - 1) and every block row of its stream
-        try tri_attn.sparseAttn(t, .{
+    /// sparseAttn's arguments for stage j's R rows of hl heads (attention): each row sees its stream's 128 newest
+    /// absorbed positions (to q0 - 1) and every block row of its stream; four ways the key-split part's variant from the
+    /// kit's extra set (H = the node's heads, which the base set lacks).
+    fn sattnArgs(dr: *const Drafter, c: *const Config, sink: u64, pool: *const Pool, j: usize, R: usize, hl: usize) tri_attn.Attn {
+        return .{
             .q = dr.q,
             .out = dr.o,
             .rows = R,
             .h = hl,
-            .hd = hd,
-            .sink = lay.sink,
+            .hd = c.head_dim,
+            .sink = sink,
             .wsrc = pool.rings[j],
-            .wsrc_rows = plane_rows,
+            .wsrc_rows = pool.slots * pool.ring,
             .wlo = dr.wlo,
             .ring = true,
             .comp = .{ .bf16 = dr.kvb },
             .idx = dr.bidx,
             .n_idx = dr.n,
             .pos = dr.row(2),
-            .scale = prompt.scale(hd),
+            .scale = prompt.scale(c.head_dim),
             .window = c.window,
             .wbase = dr.row(3),
             .cbase = dr.row(4),
             .ring_rows = pool.ring,
             .parts = .{ .pm = dr.pm_, .pl = dr.pl_, .po = dr.po_ },
-        });
+            .extra = dr.four,
+        };
+    }
+
+    fn attention(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, j: usize, R: usize) !void {
+        const c = e.c;
+        const t = e.t;
+        const lay = dr.ds.blocks[j];
+        const hd = c.head_dim;
+        const rd = c.rope_dim;
+        const hl = lay.wq_b.n / hd; // the block's heads (TP2's on a 2D node, the node's own four ways)
+        const rope = e.plain; // a window-only stage (Model._cs: ratio 0)
+        const pos = dr.row(1);
+        // attn_in(comp=False): wq_a and wkv, one group
         try prompt.groupedDecode(e, ch, R, &.{ lay.wq_a, lay.wkv }, &.{ dr.x, dr.x }, &.{ c.hidden, c.hidden }, &.{ dr.qa, dr.ykv }, &.{ lay.wq_a.n, hd }, &.{ .bf16, .bf16 });
         pmark(e, .qkv_a);
         if (e.mx != null) {
@@ -943,6 +1018,7 @@ pub const Drafter = struct {
         const plane_rows = pool.slots * pool.ring;
         try tri_norm.kvNormRope(t, dr.ykv, lay.kv_norm, rope.cos, rope.sin, pos, pool.rings[j], plane_rows, dr.row(5), c.eps, true, rd, dr.kvb, R, hd);
         pmark(e, .kv_rope);
+        try tri_attn.sparseAttn(t, dr.sattnArgs(c, lay.sink, pool, j, R, hl));
         pmark(e, .sattn);
         dd(e, "kvb", j, dr.kvb, R * hd * 2);
         dd(e, "o_rope", j, dr.o, R * hl * hd * 2);
@@ -961,6 +1037,13 @@ pub const Drafter = struct {
             } else try mx.woA(k, e.s, ch.mxs, lay.wo_a[0..lay.groups], dr.o, hl * hd, R, dr.u, uw, dr.mxe.z);
             dd(e, "u", j, dr.u, R * uw * 2);
             pmark(e, .wo_a);
+            if (dr.four) {
+                // four ways: the rank's four groups from the column partner, then wo_b for this node's columns over all
+                // of them (round.zig attention)
+                const tw = e.two.?;
+                try tw.catRank(e, dr.u, tw.u_full, R, tw.uw, 2);
+                try prompt.groupedDecode(e, ch, R, &.{lay.wo_b}, &.{tw.u_full}, &.{tw.uw[0] + tw.uw[1]}, &.{dr.pa}, &.{lay.wo_b.n}, &.{.f32});
+            } else try prompt.groupedDecode(e, ch, R, &.{lay.wo_b}, &.{dr.u}, &.{uw}, &.{dr.pa}, &.{lay.wo_b.n}, &.{.f32});
             pmark(e, .wo_b);
             return;
         }
@@ -997,6 +1080,19 @@ pub const Drafter = struct {
             pmark(e, .gate);
             try mx.gateUp(k, e.s, e.d, lay.experts, dr.mxe, dr.x, c.hidden, dr.pick, dr.mw, R, c.swiglu_limit, dr.nxh, lay.experts.width, true);
             pmark(e, .experts_gu);
+            if (dr.four) {
+                // four ways: the packs exchanged and assembled, down over the node's output columns (round.zig moe)
+                const tw = e.two.?;
+                const ex = lay.experts;
+                const rows = R * dr.slots_moe;
+                if (tw.ir != 0 and k.decode_fuse) {
+                    try tw.assembleParityCodes(e, k, ex, dr.nxh, dr.pick, rows, dr.mxe);
+                    try mx.downDecCodes(k, e.s, ex, dr.mxe, dr.pick, R, dr.pm, tw.dw[tw.p], false);
+                } else {
+                    if (tw.ir != 0) try tw.assembleParity(e, ex, dr.nxh, dr.pick, rows) else try tw.catRank(e, dr.nxh, tw.xd_full, rows, tw.gu, 2);
+                    try mx.down(k, e.s, ex, dr.mxe, tw.xd_full, ex.down_k, dr.pick, R, dr.pm, tw.dw[tw.p], false, true);
+                }
+            } else try mx.down(k, e.s, lay.experts, dr.mxe, dr.nxh, lay.experts.width, dr.pick, R, dr.pm, c.hidden, false, true);
             pmark(e, .experts_d);
             return;
         }
@@ -1092,6 +1188,210 @@ test "draft depths and pass steps as multi.py takes them" {
     try std.testing.expectEqual(@as(usize, 5), passSteps(2, 4, 5, 16, 5));
     try std.testing.expectEqual(@as(usize, 3), passSteps(3, 4, 5, 16, 5));
     try std.testing.expectEqual(@as(usize, 3), passSteps(4, 4, 5, 16, 5));
+}
+
+/// A stage's attention launches (attention's Triton calls on Format.native, in its order: q's RoPE, the keys' norm and
+/// RoPE, the sparse attention's part and merge, o's inverse RoPE) for R rows of hl heads at the served arguments (the
+/// arena's 256-byte aligned buffers, the lane's 16-stream pool), `four` ways or TP2, into `log`.
+pub fn logStageAttn(log: *tri.Log, c: *const Config, hl: usize, R: usize, four: bool) !void {
+    const at = struct {
+        fn buf(i: u64) u64 {
+            return 0x7f00_0000_0000 + i * 0x0100_0000;
+        }
+    }.buf;
+    const pool: Pool = .{ .rings = .{ at(1), at(2), at(3), 0 }, .stages = 3, .slots = max_streams, .ring = c.window + ring_extra, .hd = c.head_dim };
+    var dr: Drafter = undefined;
+    dr.q = at(4);
+    dr.o = at(5);
+    dr.kvb = at(6);
+    dr.ykv = at(7);
+    dr.bidx = at(8);
+    dr.wlo = at(9);
+    dr.rows = at(10);
+    dr.pm_ = at(11);
+    dr.pl_ = at(12);
+    dr.po_ = at(13);
+    dr.n = c.dspark_block;
+    dr.four = four;
+    const cos = at(14);
+    const sin = at(15);
+    const pos = dr.row(1);
+    const t: tri.Tri = .{ .log = log };
+    try tri_norm.ropeHeads(t, dr.q, cos, sin, pos, c.rope_dim, false, R, hl, c.head_dim);
+    try tri_norm.kvNormRope(t, dr.ykv, at(16), cos, sin, pos, pool.rings[0], pool.slots * pool.ring, dr.row(5), c.eps, true, c.rope_dim, dr.kvb, R, c.head_dim);
+    try tri_attn.sparseAttn(t, dr.sattnArgs(c, at(17), &pool, 0, R, hl));
+    try tri_norm.ropeHeads(t, dr.o, cos, sin, pos, c.rope_dim, true, R, hl, c.head_dim);
+}
+
+/// TF_DS_DRAFT_4WAY's kit condition: null when `finds` (the kit's extra set: has(name, args, consts)) holds every launch
+/// a four-way stage of hl heads takes from it at the served arguments (a pass of at most decode_rows rows splits the
+/// keys, a larger one not), else why not.
+pub fn fourWayKitOff(gpa: std.mem.Allocator, finds: anytype, c: *const Config, hl: usize) !?[]const u8 {
+    for ([_]usize{ c.dspark_block, max_rows }) |R| {
+        var log: tri.Log = .{ .gpa = gpa };
+        defer log.deinit();
+        try logStageAttn(&log, c, hl, R, true);
+        for (log.items.items) |k| if (k.extra and !finds.has(k.name, k.args, k.consts)) return "the kit's extra set has no variant of the four-way stages' sparse attention";
+    }
+    return null;
+}
+
+test "a four-way stage's Triton launches resolve in the kit" {
+    // fixtures/kit-drafter.json and kit-drafter-extra.json (tools/dsv41-zig/kit/kit_fixture.py): the kit's base and
+    // extra entries of the stage's attention functions. Each launch of a stage at the served arguments (logStageAttn),
+    // resolved as the engine resolves it (aot.zig: exact, then general): four ways the part in the extra set alone and
+    // every other launch in the base set; TP2's launches (H=32) all in the base set.
+    const gpa = std.testing.allocator;
+    var base = try cuda.aot.Manifest.parse(gpa, @embedFile("fixtures/kit-drafter.json"));
+    defer base.deinit();
+    var extra = try cuda.aot.Manifest.parse(gpa, @embedFile("fixtures/kit-drafter-extra.json"));
+    defer extra.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var why: @import("config.zig").Why = .{};
+    const c = try @import("config.zig").parse(arena.allocator(), @import("config.zig").test_config, &why);
+    const keep = tri.decode_rows;
+    defer tri.decode_rows = keep;
+    tri.decode_rows = 16; // (a pass's: no round's bound in force)
+    var kept: [2]usize = .{ 0, 0 }; // four ways: launches from the extra set, from the base set
+    for ([_]bool{ true, false }) |four| {
+        const s: plan.Split = if (four) .{ .rank = 1, .world = 2, .pair = 1, .parity = true } else .{ .rank = 1, .world = 2 };
+        const hl = s.headSpan(c)[1];
+        try std.testing.expectEqual(@as(usize, if (four) 16 else 32), hl);
+        for ([_]usize{ 5, 10, 15, 20, 40, 80 }) |R| {
+            var log: tri.Log = .{ .gpa = gpa };
+            defer log.deinit();
+            try logStageAttn(&log, &c, hl, R, four);
+            try std.testing.expectEqual(@as(usize, if (R <= 16) 5 else 4), log.items.items.len);
+            for (log.items.items) |k| {
+                const part = std.mem.eql(u8, k.name, "_sparse_attn_part");
+                try std.testing.expectEqual(four and part, k.extra);
+                if (k.extra) {
+                    if (extra.find(k.name, k.args, k.consts) == null) {
+                        std.debug.print("four ways, {d} rows: no variant of {s} in the kit's extra set\n", .{ R, k.name });
+                        return error.TestUnexpectedResult;
+                    }
+                    // (the base set has none: the reason the part searches the extra set)
+                    try std.testing.expectEqual(@as(?usize, null), base.find(k.name, k.args, k.consts));
+                    kept[0] += 1;
+                } else {
+                    if (base.find(k.name, k.args, k.consts) == null) {
+                        std.debug.print("{s}, {d} rows: no variant of {s} in the kit's base set\n", .{ if (four) "four ways" else "TP2", R, k.name });
+                        return error.TestUnexpectedResult;
+                    }
+                    if (four) kept[1] += 1;
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual([2]usize{ 6, 21 }, kept);
+    // the start's check: on with this kit's extra set, off without its variants
+    const Finds = struct {
+        m: *const cuda.aot.Manifest,
+        pub fn has(f: @This(), name: []const u8, args: []const cuda.aot.Arg, consts: []const cuda.aot.Const) bool {
+            return f.m.find(name, args, consts) != null;
+        }
+    };
+    try std.testing.expectEqual(@as(?[]const u8, null), try fourWayKitOff(gpa, Finds{ .m = &extra }, &c, 16));
+    try std.testing.expect(try fourWayKitOff(gpa, Finds{ .m = &base }, &c, 16) != null);
+}
+
+test "four ways a stage takes the backbone's exchanges and its blocks' parts; a TP2 stage the baseline's" {
+    const src = @embedFile("draft.zig");
+    const S = struct {
+        fn body(text: []const u8, head: []const u8) []const u8 {
+            const at = std.mem.indexOf(u8, text, head).?;
+            return text[at .. at + std.mem.indexOf(u8, text[at..], "\n    }\n").?];
+        }
+        fn once(text: []const u8, line: []const u8) !void {
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, line));
+        }
+    };
+    // four ways when the blocks hold the node's heads, their widths the backbone's 2D parts
+    const init = S.body(src, "    pub fn init(e: *const Engine, a: *prompt.Arena, sp: plan.Split) !Drafter {");
+    try S.once(init, "dr.four = if (e.two) |tw| hl == tw.heads else false;");
+    try S.once(init, "x.down_n != tw.dw[tw.p] or ir != tw.ir) return error.WeightsNotThisSplit;");
+    try S.once(init, "const pack = ex.width + if (ex.rest) |r| r.width else 0;");
+    // attention (round.zig's): the rank's four groups from the column partner, then wo_b for the node's columns
+    const att = S.body(src, "    fn attention(");
+    try S.once(att, "try tw.catRank(e, dr.u, tw.u_full, R, tw.uw, 2);");
+    try S.once(att, "try prompt.groupedDecode(e, ch, R, &.{lay.wo_b}, &.{tw.u_full}, &.{tw.uw[0] + tw.uw[1]}, &.{dr.pa}, &.{lay.wo_b.n}, &.{.f32});");
+    try S.once(att, "} else try prompt.groupedDecode(e, ch, R, &.{lay.wo_b}, &.{dr.u}, &.{uw}, &.{dr.pa}, &.{lay.wo_b.n}, &.{.f32});");
+    try S.once(att, "try tri_attn.sparseAttn(t, dr.sattnArgs(c, lay.sink, pool, j, R, hl));");
+    try S.once(S.body(src, "    fn sattnArgs("), ".extra = dr.four,");
+    // the MoE (round.zig's): the packs exchanged and assembled (TF_DS_DECODE_FUSE: with down's codes), down over the
+    // node's output columns
+    const moe = S.body(src, "    fn moe(");
+    try S.once(moe, "if (tw.ir != 0 and k.decode_fuse) {");
+    try S.once(moe, "try tw.assembleParityCodes(e, k, ex, dr.nxh, dr.pick, rows, dr.mxe);");
+    try S.once(moe, "try mx.downDecCodes(k, e.s, ex, dr.mxe, dr.pick, R, dr.pm, tw.dw[tw.p], false);");
+    try S.once(moe, "if (tw.ir != 0) try tw.assembleParity(e, ex, dr.nxh, dr.pick, rows) else try tw.catRank(e, dr.nxh, tw.xd_full, rows, tw.gu, 2);");
+    try S.once(moe, "try mx.down(k, e.s, ex, dr.mxe, tw.xd_full, ex.down_k, dr.pick, R, dr.pm, tw.dw[tw.p], false, true);");
+    try S.once(moe, "} else try mx.down(k, e.s, lay.experts, dr.mxe, dr.nxh, lay.experts.width, dr.pick, R, dr.pm, c.hidden, false, true);");
+    // the gathers: four ways the backbone's quarters (the node's columns from every node), else the pair gather
+    const sg = S.body(src, "    fn stageGather(");
+    try S.once(sg, "return tw.quartersDecode(e, src, dst, R, if (part == .attn) tw.ow else tw.dw, 4);");
+    try S.once(sg, "return pairGather(e, src, dst, R, e.c.hidden);");
+    const pass = S.body(src, "    fn body(dr: *Drafter");
+    try S.once(pass, "try dr.stageGather(e, dr.pa, dr.ga, R, .attn);");
+    try S.once(pass, "try dr.stageGather(e, dr.pm, dr.gm, R, .moe);");
+}
+
+test "with main_proj four ways an absorb's rows are each node's quarter, gathered as quarters, each plane into its half" {
+    const src = @embedFile("draft.zig");
+    const S = struct {
+        fn body(text: []const u8, head: []const u8) []const u8 {
+            const at = std.mem.indexOf(u8, text, head).?;
+            return text[at .. at + std.mem.indexOf(u8, text[at..], "\n    }\n").?];
+        }
+        fn once(text: []const u8, line: []const u8) !void {
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, line));
+        }
+    };
+    const init = S.body(src, "    pub fn init(e: *const Engine, a: *prompt.Arena, sp: plan.Split) !Drafter {");
+    try S.once(init, "dr.main4 = ds.main_proj.n * 4 == c.hidden and e.two != null;");
+    try S.once(init, "if (ds.main_proj.n != c.hidden and !dr.main4) return error.WeightsNotThisSplit;");
+    try S.once(init, "dr.aq = try a.take(ring * (d / 4) * 2);");
+    try S.once(init, "dr.ag = try a.take(ring * d * 2);");
+    const mk = S.body(src, "    fn mainKeys(");
+    try S.once(mk, "try prompt.groupedDecode(e, ch, n, &.{dr.ds.main_proj}, &.{taps}, &.{dr.taps_w}, &.{dr.aq}, &.{q}, &.{.bf16});");
+    try S.once(mk, "try tw.quartersDecode(e, dr.aq, dr.ag, n, .{ q, q }, 2);");
+    try S.once(mk, "for (0..2) |r| try e.ops.copyRows(e.s, dr.ag + r * n * 2 * q * 2, 2 * q * 2, dr.ay + r * 2 * q * 2, d * 2, 2 * q * 2, n);");
+    try S.once(mk, "} else try prompt.groupedDecode(e, ch, n, &.{dr.ds.main_proj}, &.{taps}, &.{dr.taps_w}, &.{dr.ay}, &.{d}, &.{.bf16});");
+    try S.once(mk, "ddMain(e, dr.ay, n * d * 2);");
+    // a host model: each node's quarter (weights.mainProjCols) landed where quarters' ring lands it (ring2d.quartersDsts:
+    // plane r = TP2 rank, its pair's columns), each plane's rows copied as mainKeys copies them: the whole rows again
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var why: @import("config.zig").Why = .{};
+    var c = try @import("config.zig").parse(arena.allocator(), @import("config.zig").test_config, &why);
+    c.format = .native;
+    c.hidden = 64; // (a small hidden: 16 columns a quarter)
+    const d = c.hidden;
+    const q = d / 4;
+    const n: usize = 3;
+    const keep = weights.draft_main_4way;
+    defer weights.draft_main_4way = keep;
+    weights.draft_main_4way = true;
+    var whole: [n * 64]u16 = undefined;
+    for (&whole, 0..) |*x, i| x.* = @intCast(i + 1);
+    var gathered: [2 * n * 32]u16 = @splat(0);
+    const base: u64 = 0;
+    for (0..4) |node| {
+        const s: plan.Split = .{ .rank = @intCast(node % 2), .world = 2, .pair = @intCast(node / 2), .parity = true };
+        const cols = weights.mainProjCols(c, s).?;
+        const dsts = try ring2d.quartersDsts(base, n, 0, .{ q, q }, 2);
+        const dst = dsts[node];
+        for (0..n) |i| for (0..q) |k| {
+            const at = (dst.ptr - base) / 2 + i * (dst.stride4 * 16 / 2) + k;
+            gathered[at] = whole[i * d + cols[0] + k];
+        };
+    }
+    var ay: [n * 64]u16 = @splat(0);
+    for (0..2) |r| for (0..n) |i| for (0..2 * q) |k| {
+        ay[i * d + r * 2 * q + k] = gathered[r * n * 2 * q + i * 2 * q + k];
+    };
+    try std.testing.expectEqualSlices(u16, &whole, &ay);
 }
 
 /// error.NotPortedYet with its site on stderr (a request that reaches a path the port lacks names it in the log).

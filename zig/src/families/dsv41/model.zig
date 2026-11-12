@@ -62,6 +62,8 @@ const tri_index = @import("tri_index.zig");
 const tri_attn = @import("tri_attn.zig");
 const tri_norm = @import("tri_norm.zig");
 const tri_hc = @import("tri_hc.zig");
+const plan = @import("plan.zig");
+
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK), the resume grid: a prompt's passes start at its multiples, and every
 /// kept state, mark and frame of the grid stands on one. A pass runs one unit, or with TF_DS_PASS_ROWS up to
 /// pass_rows_max rows of whole units (lanes.passLen), where the facts allow (lanes.stream.passRows); with
@@ -321,71 +323,102 @@ fn readPassFrom() u32 {
     };
 }
 
-    fn synchronize(m: *Model) !void {
-        try m.stream.synchronize();
-        if (m.neighbor_gather) |*ng| try ng.check();
-    }
+/// A loaded kit set's variants (Set.lookup: the same match, no word in the log for a missing one).
+const SetLookups = struct {
+    set: *const cuda.aot.Set,
 
-    /// TP2's RDMA ring for the decode gathers: created on both ranks, the queue-pair infos exchanged over NCCL,
-    /// connected, and started once both are (an all-gather as the barrier).
-    pub fn openRing(gpa: std.mem.Allocator, d: *const cuda.Driver, k: rdma.Kernels, devices: []const []const u8, rank: u32, comm: *const comm_mod.Comm, stream: cuda.Stream) !*rdma.Ring {
-        if (comm.world != 2) return error.NotTwoRanks;
-        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = rdma.rdmaGid() });
-        errdefer r.destroy(gpa);
-        const per = @sizeOf(rdma.Info);
-        const mine = [2]rdma.Info{ r.info(0), r.info(1) };
-        var dev = try cuda.DeviceBuffer.alloc(d, 3 * 2 * per);
-        defer dev.free();
-        try dev.upload(0, std.mem.sliceAsBytes(&mine));
-        try comm.allGather(dev.ptr, dev.ptr + 2 * per, 2 * per, .u8, stream);
-        try stream.synchronize();
-        var all: [2][2]rdma.Info = undefined;
-        try dev.download(2 * per, std.mem.sliceAsBytes(&all));
-        try r.connect(&.{ all[0][rank], all[1][rank] });
-        // every queue pair ready on both ranks before either sends
-        try comm.allGather(dev.ptr, dev.ptr + 2 * per, 1, .u8, stream);
-        try stream.synchronize();
-        try r.start();
-        return r;
+    pub fn has(f: SetLookups, name: []const u8, args: []const cuda.aot.Arg, consts: []const cuda.aot.Const) bool {
+        return f.set.lookup(name, args, consts) != null;
     }
+};
 
-    fn readKit(a: std.mem.Allocator, io: std.Io, kit: []const u8, name: []const u8) ![]const u8 {
-        return std.Io.Dir.cwd().readFileAllocOptions(io, try std.fs.path.join(a, &.{ kit, "cubins", name }), a, .limited(1 << 28), .@"16", null);
+/// A kit set's aot.json read without its cubins (aot.Manifest: the entries Set.find would take), before any load.
+const ManifestFinds = struct {
+    m: *const cuda.aot.Manifest,
+
+    pub fn has(f: ManifestFinds, name: []const u8, args: []const cuda.aot.Arg, consts: []const cuda.aot.Const) bool {
+        return f.m.find(name, args, consts) != null;
     }
+};
 
-    /// The link to the other rank (rank 0's to rank 1, rank 1's to rank 0).
-    pub fn peer(m: *const Model) link.Link {
-        return m.fan.links[0].?;
+/// TF_DS_DRAFT_4WAY's start check on this rank, before the weights load (the stages' parts are loaded or not, so a
+/// check after it would cost a load): null when it can run (a drafter, the checkpoint's own weights, a 2D node, the
+/// decode kernels, the kit's extra set at KIT_DIR/aot-extra holding the four-way stages' attention variants: its
+/// aot.json read, no cubin loaded), else why not.
+fn draftFourWayOff(gpa: std.mem.Allocator, io: std.Io, c: *const Config, sp: plan.Split, kit_dir: []const u8, drafts: bool, dec_on: bool) !?[]const u8 {
+    if (!drafts) return "this start loads no drafter";
+    if (c.format != .native) return "needs the checkpoint's own FP8 / MXFP4 weights";
+    if (sp.pair == null) return "the four-way stages are the four-node 2D split's";
+    if (!dec_on) return "needs the decode tensor-core kernels (TF_DS_DECODE_DEC=0 turns them off)";
+    const dir = try std.fs.path.join(gpa, &.{ kit_dir, "aot-extra" });
+    defer gpa.free(dir);
+    var man = cuda.aot.Manifest.read(gpa, io, dir) catch return "the kit has no extra set (aot-extra/aot.json)";
+    defer man.deinit();
+    return try draft.fourWayKitOff(gpa, ManifestFinds{ .m = &man }, c, sp.headSpan(c.*)[1]);
+}
+
+/// TF_DS_DRAFT_4WAY after the load (each rank decided before its own, which cannot be undone): every rank's drafter
+/// split the same way and, four ways, every rank's loaded extra set holding the stages' variants (`why`: this rank's
+/// reason it cannot launch them, null when it can); else the start is refused on every rank, named. One line says which.
+fn agreeDraftFourWay(d: *const cuda.Driver, comm: *const comm_mod.Comm, stream: cuda.Stream, asked: bool, four: bool, why: ?[]const u8) !void {
+    if (!asked) return;
+    const tp2 = try prompt2d.ranksThatCannot(d, comm, stream, four);
+    const cannot = try prompt2d.ranksThatCannot(d, comm, stream, why == null);
+    var buf: [64]u8 = undefined;
+    switch (fourWayVerdict(comm.world, tp2, cannot)) {
+        .off => std.log.info("TF_DS_DRAFT_4WAY=1: off on every rank: the TP2 drafter", .{}),
+        .on => std.log.info("TF_DS_DRAFT_4WAY=1: the drafter's stages four ways on every rank (their sublayer gathers the backbone's quarters; no row pair ring)", .{}),
+        .differ => {
+            std.log.err("TF_DS_DRAFT_4WAY=1: {s} loaded the TP2 drafter and the others four ways: the start is refused (the ranks' kits differ: give every Spark the same kit, or set TF_DS_DRAFT_4WAY=0)", .{prompt2d.rankList(tp2, &buf)});
+            return error.DraftersDiffer;
+        },
+        .cannot => {
+            std.log.err("TF_DS_DRAFT_4WAY=1: {s} cannot launch the four-way stages' attention (this rank: {s}): the start is refused (give every Spark the same kit, or set TF_DS_DRAFT_4WAY=0)", .{ prompt2d.rankList(cannot, &buf), why orelse "can" });
+            return error.DraftersDiffer;
+        },
     }
+}
 
-    /// Rank 0's links to its followers: rank 1's, or ranks 1-3's on the four-node split.
-    pub fn followers(m: *const Model) []const ?link.Link {
-        return m.fan.links[0 .. m.world - 1];
+/// TF_DS_DRAFT_MAIN_4WAY's start check on this rank, before the weights load: null when it can run (a drafter, the
+/// checkpoint's own weights, a 2D node, the decode kernels: the quarter's GEMV is the whole one's launch on fewer
+/// columns, each column the same sum), else why not.
+fn draftMainFourWayOff(c: *const Config, sp: plan.Split, drafts: bool, dec_on: bool) ?[]const u8 {
+    if (!drafts) return "this start loads no drafter";
+    if (c.format != .native) return "needs the checkpoint's own FP8 / MXFP4 weights";
+    if (sp.pair == null) return "main_proj's quarters are the four-node 2D split's";
+    if (!dec_on) return "needs the decode tensor-core kernels (TF_DS_DECODE_DEC=0 turns them off)";
+    if (c.hidden % 128 != 0) return "a quarter of the hidden columns is not whole 32-row scale blocks";
+    return null;
+}
+
+/// TF_DS_DRAFT_MAIN_4WAY after the load (each rank decided before its own): every rank's main_proj loaded the same
+/// way (quarters on all, or whole on all); else the start is refused on every rank, named. One line says which.
+fn agreeDraftMainFourWay(d: *const cuda.Driver, comm: *const comm_mod.Comm, stream: cuda.Stream, asked: bool, four: bool) !void {
+    if (!asked) return;
+    const whole = try prompt2d.ranksThatCannot(d, comm, stream, four);
+    var buf: [64]u8 = undefined;
+    switch (fourWayVerdict(comm.world, whole, 0)) {
+        .off => std.log.info("TF_DS_DRAFT_MAIN_4WAY=1: off on every rank: main_proj whole on every node", .{}),
+        .on => std.log.info("TF_DS_DRAFT_MAIN_4WAY=1: the drafter's main_proj four ways on every rank (a node's quarter of the columns, the absorb's rows gathered by the backbone's quarters)", .{}),
+        .differ, .cannot => {
+            std.log.err("TF_DS_DRAFT_MAIN_4WAY=1: {s} loaded main_proj whole and the others four ways: the start is refused (the ranks differ: set TF_DS_DRAFT_MAIN_4WAY=0 on every Spark, or fix the one)", .{prompt2d.rankList(whole, &buf)});
+            return error.DraftersDiffer;
+        },
     }
+}
 
-    /// From here on a peer rank that stops stops this one too, with a line that names it (link.Watch): rank 0 watches
-    /// its followers, a follower rank 0. The server's rank 0 and the lane followers watch; rank 0's done (Lanes.deinit),
-    /// a follower reading it (follow) and close end the watch.
-    pub fn watchPeers(m: *Model) !void {
-        if (m.world < 2 or m.watch.thread != null) return;
-        m.watch = .{ .rank = m.rank };
-        if (m.rank == 0) {
-            for (m.followers(), 1..) |l, r| if (l) |x| try m.watch.add(x, @intCast(r));
-        } else try m.watch.add(m.peer(), 0);
-        try m.watch.start();
-    }
+/// TF_DS_DRAFT_4WAY's verdict from the ranks' masks (a bit a rank of `world`): `tp2` the ranks that loaded the TP2
+/// drafter, `cannot` the ranks that cannot launch the four-way stages. Off when every rank loaded TP2's, on when
+/// every rank loaded four ways and can launch them; a mix of the two drafters, or a four-way rank that cannot, refuses.
+const FourWay = enum { off, on, differ, cannot };
+fn fourWayVerdict(world: u32, tp2: u32, cannot: u32) FourWay {
+    const all = (@as(u32, 1) << @intCast(world)) - 1;
+    if (tp2 == all) return .off;
+    if (tp2 != 0) return .differ;
+    if (cannot != 0) return .cannot;
+    return .on;
+}
 
-    /// Ends watchPeers' watch: this process ends its links itself now.
-    pub fn unwatch(m: *Model) void {
-        m.watch.stop();
-    }
-
-    /// Whether this rank's GPU context has failed for good: after a fault in a kernel (an illegal address, a trap)
-    /// every later call returns that fault, the stream's query too (which logs it); a context that survived a failed
-    /// call answers done or busy.
-    pub fn contextFailed(m: *Model) bool {
-        _ = m.stream.done() catch return true;
-        return false;
 /// TF_DS_PF_SPLIT's setting (mx.PfSplit.parse); text that is no setting runs off, said once.
 /// TF_DS_PF_RASTER's setting (prompt2d.rasterSetting): the group of row tiles, 0 unset. Text that is no setting refuses the
 /// start, and says so.
@@ -1383,6 +1416,13 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     rdma_mod: ?cuda.Module = null, // the RDMA kernels (TP2's ring or world 4's rings)
     ring: ?*rdma.Ring = null,
     set: cuda.aot.Set,
+    extra: ?cuda.aot.Set = null, // the kit's extra set (TF_DS_DRAFT_4WAY's stages)
+    pf: exl3_prefill.Kernels,
+    lg: exl3_linear.Kernels,
+    exk: exl3_experts.Kernels,
+    ops: ops_mod.Ops,
+    ex: exact.Exact,
+    par: ?exl3_experts2d.ParKernels, // the parity split's one-launch gate / up (parOne)
     mxk: ?mx.Kernels = null, // Format.native: DeepSeek's own FP8 / MXFP4 checkpoint's kernels (mx.zig)
     rope_buf: cuda.DeviceBuffer,
     arena: prompt.Arena,
@@ -1499,6 +1539,8 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         prompt2d.split64n_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_SPLIT64N")) |v| std.mem.span(v) else null); // this rank's launches alone: its bytes are the 128-column tile's
         prompt2d.pf_t64_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_PF_T64")) |v| std.mem.span(v) else null); // this rank's launches alone: its bytes are the 128 x 128 tile's
         prompt2d.gemm_r2_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_GEMM_R2")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.draft_4way_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_DRAFT_4WAY")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.draft_main_4way_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_DRAFT_MAIN_4WAY")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.attn_u_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ATTN_U")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.hc_fused_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_HC_FUSED")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.attn_epi_fused_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ATTN_EPI_FUSED")) |v| std.mem.span(v) else null); // every rank alike (Settings)
@@ -1714,6 +1756,17 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         if (prompt2d.woa_w8_asked) {
             if (mx.woaW8Off(c.format == .native, mx.pfOffEnv(), mx.decOnEnv())) |why| std.log.info("TF_DS_WOA_W8=1: off: {s}", .{why}) else weights.woa_w8 = true;
         }
+        // TF_DS_DRAFT_4WAY: decided here, before the weights load, by each rank (asked and its conditions); the ranks'
+        // drafters compared after the load (agreeDraftFourWay)
+        weights.draft_4way = false;
+        if (prompt2d.draft_4way_asked) {
+            if (try draftFourWayOff(a, io, c, sp, o.kit_dir, o.drafts, mx.decOnEnv())) |why| std.log.info("TF_DS_DRAFT_4WAY=1: off on rank {d}: {s}", .{ o.rank, why }) else weights.draft_4way = true;
+        }
+        // TF_DS_DRAFT_MAIN_4WAY: likewise decided before the load by each rank; the ranks compared after it
+        weights.draft_main_4way = false;
+        if (prompt2d.draft_main_4way_asked) {
+            if (draftMainFourWayOff(c, sp, o.drafts, mx.decOnEnv())) |why| std.log.info("TF_DS_DRAFT_MAIN_4WAY=1: off on rank {d}: {s}", .{ o.rank, why }) else weights.draft_main_4way = true;
+        }
         // the ranks' links (rank 0 takes its followers in order; a follower retries its connect for TF_DS_CONNECT_S)
 
         try m.fan.join(io, o.master, o.port, o.rank, o.world, prompt2d.connectSeconds());
@@ -1724,12 +1777,21 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         // the kit's extra set (aot-extra/), which only the call sites of TF_DS_DRAFT_4WAY's stages, TF_DS_ATTN_U's prompt
         // attention, TF_DS_IDX_U's and TF_DS_IDX_V's prompt index scores and TF_DS_ATTN_U_DECODE's round attention search;
         // then every rank's drafter compared
+        m.extra = null;
+        var extra_why: ?[]const u8 = null;
         const qkv_plain_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_QKV_PLAIN")) |v| std.mem.span(v) else null);
         if (weights.draft_4way or prompt2d.attn_u_asked or prompt2d.idx_u_asked or prompt2d.idx_v_asked or prompt2d.attn_u_decode_asked or prompt2d.hc_fused_asked or merge_d_asked != 0 or prompt2d.rope_w_asked or qkv_plain_asked or prompt2d.attn_epi_fused_asked or prompt2d.hc_2s_asked or idxTpp(prompt2d.idx_tpp_text) != 0) {
+            if (cuda.aot.Set.load(gpa, io, d, ctx.device, try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }))) |x| {
+                m.extra = x;
+            } else |e| extra_why = @errorName(e);
+        }
+        errdefer if (m.extra) |*x| x.deinit();
         const load_why = extra_why;
         if (weights.draft_4way) if (m.extra) |*x| {
             extra_why = try draft.fourWayKitOff(gpa, SetLookups{ .set = x }, c, sp.headSpan(c.*)[1]);
         };
+        try agreeDraftFourWay(d, &m.comm, m.stream, prompt2d.draft_4way_asked, weights.draft_4way, extra_why);
+        try agreeDraftMainFourWay(d, &m.comm, m.stream, prompt2d.draft_main_4way_asked, weights.draft_main_4way);
         try useAttnTwin(a, io, prompt2d.attn_twin_text, prompt2d.attn_u_asked or prompt2d.attn_u_decode_asked, m.extra != null, load_why, try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }));
         useQkvPlain(qkv_plain_asked, m.extra != null, load_why, if (qkv_plain_asked and m.extra != null) extraVariants(a, io, try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }), "_q_kv_norm") else 0);
         try useRopeW(prompt2d.rope_w_asked, m.extra != null, load_why, if (prompt2d.rope_w_asked and m.extra != null) extraVariants(a, io, try std.fs.path.join(a, &.{ o.kit_dir, "aot-extra" }), "_rope_heads_w") else 0);
@@ -1938,6 +2000,9 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         }
         logPdlControls(m.comm.rank);
         std.log.info("transport: Rocinante carries every exchange between the Sparks; no NCCL is loaded or made (rank {d})", .{o.rank});
+        m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .extra = if (m.extra) |*x| x else null, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
+        m.eng.round_rows = o.round_rows;
+        if (m.par) |*x| m.eng.par = x;
         if (m.mxk) |*x| m.eng.mx = x;
         try agreeQgateCanary(d, &m.comm, m.stream, prompt2d.qgate_canary_asked);
         if (prompt.qgate_body != .off) try m.mxk.?.useQgateBody();
@@ -2056,6 +2121,12 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         m.lg.unload();
         m.pf.unload();
         m.set.deinit();
+        if (m.extra) |*x| x.deinit();
+        if (m.ring) |r| {
+            r.stop();
+            r.destroy(m.gpa);
+        }
+        if (m.rdma_mod) |*x| x.unload();
         if (m.two) |*t| if (t.rc) |rc| rc.close();
         m.comm.deinit();
         m.watch.stop(); // (still watching up to here: a wait above on a rank that went ends this process)
@@ -2994,6 +3065,16 @@ test "the start-up settings carry TF_DS_PF_SPLIT and the kernel switches as Mode
     prompt2d.pf_run128_asked = true;
     try std.testing.expectEqual(prompt2d.kern_pf_run128, startSettings(o).kern);
     prompt2d.pf_run128_asked = false;
+    const was_d4 = prompt2d.draft_4way_asked;
+    defer prompt2d.draft_4way_asked = was_d4;
+    prompt2d.draft_4way_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_draft_4way, startSettings(o).kern);
+    prompt2d.draft_4way_asked = false;
+    const was_dm = prompt2d.draft_main_4way_asked;
+    defer prompt2d.draft_main_4way_asked = was_dm;
+    prompt2d.draft_main_4way_asked = true;
+    try std.testing.expectEqual(prompt2d.kern_draft_main_4way, startSettings(o).kern);
+    prompt2d.draft_main_4way_asked = false;
     const was_au = prompt2d.attn_u_asked;
     defer prompt2d.attn_u_asked = was_au;
     prompt2d.attn_u_asked = true;
@@ -3047,8 +3128,110 @@ test "the start-up settings carry TF_DS_PF_SPLIT and the kernel switches as Mode
     }
 }
 
+test "the four-way drafter is off by its can bit without a drafter, the checkpoint's own weights, a pair, the decode kernels or the kit's variants, decided before the weights load" {
+    const io = std.testing.io;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var why: @import("config.zig").Why = .{};
+    var c = try @import("config.zig").parse(a, @import("config.zig").test_config, &why);
+    c.format = .native;
+    // three kits: the extra set of the stages' variants (draft.zig's fixture, from the kit), an empty one, none
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "with/aot-extra", "empty/aot-extra", "none/aot" }) |sub| try tmp.dir.createDirPath(io, sub);
+    try tmp.dir.writeFile(io, .{ .sub_path = "with/aot-extra/aot.json", .data = @embedFile("fixtures/kit-drafter-extra.json") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "empty/aot-extra/aot.json", .data = "{\"kernels\": []}" });
+    const root = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const with = try std.fs.path.join(a, &.{ root, "with" });
+    const sp: plan.Split = .{ .rank = 1, .world = 2, .pair = 0, .parity = true };
+    try std.testing.expectEqual(@as(?[]const u8, null), try draftFourWayOff(a, io, &c, sp, with, true, true));
+    const Why = struct {
+        fn says(text: ?[]const u8, part: []const u8) !void {
+            try std.testing.expect(std.mem.indexOf(u8, text orelse return error.TestExpectedOff, part) != null);
         }
-        return true;
+    };
+    try Why.says(try draftFourWayOff(a, io, &c, sp, with, false, true), "no drafter");
+    try Why.says(try draftFourWayOff(a, io, &c, sp, with, true, false), "TF_DS_DECODE_DEC");
+    try Why.says(try draftFourWayOff(a, io, &c, .{ .rank = 1, .world = 2 }, with, true, true), "2D split");
+    try Why.says(try draftFourWayOff(a, io, &c, sp, try std.fs.path.join(a, &.{ root, "empty" }), true, true), "no variant");
+    try Why.says(try draftFourWayOff(a, io, &c, sp, try std.fs.path.join(a, &.{ root, "none" }), true, true), "no extra set");
+    var ce = c;
+    ce.format = .exl3;
+    try Why.says(try draftFourWayOff(a, io, &ce, sp, with, true, true), "own FP8");
+    // Model.open decides before the weights load (which loads the stages as decided), each rank on its own
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    const reset = std.mem.indexOf(u8, body, "weights.draft_4way = false;").?;
+    const decide = std.mem.indexOf(u8, body, "if (try draftFourWayOff(a, io, c, sp, o.kit_dir, o.drafts, mx.decOnEnv())) |why|").?;
+    const load = std.mem.indexOf(u8, body, "m.w = try weights.load(").?;
+    try std.testing.expect(reset < decide and decide < load);
+}
+
+test "the drafter's main_proj four ways: off by its can bit without a drafter, the checkpoint's own weights, a pair or the decode kernels, decided before the load, agreed after it" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var why: @import("config.zig").Why = .{};
+    var c = try @import("config.zig").parse(a, @import("config.zig").test_config, &why);
+    c.format = .native;
+    const sp: plan.Split = .{ .rank = 1, .world = 2, .pair = 0, .parity = true };
+    try std.testing.expectEqual(@as(?[]const u8, null), draftMainFourWayOff(&c, sp, true, true));
+    const Why = struct {
+        fn says(text: ?[]const u8, part: []const u8) !void {
+            try std.testing.expect(std.mem.indexOf(u8, text orelse return error.TestExpectedOff, part) != null);
+        }
+    };
+    try Why.says(draftMainFourWayOff(&c, sp, false, true), "no drafter");
+    try Why.says(draftMainFourWayOff(&c, sp, true, false), "TF_DS_DECODE_DEC");
+    try Why.says(draftMainFourWayOff(&c, .{ .rank = 1, .world = 2 }, true, true), "2D split");
+    var ce = c;
+    ce.format = .exl3;
+    try Why.says(draftMainFourWayOff(&ce, sp, true, true), "own FP8");
+    var ch = c;
+    ch.hidden = c.hidden + 64;
+    try Why.says(draftMainFourWayOff(&ch, sp, true, true), "32-row scale blocks");
+    // decided before the weights load, each rank on its own, and the ranks compared after it, beside the stages'
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    const reset = std.mem.indexOf(u8, body, "weights.draft_main_4way = false;").?;
+    const decide = std.mem.indexOf(u8, body, "if (draftMainFourWayOff(c, sp, o.drafts, mx.decOnEnv())) |why|").?;
+    const load = std.mem.indexOf(u8, body, "m.w = try weights.load(").?;
+    const stages = std.mem.indexOf(u8, body, "try agreeDraftFourWay(d, &m.comm, m.stream, prompt2d.draft_4way_asked, weights.draft_4way, extra_why);").?;
+    const agree = std.mem.indexOf(u8, body, "try agreeDraftMainFourWay(d, &m.comm, m.stream, prompt2d.draft_main_4way_asked, weights.draft_main_4way);").?;
+    const rings = std.mem.indexOf(u8, body, "ring2d.Rings.open(").?;
+    try std.testing.expect(reset < decide and decide < load and load < stages and stages < agree and agree < rings);
+    // the verdict: every rank whole: off; every rank four ways: on; a mix: refused
+    try std.testing.expectEqual(FourWay.off, fourWayVerdict(4, 0b1111, 0));
+    try std.testing.expectEqual(FourWay.on, fourWayVerdict(4, 0, 0));
+    try std.testing.expectEqual(FourWay.differ, fourWayVerdict(4, 0b0010, 0));
+}
+
+test "the ranks' drafters agree after the load, else the start is refused; the row pair's ring only for TP2's" {
+    // every rank TP2's: off; every rank four ways and able to launch them: on; a mix, or a rank that cannot: refused
+    try std.testing.expectEqual(FourWay.off, fourWayVerdict(4, 0b1111, 0));
+    try std.testing.expectEqual(FourWay.off, fourWayVerdict(4, 0b1111, 0b0100));
+    try std.testing.expectEqual(FourWay.on, fourWayVerdict(4, 0, 0));
+    try std.testing.expectEqual(FourWay.differ, fourWayVerdict(4, 0b0100, 0));
+    try std.testing.expectEqual(FourWay.differ, fourWayVerdict(4, 0b0111, 0b1000));
+    try std.testing.expectEqual(FourWay.cannot, fourWayVerdict(4, 0, 0b0010));
+    try std.testing.expectEqual(FourWay.off, fourWayVerdict(2, 0b11, 0));
+    try std.testing.expectEqual(FourWay.differ, fourWayVerdict(2, 0b10, 0));
+    // the agreement comes after the extra set's load and before the 2D state and its rings; the rings open the row
+    // pair's ring only for the TP2 drafter; the engine's Triton launches carry the extra set
+    const src = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    const extra = std.mem.indexOf(u8, body, "try std.fs.path.join(a, &.{ o.kit_dir, \"aot-extra\" })").?;
+    const agree = std.mem.indexOf(u8, body, "try agreeDraftFourWay(d, &m.comm, m.stream, prompt2d.draft_4way_asked, weights.draft_4way, extra_why);").?;
+    const rings = std.mem.indexOf(u8, body, "ring2d.Rings.open(").?;
+    try std.testing.expect(extra < agree and agree < rings);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "&m.comm, m.stream, !weights.draft_4way);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, ".t = .{ .set = &m.set, .extra = if (m.extra) |*x| x else null, .stream = m.stream }"));
+}
+
 test "Model.open reads TF_DS_PF_RUN128 into the switch every rank compares, and puts it into effect once the kernels load" {
     const src = @embedFile("model.zig");
     const at = std.mem.indexOf(u8, src, "    pub fn open(gpa: std.mem.Allocator").?;

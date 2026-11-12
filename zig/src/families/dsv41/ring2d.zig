@@ -8,78 +8,22 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const rdma = @import("rdma.zig");
-const comm_mod = @import("comm.zig");
-const Comm = comm_mod.Comm;
-
-/// A verbs device and the /24 of its IPv4 GID (TF_DS_TWO_HOP: the subnet names the cable it is on).
-pub const Dev = extern struct { name: [24]u8 = @splat(0), net: [3]u8 = .{ 0, 0, 0 }, ok: u8 = 0 };
-
-/// The /24 of an IPv4-mapped GID as sysfs prints it ("0000:...:ffff:c000:1e07" -> 192.0.30), null for another GID.
-pub fn gidNet(text: []const u8) ?[3]u8 {
-    const t = std.mem.trim(u8, text, " \n");
-    if (t.len != 39 or !std.mem.startsWith(u8, t, "0000:0000:0000:0000:0000:ffff:")) return null;
-    const a = std.fmt.parseInt(u16, t[30..34], 16) catch return null;
-    const b = std.fmt.parseInt(u16, t[35..39], 16) catch return null;
-    return .{ @intCast(a >> 8), @intCast(a & 0xff), @intCast(b >> 8) };
-}
-
-/// This node's devices with their GID index `gi` subnets, from sysfs.
-fn devs(io: std.Io, devices: []const []const u8, gi: u8) ![4]Dev {
-    var out: [4]Dev = @splat(.{});
-    if (devices.len > 4) return error.TooManyDevices;
-    for (devices, 0..) |name, i| {
-        if (name.len >= out[i].name.len) return error.DeviceName;
-        @memcpy(out[i].name[0..name.len], name);
-        var pb: [128]u8 = undefined;
-        const path = try std.fmt.bufPrint(&pb, "/sys/class/infiniband/{s}/ports/1/gids/{d}", .{ name, gi });
-        var tb: [64]u8 = undefined;
-        const text = std.Io.Dir.cwd().readFile(io, path, &tb) catch continue;
-        if (gidNet(text)) |n| {
-            out[i].net = n;
-            out[i].ok = 1;
-        }
-    }
-    return out;
-}
-
-/// TF_DS_TWO_HOP: this node's devices toward one partner, those on a subnet one of the partner's devices is on, in
-/// subnet order (so device d of the ring meets the partner's device d on the same cable).
-pub fn pick(mine: [4]Dev, theirs: [4]Dev, out: *[4][]const u8, names: *[4][24]u8) usize {
-    var idx: [4]usize = undefined;
-    var n: usize = 0;
-    for (mine, 0..) |m, i| {
-        if (m.ok == 0) continue;
-        for (theirs) |t| if (t.ok == 1 and std.mem.eql(u8, &m.net, &t.net)) {
-            idx[n] = i;
-            n += 1;
-            break;
-        };
-    }
-    std.mem.sort(usize, idx[0..n], mine, struct {
-        fn lt(ms: [4]Dev, a: usize, b: usize) bool {
-            return std.mem.order(u8, &ms[a].net, &ms[b].net) == .lt;
-        }
-    }.lt);
-    for (idx[0..n], 0..) |i, k| {
-        names[k] = mine[i].name;
-        out[k] = std.mem.sliceTo(&names[k], 0);
-    }
-    return n;
-}
+const Comm = @import("comm.zig").Comm;
 
 pub const Rings = struct {
     g: u32,
     r: u32,
     p: u32,
-    all4: ?*rdma.Ring, // null with TF_DS_TWO_HOP: the quarters go as two hops over col and pair
+    all4: *rdma.Ring,
     col: *rdma.Ring,
-    pair: *rdma.Ring,
+    pair: ?*rdma.Ring, // null: none opened (TF_DS_DRAFT_4WAY: the drafter, its only user, gathers four ways)
 
-    /// The three rings of node `g` (of 4): created, their infos exchanged over `comm` (world 4), connected and
-    /// started on every node before any returns.
-    pub fn open(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, k: rdma.Kernels, devices: []const []const u8, g: u32, s: rdma.Settings, comm: *const Comm, stream: cuda.Stream) !Rings {
-        if (g >= 4 or comm.world != 4) return error.NotFourNodes;
+    /// The three rings of node `g` (of 4; without the row pair's when `pair_ring` is false, every node alike): created,
     /// their infos exchanged over `comm` (world 4, rank i serving node ord[i]: TF_DS_2D_ORDER), connected and
+    /// started on every node before any returns. On a ring without a switch each ring routes its peers over the devices
+    /// on their cables, and the four nodes' ring relays a node's part to the node across through the two between
+    /// (rdma.zig).
+    pub fn open(gpa: std.mem.Allocator, d: *const cuda.Driver, k: rdma.Kernels, devices: []const []const u8, g: u32, ord: [4]u32, s: rdma.Settings, comm: *const Comm, stream: cuda.Stream, pair_ring: bool) !Rings {
         if (g >= 4 or comm.world != 4 or comm.rank >= 4) return error.NotFourNodes;
         var seen: [4]bool = @splat(false);
         for (ord) |x| {
@@ -107,14 +51,14 @@ pub const Rings = struct {
         errdefer all4.destroy(gpa);
         const col = try rdma.Ring.create(gpa, d, k, devices, p, 2, sc); // members (r, 0), (r, 1): ring rank = pair
         errdefer col.destroy(gpa);
-        const pair = try rdma.Ring.create(gpa, d, k, pair_devs, r, 2, s); // members (0, p), (1, p): ring rank = TP2 rank
-        errdefer pair.destroy(gpa);
+        const pair: ?*rdma.Ring = if (pair_ring) try rdma.Ring.create(gpa, d, k, devices, r, 2, sr) else null; // members (0, p), (1, p): ring rank = TP2 rank
+        errdefer if (pair) |x| x.destroy(gpa);
         // this node's infos: the four-node ring's toward each node, the column pair's and the row pair's toward each member
         const per = @sizeOf(rdma.Info);
         var mine: [8]rdma.Info = undefined;
-        for (0..4) |q| mine[q] = if (all4) |x| x.info(@intCast(q)) else std.mem.zeroes(rdma.Info);
+        for (0..4) |q| mine[q] = all4.info(@intCast(q));
         for (0..2) |q| mine[4 + q] = col.info(@intCast(q));
-        for (0..2) |q| mine[6 + q] = pair.info(@intCast(q));
+        for (0..2) |q| mine[6 + q] = if (pair) |x| x.info(@intCast(q)) else std.mem.zeroes(rdma.Info);
         var dev = try cuda.DeviceBuffer.alloc(d, 5 * 8 * per);
         defer dev.free();
         try dev.upload(0, std.mem.sliceAsBytes(&mine));
@@ -129,22 +73,26 @@ pub const Rings = struct {
         var remote_col: [2]rdma.Info = undefined;
         for (0..2) |pp| remote_col[pp] = all[rank_of[r + 2 * pp]][4 + p];
         try col.connect(&remote_col);
-        var remote_pair: [2]rdma.Info = undefined;
-        for (0..2) |rr| remote_pair[rr] = all[2 * p + rr][6 + r];
-        try pair.connect(&remote_pair);
+        if (pair) |x| {
+            var remote_pair: [2]rdma.Info = undefined;
             for (0..2) |rr| remote_pair[rr] = all[rank_of[2 * p + rr]][6 + r];
+            try x.connect(&remote_pair);
+        }
         // every queue pair ready on every node before any ring sends: one more all-gather as the barrier
         try comm.gatherHost(d, dev.ptr, dev.ptr + 8 * per, 1, stream);
         try stream.synchronize();
-        if (all4) |x| try x.start();
+        try all4.start();
         try col.start();
-        try pair.start();
+        if (pair) |x| try x.start();
         const rt = all4.routes();
+        if (pair) |x| {
+            std.log.info("2D RDMA rings on node {d}: lanes to nodes 0-3 {d},{d},{d},{d} (0: relayed), {d} relay(s); column {d} lane(s), row {d}", .{ g, rt.lanes[0], rt.lanes[1], rt.lanes[2], rt.lanes[3], rt.relays, col.routes().lanes[1 - p], x.routes().lanes[1 - r] });
+        } else std.log.info("2D RDMA rings on node {d}: lanes to nodes 0-3 {d},{d},{d},{d} (0: relayed), {d} relay(s); column {d} lane(s), no row pair ring", .{ g, rt.lanes[0], rt.lanes[1], rt.lanes[2], rt.lanes[3], rt.relays, col.routes().lanes[1 - p] });
         return .{ .g = g, .r = r, .p = p, .all4 = all4, .col = col, .pair = pair };
     }
 
     pub fn close(rs: *Rings, gpa: std.mem.Allocator) void {
-        for ([_]?*rdma.Ring{ rs.pair, rs.col, rs.all4 }) |o| if (o) |x| {
+        for ([_]?*rdma.Ring{ rs.pair, rs.col, rs.all4 }) |y| if (y) |x| {
             x.stop();
             x.destroy(gpa);
         };
@@ -159,18 +107,17 @@ pub const Rings = struct {
     /// quarters (Comm2D.quarters): `src` [rows, w[p]] (this node's columns of its TP2 rank's part) -> `dst`
     /// [2, rows, w0 + w1]: each TP2 rank's whole part, pair 0's columns then pair 1's.
     pub fn quarters(rs: *const Rings, stream: cuda.Stream, src: u64, dst: u64, rows: usize, w: [2]usize, esize: usize) !void {
-        const row = (w[0] + w[1]) * esize;
-        var dsts: [4]rdma.Ring.Dst = undefined;
-        for (0..4) |q| dsts[q] = .{ .ptr = dst + (q % 2) * rows * row + (q / 2) * w[0] * esize, .row4 = try float4s(w[q / 2] * esize), .stride4 = try float4s(row) };
-        const a4 = rs.all4 orelse {
-            // TF_DS_TWO_HOP: the column pair's parts make rank r's row of dst, then the row pair swaps whole rows
-            const rw = (w[0] + w[1]) * esize;
-            if (rows * rw > rs.pair.s.max_bytes) return error.TooLarge;
-            const mine = dst + rs.r * rows * rw;
-            try rs.catRank(stream, src, mine, rows, w, esize);
-            return rs.pairGather(stream, mine, dst, rows, w[0] + w[1], esize);
-        };
-        try a4.gatherInto(stream, src, @intCast(rows), try float4s(w[rs.p] * esize), &dsts);
+        const dsts = try quartersDsts(dst, rows, 0, w, esize);
+        try rs.all4.gatherInto(stream, src, @intCast(rows), try float4s(w[rs.p] * esize), &dsts);
+    }
+
+    /// quarters of rows r0 .. r0 + rows - 1 of an exchange of n_total rows: `src` this node's part of those rows only
+    /// ([rows, w[p]]), `dst` the whole [2, n_total, w0 + w1], where one quarters call of every row lands them.
+    pub fn quartersRows(rs: *const Rings, stream: cuda.Stream, src: u64, dst: u64, n_total: usize, r0: usize, rows: usize, w: [2]usize, esize: usize) !void {
+        const dsts = try quartersDsts(dst, n_total, r0, w, esize);
+        try rs.all4.gatherInto(stream, src, @intCast(rows), try float4s(w[rs.p] * esize), &dsts);
+    }
+
     /// One part of `rows` rows of 16 bytes (four fp32) from every node into `dst` [4, rows, 16 bytes], the parts in
     /// `slot_of[node]` order (the communicator's rank order, which Markov's pick reads): the four nodes' ring, no copy after
     /// it.
@@ -179,6 +126,9 @@ pub const Rings = struct {
         try rs.all4.gatherInto(stream, src, @intCast(rows), 1, &dsts);
     }
 
+    /// The bytes a part of one exchange takes at most (each ring's slot).
+    pub fn slotBytes(rs: *const Rings) usize {
+        return rs.all4.s.max_bytes;
     }
 
     /// cat_rank (Comm2D.cat_rank): `src` [rows, w[p]] -> `dst` [rows, w0 + w1], pair 0's part then pair 1's, from the
@@ -190,19 +140,37 @@ pub const Rings = struct {
         try rs.col.gatherInto(stream, src, @intCast(rows), try float4s(w[rs.p] * esize), &dsts);
     }
 
-    /// The pair gather (Comm2D.gather: TP2 inside a pair): `src` [rows, width] -> `dst` [2, rows, width] in TP2 rank order.
+    /// The pair gather (Comm2D.gather: TP2 inside a pair): `src` [rows, width] -> `dst` [2, rows, width] in TP2 rank order;
+    /// error.NoPairRing when the row pair's ring was not opened.
     pub fn pairGather(rs: *const Rings, stream: cuda.Stream, src: u64, dst: u64, rows: usize, width: usize, esize: usize) !void {
+        const pair = rs.pair orelse return error.NoPairRing;
         var dsts: [2]rdma.Ring.Dst = undefined;
         for (0..2) |rr| dsts[rr] = .{ .ptr = dst + rr * rows * width * esize, .row4 = try float4s(width * esize), .stride4 = try float4s(width * esize) };
-        try rs.pair.gatherInto(stream, src, @intCast(rows), try float4s(width * esize), &dsts);
+        try pair.gatherInto(stream, src, @intCast(rows), try float4s(width * esize), &dsts);
     }
 };
+
+/// Where each node's part of quarters lands: node q (TP2 rank q % 2, pair q / 2) at its rank's [n_total, w0 + w1]
+/// plane, row r0, its pair's columns.
+pub fn quartersDsts(dst: u64, n_total: usize, r0: usize, w: [2]usize, esize: usize) ![4]rdma.Ring.Dst {
+    const row = (w[0] + w[1]) * esize;
+    var dsts: [4]rdma.Ring.Dst = undefined;
+    for (0..4) |q| dsts[q] = .{ .ptr = dst + (q % 2) * n_total * row + r0 * row + (q / 2) * w[0] * esize, .row4 = try Rings.float4s(w[q / 2] * esize), .stride4 = try Rings.float4s(row) };
+    return dsts;
+}
 
 /// Where each node's part of nodesGather lands: node q's `rows` rows of one float4 at slot `slot_of[q]` of `dst`.
 pub fn nodesDsts(dst: u64, rows: usize, slot_of: [4]u32) [4]rdma.Ring.Dst {
     var dsts: [4]rdma.Ring.Dst = undefined;
     for (0..4) |q| dsts[q] = .{ .ptr = dst + @as(u64, slot_of[q]) * rows * 16, .row4 = 1, .stride4 = 1 };
     return dsts;
+}
+
+/// The rows of one exchange whose widest part (`row_bytes` a row) fits a slot of `slot` bytes; a row wider than a slot:
+/// error.TooLarge.
+pub fn rowsPerSlot(row_bytes: usize, slot: usize) !usize {
+    if (row_bytes == 0 or row_bytes > slot) return error.TooLarge;
+    return slot / row_bytes;
 }
 
 /// Where node q's word j of part `kind` lands, for the checks: (TP2 rank, pair) of the node owning it.
@@ -218,38 +186,57 @@ test "a 2D node's ring ranks and members" {
     try std.testing.expectEqual(@as(u32, 640), try Rings.float4s(2560 * 4));
 }
 
-test "two hops: each partner's ring takes the devices cabled to it, in subnet order (the first node with the second and the third)" {
-    try std.testing.expectEqual([3]u8{ 192, 0, 30 }, gidNet("0000:0000:0000:0000:0000:ffff:c000:1e07\n").?);
-    try std.testing.expect(gidNet("fe80:0000:0000:0000:bd59:6cf0:c06e:0323") == null);
-    const mk = struct {
-        fn of(names: [4][]const u8, nets: [4]u8) [4]Dev {
-            var o: [4]Dev = @splat(.{});
-            for (names, nets, 0..) |nm, n, i| {
-                @memcpy(o[i].name[0..nm.len], nm);
-                o[i].net = .{ 192, 0, n };
-                o[i].ok = 1;
-            }
-            return o;
+test "quartersRows lands rows [r0, r0 + n) where one quarters call lands them" {
+    // a host model of gatherInto's destinations: float4 j of row i of node q's part lands at ptr + i * stride4 + j
+    const Model = struct {
+        fn at(d: rdma.Ring.Dst, i: usize, j: usize) u64 {
+            return d.ptr + i * d.stride4 * 16 + j * 16;
         }
     };
-    const names = [4][]const u8{ "rdma0", "rdma0f1", "rdma1", "rdma1f1" };
-    const a7 = mk.of(names, .{ 30, 110, 40, 120 });
-    const a8 = mk.of(names, .{ 30, 90, 40, 100 });
-    const a5 = mk.of(names, .{ 110, 70, 120, 80 });
-    var out: [4][]const u8 = undefined;
-    var nb: [4][24]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 2), pick(a7, a8, &out, &nb));
-    try std.testing.expectEqualStrings("rdma0", out[0]);
-    try std.testing.expectEqualStrings("rdma1", out[1]);
-    try std.testing.expectEqual(@as(usize, 2), pick(a7, a5, &out, &nb));
-    try std.testing.expectEqualStrings("rdma0f1", out[0]);
-    try std.testing.expectEqualStrings("rdma1f1", out[1]);
-    var back: [4][]const u8 = undefined;
-    var nb2: [4][24]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 2), pick(a5, a7, &back, &nb2));
-    try std.testing.expectEqualStrings("rdma0", back[0]); // .110 meets the first node's .110
-    try std.testing.expectEqualStrings("rdma1", back[1]);
-    try std.testing.expectEqual(@as(usize, 0), pick(a8, a5, &out, &nb)); // the second and third: no cable
+    const dst: u64 = 1 << 32;
+    // the head's quarters (both pair widths) and the partials, fp32
+    for ([_][2]usize{ .{ 32384, 32256 }, .{ 2560, 2560 } }) |w| for ([_]usize{ 35, 48 }) |n_total| {
+        const whole = try quartersDsts(dst, n_total, 0, w, 4);
+        for ([_][2]usize{ .{ 0, 34 }, .{ 34, n_total - 34 } }) |blk| {
+            const part = try quartersDsts(dst, n_total, blk[0], w, 4);
+            for (0..4) |q| {
+                try std.testing.expectEqual(whole[q].row4, part[q].row4);
+                try std.testing.expectEqual(whole[q].stride4, part[q].stride4);
+                for ([_]usize{ 0, blk[1] - 1 }) |i| for ([_]usize{ 0, whole[q].row4 - 1 }) |j| {
+                    try std.testing.expectEqual(Model.at(whole[q], blk[0] + i, j), Model.at(part[q], i, j));
+                };
+            }
+        }
+    };
+    // a rank's plane holds both pairs' columns: rank 1, pair 1 starts its row past pair 0's columns of rank 1's plane
+    const d3 = (try quartersDsts(dst, 48, 34, .{ 32384, 32256 }, 4))[3];
+    try std.testing.expectEqual(dst + 48 * (32384 + 32256) * 4 + 34 * (32384 + 32256) * 4 + 32384 * 4, d3.ptr);
+}
+
+test "a decode gather's rows per slot" {
+    try std.testing.expectEqual(@as(usize, 34), try rowsPerSlot(129536, 4456448)); // the head's pair-0 row
+    try std.testing.expectEqual(@as(usize, 435), try rowsPerSlot(10240, 4456448)); // a partial's row: 80 rows in one
+    try std.testing.expectError(error.TooLarge, rowsPerSlot(4456449, 4456448));
+    try std.testing.expectError(error.TooLarge, rowsPerSlot(0, 4456448));
+}
+
+test "without the row pair's ring the pair gather says so" {
+    // (TF_DS_DRAFT_4WAY opens none on any node: its only user, the TP2 drafter, does not run)
+    var rs: Rings = undefined;
+    rs.pair = null;
+    try std.testing.expectError(error.NoPairRing, rs.pairGather(undefined, 0, 0, 5, 5120, 4));
+}
+
+test "quarters is quartersRows of every row" {
+    const src = @embedFile("ring2d.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn quarters(").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "const dsts = try quartersDsts(dst, rows, 0, w, esize);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "try rs.all4.gatherInto(stream, src, @intCast(rows), try float4s(w[rs.p] * esize), &dsts);"));
+    const rr = std.mem.indexOf(u8, src, "    pub fn quartersRows(").?;
+    const rbody = src[rr .. rr + std.mem.indexOf(u8, src[rr..], "\n    }\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rbody, "const dsts = try quartersDsts(dst, n_total, r0, w, esize);"));
+}
 
 test "nodesDsts: a node's rows land at its communicator rank's slot, contiguous, whatever the ring order" {
     const dst: u64 = 1 << 32;

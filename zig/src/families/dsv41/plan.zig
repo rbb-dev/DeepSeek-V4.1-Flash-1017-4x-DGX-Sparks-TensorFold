@@ -469,3 +469,57 @@ test "the 2D split: node 2 (rank 0 of pair 1) keeps pair 1's blocks, DSpark stay
     for (p0) |x| down0 = down0 or std.mem.eql(u8, x.key, "layers.5.ffn.shared_experts.w2|(0, 2560)|(1152, 2304)|tr");
     try std.testing.expect(down0);
 }
+
+test "every four-way drafter part lies inside its TP2 part" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var why: @import("config.zig").Why = .{};
+    const c = try @import("config.zig").parse(arena.allocator(), @import("config.zig").test_config, &why);
+    const Inside = struct {
+        fn check(part: [2]usize, whole: [2]usize) !void {
+            try std.testing.expect(part[0] >= whole[0] and part[1] <= whole[1] and part[0] < part[1]);
+            try std.testing.expect((part[0] - whole[0]) % 32 == 0 and (part[1] - part[0]) % 32 == 0);
+        }
+    };
+    for ([_]bool{ true, false }) |parity| for (0..2) |r| for (0..2) |p| {
+        const s: Split = .{ .rank = @intCast(r), .world = 2, .pair = @intCast(p), .parity = parity };
+        const t: Split = .{ .rank = @intCast(r), .world = 2 };
+        try Inside.check(s.wqB(c), t.wqB(c));
+        const hs = s.headSpan(c);
+        const ht = t.headSpan(c);
+        try std.testing.expect(hs[0] >= ht[0] and hs[0] + hs[1] <= ht[0] + ht[1]);
+        const gs = s.woAGroups(c);
+        const gt = t.woAGroups(c);
+        try std.testing.expect(gs[0] >= gt[0] and gs[0] + gs[1] <= gt[0] + gt[1]);
+        try Inside.check(s.woBCols(c).?, t.woBCols(c) orelse .{ 0, c.hidden });
+        const xs = s.expertParts(c);
+        const xt = t.expertParts(c);
+        try std.testing.expectEqual(xt.half, xs.half); // down's input rows: the same half
+        try Inside.check(xs.gu, xt.gu);
+        if (xs.rest) |rc| try Inside.check(rc, xt.gu);
+        try Inside.check(xs.dcols.?, xt.dcols orelse .{ 0, c.hidden });
+    };
+}
+
+test "the weight-file index of nodes 0-3 is unchanged" {
+    // the rank files' listings (plan.wants: every key, dtype and trellis shape, in order) at the served split, hashed:
+    // a change here changes the weight-index hash, and prepare.sh deletes a rank file whose index differs
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var why: @import("config.zig").Why = .{};
+    var c = try @import("config.zig").parse(a, @import("config.zig").test_config, &why);
+    c.format = .native;
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    for (0..4) |g| {
+        var s: Split = .{ .rank = @intCast(g % 2), .world = 2, .pair = @intCast(g / 2), .parity = true };
+        _ = &s;
+        for (try wants(a, c, s, true)) |x| {
+            var lb: [512]u8 = undefined;
+            h.update(try std.fmt.bufPrint(&lb, "{d} {s} {s} {?d} {?d}\n", .{ g, x.key, if (x.dtype) |d| d.name() else "-", x.k16, x.n16 }));
+        }
+    }
+    var digest: [32]u8 = undefined;
+    h.final(&digest);
+    try std.testing.expectEqualStrings("b04d97c3b5d5f6f8da860d34154a4296f4bfb088741414dd73bdb422b4ea67de", &std.fmt.bytesToHex(digest, .lower));
+}

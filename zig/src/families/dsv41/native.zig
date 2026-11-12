@@ -108,6 +108,16 @@
 //!                                               without it 64 bytes, one stage's), the same arithmetic in the same
 //!                                               order (the replies' bits as without); with the checkpoint's own
 //!                                               weights and the tile kernels; every rank the same
+//!   TF_DS_DRAFT_MAIN_4WAY=1                     a 2D node's drafter main_proj on its quarter of the columns (rows of
+//!                                               the rank file's whole entry), an absorb's rows gathered by the
+//!                                               backbone's quarters; the drafts' bits as without; with the
+//!                                               checkpoint's own weights and the decode kernels; every rank the same
+//!   TF_DS_DRAFT_4WAY=1                          a 2D node's drafter stages split four ways like the backbone's layers
+//!                                               (their parts of the rank file's TP2 entries; their sublayer gathers the
+//!                                               backbone's quarters, no row pair ring), the drafts' bits as without;
+//!                                               with the checkpoint's own weights, the decode kernels and the kit's
+//!                                               extra set (aot-extra/: the stages' sparse attention at their heads);
+//!                                               decided before the weights load, every rank the same
 //!   TF_DS_ATTN_EPILOGUE=1                      a prompt chunk's attention output takes the inverse RoPE and wo_a's
 //!                                               quant (its codes and scales, or wo_a's quant-dequant rows) in one
 //!                                               launch, wo_a then reading those bytes (the same arithmetic and the
@@ -465,6 +475,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
         error.CanariesDiffer => "TF_DS_QGATE_CANARY: the ranks asked different canaries (the lines above say which): set the same on every rank (a quality gate's runs, never a serving setting)",
+        error.DraftersDiffer => "TF_DS_DRAFT_4WAY=1 or TF_DS_DRAFT_MAIN_4WAY=1: the ranks' drafters are not split the same way, or a rank cannot launch the four-way stages (the lines above say which): give every rank the same kit (its aot-extra/), TF_DS_DECODE_DEC, TF_DS_DRAFT_4WAY and TF_DS_DRAFT_MAIN_4WAY",
         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
         error.TooManyRingStreams => "TF_DS_RING_INPLACE=1: more than 2 CUDA streams gather on one ring (each stream owns a fixed send slot): run the decode on one stream, or leave the switch off",
         else => null,
@@ -607,6 +618,9 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_IDX_PROJ_OWNED") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_BF16_ROWS") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_PF_RUN128") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_DRAFT_4WAY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_DRAFT_MAIN_4WAY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.DraftersDiffer).?, "TF_DS_DRAFT_MAIN_4WAY") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_ATTN_U") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_IDX_U") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_IDX_V") != null);
@@ -617,6 +631,7 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_HC_FUSED") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_RING_WORD") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_RING_WORD_SIGNAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.DraftersDiffer).?, "aot-extra") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.CanariesDiffer) orelse "", "TF_DS_QGATE_CANARY") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
 }

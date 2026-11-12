@@ -360,12 +360,14 @@ pub const kern_topk_tiles: u32 = 1 << 4;
 pub const kern_idx_proj_owned: u32 = 1 << 5;
 pub const kern_bf16_rows: u32 = 1 << 6;
 pub const kern_pf_run128: u32 = 1 << 7;
+pub const kern_draft_4way: u32 = 1 << 9;
 pub const kern_attn_u: u32 = 1 << 12;
 pub const kern_idx_u: u32 = 1 << 13;
 pub const kern_idx_v: u32 = 1 << 19;
 pub const kern_attn_u_decode: u32 = 1 << 14;
 pub const kern_assemble_quant: u32 = 1 << 15;
 pub const kern_hc_stride: u32 = 1 << 20;
+pub const kern_draft_main_4way: u32 = 1 << 17;
 pub const kern_mma_sf: u32 = 1 << 18;
 pub const kern_attn_epilogue: u32 = 1 << 16;
 pub const kern_mma_sf_exact: u32 = 1 << 22;
@@ -413,6 +415,10 @@ pub var bf16_rows_asked: bool = false;
 /// TF_DS_PF_RUN128 as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useRun128).
 pub var pf_run128_asked: bool = false;
 
+/// TF_DS_DRAFT_4WAY as Model.open read it (switchAsked), once (Settings.kern; in effect: weights.draft_4way, decided
+/// before the weights load).
+pub var draft_4way_asked: bool = false;
+
 /// TF_DS_ATTN_EPI_FUSED as Model.open read it (switchAsked), once (Settings.kern, tri_attn.attn_epi_fused): a prompt chunk's
 /// attention epilogue (inverse RoPE and wo_a's quant) in the final store of the part kernel from the kit's extra set.
 pub var attn_epi_fused_asked: bool = false;
@@ -454,6 +460,10 @@ pub var attn_epilogue_asked: bool = false;
 
 /// TF_DS_HC_STRIDE as Model.open read it (switchAsked), once (Settings.kern, prompt.hc_stride).
 pub var hc_stride_asked: bool = false;
+
+/// TF_DS_DRAFT_MAIN_4WAY as Model.open read it (switchAsked), once (Settings.kern; in effect: weights.draft_main_4way,
+/// decided before the weights load).
+pub var draft_main_4way_asked: bool = false;
 
 /// TF_DS_MMA_SF as Model.open read it (switchAsked), once (Settings.kern, mx.Kernels.useMmaSf).
 pub var mma_sf_asked: bool = false;
@@ -550,6 +560,7 @@ pub fn kernAsked() u32 {
     if (idx_proj_owned_asked) x |= kern_idx_proj_owned;
     if (bf16_rows_asked) x |= kern_bf16_rows;
     if (pf_run128_asked) x |= kern_pf_run128;
+    if (draft_4way_asked) x |= kern_draft_4way;
     if (attn_u_asked) x |= kern_attn_u;
     if (idx_u_asked) x |= kern_idx_u;
     if (idx_v_asked) x |= kern_idx_v;
@@ -557,6 +568,7 @@ pub fn kernAsked() u32 {
     if (assemble_quant_asked) x |= kern_assemble_quant;
     if (attn_epilogue_asked) x |= kern_attn_epilogue;
     if (hc_stride_asked) x |= kern_hc_stride;
+    if (draft_main_4way_asked) x |= kern_draft_main_4way;
     if (mma_sf_asked) x |= kern_mma_sf;
     if (mma_sf_exact_asked) x |= kern_mma_sf_exact;
     if (pass_tail_asked) x |= kern_pass_tail;
@@ -717,6 +729,23 @@ fn len(r: ?[2]usize) usize {
 
 /// A 2D node's part of the prompt path and the decode rounds: the pairs' widths of each split output and the exchange
 /// buffers.
+/// The row blocks a decode exchange of n rows takes at most (decodeBlocks).
+pub const max_decode_blocks = 8;
+
+/// quartersDecode's row blocks of an exchange of n rows whose widest part is `row_bytes` a row: [start, rows] each, every
+/// block as many rows as a slot of `slot` bytes holds (the last the rest); a row wider than a slot: error.TooLarge.
+pub fn decodeBlocks(n: usize, row_bytes: usize, slot: usize, out: *[max_decode_blocks][2]usize) ![]const [2]usize {
+    const per = try ring2d.rowsPerSlot(row_bytes, slot);
+    var k: usize = 0;
+    var r0: usize = 0;
+    while (r0 < n) : (r0 += per) {
+        if (k == max_decode_blocks) return error.TooLarge;
+        out[k] = .{ r0, @min(per, n - r0) };
+        k += 1;
+    }
+    return out[0..k];
+}
+
 /// The widths and sizes of a node's decode exchanges, for decodeOff.
 pub const DecodeShape = struct {
     ow: [2]usize, // wo_b's output columns a pair (fp32 partials)
@@ -925,7 +954,7 @@ pub const Two = struct {
     /// Whether a ring took the exchange: false when there is none or the part does not fit it (nothing sent then).
     fn ringed(r: anyerror!void) !bool {
         r catch |err| switch (err) {
-            error.TooLarge, error.NotFloat4 => return false,
+            error.TooLarge, error.NotFloat4, error.NoPairRing => return false,
             else => return err,
         };
         return true;
@@ -936,8 +965,13 @@ pub const Two = struct {
         if (!try ringed(rs.quarters(e.s, src, dst, n, w, esize))) return error.RingRefused;
     }
 
+    pub fn quartersDecode(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, w: [2]usize, esize: usize) !void {
         const rs = t.rings orelse return error.DecodeNeedsRings;
+        var bb: [max_decode_blocks][2]usize = undefined;
         const blocks = try decodeBlocks(n, @max(w[0], w[1]) * esize, rs.slotBytes(), &bb);
+        for (blocks, 0..) |b, i| {
+            const sent = try ringed(rs.quartersRows(e.s, src + b[0] * w[t.p] * esize, dst, n, b[0], b[1], w, esize));
+            // (a refusal is by widths alone: the first block's, before anything is sent)
             if (!sent) return if (i == 0) error.RingRefused else error.RingRefusedBlock;
         }
     }
@@ -2052,6 +2086,8 @@ test "the expert pack as codes needs the checkpoint's own weights, the parity re
     try std.testing.expectEqualStrings("needs TF_DS_2D_GU=parity (each slot's rest block in the pack)", packCodesOff(true, 512, 0).?);
     try std.testing.expectEqualStrings("needs a pack of whole 128-value blocks (its scales move in 16-byte units)", packCodesOff(true, 576, 128).?);
     try std.testing.expectEqualStrings("needs a pack of whole 128-value blocks (its scales move in 16-byte units)", packCodesOff(true, 512, 96).?);
+}
+
 test "wo_b's input as codes needs the checkpoint's own weights and an FP8 wo_b of both pairs' whole 32-value groups" {
     var lays: [40]weights.Layer = undefined;
     woBLayers(&lays);
@@ -2072,10 +2108,18 @@ test "wo_b's input as codes needs the checkpoint's own weights and an FP8 wo_b o
     try std.testing.expectEqualStrings(groups, catCodesOff(true, &odd, uw).?);
     // unequal pair widths of whole groups run
     try std.testing.expectEqual(@as(?[]const u8, null), catCodesOff(true, &lays, .{ 2016, 2080 }));
+}
+
 test "quartersDecode sends each block's own rows of src at its place in the whole exchange, over the ring alone" {
+    const src = @embedFile("prompt2d.zig");
+    const at = std.mem.indexOf(u8, src, "    pub fn quartersDecode(").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n    }\n").?];
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "const blocks = try decodeBlocks(n, @max(w[0], w[1]) * esize, rs.slotBytes(), &bb);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "const sent = try ringed(rs.quartersRows(e.s, src + b[0] * w[t.p] * esize, dst, n, b[0], b[1], w, esize));"));
     // no fallback: a refused block ends the exchange by name
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "error.RingRefusedBlock"));
+    const q = std.mem.indexOf(u8, src, "    pub fn quarters(").?;
+    const qbody = src[q .. q + std.mem.indexOf(u8, src[q..], "\n    }\n").?];
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, qbody, "error.RingRefused"));
     try std.testing.expect(std.mem.indexOf(u8, qbody, "t.parts") == null);
 }

@@ -221,6 +221,82 @@ pub fn draftWoAFp8() bool {
 /// the prompt path's kernel takes (w8Admits) loads it alone, without the bf16 rows (Layer.wo_a_rows false).
 pub var woa_w8: bool = false;
 
+/// TF_DS_DRAFT_4WAY in effect (Model.open, before the load: asked, and its conditions hold): on a 2D node the drafter's
+/// stages load the backbone's 2D parts (the node's half of wq_b's heads, of wo_a's groups, of wo_b's and down's output
+/// columns, and the parity split's gate / up blocks), each derived from the rank cache's TP2 entry of the same tensor
+/// (Loader.partOf); else the TP2 drafter.
+pub var draft_4way: bool = false;
+
+/// TF_DS_DRAFT_MAIN_4WAY in effect (Model.open, before the load: asked, and its conditions hold): on a 2D node the
+/// drafter's main_proj loads its node's quarter of the output columns (mainProjCols), rows of the rank cache's whole
+/// entry (Loader.partOf's untouched part); the absorb gathers the quarters (draft.zig mainKeys). Else main_proj whole.
+pub var draft_main_4way: bool = false;
+
+/// The drafter's main_proj columns this 2D node loads with TF_DS_DRAFT_MAIN_4WAY (null: all): node (TP2 rank r, pair p)
+/// holds quarter 2r + p of the hidden columns, where quartersDecode lands it (plane r, pair p's columns), so the four
+/// gathered planes are the whole output, plane 0 the first half of each row.
+pub fn mainProjCols(c: Config, s: plan.Split) ?[2]usize {
+    if (!draft_main_4way or c.format != .native) return null;
+    const p = s.pair orelse return null;
+    const q = c.hidden / 4;
+    const at = (2 * @as(usize, s.rank) + p) * q;
+    return .{ at, at + q };
+}
+
+/// "(a, b)" -> .{ a, b }; anything else null.
+fn rangeOf(text: []const u8) ?[2]usize {
+    if (text.len < 5 or text[0] != '(' or text[text.len - 1] != ')') return null;
+    var it = std.mem.splitSequence(u8, text[1 .. text.len - 1], ", ");
+    const a = std.fmt.parseInt(usize, it.next() orelse return null, 10) catch return null;
+    const b = std.fmt.parseInt(usize, it.next() orelse return null, 10) catch return null;
+    if (it.next() != null or b < a) return null;
+    return .{ a, b };
+}
+
+/// The drafter's four-way parts' source: a native part "prefix|(a, b)|rows|part" the rank cache lacks is the rows of
+/// the same tensor's TP2 entry that hold its columns: the TP2 split's wq_b heads, its experts' half, or (None) all
+/// of them, in rows of that entry (an FP8 scale row, `|s8`, is 32 columns).
+const Derive = struct { c: Config, tp2: plan.Split };
+
+/// A derived part: its parent's entry and the part's rows of it.
+const PartRef = struct { parent: rank_cache.Entry, row0: usize, rows: usize };
+
+/// The part as an entry of the source: the parent's rows row0 .. row0 + rows - 1 (contiguous in a [rows, ...] tensor).
+fn partEntry(pr: PartRef) rank_cache.Entry {
+    const row_bytes = pr.parent.bytes / pr.parent.shape[0];
+    var e = pr.parent;
+    e.offset = pr.parent.offset + pr.row0 * row_bytes;
+    e.bytes = pr.rows * row_bytes;
+    e.shape[0] = pr.rows;
+    return e;
+}
+
+/// `key`'s parent under `dv` in `ix` (null: none, or not a part key).
+fn partOf(ix: *const rank_cache.Index, dv: Derive, key: []const u8) !?PartRef {
+    var it = std.mem.splitScalar(u8, key, '|');
+    const prefix = it.next() orelse return null;
+    const cols_s = it.next() orelse return null;
+    const rows_s = it.next() orelse return null;
+    const part = it.next() orelse return null;
+    if (it.next() != null) return null;
+    const cols = rangeOf(cols_s) orelse return null;
+    const unit: usize = if (std.mem.eql(u8, part, "s8")) 32 else 1;
+    const cands = [_]?[2]usize{ dv.tp2.wqB(dv.c), dv.tp2.expertParts(dv.c).gu, null };
+    for (cands) |pc| {
+        if (pc) |r| if (cols[0] < r[0] or cols[1] > r[1]) continue;
+        var kb: [256]u8 = undefined;
+        var cb: [48]u8 = undefined;
+        const cs = if (pc) |r| try std.fmt.bufPrint(&cb, "({d}, {d})", .{ r[0], r[1] }) else "None";
+        const parent = ix.get(try std.fmt.bufPrint(&kb, "{s}|{s}|{s}|{s}", .{ prefix, cs, rows_s, part })) orelse continue;
+        const lo: usize = if (pc) |r| r[0] else 0;
+        if ((cols[0] - lo) % unit != 0 or (cols[1] - cols[0]) % unit != 0) return error.UnexpectedTensor;
+        const pr: PartRef = .{ .parent = parent, .row0 = (cols[0] - lo) / unit, .rows = (cols[1] - cols[0]) / unit };
+        if (parent.rank != 2 or pr.rows == 0 or pr.row0 + pr.rows > parent.shape[0]) return error.UnexpectedTensor;
+        return pr;
+    }
+    return null;
+}
+
 /// The bf16 value of the loader's wo_a rows for an E4M3 code and its UE8M0 block scale (convert.py: weight * scale,
 /// then bfloat16): e4m3(code) * 2^(scale - 127) in f32, its top 16 bits (exact for every finite product: an E4M3
 /// value has 4 significant bits).
@@ -414,6 +490,8 @@ const Loader = struct {
     // tests: each upload's bytes kept on the host in place of a device buffer (the address returned: its index + 1)
     host_uploads: ?*std.ArrayList([]u8) = null,
     entries: u64 = 0, // entries asked for (entry)
+    // the drafter's four-way parts while its blocks load (TF_DS_DRAFT_4WAY): keys the rank cache lacks derived
+    derive: ?Derive = null,
 
     fn deinit(L: *Loader) void {
         L.host.deinit(L.gpa);
@@ -436,48 +514,18 @@ const Loader = struct {
         return b.ptr;
     }
 
-    /// The entry's bytes, valid until the next entry() (a view into the span until endSpan).
-    fn entry(L: *Loader, key: []const u8) ![]u8 {
-        if (L.spanned(key)) |bytes| return bytes;
-        try L.host.resize(L.gpa, try L.src.size(key));
-        try L.src.read(key, L.host.items);
-        return L.host.items;
+    /// The rank cache's entry of `key`, or (deriving) the TP2 entry's rows it is (partOf); error.MissingEntry without.
+    fn cacheEntry(L: *Loader, ix: *const rank_cache.Index, key: []const u8) !rank_cache.Entry {
+        if (ix.get(key)) |e| return e;
+        const dv = L.derive orelse return error.MissingEntry;
+        return partEntry(try partOf(ix, dv, key) orelse return error.MissingEntry);
     }
 
-    /// The entry's bytes in the span, when it lies inside it.
-    fn spanned(L: *const Loader, key: []const u8) ?[]u8 {
-        if (L.span.len == 0) return null;
-        const c = switch (L.src) {
-            .cache => |c| c,
-            .shards => return null,
-        };
-        const e = c.index.get(key) orelse return null;
-        if (e.offset < L.span_lo or e.offset + e.bytes > L.span_lo + L.span.len) return null;
-        return L.span[@intCast(e.offset - L.span_lo)..][0..@intCast(e.bytes)];
-    }
-
-    /// The cache bytes [lo, hi) holding every part experts() reads of a layer; null without a cache or an entry.
-    fn expertSpan(L: *const Loader, prefixes: []const [3][]u8, pq: anytype) !?[2]u64 {
-        const c = switch (L.src) {
-            .cache => |c| c,
-            .shards => return null,
-        };
-        var kb: [256]u8 = undefined;
-        var lo: u64 = std.math.maxInt(u64);
-        var hi: u64 = 0;
-        for (prefixes) |pp| for (0..3) |j| for ([_][]const u8{ "tr", "suh", "svh" }) |part| {
-            const e = c.index.get(try plan.partKey(&kb, pp[j], pq.cols(j), pq.rows(j), part)) orelse return null;
-            lo = @min(lo, e.offset);
-            hi = @max(hi, e.offset + e.bytes);
-        };
-        return if (hi > lo) .{ lo, hi } else null;
-    }
-
-    /// Serves the entries in the cache bytes [lo, hi) from one whole read until endSpan; on failure each is read alone.
-    fn beginSpan(L: *Loader, lo: u64, hi: u64) void {
-        L.readSpan(lo, hi) catch |err| {
-            std.log.warn("rank cache: reading bytes {d}..{d} whole failed ({t}); their entries are read one by one", .{ lo, hi, err });
-            L.span = &.{};
+    /// The source's bytes of `key` (a derived part's too).
+    fn size(L: *Loader, key: []const u8) !usize {
+        return switch (L.src) {
+            .cache => |c| @intCast((try L.cacheEntry(c.index, key)).bytes),
+            .shards => L.src.size(key),
         };
     }
 
@@ -498,6 +546,13 @@ const Loader = struct {
             L.span_buf = null;
             L.span_buf = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(dio.alignment), need);
         L.entries += 1;
+            .cache => |c| {
+                const e = try L.cacheEntry(c.index, key);
+                if (c.direct) |f| return L.direct(f, e, c.index.data_end);
+                try L.host.resize(L.gpa, @intCast(e.bytes));
+                if (try c.file.readPositionalAll(c.io, L.host.items, e.offset) != L.host.items.len) return error.ShortRead;
+                return L.host.items;
+            },
         }
         try L.host.resize(L.gpa, try L.src.size(key));
         try L.src.read(key, L.host.items);
@@ -506,6 +561,7 @@ const Loader = struct {
 
     fn endSpan(L: *Loader) void {
         L.span = &.{};
+                r.offset = (try L.cacheEntry(c.index, r.key())).offset;
     }
 
     /// plain(name, dtype).cuda(): the entry as it is.
@@ -536,6 +592,7 @@ const Loader = struct {
     fn shape2(L: *Loader, key: []const u8) ![2]usize {
         return switch (L.src) {
             .cache => |c| blk: {
+                const e = try L.cacheEntry(c.index, key);
                 if (e.rank != 2) return error.UnexpectedTensor;
                 break :blk .{ e.shape[0], e.shape[1] };
             },
@@ -710,6 +767,7 @@ const Loader = struct {
         for (0..e_count) |e| for (0..6) |j| {
             var len_j: usize = 0;
             for (pieces(&pbuf, j, e < n, gu, rest, owner[e] == 1, dcols, half)) |pc| {
+                len_j += try L.size(try plan.partKey(&kb, try name(&nb, p, e, n, pc.proj), pc.cols, pc.rows, pc.part));
             }
             total += std.mem.alignForward(usize, len_j, 256);
         };
@@ -723,6 +781,7 @@ const Loader = struct {
                 tabs[j * e_count + e] = buf.ptr + at;
                 var len_j: usize = 0;
                 for (pieces(&pbuf, j, e < n, gu, rest, owner[e] == 1, dcols, half)) |pc| {
+                    len_j += try L.size(r.key());
                 }
                 switch (j) {
                     2 => slens[e][0] = len_j,
@@ -1179,19 +1238,32 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, src: Source, c: Confi
     if (dspark and c.dspark_block > 0) {
         const blocks = try gpa.alloc(Layer, c.draft_layers);
         errdefer gpa.free(blocks);
-        // DSpark stays TP2 inside the pair on a 2D node (weights.py _load_2d)
+        // DSpark stays TP2 inside the pair on a 2D node (weights.py _load_2d); TF_DS_DRAFT_4WAY: the backbone's 2D
+        // parts, derived from those TP2 entries
         const tp2: plan.Split = .{ .rank = s.rank, .world = s.world };
-        for (0..c.draft_layers) |j| blocks[j] = try L.block(c, tp2, try std.fmt.bufPrint(&nb, "mtp.{d}", .{j}), c.layers + j, c.draft_experts);
+        const ds_split: plan.Split = if (draft_4way and s.pair != null and c.format == .native) s else tp2;
+        L.derive = if (ds_split.pair != null) .{ .c = c, .tp2 = tp2 } else null;
+        defer L.derive = null;
         // the drafter's wo_a reads its FP8 rows: act_quant(o) times them is the reference's quant-dequantized o times
         // the dequantized bf16 rows, product for product (TF_DS_DRAFT_WOA=bf16: the bf16 rows, as the backbone's)
         L.wo_a_fp8 = c.format == .native and draftWoAFp8();
         defer L.wo_a_fp8 = false;
+        const before = L.w.bytes;
+        for (0..c.draft_layers) |j| blocks[j] = try L.block(c, ds_split, try std.fmt.bufPrint(&nb, "mtp.{d}", .{j}), c.layers + j, c.draft_experts);
+        if (ds_split.pair != null) std.log.info("TF_DS_DRAFT_4WAY=1: the drafter's {d} stages split four ways like the backbone, {d:.1} MB a node (their parts of the TP2 entries)", .{ c.draft_layers, @as(f64, @floatFromInt(L.w.bytes - before)) / 1e6 });
         var lb: [64]u8 = undefined;
         const last = try std.fmt.bufPrint(&lb, "mtp.{d}", .{c.draft_layers - 1});
         var tb: [128]u8 = undefined;
+        // TF_DS_DRAFT_MAIN_4WAY: the node's quarter of main_proj's columns, rows of its whole entry
+        const main_cols = mainProjCols(c, s);
+        const keep_dv = L.derive;
+        if (main_cols != null) L.derive = .{ .c = c, .tp2 = tp2 };
+        const main_proj = if (c.format == .native) try L.native("mtp.0.main_proj", main_cols, null, .fp8) else try L.linear("mtp.0.main_proj", null, null);
+        L.derive = keep_dv;
+        if (main_cols) |mc| std.log.info("TF_DS_DRAFT_MAIN_4WAY=1: the drafter's main_proj columns {d} .. {d} on this node, {d:.1} MB (rows of its whole entry)", .{ mc[0], mc[1] - 1, @as(f64, @floatFromInt(main_proj.n * main_proj.k + (main_proj.n / 32) * (main_proj.k / 32))) / 1e6 });
         w.dspark = .{
             .blocks = blocks,
-            .main_proj = try L.linear("mtp.0.main_proj", null, null),
+            .main_proj = main_proj,
             .main_norm = try L.plain("mtp.0.main_norm.weight", null),
             .norm = try L.plain(try std.fmt.bufPrint(&tb, "{s}.norm.weight", .{last}), null),
             .markov_embed = try L.plain(try std.fmt.bufPrint(&tb, "{s}.markov_head.embed.weight", .{last}), null),
@@ -1432,27 +1504,193 @@ test "strips: each 128-column block's tiles in k order" {
 }
 
 test "rank cache span: entries read whole come back byte for byte, the rest one by one" {
+
+test "the drafter's stages load four ways only as decided, on a 2D node with the checkpoint's own weights" {
+    // (TF_DS_DRAFT_4WAY: Model.open sets draft_4way before the load; plan.zig's listing, the rank files, unchanged)
+    const src = @embedFile("weights.zig");
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n}\n").?];
+    for ([_][]const u8{
+        "const ds_split: plan.Split = if (draft_4way and s.pair != null and c.format == .native) s else tp2;",
+        "L.derive = if (ds_split.pair != null) .{ .c = c, .tp2 = tp2 } else null;",
+        "defer L.derive = null;",
+        "blocks[j] = try L.block(c, ds_split, ",
+    }) |line| try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, line));
+    try std.testing.expect(!draft_4way); // unset: the TP2 drafter
+}
+
+test "a node's main_proj quarter is its whole entry's rows, quarter 2r + p, scales in 32-row blocks" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    var why: @import("config.zig").Why = .{};
+    var c = try @import("config.zig").parse(a, @import("config.zig").test_config, &why);
+    c.format = .native;
+    const H = c.hidden;
+    const B = struct {
+        fn at(i: usize, j: usize) u8 {
+            return @truncate(std.hash.Wyhash.hash(7, std.mem.asBytes(&[2]u64{ i, j })));
+        }
+    };
+    // the whole entry, as every rank file holds it: FP8 rows [hidden, 64] and their 32 x 32 block scales
+    const Row = struct { key: []const u8, shape: [2]usize };
+    const rows = [_]Row{ .{ .key = "mtp.0.main_proj|None|None|w8", .shape = .{ H, 64 } }, .{ .key = "mtp.0.main_proj|None|None|s8", .shape = .{ H / 32, 2 } } };
+    var body: std.ArrayList(u8) = .empty;
+    var index: std.ArrayList(u8) = .empty;
+    try index.append(a, '[');
+    for (rows, 0..) |r, k| {
+        const at = body.items.len;
+        for (0..r.shape[0]) |i| for (0..r.shape[1]) |j| try body.append(a, B.at(i + 100000 * k, j));
+        if (k > 0) try index.appendSlice(a, ", ");
+        try index.print(a, "[\"{s}\", \"uint8\", [{d}, {d}], {d}, {d}]", .{ r.key, r.shape[0], r.shape[1], at, body.items.len - at });
+    }
+    try index.append(a, ']');
+    const data_end = body.items.len;
+    try body.appendSlice(a, index.items);
+    var word: [8]u8 = undefined;
+    std.mem.writeInt(u64, &word, data_end, .little);
+    try body.appendSlice(a, &word);
+    try body.appendSlice(a, rank_cache.magic);
+    var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // every boundary off the 4 KiB grid; "after" keeps the aligned end of [first, last] inside the file
-    const name = "rank0of1-span.bin";
-    try rank_cache.writeFake(a, io, tmp.dir, name, &.{
-        .{ .key = "before", .dtype = "uint8", .shape = &.{5000}, .fill = 1 },
-        .{ .key = "first", .dtype = "uint8", .shape = &.{3000}, .fill = 2 },
-        .{ .key = "middle", .dtype = "uint8", .shape = &.{70001}, .fill = 3 },
-        .{ .key = "last", .dtype = "uint8", .shape = &.{4096}, .fill = 4 },
-        .{ .key = "after", .dtype = "uint8", .shape = &.{9000}, .fill = 5 },
-    });
-    var ix = try rank_cache.open(std.testing.allocator, io, tmp.dir, name);
+    try tmp.dir.writeFile(io, .{ .sub_path = "r.bin", .data = body.items });
+    var ix = try rank_cache.open(std.testing.allocator, io, tmp.dir, "r.bin");
     defer ix.deinit();
-    var file = try tmp.dir.openFile(io, name, .{});
+    var file = try tmp.dir.openFile(io, "r.bin", .{});
     defer file.close(io);
-    var L: Loader = .{ .gpa = std.testing.allocator, .d = undefined, .src = .{ .cache = .{ .file = file, .index = &ix, .io = io } }, .w = undefined };
+    var w: Weights = .{ .gpa = std.testing.allocator };
+    var L: Loader = .{ .gpa = std.testing.allocator, .d = undefined, .src = .{ .cache = .{ .file = file, .index = &ix, .io = io } }, .w = &w };
     defer L.deinit();
+    const keep = draft_main_4way;
+    defer draft_main_4way = keep;
+    draft_main_4way = true;
+    var seen: [4]bool = @splat(false);
+    for (0..2) |r| for (0..2) |p| {
+        const s: plan.Split = .{ .rank = @intCast(r), .world = 2, .pair = @intCast(p), .parity = true };
+        const cols = mainProjCols(c, s).?;
+        try std.testing.expectEqual(H / 4, cols[1] - cols[0]);
+        const q = cols[0] / (H / 4);
+        try std.testing.expectEqual(2 * r + p, q);
+        seen[q] = true;
+        L.derive = .{ .c = c, .tp2 = .{ .rank = @intCast(r), .world = 2 } };
+        var kb: [128]u8 = undefined;
+        for ([_][]const u8{ "w8", "s8" }, 0..) |part, k| {
+            const unit: usize = if (k == 1) 32 else 1;
+            const width = rows[k].shape[1];
+            const key = try plan.partKey(&kb, "mtp.0.main_proj", cols, null, part);
+            const got = try L.entry(key);
+            try std.testing.expectEqual((cols[1] - cols[0]) / unit * width, got.len);
+            for (0..(cols[1] - cols[0]) / unit) |i| for (0..width) |j| {
+                if (got[i * width + j] != B.at(cols[0] / unit + i + 100000 * k, j)) {
+                    std.debug.print("node (rank {d}, pair {d}) {s}: byte ({d}, {d}) is not the whole entry's ({d}, {d})\n", .{ r, p, part, i, j, cols[0] / unit + i, j });
+                    return error.TestUnexpectedResult;
+                }
+            };
+        }
+    };
+    try std.testing.expectEqual([4]bool{ true, true, true, true }, seen);
+    // off, without a pair or on another format: main_proj whole
+    try std.testing.expect(mainProjCols(c, .{ .rank = 1, .world = 2 }) == null);
+    var ce = c;
+    ce.format = .exl3;
+    try std.testing.expect(mainProjCols(ce, .{ .rank = 1, .world = 2, .pair = 1 }) == null);
+    draft_main_4way = false;
+    try std.testing.expect(mainProjCols(c, .{ .rank = 1, .world = 2, .pair = 1 }) == null);
+}
+
+test "main_proj loads its node's quarter with the derivation armed for it alone, then the DSpark tail as before" {
+    const src = @embedFile("weights.zig");
+    const at = std.mem.indexOf(u8, src, "        const main_cols = mainProjCols(c, s);").?;
+    const tail = src[at..];
+    for ([_][]const u8{
+        "        const main_cols = mainProjCols(c, s);",
+        "        if (main_cols != null) L.derive = .{ .c = c, .tp2 = tp2 };",
+        "        const main_proj = if (c.format == .native) try L.native(\"mtp.0.main_proj\", main_cols, null, .fp8) else try L.linear(\"mtp.0.main_proj\", null, null);",
+        "        L.derive = keep_dv;",
+        "            .main_proj = main_proj,",
+    }) |line| try std.testing.expect(std.mem.indexOf(u8, tail, line) != null);
+    // the derivation put back before the other tail entries load
+    try std.testing.expect(std.mem.indexOf(u8, tail, "        L.derive = keep_dv;").? < std.mem.indexOf(u8, tail, ".main_norm = try L.plain(").?);
+}
+
+test "a four-way drafter part is its TP2 entry's rows" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var why: @import("config.zig").Why = .{};
+    var c = try @import("config.zig").parse(a, @import("config.zig").test_config, &why);
+    c.format = .native;
+    // a rank cache of TP2 rank 0's entries: wq_b's FP8 rows and 32 x 32 block scales, an expert's MXFP4 rows and scales;
+    // byte (i, j) of an entry a hash of (i, j), so a row range is checked byte for byte (no row repeats another's)
+    const B = struct {
+        fn at(i: usize, j: usize) u8 {
+            return @truncate(std.hash.Wyhash.hash(0, std.mem.asBytes(&[2]u64{ i, j })));
+        }
+    };
+    const Row = struct { key: []const u8, dtype: []const u8, shape: [2]usize };
+    const rows = [_]Row{
+        .{ .key = "mtp.0.attn.wq_b|(0, 16384)|None|w8", .dtype = "uint8", .shape = .{ 16384, 128 } },
+        .{ .key = "mtp.0.attn.wq_b|(0, 16384)|None|s8", .dtype = "uint8", .shape = .{ 512, 4 } },
+        .{ .key = "mtp.0.attn.wo_b|None|(0, 4096)|w8", .dtype = "uint8", .shape = .{ 5120, 64 } },
+        .{ .key = "mtp.0.ffn.experts.0.w1|(0, 1152)|None|w4", .dtype = "uint8", .shape = .{ 1152, 64 } },
+        .{ .key = "mtp.0.ffn.experts.0.w1|(0, 1152)|None|s4", .dtype = "uint8", .shape = .{ 1152, 2 } },
+    };
+    var body: std.ArrayList(u8) = .empty;
+    var index: std.ArrayList(u8) = .empty;
+    try index.append(a, '[');
+    for (rows, 0..) |r, k| {
+        const at = body.items.len;
+        for (0..r.shape[0]) |i| for (0..r.shape[1]) |j| try body.append(a, B.at(i, j));
+        if (k > 0) try index.appendSlice(a, ", ");
+        try index.print(a, "[\"{s}\", \"{s}\", [{d}, {d}], {d}, {d}]", .{ r.key, r.dtype, r.shape[0], r.shape[1], at, body.items.len - at });
+    }
+    try index.append(a, ']');
+    const data_end = body.items.len;
+    try body.appendSlice(a, index.items);
+    var word: [8]u8 = undefined;
+    std.mem.writeInt(u64, &word, data_end, .little);
+    try body.appendSlice(a, &word);
+    try body.appendSlice(a, rank_cache.magic);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "r.bin", .data = body.items });
+    var ix = try rank_cache.open(std.testing.allocator, io, tmp.dir, "r.bin");
+    defer ix.deinit();
+    var file = try tmp.dir.openFile(io, "r.bin", .{});
+    defer file.close(io);
+    var w: Weights = .{ .gpa = std.testing.allocator };
+    var L: Loader = .{ .gpa = std.testing.allocator, .d = undefined, .src = .{ .cache = .{ .file = file, .index = &ix, .io = io } }, .w = &w };
+    defer L.deinit();
+    L.derive = .{ .c = c, .tp2 = .{ .rank = 0, .world = 2 } };
+    const Want = struct { key: []const u8, row0: usize, rows: usize, width: usize };
+    const want = [_]Want{
+        .{ .key = "mtp.0.attn.wq_b|(8192, 16384)|None|w8", .row0 = 8192, .rows = 8192, .width = 128 }, // pair 1's heads
+        .{ .key = "mtp.0.attn.wq_b|(8192, 16384)|None|s8", .row0 = 256, .rows = 256, .width = 4 }, // their 32-row scales
+        .{ .key = "mtp.0.attn.wo_b|(2560, 5120)|(0, 4096)|w8", .row0 = 2560, .rows = 2560, .width = 64 }, // of all columns
+        .{ .key = "mtp.0.ffn.experts.0.w1|(512, 1024)|None|w4", .row0 = 512, .rows = 512, .width = 64 }, // a main block
+        .{ .key = "mtp.0.ffn.experts.0.w1|(1024, 1152)|None|s4", .row0 = 1024, .rows = 128, .width = 2 }, // the rest
+    };
+    for (want) |x| {
+        try std.testing.expectEqual(x.rows * x.width, try L.size(x.key));
+        try std.testing.expectEqual([2]usize{ x.rows, x.width }, try L.shape2(x.key));
+        const got = try L.entry(x.key);
+        try std.testing.expectEqual(x.rows * x.width, got.len);
+        for (0..x.rows) |i| for (0..x.width) |j| {
+            if (got[i * x.width + j] != B.at(x.row0 + i, j)) {
+                std.debug.print("{s}: byte ({d}, {d}) is not the TP2 entry's ({d}, {d})\n", .{ x.key, i, j, x.row0 + i, j });
+                return error.TestUnexpectedResult;
+            }
+        };
+    }
+    // an entry the cache holds is its own; a part with no parent, or off its scale blocks, is refused
+    try std.testing.expectEqual(@as(usize, 512 * 4), try L.size("mtp.0.attn.wq_b|(0, 16384)|None|s8"));
+    try std.testing.expectError(error.MissingEntry, L.entry("mtp.0.attn.wq_x|(8192, 16384)|None|w8"));
+    try std.testing.expectError(error.UnexpectedTensor, L.entry("mtp.0.attn.wq_b|(8200, 16384)|None|s8"));
+    // without the drafter's four-way load nothing is derived
+    L.derive = null;
+    try std.testing.expectError(error.MissingEntry, L.entry("mtp.0.attn.wq_b|(8192, 16384)|None|w8"));
+}
 
 
 test "the loader's expert scale tensors against the kernels' lengths: every expert's gate, up and down bytes, the rest rows where owned" {

@@ -86,6 +86,10 @@
 //!   - TF_DS_ATTN_U_DECODE: tri_attn.sparseAttn of a decode round's shapes with and without `u` (the pool's ring, 1 ..
 //!     16 rows split 8 ways, each row's ring and compressed bases or none, 512 and 20 picks), the part against its
 //!     twin: OUT and the partials byte-equal; one picked row's code byte changed differs; every call found its twin.
+//!   - TF_DS_DRAFT_MAIN_4WAY: the drafter's main_proj (FP8, 5,120 x 15,360) on each quarter of its output columns (the
+//!     whole weight's rows and their scale blocks, as a node loads them) through mx.linearsDecode, the absorb's call,
+//!     against the whole GEMV at 1 .. 128 rows: each quarter the whole output's columns byte for byte; a changed taps
+//!     value differs.
 //!   - TF_DS_MMA_SF: mx.gemm of the dense FP8 GEMMs' shapes (the split ones and Engram's wkv) and mx.gateUp / mx.down of
 //!     a 2D node's experts (pf_run128's) on the block-scaled kernels (native_sf.cu; their own seed): the exact
 //!     arithmetic (each K block's MMA from zero, then an fp32 add), each GEMM's key proven first, against the baseline
@@ -2773,6 +2777,80 @@ fn idxTwin(r: *Run, rng: std.Random, which: Which) !void {
     }
     // (a call the extra set has no twin for would have run the baseline kernel: the comparisons above would hold vacuously)
     r.note(try std.fmt.bufPrint(&line, "{s}: every call found its twin in the extra set (no call sent to _index_score_rows)", .{label}), tri.twin_misses.load(.monotonic) == misses);
+}
+
+/// TF_DS_DRAFT_MAIN_4WAY: the drafter's main_proj (FP8, 5,120 x 15,360: the taps' three hidden rows) on each quarter of
+/// its output columns (the rows of its whole weight and of its 32-row scale blocks a node loads: mx.linearsDecode, the
+/// absorb's call) against the whole GEMV: each quarter's rows are the whole output's columns of that quarter, byte for
+/// byte, at an absorb's 1 .. 128 rows; one taps value changed differs.
+fn draftMain4(r: *Run, rng: std.Random) !void {
+    const d = r.d;
+    const N: usize = 5120;
+    const K: usize = 3 * 5120;
+    const Q = N / 4;
+    const CAP: usize = 128;
+    var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sarena.deinit();
+    const ha = sarena.allocator();
+    var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer for (keep.items) |*b| b.free();
+    const full = try fp8Linear(d, N, K, .fast, rng, ha, &keep);
+    const x = try upload(d, try bf16s(CAP * K, rng, 0.5, ha));
+    try keep.append(ha, x);
+    var sb: [4]cuda.DeviceBuffer = undefined;
+    for (&sb, mx.Scratch.sizes(CAP, K, 1)) |*b, n| {
+        b.* = try cuda.DeviceBuffer.alloc(d, n);
+        try keep.append(ha, b.*);
+    }
+    const sc: mx.Scratch = .{ .q = sb[0].ptr, .s = sb[1].ptr, .z = sb[2].ptr, .fake = sb[3].ptr, .rows = CAP, .max_k = K };
+    const z: mx.Z = .{ .ptr = sb[2].ptr, .floats = 1 };
+    const yw = try cuda.DeviceBuffer.alloc(d, CAP * N * 2);
+    try keep.append(ha, yw);
+    const yq = try cuda.DeviceBuffer.alloc(d, CAP * Q * 2);
+    try keep.append(ha, yq);
+    const Gemv = struct {
+        fn run(rr: *Run, scc: mx.Scratch, zz: mx.Z, l: weights.Linear, xp: u64, m: usize, out: u64, ldo: usize) ![]u8 {
+            try poison(out, m * ldo * 2, rr.d, rr.s);
+            try mx.linearsDecode(rr.k, rr.s, scc, &.{l}, &.{xp}, &.{3 * 5120}, m, &.{out}, &.{ldo}, &.{.bf16}, zz);
+            try rr.s.synchronize();
+            return get(out, m * ldo * 2, rr.d);
+        }
+    };
+    // the quarter: the whole weight's rows q .. q + Q and their scale blocks' rows (32 rows a block)
+    const Part = struct {
+        fn of(l: weights.Linear, q: usize) weights.Linear {
+            var p = l;
+            p.w = l.w + q * Q * K;
+            p.s = l.s + (q * Q / 32) * (K / 32);
+            p.n = @intCast(Q);
+            return p;
+        }
+    };
+    var line: [256]u8 = undefined;
+    for ([_]usize{ 1, 5, 16, 17, 48, 80, 128 }) |m| {
+        const want = try Gemv.run(r, sc, z, full, x.ptr, m, yw.ptr, N);
+        defer free(want);
+        var bad: usize = 0;
+        for (0..4) |q| {
+            const got = try Gemv.run(r, sc, z, Part.of(full, q), x.ptr, m, yq.ptr, Q);
+            defer free(got);
+            for (0..m) |i| bad += differs(want[(i * N + q * Q) * 2 ..][0 .. Q * 2], got[i * Q * 2 ..][0 .. Q * 2]);
+        }
+        r.report(try std.fmt.bufPrint(&line, "draft_main4: {d} rows: main_proj's four quarters (1,280 columns each, the whole weight's rows) against the whole GEMV's columns", .{m}), bad, true);
+    }
+    // the control: one taps value of row 0 set to 64, quarter 0 against the unchanged whole output
+    {
+        const m: usize = 16;
+        const want = try Gemv.run(r, sc, z, full, x.ptr, m, yw.ptr, N);
+        defer free(want);
+        var was: [2]u8 = undefined;
+        const big = [2]u8{ 0x80, 0x42 }; // 64.0
+        const got = try Gemv.run(r, sc, z, Part.of(full, 0), x.ptr, m, yq.ptr, Q);
+        defer free(got);
+        var n: usize = 0;
+        for (0..m) |i| n += differs(want[i * N * 2 ..][0 .. Q * 2], got[i * Q * 2 ..][0 .. Q * 2]);
+        r.report("draft_main4 control: one taps value of row 0 set to 64, quarter 0 against the unchanged whole output", n, false);
+    }
 }
 
 // -- TF_DS_MMA_SF ----------------------------------------------------------------------------------------------------
@@ -9987,6 +10065,7 @@ fn qgateBody(r: *Run, rng: std.Random) !void {
     .{ "attn_z_decode", attnZDecode, 7 },
     .{ "rope_w", ropeW, 9 + 2 },
     .{ "qkv_plain", qkvPlain, 4 * 3 + 2 },
+    .{ "draft_main4", draftMain4, 8 },
     .{ "mma_sf", mmaSf, 32 },
     .{ "mma_sf_exact", mmaSfExact, 22 },
     .{ "gemm_w16", gemmW16, 13 },
