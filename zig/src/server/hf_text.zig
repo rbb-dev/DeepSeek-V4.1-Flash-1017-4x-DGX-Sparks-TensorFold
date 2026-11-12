@@ -215,10 +215,15 @@ pub const HfText = struct {
             .render = renderFn,
             .template_source = sourceFn,
             .special = specialFn,
+            .mask = maskFn,
             .token_bytes = tokenBytesFn,
             .encode_plain = encodePlainFn,
             .added_text = addedTextFn,
         } };
+    }
+
+    fn maskFn(ctx: *anyopaque, a: Allocator, s: []const u8) Allocator.Error!?[]u8 {
+        return self(ctx).tok.maskAdded(a, s);
     }
 
     fn addedTextFn(ctx: *anyopaque) []const []const u8 {
