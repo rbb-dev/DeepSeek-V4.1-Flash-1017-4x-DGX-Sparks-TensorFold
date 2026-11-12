@@ -6,6 +6,26 @@
    "default": "atomic",
    "doc": "How the generation word is sent: by default an RDMA atomic add, which the card executes only after the data writes are placed (the guaranteed arrival); word sends an 8-byte RDMA write instead. Every node must agree. A card without atomics: left unset, the rings send the write and say why in a warning; set to atomic, the start refuses by name.",
    "first_use": "families/dsv41/model.zig:1895",
+  {
+   "id": 413,
+   "name": "tf_ds_engram_wait_us",
+   "env": "TF_DS_ENGRAM_WAIT_US",
+   "group": "cache",
+   "tab": "Cache & SSD",
+   "kind": "int",
+   "unit": "us",
+   "min": null,
+   "max": null,
+   "default_check": "none",
+   "apply": "A",
+   "who": [
+    "admin"
+   ],
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/prompt.zig:readWaitEnv",
+   "secret": false
+  },
    "name": "tf_ds_bf16_rows",
    "env": "TF_DS_BF16_ROWS",
    "unit": "rows",

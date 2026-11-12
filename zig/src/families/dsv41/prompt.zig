@@ -34,6 +34,7 @@ const engram = @import("engram.zig");
 const engram_io = @import("engram_io.zig");
 const engram_aio = @import("engram_aio.zig");
 const engram_rows = @import("engram_rows.zig");
+const wait_bell = @import("wait_bell.zig");
 const exact = @import("exact.zig");
 const tri_index = @import("tri_index.zig");
 const idx_spread = @import("idx_spread.zig");
@@ -2577,6 +2578,19 @@ pub const EngramHost = struct {
     inst_rows: std.atomic.Value(u64) = .init(0),
     inst_miss: std.atomic.Value(u64) = .init(0),
     inst_bytes: std.atomic.Value(u64) = .init(0),
+    inst_snap: [23]u64 = @splat(0),
+    // where the worker's time went (its thread adds; the pair line reads the differences): its CPU time, its involuntary context
+    // switches, and the cores it was on at each step's start and end, as counts on the GB10's big cores (X925: 5-9, 15-19) and small
+    // ones (A725: 0-4, 10-14), and a mask of the cores seen since the last line
+    inst_cpu_ns: std.atomic.Value(u64) = .init(0),
+    inst_nivcsw: std.atomic.Value(u64) = .init(0),
+    inst_big: std.atomic.Value(u64) = .init(0),
+    inst_small: std.atomic.Value(u64) = .init(0),
+    inst_cores: std.atomic.Value(u64) = .init(0),
+    // sleeping waits on the counters above and the flags below (wait_bell): the engine thread rings `wk_go` after it gives a slot back or
+    // stops the worker, the worker rings `wk_ready` after a chunk is done or it failed
+    wk_go: wait_bell.Bell = .{},
+    wk_ready: wait_bell.Bell = .{},
     wk_stop: std.atomic.Value(bool) = .init(false),
     wk_failed: std.atomic.Value(bool) = .init(false),
     wk_err: ?anyerror = null,
@@ -2746,18 +2760,34 @@ pub const WorkerOrder = struct {
     }
 };
 
+/// A thread's CPU time, involuntary switches and core now (a worker step's start and end).
+const ThreadProbe = struct { cpu_ns: u64, nivcsw: u64, core: usize };
+
+fn threadProbe() ThreadProbe {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.THREAD_CPUTIME_ID, &ts);
+    var ru: std.os.linux.rusage = undefined;
+    var inv: u64 = 0;
+    if (std.os.linux.getrusage(std.os.linux.rusage.THREAD, &ru) == 0) inv = @intCast(ru.nivcsw);
+    var cpu: usize = 0;
+    _ = std.os.linux.getcpu(&cpu, null);
+    return .{ .cpu_ns = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec)), .nivcsw = inv, .core = cpu };
 }
 
-/// A profile's clock after the stream drains (prompt Engram split).
-fn pstamp(e: *const Engine, eh: *const EngramHost) u64 {
-    e.s.synchronize() catch {};
-    return @intCast(std.Io.Timestamp.now(eh.io.?, .awake).nanoseconds);
+/// GB10: X925 cores 5-9 and 15-19, A725 cores 0-4 and 10-14.
+pub fn coreIsBig(core: usize) bool {
+    return (core >= 5 and core <= 9) or (core >= 15 and core <= 19);
 }
 
-fn lap(e: *const Engine, eh: *const EngramHost, t: *u64) u64 {
-    const now = pstamp(e, eh);
-    defer t.* = now;
-    return now - t.*;
+/// Adds a step's thread time, switches and the cores at its two ends to the worker's counters.
+fn workerProbe(eh: *EngramHost, start: ThreadProbe) void {
+    const end = threadProbe();
+    _ = eh.inst_cpu_ns.fetchAdd(end.cpu_ns -% start.cpu_ns, .monotonic);
+    _ = eh.inst_nivcsw.fetchAdd(end.nivcsw -% start.nivcsw, .monotonic);
+    for ([_]usize{ start.core, end.core }) |core| {
+        _ = (if (coreIsBig(core)) &eh.inst_big else &eh.inst_small).fetchAdd(1, .monotonic);
+        if (core < 64) _ = eh.inst_cores.fetchOr(@as(u64, 1) << @intCast(core), .monotonic);
+    }
 }
 
 /// The fill's read-ahead worker (a thread of model.zig's fill): from the chunk at `start`, chunk after chunk of
@@ -2807,25 +2837,57 @@ pub fn engramFaultFires(f: EngramFault, rank: u32, j: usize) bool {
     return true;
 }
 
-/// DSpark tap j (_forward_k at a tap layer): a pending MoE gather posted into the streams first (hc_post, not fused),
-/// then h.to(fp32).mean(1).to(bf16) into tap j's rows.
-pub fn tap(e: *const Engine, ch: *Chunk, j: usize) !void {
-    const c = e.c;
-    if (ch.pending) {
-        try tri_basic.hcPostRs(e.t, ch.gm, ch.gm_rs, ch.h, ch.post, ch.comb, ch.h, e.world, ch.n, c.hidden);
-        ch.pending = false;
-    }
-    try e.exact.hcMean4(e.s, ch.h, ch.taps + j * ch.cap * c.hidden * 2, c.hidden, ch.n, c.hidden);
+/// How long the engine thread sleeps for the worker's rows before it looks again for the work that no ring announces (a copy
+/// of its own finishing, rank 0's next round frame); TF_DS_ENGRAM_WAIT_US (readWaitEnv). A frame waits at most this long.
+pub var engram_wait_ns: u64 = 100_000;
+/// Read TF_DS_ENGRAM_WAIT_US once at start (model.readWorkerEnv, from Model.open).
+pub fn readWaitEnv() void {
+    if (std.c.getenv("TF_DS_ENGRAM_WAIT_US")) |v| engram_wait_ns = @as(u64, std.fmt.parseInt(u32, std.mem.span(v), 10) catch 100) *| 1000;
 }
 
-/// Tap j's rows (bf16 [n, D]).
-pub fn tapRows(e: *const Engine, ch: *const Chunk, j: usize) u64 {
-    return ch.taps + j * ch.cap * e.c.hidden * 2;
+/// The worker's longest sleep for a free slot: a ring ends it at once, this only bounds a ring that never came.
+const worker_backstop_ns: u64 = 10_000_000;
+
+/// Waits (the worker's thread) until chunk `chunk` has a free slot: the layer's uploads (`used`) within `slots` of it.
+/// False when `stop` ended the wait.
+fn waitSlot(go: *wait_bell.Bell, used: *const std.atomic.Value(usize), slots: usize, chunk: usize, stop: *const std.atomic.Value(bool)) bool {
+    while (chunk >= used.load(.acquire) + slots) {
+        if (stop.load(.acquire)) return false;
+        const at = go.seen(); // (read before the check below: a ring after it makes the sleep return at once)
+        if (chunk < used.load(.acquire) + slots or stop.load(.acquire)) continue;
+        go.sleep(at, worker_backstop_ns);
+    }
+    return !stop.load(.acquire);
+}
+
+/// What the engine thread does between its sleeps for the worker's rows: its copies' slots given back (the worker may be
+/// waiting for one).
+const EngramDuties = struct {
+    eh: *EngramHost,
+    pub fn run(d: EngramDuties) !void {
+        try engramPoll(d.eh);
+    }
+};
+
+/// Waits (the engine thread) until the worker has finished chunk `ci` of a layer (`done` > ci), running `duties` between sleeps.
+/// False when `failed` ended the wait.
+fn waitDone(ready: *wait_bell.Bell, done: *const std.atomic.Value(usize), ci: usize, failed: *const std.atomic.Value(bool), duties: anytype, timeout_ns: u64) !bool {
+    while (done.load(.acquire) <= ci) {
+        if (failed.load(.acquire)) return false;
+        const at = ready.seen(); // (read before the duties and the check: a ring after it makes the sleep return at once)
+        try duties.run();
+        if (done.load(.acquire) > ci or failed.load(.acquire)) continue;
+        ready.sleep(at, timeout_ns);
+    }
+    return true;
+}
+
 pub fn engramWorker(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize, chunk: usize) void {
     const nl = @min(2, c.engram_layers.slice().len);
     const cols = eh.hasher.cols();
     const k = eh.hi - eh.lo;
     if (chunk == 0) return;
+    if (std.c.getenv("TF_DS_ROCI_PAIR_LOG") != null) std.log.info("the Engram worker of this fill is thread {d} (core {d})", .{ std.os.linux.gettid(), threadProbe().core });
     const chunks = if (seq.len > start) (seq.len - start + chunk - 1) / chunk else 0;
     var order: WorkerOrder = .{
         .start = start,
@@ -2840,18 +2902,24 @@ pub fn engramWorker(eh: *EngramHost, c: *const Config, seq: []const i32, start: 
         const at = start + step.chunk * chunk;
         const n = @min(chunk, seq.len - at);
         const j = step.layer;
+        if (!waitSlot(&eh.wk_go, &eh.wk_used[j], eh.wk_slots, step.chunk, &eh.wk_stop)) return;
+        const probe0 = threadProbe();
+        defer workerProbe(eh, probe0);
         if (engramFaultFires(engram_fault, engram_fault_rank, j)) {
             std.log.err("TF_DS_ENGRAM_FAULT: rank {d}: the worker's row read of layer {d} at position {d} fails once (a drill)", .{ engram_fault_rank, j, at });
             eh.wk_err = error.InputOutput;
             eh.wk_failed.store(true, .release);
+            eh.wk_ready.ring();
             return;
         }
         workerRows(eh, c, seq, at, n, j, cols, k, eh.wk_rows[step.chunk % eh.wk_slots][j], step.chunk % eh.wk_slots) catch |err| {
             eh.wk_err = err;
             eh.wk_failed.store(true, .release);
+            eh.wk_ready.ring();
             return;
         };
         eh.wk_done[j].store(step.chunk + 1, .release);
+        eh.wk_ready.ring();
     }
 }
 
@@ -2866,6 +2934,7 @@ fn workerRows(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize,
     }
     // packed shards: the chunk's records staged in the worker's slot, decoded on the GPU when applied
     if (eh.pk) |pr| {
+        pr.step_tag.store(((start / 2048) << 8) | j, .monotonic);
         const tg = nowNs();
         try pr.chunkReadSplit(&pr.wk[slot][j], j, eh.wk_hashes[slot][0 .. n * eh.hasher.layers * cols], n, eh.hasher.layers, ((start / 2048) << 8) | j);
         _ = eh.inst_gather_ns.fetchAdd(@intCast(nowNs() - tg), .monotonic);
@@ -2915,6 +2984,7 @@ pub fn engramWorkerStart(eh: *EngramHost, c: *const Config, seq: []const i32, st
 pub fn engramWorkerStop(eh: *EngramHost) void {
     const th = eh.wk_thread orelse return;
     eh.wk_stop.store(true, .release);
+    eh.wk_go.ring();
     where.joinThread(th);
     eh.wk_thread = null;
     eh.wk_seq = &.{};
@@ -2967,6 +3037,7 @@ const PinCtx = struct {
 
     fn release(c: PinCtx, j: usize, used: usize) void {
         c.eh.wk_used[j].store(used, .release);
+        c.eh.wk_go.ring();
     }
 };
 
@@ -2981,6 +3052,7 @@ pub fn engramPoll(eh: *EngramHost) !void {
 pub fn engramRelease(eh: *EngramHost, s: cuda.Stream, j: usize, used: usize) !void {
     if (!eh.pinned) {
         eh.wk_used[j].store(used, .release);
+        eh.wk_go.ring();
         return;
     }
     const held = where.enter(.engram_release, @intCast(j), 0);
@@ -3025,6 +3097,7 @@ pub fn engramWorkerRows(eh: *EngramHost, j: usize, start: usize, chunk: usize) !
         eh.inst_wait_ns += waited;
         if (j == 0) eh.ka.firstLayerWait(waited);
     }
+    if (!try waitDone(&eh.wk_ready, &eh.wk_done[j], ci, &eh.wk_failed, EngramDuties{ .eh = eh }, engram_wait_ns)) return eh.wk_err orelse error.EngramWorkerFailed;
     return eh.wk_rows[ci % eh.wk_slots][j];
 }
 
@@ -4619,6 +4692,100 @@ fn hostEngine(two: *const prompt2d.Two, cfg: *Config, cm: *comm.Comm) Engine {
     e.comm = cm;
     e.world = 2;
     return e;
+}
+
+const WaitFix = struct {
+    go: wait_bell.Bell = .{},
+    ready: wait_bell.Bell = .{},
+    used: std.atomic.Value(usize) = .init(0),
+    done: std.atomic.Value(usize) = .init(0),
+    stop: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(bool) = .init(false),
+    cpu_ns: std.atomic.Value(u64) = .init(0),
+    result: std.atomic.Value(u8) = .init(0), // 1 true, 2 false once the wait ended
+    duties: std.atomic.Value(u32) = .init(0),
+
+    const Duties = struct {
+        f: *WaitFix,
+        pub fn run(d: @This()) !void {
+            _ = d.f.duties.fetchAdd(1, .monotonic);
+        }
+    };
+
+    fn cpu() u64 {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(.THREAD_CPUTIME_ID, &ts);
+        return @intCast(@as(i128, ts.sec) * 1_000_000_000 + ts.nsec);
+    }
+    fn slot(f: *WaitFix) void {
+        const c0 = cpu();
+        const r = waitSlot(&f.go, &f.used, 2, 5, &f.stop);
+        f.cpu_ns.store(cpu() -% c0, .release);
+        f.result.store(if (r) 1 else 2, .release);
+    }
+    fn rows(f: *WaitFix, timeout_ns: u64) void {
+        const c0 = cpu();
+        const r = waitDone(&f.ready, &f.done, 3, &f.failed, Duties{ .f = f }, timeout_ns) catch false;
+        f.cpu_ns.store(cpu() -% c0, .release);
+        f.result.store(if (r) 1 else 2, .release);
+    }
+    fn nap(ms: i64) !void {
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(ms), .awake);
+    }
+};
+
+test "the worker's wait for a free slot sleeps, wakes on the upload, ends on stop" {
+    // sleeps: 200 ms waited, a yield loop would burn ~200 ms of CPU
+    var f: WaitFix = .{};
+    var th = try std.Thread.spawn(.{}, WaitFix.slot, .{&f});
+    try WaitFix.nap(200);
+    try std.testing.expectEqual(@as(u8, 0), f.result.load(.acquire));
+    f.used.store(4, .release); // 5 < 4 + 2: a slot is free
+    f.go.ring();
+    th.join();
+    try std.testing.expectEqual(@as(u8, 1), f.result.load(.acquire));
+    try std.testing.expect(f.cpu_ns.load(.acquire) < 20_000_000);
+    try std.testing.expect(f.go.sleeps.load(.monotonic) >= 1);
+    // stop
+    var g: WaitFix = .{};
+    th = try std.Thread.spawn(.{}, WaitFix.slot, .{&g});
+    try WaitFix.nap(50);
+    g.stop.store(true, .release);
+    g.go.ring();
+    th.join();
+    try std.testing.expectEqual(@as(u8, 2), g.result.load(.acquire));
+}
+
+test "the engine thread's wait for rows sleeps, runs its duties between sleeps, wakes on done and on failure" {
+    var f: WaitFix = .{};
+    var th = try std.Thread.spawn(.{}, WaitFix.rows, .{ &f, @as(u64, 100_000) });
+    try WaitFix.nap(200);
+    try std.testing.expectEqual(@as(u8, 0), f.result.load(.acquire));
+    // a frame waiting at the socket is served within the timeout: the duties ran many times while it waited
+    try std.testing.expect(f.duties.load(.monotonic) > 100);
+    f.done.store(4, .release);
+    f.ready.ring();
+    th.join();
+    try std.testing.expectEqual(@as(u8, 1), f.result.load(.acquire));
+    try std.testing.expect(f.cpu_ns.load(.acquire) < 40_000_000);
+    // failure
+    var g: WaitFix = .{};
+    th = try std.Thread.spawn(.{}, WaitFix.rows, .{ &g, @as(u64, 100_000) });
+    try WaitFix.nap(30);
+    g.failed.store(true, .release);
+    g.ready.ring();
+    th.join();
+    try std.testing.expectEqual(@as(u8, 2), g.result.load(.acquire));
+}
+
+test "a long timeout still ends at once on a ring, and a ring is not needed for the duties" {
+    var f: WaitFix = .{};
+    const th = try std.Thread.spawn(.{}, WaitFix.rows, .{ &f, @as(u64, 5_000_000_000) });
+    try WaitFix.nap(100);
+    f.done.store(4, .release);
+    f.ready.ring();
+    th.join(); // would take 5 s if the ring did not wake it
+    try std.testing.expectEqual(@as(u8, 1), f.result.load(.acquire));
 }
 
 test "TF_DS_WINDOW_ONCE: a chunk's window uploads are due once per (start, rows, floor, mode) and again when the key changes" {

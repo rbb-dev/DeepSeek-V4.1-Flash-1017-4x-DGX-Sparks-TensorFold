@@ -58,14 +58,38 @@ const Batch = struct {
     first: u64, // reads [first, first + n) of the ring
     n: usize,
     left: usize, // still in flight
-    dst: []?[*]u8, // per read: where its row goes (null: nothing copied, a touch)
-    skew: []usize,
-    bytes: []usize,
     failed: bool = false,
     touch: bool = false,
 };
 
+fn aioNowNs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
 pub const Aio = struct {
+    // what the ring's users spent (a pair line reads the differences): time in io_submit, time in the wait for completions (the
+    // reaping and the copy of each row out of the ring are done in that wait, and in the submit's wait for a free ring slot), reads
+    // in flight now and the most since it was last read
+    st_submit_ns: std.atomic.Value(u64) = .init(0),
+    st_wait_ns: std.atomic.Value(u64) = .init(0),
+    // TF_DS_ENGRAM_AIO_SLEEP: a waiter sleeps in the kernel (io_getevents asking for `wake_min` completions or `wake_ns`) instead of polling
+    sleep: bool = false,
+    // TF_DS_ENGRAM_AIO_DEPTH: a cap on reads in flight (0: none), submitted `depth_slice` at a time; the drive's throughput falls when it is over-queued
+    depth_cap: usize = 0,
+    depth_slice: usize = 1,
+    wake_min: usize = 32,
+    spin: usize = 0, // empty polls a sleeping waiter makes before it sleeps (after a poll that found completions it polls again at once)
+    wake_ns: i64 = 1_000_000,
+    st_wakes: std.atomic.Value(u64) = .init(0), // blocking io_getevents calls and the completions they brought
+    st_wake_events: std.atomic.Value(u64) = .init(0),
+    st_calls: std.atomic.Value(u64) = .init(0), // io_submit calls, the reads they took, and the longest call
+    st_reads: std.atomic.Value(u64) = .init(0),
+    st_call_max_ns: std.atomic.Value(u64) = .init(0),
+    st_inflight: std.atomic.Value(u32) = .init(0),
+    st_inflight_max: std.atomic.Value(u32) = .init(0),
+
     gpa: std.mem.Allocator,
     io: std.Io,
     ctx: aio_context_t = 0,
@@ -107,11 +131,9 @@ pub const Aio = struct {
     pub fn deinit(a: *Aio) void {
         // every read in flight lands before the ring goes
         a.mutex.lockUncancelable(a.io);
-        while (a.inFlight()) a.reap();
+        while (a.inFlight()) _ = a.reap();
         a.mutex.unlock(a.io);
         _ = ioDestroy(a.ctx);
-        var it = a.batches.valueIterator();
-        while (it.next()) |b| a.freeBatch(b.*);
         a.batches.deinit(a.gpa);
         a.live.deinit(a.gpa);
         a.gpa.free(a.ptr_s);
@@ -123,16 +145,34 @@ pub const Aio = struct {
         a.gpa.destroy(a);
     }
 
+    /// io_submit of `n` reads, timed: its wall time, the reads it took and the reads then in flight.
+    fn submitTimed(a: *Aio, n: usize, cbs: [*]*Iocb) isize {
+        const t0 = aioNowNs();
+        const r = ioSubmit(a.ctx, n, cbs);
+        const dt = aioNowNs() - t0;
+        _ = a.st_submit_ns.fetchAdd(dt, .monotonic);
+        _ = a.st_call_max_ns.fetchMax(dt, .monotonic);
+        _ = a.st_calls.fetchAdd(1, .monotonic);
+        if (r > 0) {
+            _ = a.st_reads.fetchAdd(@intCast(r), .monotonic);
+            const now_in = a.st_inflight.fetchAdd(@intCast(r), .monotonic) + @as(u32, @intCast(r));
+            _ = a.st_inflight_max.fetchMax(now_in, .monotonic);
+        }
+        return r;
+    }
+
     fn inFlight(a: *Aio) bool {
         var it = a.batches.valueIterator();
         while (it.next()) |b| if (b.left > 0) return true;
         return false;
     }
 
-    fn freeBatch(a: *Aio, b: Batch) void {
-        a.gpa.free(b.dst);
-        a.gpa.free(b.skew);
-        a.gpa.free(b.bytes);
+    /// Completions already taken from the kernel: rows copied out, batches counted down. Holds `mutex`.
+    fn handle(a: *Aio, evs: []const IoEvent) void {
+        for (evs) |e| {
+            const id = e.data >> 20;
+            const j: usize = @intCast(e.data & 0xFFFFF);
+            const b = a.batches.getPtr(id) orelse continue;
             const sl: usize = @intCast((b.first + j) % a.slots);
             if (e.res < @as(i64, @intCast(a.skew_s[sl] + a.bytes_s[sl]))) {
                 b.failed = true;
@@ -141,28 +181,59 @@ pub const Aio = struct {
                 @memcpy(d[0..a.bytes_s[sl]], a.ring[at..][0..a.bytes_s[sl]]);
             }
             b.left -= 1;
+            _ = a.st_inflight.fetchSub(1, .monotonic);
+        }
     }
 
     /// Whatever has completed (no wait): rows copied out, batches counted down. Holds `mutex`.
-    fn reap(a: *Aio) void {
+    fn reap(a: *Aio) usize {
         var ev: [256]IoEvent = undefined;
         var zero: linux.timespec = .{ .sec = 0, .nsec = 0 };
+        var got: usize = 0;
         while (true) {
             const r = ioGetevents(a.ctx, 0, ev.len, &ev, &zero);
-            if (r <= 0) return;
-            for (ev[0..@intCast(r)]) |e| {
-                const id = e.data >> 20;
-                const j: usize = @intCast(e.data & 0xFFFFF);
-                const b = a.batches.getPtr(id) orelse continue;
-                if (e.res < @as(i64, @intCast(b.skew[j] + b.bytes[j]))) {
-                    b.failed = true;
-                } else if (b.dst[j]) |d| {
-                    const at = ((b.first + j) % a.slots) * slot + b.skew[j];
-                    @memcpy(d[0..b.bytes[j]], a.ring[at..][0..b.bytes[j]]);
-                }
-                b.left -= 1;
-            }
+            if (r <= 0) return got;
+            a.handle(ev[0..@intCast(r)]);
+            got += @intCast(r);
         }
+    }
+
+    /// Sleeps in the kernel until `want` completions are in or `wake_ns` has passed, and takes them (they are handled by whoever holds
+    /// `mutex` next): the batched wake-up, a wake per `want` completions and not one per read. Needs no lock.
+    fn sleepFor(a: *Aio, want: usize, ev: []IoEvent) usize {
+        var ts: linux.timespec = .{ .sec = 0, .nsec = a.wake_ns };
+        const r = ioGetevents(a.ctx, @max(@as(usize, 1), want), ev.len, ev.ptr, &ts);
+        _ = a.st_wakes.fetchAdd(1, .monotonic);
+        if (r <= 0) return 0;
+        _ = a.st_wake_events.fetchAdd(@intCast(r), .monotonic);
+        return @intCast(r);
+    }
+
+    /// The ring-full wait of a submit (`mutex` held): polls, or sleeps for a completion and handles it.
+    fn waitSlot(a: *Aio) void {
+        if (!a.sleep) {
+            _ = a.reap();
+            return;
+        }
+        var ev: [256]IoEvent = undefined;
+        const n = a.sleepFor(1, &ev);
+        a.handle(ev[0..n]);
+        _ = a.reap();
+    }
+
+    /// TF_DS_ENGRAM_AIO_DEPTH: at most `cap` reads in flight (0: no cap), submitted in slices of `slice` (at most a quarter of the cap).
+    pub fn configureDepth(a: *Aio, cap: usize, slice: usize) void {
+        a.depth_cap = cap;
+        a.depth_slice = if (cap == 0) 1 else @max(@as(usize, 1), @min(slice, @max(@as(usize, 1), cap / 4)));
+    }
+
+    /// The ring's way of waiting for completions: TF_DS_ENGRAM_AIO_SLEEP's settings (the decode rounds' ring keeps polling: a woken
+    /// thread costs it more than a poll).
+    pub fn configureSleep(a: *Aio, on: bool, min_events: usize, wake_us: u32, spin: usize) void {
+        a.sleep = on;
+        a.spin = spin;
+        a.wake_min = @max(@as(usize, 1), min_events);
+        a.wake_ns = @as(i64, wake_us) * 1000;
     }
 
     /// The submission (`mutex` held): rows `ids` of table `t`, a weight then a scale read each, copied into out_w /
@@ -187,7 +258,9 @@ pub const Aio = struct {
                 }
             }
             if (!busy) break;
-            a.reap();
+            const tw = aioNowNs();
+            a.waitSlot();
+            _ = a.st_wait_ns.fetchAdd(aioNowNs() - tw, .monotonic);
         }
         const id = a.next_id;
         a.next_id += 1;
@@ -196,9 +269,6 @@ pub const Aio = struct {
             .n = reads,
             .left = reads,
             .touch = out_w == null,
-            .dst = try a.gpa.alloc(?[*]u8, reads),
-            .skew = try a.gpa.alloc(usize, reads),
-            .bytes = try a.gpa.alloc(usize, reads),
         };
         const cbs = a.cb_s[0..reads];
         const ptrs = a.ptr_s[0..reads];
@@ -228,7 +298,17 @@ pub const Aio = struct {
         try a.live.append(a.gpa, .{ id, b.first });
         var sent: usize = 0;
         while (sent < reads) {
-            const r = ioSubmit(a.ctx, reads - sent, ptrs[sent..].ptr);
+            // TF_DS_ENGRAM_AIO_DEPTH: at most `depth_cap` reads in flight, submitted a slice at a time as completions make room
+            var n = reads - sent;
+            if (a.depth_cap != 0) {
+                n = @min(n, a.depth_slice);
+                while (a.st_inflight.load(.monotonic) + n > a.depth_cap) {
+                    const tw = aioNowNs();
+                    a.waitSlot();
+                    _ = a.st_wait_ns.fetchAdd(aioNowNs() - tw, .monotonic);
+                }
+            }
+            const r = a.submitTimed(n, ptrs[sent..].ptr);
             if (r <= 0) {
                 const bp = a.batches.getPtr(id).?;
                 bp.left -= reads - sent; // never submitted
@@ -271,6 +351,9 @@ pub const Aio = struct {
                 }
             }
             if (!busy) break;
+            const tw = aioNowNs();
+            a.waitSlot();
+            _ = a.st_wait_ns.fetchAdd(aioNowNs() - tw, .monotonic);
         }
         const id = a.next_id;
         a.next_id += 1;
@@ -304,6 +387,17 @@ pub const Aio = struct {
         try a.live.append(a.gpa, .{ id, b.first });
         var sent: usize = 0;
         while (sent < reads) {
+            // TF_DS_ENGRAM_AIO_DEPTH: at most `depth_cap` reads in flight, submitted a slice at a time as completions make room
+            var n = reads - sent;
+            if (a.depth_cap != 0) {
+                n = @min(n, a.depth_slice);
+                while (a.st_inflight.load(.monotonic) + n > a.depth_cap) {
+                    const tw = aioNowNs();
+                    a.waitSlot();
+                    _ = a.st_wait_ns.fetchAdd(aioNowNs() - tw, .monotonic);
+                }
+            }
+            const r = a.submitTimed(n, ptrs[sent..].ptr);
             if (r <= 0) {
                 const bp = a.batches.getPtr(id).?;
                 bp.left -= reads - sent; // never submitted
@@ -344,11 +438,22 @@ pub const Aio = struct {
 
     /// Reap (polling) until batch `id`'s rows are all in; error.ReadFailed when one failed. A batch is waited for once.
     pub fn wait(a: *Aio, id: u64) !void {
+        const t0 = aioNowNs();
+        defer _ = a.st_wait_ns.fetchAdd(aioNowNs() - t0, .monotonic);
+        var ev: [256]IoEvent = undefined;
+        var taken: usize = 0; // completions the last sleep brought, to be handled under the lock
+        var empty: usize = 0;
         while (true) {
             a.mutex.lockUncancelable(a.io);
-            defer a.mutex.unlock(a.io);
-            const b = a.batches.getPtr(id) orelse return;
-            a.reap();
+            if (taken > 0) {
+                a.handle(ev[0..taken]);
+                taken = 0;
+            }
+            const b = a.batches.getPtr(id) orelse {
+                a.mutex.unlock(a.io);
+                return;
+            };
+            const got = a.reap();
             if (b.left == 0) {
                 const failed = b.failed;
                 _ = a.batches.fetchRemove(id);
@@ -356,14 +461,30 @@ pub const Aio = struct {
                     _ = a.live.orderedRemove(k);
                     break;
                 };
+                a.mutex.unlock(a.io);
                 if (failed) return error.ReadFailed;
                 return;
+            }
+            const want = @min(b.left, a.wake_min);
+            a.mutex.unlock(a.io);
+            // polling: round again; sleeping: wait here, off the lock, for a batch of completions
+            if (a.sleep) {
+                // a poll that found completions is followed by another at once; only polls that find none count towards the sleep
+                if (got > 0 and a.spin > 0) {
+                    empty = 0;
+                } else {
+                    empty += 1;
+                    if (empty > a.spin) {
+                        taken = a.sleepFor(want, &ev);
+                        empty = 0;
+                    }
+                }
             }
         }
     }
 };
 
-test "AIO rows equal the pool's, across a ring that wraps" {
+fn aioRowsRun(sleep: bool, min_events: usize, wake_us: u32, depth: usize, spin: usize) !u32 {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -393,6 +514,8 @@ test "AIO rows equal the pool's, across a ring that wraps" {
         else => return e,
     };
     defer aio.deinit();
+    aio.configureSleep(sleep, min_events, wake_us, spin);
+    aio.configureDepth(depth, 2);
     var prng = std.Random.DefaultPrng.init(7);
     for (0..12) |round| {
         var ids: [6]i64 = undefined;
@@ -408,10 +531,49 @@ test "AIO rows equal the pool's, across a ring that wraps" {
         try std.testing.expectEqualSlices(u8, &want_w, &got_w);
         try std.testing.expectEqualSlices(u8, &want_s, &got_s);
     }
+    // the ring's counters: every submission counted with its reads, the longest call timed, reads in flight seen
+    try std.testing.expect(aio.st_calls.load(.monotonic) >= 12);
+    try std.testing.expect(aio.st_reads.load(.monotonic) >= 12 * 6);
+    try std.testing.expect(aio.st_reads.load(.monotonic) >= aio.st_calls.load(.monotonic));
+    try std.testing.expect(aio.st_call_max_ns.load(.monotonic) > 0);
+    try std.testing.expect(aio.st_inflight_max.load(.monotonic) >= 1);
+    try std.testing.expect(aio.st_wait_ns.load(.monotonic) > 0);
+    // sleeping waiters sleep (and take completions on the way); polling ones never call the blocking wait
+    if (sleep) try std.testing.expect(aio.st_wakes.load(.monotonic) > 0) else try std.testing.expectEqual(@as(u64, 0), aio.st_wakes.load(.monotonic));
     var big_w: [9 * 100]u8 = undefined;
     var big_s: [9 * 3]u8 = undefined;
     const nine: [9]i64 = @splat(0);
     try std.testing.expectError(error.TooManyRows, aio.start(tab, &nine, &big_w, &big_s));
+    return aio.st_inflight_max.load(.monotonic);
+}
+
+test "AIO rows equal the pool's, across a ring that wraps" {
+    _ = try aioRowsRun(false, 4, 500, 0, 0);
+}
+
+test "AIO rows equal the pool's, across a ring that wraps, with the waiters sleeping for batches of completions" {
+    _ = try aioRowsRun(true, 4, 500, 0, 0);
+}
+
+test "AIO rows equal the pool's with sleeping waiters asking for more completions than there are, ending on the time bound, and for one" {
+    _ = try aioRowsRun(true, 1000, 100, 0, 0);
+    _ = try aioRowsRun(true, 1, 50, 0, 0);
+}
+
+test "AIO rows equal the pool's with sleeping waiters that poll on after a poll that found completions and sleep after a few that found none" {
+    _ = try aioRowsRun(true, 4, 500, 0, 3);
+    _ = try aioRowsRun(true, 1000, 100, 4, 1);
+}
+
+test "AIO rows equal the pool's with a cap on reads in flight, polling and sleeping: the cap holds, and without it the batch goes in whole" {
+    const open_max = try aioRowsRun(false, 4, 500, 0, 0);
+    try std.testing.expect(open_max > 4); // (the control: a batch of 12 reads goes in at once, so the cap below is live)
+    for ([_]bool{ false, true }) |sleep| {
+        const m = try aioRowsRun(sleep, 4, 500, 4, 0);
+        try std.testing.expect(m >= 1 and m <= 4);
+    }
+    // a cap of one: every read waits for the one before it
+    try std.testing.expect((try aioRowsRun(true, 1, 50, 1, 0)) == 1);
 }
 
 test "a refused row id leaves the ring and its allocations as they were" {

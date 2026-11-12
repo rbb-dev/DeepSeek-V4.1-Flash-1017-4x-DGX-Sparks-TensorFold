@@ -89,6 +89,9 @@ pub const local_first = @import("local_first.zig");
 /// Collectives of the ranks' host threads over the engine's own links.
 pub const star = @import("star.zig");
 
+/// A sleeping wait on a counter another thread advances (the Engram worker's and the engine thread's).
+pub const wait_bell = @import("wait_bell.zig");
+
 /// The SSD landing's broadcast as the WRITEs Rocinante would post.
 pub const land_writes = @import("land_writes.zig");
 
@@ -161,6 +164,7 @@ test {
     refAll(local_first);
     refAll(star);
     refAll(land_writes);
+    refAll(wait_bell);
     _ = @import("roci_pair.zig");
     _ = @import("pack_epilogue.zig");
     _ = @import("wc_verdict.zig");

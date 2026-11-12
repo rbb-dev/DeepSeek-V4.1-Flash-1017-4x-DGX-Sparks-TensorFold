@@ -40,7 +40,11 @@ pub fn prioritiesOf(p: Prio, least: c_int, greatest: c_int) [2]c_int {
     };
 }
 
+/// TF_DS_ROCI_WORKER_PAIR_MAJOR: with two passes in flight the Engram worker reads a pair's order (both passes' layer 0, then both
+/// layer 1) unless the variable is "0" (then each pass's layers in turn).
 pub fn pairMajorOf(text: ?[]const u8) bool {
+    const t = std.mem.trim(u8, text orelse return true, " \t");
+    return !std.mem.eql(u8, t, "0");
 }
 
 /// The most encoder layers a pair has (the engine's layers / 2) and so the most events a parity holds besides the boundary's.
@@ -334,6 +338,9 @@ test "the streams' priorities: 0 equal, 1 A above B, 2 the reverse; anything els
     }
 }
 
+test "TF_DS_ROCI_WORKER_PAIR_MAJOR is on with the stagger unless it is 0" {
+    for ([_]?[]const u8{ null, "", "1", " 1 ", "2", "yes" }) |t| try std.testing.expect(pairMajorOf(t));
+    for ([_]?[]const u8{ "0", " 0 " }) |t| try std.testing.expect(!pairMajorOf(t));
 }
 
 test "the list is a pure function of its inputs: two ranks build the same one" {

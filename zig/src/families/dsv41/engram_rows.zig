@@ -27,7 +27,74 @@ pub fn envOn(name: [:0]const u8) bool {
     return !std.mem.eql(u8, std.mem.span(v), "0");
 }
 
+/// How many different ids `ids` holds (a miss list: a row asked by several slots of a step is read once per slot in the baseline).
+pub fn uniqueIds(gpa: std.mem.Allocator, ids: []const i64) !usize {
+    if (ids.len == 0) return 0;
+    var cap: usize = 16;
+    while (cap < 2 * ids.len) cap *= 2;
+    const set = try gpa.alloc(u64, cap);
+    defer gpa.free(set);
+    @memset(set, 0);
+    var uniq: usize = 0;
+    for (ids) |x| {
+        const key: u64 = @as(u64, @bitCast(x)) +% 1; // (0 is the empty mark)
+        var at: usize = @intCast((key *% 0x9e3779b97f4a7c15) >> @intCast(64 - @ctz(cap)));
+        while (set[at] != 0 and set[at] != key) at = (at + 1) & (cap - 1);
+        if (set[at] == 0) {
+            set[at] = key;
+            uniq += 1;
+        }
+    }
+    return uniq;
+}
+
+test "uniqueIds counts the different ids of a miss list: repeats once, a list without repeats whole, the empty list none" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(@as(usize, 0), try uniqueIds(a, &.{}));
+    try std.testing.expectEqual(@as(usize, 5), try uniqueIds(a, &.{ 7, 9, 11, 13, 1_000_000_007 })); // the control: no repeats
+    try std.testing.expectEqual(@as(usize, 3), try uniqueIds(a, &.{ 7, 9, 7, 7, 11, 9 }));
+    try std.testing.expectEqual(@as(usize, 1), try uniqueIds(a, &.{ 0, 0, 0, 0 })); // (id 0 is an id, not the empty mark)
+    // a long list with a known number of different ids, as a step's 24,576 slots
+    var prng = std.Random.DefaultPrng.init(3);
+    const big = try a.alloc(i64, 24576);
+    defer a.free(big);
+    for (big) |*x| x.* = prng.random().intRangeLessThan(i64, 0, 9000);
+    var seen = std.AutoHashMap(i64, void).init(a);
+    defer seen.deinit();
+    for (big) |x| try seen.put(x, {});
+    try std.testing.expectEqual(@as(usize, seen.count()), try uniqueIds(a, big));
+}
+
 /// A staging buffer: rows x slots records, the misses' row ids and where each lands, their AIO batch.
+pub const step_ring = 64;
+pub const StepRec = struct { tag: u64 = 0, count: u32 = 0, ord: u32 = 0, set: u32 = 0 };
+
+/// Hashes of a miss list: one that depends on the order of the ids, one that does not.
+pub fn missHashes(ids: []const i64) struct { ord: u32, set: u32 } {
+    var o: u32 = 0x811c9dc5;
+    var s: u32 = 0;
+    for (ids) |x| {
+        const v: u64 = @bitCast(x);
+        o = (o ^ @as(u32, @truncate(v))) *% 16777619;
+        o = (o ^ @as(u32, @truncate(v >> 32))) *% 16777619;
+        var z = v +% 0x9e3779b97f4a7c15;
+        z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+        z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+        s +%= @as(u32, @truncate(z ^ (z >> 31)));
+    }
+    return .{ .ord = o, .set = s };
+}
+
+test "missHashes: the order hash sees a swap, the set hash does not, a changed id changes both" {
+    const a = missHashes(&.{ 5, 9, 12, 7 });
+    const b = missHashes(&.{ 9, 5, 12, 7 });
+    const c = missHashes(&.{ 5, 9, 12, 8 });
+    try std.testing.expect(a.ord != b.ord);
+    try std.testing.expectEqual(a.set, b.set);
+    try std.testing.expect(a.ord != c.ord and a.set != c.set);
+    try std.testing.expectEqual(missHashes(&.{ 5, 9, 12, 7 }).ord, a.ord);
+}
+
 pub const Stage = struct {
     /// A stage that holds nothing: the slots a Rows does not make.
     pub const empty: Stage = .{ .j = 0, .bytes = &.{}, .ids = &.{}, .dsts = &.{} };
@@ -121,8 +188,18 @@ pub const Rows = struct {
     instream: bool,
     fault: [2]engram_cache.Fault = .{ .{}, .{} }, // how each layer's cache was faulted in (Options.prefault)
     fault_ns: u64 = 0, // and the time it took
+    // TF_DS_ROCI_PAIR_LOG's count of repeated ids: the misses of every staged step and how many different ids they name
+    dup_on: bool = false,
     // TF_DS_ENGRAM_PARTNER: the fill worker's steps read half of their misses and take the other half from the column partner
     partner: ?*engram_partner.Link = null,
+    // the worker's steps' miss lists, for comparing two nodes that need the same rows (TF_DS_ROCI_PAIR_LOG): per step the tag the worker
+    // set (absolute chunk index << 8 | layer slot), the miss count, a hash of the ids in list order and a hash of the set (order-free)
+    steps: [step_ring]StepRec = @splat(.{}),
+    steps_n: std.atomic.Value(u64) = .init(0),
+    step_tag: std.atomic.Value(u64) = .init(0),
+    other_plans: std.atomic.Value(u64) = .init(0), // plans by anything but the fill worker (rounds, read-ahead, inline reads): they fill the cache too
+    dup_misses: std.atomic.Value(u64) = .init(0),
+    dup_unique: std.atomic.Value(u64) = .init(0),
 
     /// The shards of node o.node of o.nodes (owned) or the whole ones, checked against `tables`; the kernels; the
     /// staging buffers and the caches. Needs the CUDA context current.
@@ -257,6 +334,21 @@ pub const Rows = struct {
         st.j = j;
         st.misses = m;
         st.batch = 0;
+        if (r.dup_on) {
+            const w0 = @intFromPtr(&r.wk[0][0]);
+            const w1 = @intFromPtr(&r.wk[max_wk - 1][1]) + @sizeOf(Stage);
+            if (@intFromPtr(st) >= w0 and @intFromPtr(st) < w1) {
+                const h = missHashes(st.ids[0..m]);
+                const at = r.steps_n.load(.monotonic);
+                r.steps[at % step_ring] = .{ .tag = r.step_tag.load(.monotonic), .count = @intCast(m), .ord = h.ord, .set = h.set };
+                r.steps_n.store(at + 1, .release);
+            } else _ = r.other_plans.fetchAdd(1, .monotonic);
+        }
+        if (r.dup_on and m > 0) {
+            const u = uniqueIds(r.gpa, st.ids[0..m]) catch m;
+            _ = r.dup_misses.fetchAdd(m, .monotonic);
+            _ = r.dup_unique.fetchAdd(u, .monotonic);
+        }
     }
 
     /// The staged misses' records kept in their layer's cache.

@@ -89,6 +89,7 @@ pub fn readWorkerEnv() void {
     if (std.c.getenv("TF_DS_ENGRAM_WORKER")) |v| wk_on = !std.mem.eql(u8, std.mem.span(v), "0");
     if (std.c.getenv("TF_DS_ENGRAM_PINNED")) |v| pinned_on = !std.mem.eql(u8, std.mem.span(v), "0");
     prompt.readAheadPassEnv(); // TF_DS_ENGRAM_AHEAD_PASS (its start line printed here, once)
+    prompt.readWaitEnv(); // TF_DS_ENGRAM_WAIT_US
 }
 pub const live_config = engine_api.live_config;
 /// The pool's streams (--parallel 4).
@@ -1556,6 +1557,7 @@ fn openPair(m: *Model, gpa: std.mem.Allocator, d: *const cuda.Driver, o: Options
     m.pair_t0 = try cuda.Event.init(d, true);
     errdefer if (m.pair_t0) |*e| e.deinit();
     m.pair_log = std.c.getenv("TF_DS_ROCI_PAIR_LOG") != null;
+    if (m.erows) |r| r.dup_on = m.pair_log;
     if (m.pair_log) {
         // the span log's events: a pair of timing events per outstanding pair (pair_spans.cap of them), made here and only here
         m.span_t0 = try m.gpa.alloc(cuda.Event, pair_spans.cap);
@@ -1590,6 +1592,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     std.log.info(fmt, args);
     const v = std.c.getenv("TF_DS_ROCI_PAIR_LOG") orelse return;
     if (v[0] != '/') return;
+    var buf: [2048]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch return;
     const fd = std.c.open(v, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o644));
     if (fd < 0) return;
@@ -1759,6 +1762,10 @@ pub const Model = struct {
     partner_seen: engram_partner.Counters = .{}, // the partner counters at the last line of the pair log
     fill_t0: u64 = 0, // the fill's admission (fillBegin), for the pair log's first line of a prompt
     pair_in_fill: u64 = 0, // pairs run since fillBegin
+    dup_snap: [2]u64 = .{ 0, 0 }, // the row stages' miss totals at the last pair line, and at the fill's start (the repeats' share per line and per fill)
+    dup_fill: [2]u64 = .{ 0, 0 },
+    steps_seen: u64 = 0, // the row stages' step records already printed
+    other_seen: u64 = 0,
     pair_count: u64 = 0,
     pair_prev_pending: bool = false, // the last pair's GPU span has not been printed
     meter: pass_meter.Meter = .{}, // the rows the device has finished of each slot's prompt pass (the lane host's live prefill speed)
@@ -1996,6 +2003,10 @@ pub const Model = struct {
         m.partner_seen = .{};
         m.fill_t0 = 0;
         m.pair_in_fill = 0;
+        m.dup_snap = .{ 0, 0 };
+        m.dup_fill = .{ 0, 0 };
+        m.steps_seen = 0;
+        m.other_seen = 0;
         m.pair_count = 0;
         m.pair_prev_pending = false;
         m.meter = .{};
@@ -2401,6 +2412,25 @@ pub const Model = struct {
             if (prompt.engram_fault.asked) {
                 var fb: [96]u8 = undefined;
                 std.log.info("TF_DS_ENGRAM_FAULT {s}", .{prompt.engram_fault.describe(&fb, @intCast(o.rank))});
+            }
+                // TF_DS_ENGRAM_AIO_DEPTH: a cap on the prompt ring's reads in flight, 256 unless set (0: none), submitted a slice at a time
+                // (TF_DS_ENGRAM_AIO_SLICE, default 64): the drive loses throughput when over-queued and io_submit then blocks for block-layer tags
+                {
+                    const cap: usize = if (std.c.getenv("TF_DS_ENGRAM_AIO_DEPTH")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch 256 else 256;
+                    const slice: usize = if (std.c.getenv("TF_DS_ENGRAM_AIO_SLICE")) |sv| std.fmt.parseInt(usize, std.mem.span(sv), 10) catch 64 else 64;
+                    m.paio.?.configureDepth(cap, slice);
+                    if (cap != 0) std.log.info("TF_DS_ENGRAM_AIO_DEPTH={d}: rank {d}: the prompt path's AIO ring keeps at most {d} reads in flight, submitted {d} at a time as completions make room (the drive loses throughput when over-queued)", .{ cap, m.comm.rank, cap, m.paio.?.depth_slice });
+                }
+                // TF_DS_ENGRAM_AIO_SLEEP: the prompt ring's waiters sleep in the kernel for a batch of completions instead of polling
+                // (on unless "0": waiters sleep after two polls that find nothing; the decode rounds' ring keeps polling)
+                if (if (std.c.getenv("TF_DS_ENGRAM_AIO_SLEEP")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true) {
+                    const wake: usize = if (std.c.getenv("TF_DS_ENGRAM_AIO_WAKE")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch 32 else 32;
+                    const us: u32 = if (std.c.getenv("TF_DS_ENGRAM_AIO_WAKE_US")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 1000 else 1000;
+                    const spin: usize = if (std.c.getenv("TF_DS_ENGRAM_AIO_SPIN")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch 2 else 2;
+                    m.paio.?.configureSleep(true, wake, us, spin);
+                    std.log.info("TF_DS_ENGRAM_AIO_SLEEP (on unless 0): rank {d}: the prompt path's AIO ring sleeps in io_getevents for {d} completions or {d} us instead of polling, after {d} empty polls (the decode rounds' ring keeps polling)", .{ m.comm.rank, m.paio.?.wake_min, us, spin });
+                }
+                m.eh.?.paio = m.paio;
             }
             // TF_DS_ENGRAM_PACKED (a folder of tf-dsv41-engram-pack's shards): a row is one read, kept in a row cache
             // (TF_DS_ENGRAM_CACHE_MIB, default 2048, 0 none) and decoded on the GPU; TF_DS_ENGRAM_OWNED=1: each node
@@ -2920,6 +2950,15 @@ pub const Model = struct {
         m.fill_t0 = m.now();
         m.pair_in_fill = 0;
         if (m.eh) |*eh| eh.ka.newPrompt();
+        if (m.erows) |r| m.dup_fill = .{ r.dup_misses.load(.monotonic), r.dup_unique.load(.monotonic) };
+        if (slot >= m.streams) return error.BadSlot;
+        m.spans.clearRetainingCapacity();
+        m.ch.spans = &.{};
+        m.view = try m.caches.view(&m.eng, slot, base);
+        for (m.rings, m.ring_view) |r, *v| v.* = r + slot * m.eng.ringBytes();
+        m.fill_slot = slot;
+    }
+
     /// Layer li's Engram on the chunk, in phases: all (the baseline order: the pending MoE post, the rows and their projection, the
     /// sums and the gate), pre (TF_DS_ROCI_ENGRAM_AHEAD: the rows and the projection, then the part-1 send, a layer early) and finish
     /// (the pending post, the sums, the gate).
@@ -3415,14 +3454,70 @@ pub const Model = struct {
         m.pair_count += 1;
         m.pair_prev_pending = true;
         m.pair_in_fill += 1;
+        if (m.pair_log) {
             const eh = &m.eh.?;
+            const aio_s: u64 = if (eh.paio) |x| x.st_submit_ns.load(.monotonic) else 0;
+            const aio_w: u64 = if (eh.paio) |x| x.st_wait_ns.load(.monotonic) else 0;
+            const aio_max: u32 = if (eh.paio) |x| x.st_inflight_max.swap(x.st_inflight.load(.monotonic), .monotonic) else 0;
+            const aio_c: u64 = if (eh.paio) |x| x.st_calls.load(.monotonic) else 0;
+            const aio_r: u64 = if (eh.paio) |x| x.st_reads.load(.monotonic) else 0;
+            const aio_cmax: u64 = if (eh.paio) |x| x.st_call_max_ns.swap(0, .monotonic) else 0;
+            const aio_wk: u64 = if (eh.paio) |x| x.st_wakes.load(.monotonic) else 0;
+            const aio_we: u64 = if (eh.paio) |x| x.st_wake_events.load(.monotonic) else 0;
+            const cur: [23]u64 = .{ eh.inst_steps.load(.monotonic), eh.inst_hash_ns.load(.monotonic), eh.inst_gather_ns.load(.monotonic), eh.inst_decode_ns.load(.monotonic), eh.inst_rows.load(.monotonic), eh.inst_miss.load(.monotonic), eh.inst_bytes.load(.monotonic), eh.inst_cpu_ns.load(.monotonic), eh.inst_nivcsw.load(.monotonic), eh.inst_big.load(.monotonic), eh.inst_small.load(.monotonic), aio_s, aio_w, aio_c, aio_r, aio_wk, aio_we, eh.wk_go.sleeps.load(.monotonic), eh.wk_go.asleep_ns.load(.monotonic), eh.wk_go.rung.load(.monotonic), eh.wk_ready.sleeps.load(.monotonic), eh.wk_ready.asleep_ns.load(.monotonic), eh.wk_ready.rung.load(.monotonic) };
+            var d: [23]u64 = undefined;
             for (&d, cur, eh.inst_snap) |*x, y, z| x.* = y -% z;
             eh.inst_snap = cur;
+            const cores = eh.inst_cores.swap(0, .monotonic);
+            var core_text: [160]u8 = undefined;
+            var cw = std.Io.Writer.fixed(&core_text);
+            for (0..64) |ci| if (cores >> @intCast(ci) & 1 != 0) cw.print("{s}{d}", .{ if (cw.end == 0) "" else ",", ci }) catch {};
             const ms = struct {
                 fn of(t_ns: u64) f64 {
                     return @as(f64, @floatFromInt(t_ns)) / 1e6;
                 }
             }.of;
+            const dm: u64 = if (m.erows) |r| r.dup_misses.load(.monotonic) else 0;
+            const du: u64 = if (m.erows) |r| r.dup_unique.load(.monotonic) else 0;
+            const dm_line = dm -% m.dup_snap[0];
+            const du_line = du -% m.dup_snap[1];
+            const dm_fill = dm -% m.dup_fill[0];
+            const du_fill = du -% m.dup_fill[1];
+            m.dup_snap = .{ dm, du };
+            // the worker's steps' miss lists since the last line: chunk (absolute index) and layer slot, count, order hash, set hash; the
+            // plans anything else made (they fill the cache too) since the last line
+            if (m.erows) |r| {
+                var txt: [420]u8 = undefined;
+                var tw = std.Io.Writer.fixed(&txt);
+                const n_all = r.steps_n.load(.acquire);
+                var from = m.steps_seen;
+                if (n_all -% from > roci_step_print) from = n_all - roci_step_print;
+                for (from..n_all) |si| {
+                    const rec = r.steps[si % engram_rows.step_ring];
+                    tw.print("{s}c{d}l{d}:{d}:{x:0>8}:{x:0>8}", .{ if (tw.end == 0) "" else " ", rec.tag >> 8, rec.tag & 0xff, rec.count, rec.ord, rec.set }) catch break;
+                }
+                m.steps_seen = n_all;
+                const other = r.other_plans.load(.monotonic);
+                pairLog("ROCI pair {d} (rank {d}) misses: {s}; other plans {d}", .{ m.pair_count, m.comm.rank, tw.buffered(), other -% m.other_seen });
+                m.other_seen = other;
+            }
+            const share = struct {
+                fn of(misses: u64, uniq: u64) f64 {
+                    return if (misses == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(misses -| uniq)) / @as(f64, @floatFromInt(misses));
+                }
+            }.of;
+            // the sleeping waits (wait_bell) since the last line: the worker's for a free slot (ended by the engine thread's ring or its 10 ms backstop),
+            // the engine thread's for rows (ended by the worker's ring or its timeout; the timeouts are the duties' turns)
+            pairLog("ROCI pair {d} (rank {d}) Engram waits: worker slept {d} times for {d:.1} ms ({d} woken by a ring); engine thread slept {d} times for {d:.1} ms ({d} woken by a ring, {d} ended by the timeout or an earlier ring)", .{ m.pair_count, m.comm.rank, d[17], ms(d[18]), d[19], d[20], ms(d[21]), d[22], d[20] -| d[22] });
+            if (m.comm.rank != 0) {
+                // the followers' balance figures: what this rank asked and read in the pair, its repeats and its worker's gather time
+                pairLog("ROCI pair {d} (rank {d}): {d} rows asked, {d} read, repeats {d:.1}% of this line's misses ({d:.1}% of the fill's), worker gather {d:.1} ms in {d} steps", .{ m.pair_count, m.comm.rank, d[4], d[5], share(dm_line, du_line), share(dm_fill, du_fill), ms(d[2]), d[0] });
+            } else {
+                // three lines a pair, each under the log's 512-byte limit: the host's issue, the worker, the AIO ring and the repeats
+                pairLog("ROCI pair {d} at {d}: host issue {d:.1} ms (engine thread CPU {d:.1} ms), of it waiting for the Engram worker {d:.1} ms and in the Engram upload calls (copies blocked included) {d:.1} ms", .{ m.pair_count, start_a, ms(m.now() - host_t0), ms(pair_nap.cpuNow() - cpu_t0), ms(eh.inst_wait_ns), ms(eh.inst_apply_ns) });
+                pairLog("ROCI pair {d} worker: {d} steps, hash {d:.1} ms, gather {d:.1} ms, decode {d:.1} ms, {d} rows asked, {d} read ({d:.1} MB); thread CPU {d:.1} ms, {d} involuntary switches, core samples X925 {d} / A725 {d}, cores [{s}]", .{ m.pair_count, d[0], ms(d[1]), ms(d[2]), ms(d[3]), d[4], d[5], @as(f64, @floatFromInt(d[6])) / 1e6, ms(d[7]), d[8], d[9], d[10], cw.buffered() });
+                pairLog("ROCI pair {d} AIO: io_submit {d:.1} ms in {d} calls of {d:.0} reads on average (longest {d:.2} ms), waiting for completions {d:.1} ms, slept {d} times for {d:.0} completions on average, most reads in flight {d}; repeats {d:.1}% of this line's misses, {d:.1}% of the fill's ({d} different ids in {d} misses)", .{ m.pair_count, ms(d[11]), d[13], if (d[13] == 0) 0.0 else @as(f64, @floatFromInt(d[14])) / @as(f64, @floatFromInt(d[13])), ms(aio_cmax), ms(d[12]), d[15], if (d[15] == 0) 0.0 else @as(f64, @floatFromInt(d[16])) / @as(f64, @floatFromInt(d[15])), aio_max, share(dm_line, du_line), share(dm_fill, du_fill), du_line, dm_line });
+            }
         }
         if (m.eh) |*eh| {
             eh.inst_wait_ns = 0;
@@ -4545,6 +4640,8 @@ test "TF_DS_ENGRAM_PINNED: the worker's slots go back through engramRelease afte
     const rel = std.mem.indexOf(u8, code[up..], "try prompt.engramRelease(eh, e.s, j, first + units);") orelse return error.TestUnexpectedResult;
     try std.testing.expect(rel > 0);
     const p = @embedFile("prompt.zig");
+    const wait = std.mem.indexOf(u8, p, "const EngramDuties = struct {") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, p[wait .. wait + 400], "try engramPoll(d.eh);") != null);
     const start = std.mem.indexOf(u8, p, "pub fn engramWorkerStart(") orelse return error.TestUnexpectedResult;
     const flush = std.mem.indexOf(u8, p[start..], "try engramFlushPins(eh);") orelse return error.TestUnexpectedResult;
     const spawn = std.mem.indexOf(u8, p[start..], "eh.wk_thread = try std.Thread.spawn(") orelse return error.TestUnexpectedResult;
@@ -4621,6 +4718,35 @@ test "TF_DS_ROCI_PAIR_LOG: the pair line names the engine thread's CPU time, the
     const p = @embedFile("prompt.zig");
     for ([_][]const u8{ "eh.inst_hash_ns.fetchAdd", "eh.inst_gather_ns.fetchAdd", "eh.inst_decode_ns.fetchAdd", "eh.inst_bytes.fetchAdd" }) |w|
         try std.testing.expect(std.mem.count(u8, p, w) >= 1);
+}
+
+const roci_step_print = 12;
+
+test "TF_DS_ROCI_PAIR_LOG: every line of a pair is short enough for the log (512 bytes) with 12 characters for each number, and the file writer's buffer holds more" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    var at: usize = 0;
+    var lines: usize = 0;
+    while (std.mem.indexOfPos(u8, code, at, "pairLog(\"")) |i| {
+        const start = i + "pairLog(\"".len;
+        const end = std.mem.indexOfPos(u8, code, start, "\", .{") orelse break;
+        const fmt = code[start..end];
+        const holes = std.mem.count(u8, fmt, "{");
+        try std.testing.expect(fmt.len - 5 * holes + 12 * holes < 480);
+        lines += 1;
+        at = end;
+    }
+    try std.testing.expect(lines >= 6); // the first-launch line, the span line, the follower's line and the three of rank 0
+    try std.testing.expect(std.mem.indexOf(u8, code, "var buf: [2048]u8 = undefined;\n    const line = std.fmt.bufPrint(&buf, fmt ++") != null);
+}
+
+test "TF_DS_ENGRAM_AIO_SLEEP: the prompt ring sleeps by default (two empty polls, 32 completions, 1 ms) unless the variable is 0" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    try std.testing.expect(std.mem.indexOf(u8, code, "if (std.c.getenv(\"TF_DS_ENGRAM_AIO_SLEEP\")) |v| !std.mem.eql(u8, std.mem.span(v), \"0\") else true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "catch 2 else 2;") != null); // SPIN
+    try std.testing.expect(std.mem.indexOf(u8, code, "catch 32 else 32;") != null); // WAKE
+    try std.testing.expect(std.mem.indexOf(u8, code, "catch 1000 else 1000;") != null); // WAKE_US
 }
     const pair = code[std.mem.indexOf(u8, code, "pub fn fillGroup(").?..];
     const g_at = std.mem.indexOf(u8, steps, "try m.issueLead(m.passStreamOf(l.pass));").?;
