@@ -34,6 +34,8 @@ const exact = @import("exact.zig");
 const tri_index = @import("tri_index.zig");
 const idx_split = @import("idx_split.zig");
 const roci_engine = @import("roci_engine.zig");
+const roci = @import("rocinante.zig");
+const slab_plan = @import("slab_plan.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const mx = @import("mx.zig");
 const prompt2d = @import("prompt2d.zig");
@@ -342,6 +344,15 @@ pub const Chunk = struct {
     // the full-cap ch.part assumes a row-major layout that was never established; give it its own buffer, sized
     // tight for q = cap / world rows, exactly as the real engine would size ch.part for a q-row chunk.
     qhc_part: u64 = 0,
+    /// TF_DS_ROCI_ANY: the boundary layer's owned update and the handoff of the decoder rows are done; the layers after it are not owned
+    boundary_done: bool = false,
+    /// TF_DS_ROCI_COMBINE_FIRST: the MoE's partials' part-1 send was queued inside moe (behind the rows it sends); the gather that follows
+    /// takes it as sent, once.
+    own1_sent: bool = false,
+    // TF_DS_ROCI_GATHERS in effect: x of the layers whose x is gathered lives in the transport's arena (x_g) and every other
+    // layer's x in the device buffer (x_dev); `x` is the one the current layer reads and writes. 0 otherwise.
+    x_dev: u64 = 0,
+    x_g: u64 = 0,
     xs: exl3_experts.Scratch,
     // Model._moe_scratch's decode scratch: windows under 64 rows (a prompt's small chunk, every decode round), one for
     // every layer of the same slots and experts, its epoch carried from call to call
@@ -400,7 +411,11 @@ pub const Chunk = struct {
         ch.h = try a.take(cap * hc * d * 2);
         ch.h_alt = try a.take(cap * hc * d * 2);
         ch.x = try a.take(cap * d * 2);
+        ch.x_dev = ch.x;
+        // TF_DS_ROCI_GATHERS: the gathers' tensors are the arena's regions (the rows each rank produces in place, the others'
+        // landed by the transport), not buffers of this arena
         const ga_rc: ?*roci_engine.Roci = if (e.two) |t| t.rc else null;
+        ch.x_g = if (ga_rc) |r| r.addr(.g_x) else 0;
         // TF_DS_ROCI_DEC: the taps and the head's row are the arena's regions (each rank writes its own rows, the transport lands the others)
         const dec_rc: ?*roci_engine.Roci = if (e.two) |t| t.rc else null;
         if (dec_rc != null and ch.dec_rows > roci.hand_rows) return error.ChunkTooLong;
@@ -411,8 +426,8 @@ pub const Chunk = struct {
         ch.post = try a.take(cap * hc * 4);
         ch.comb = try a.take(cap * hc * hc * 4);
         ch.qa = try a.take(cap * l0.wq_a.n * 2);
-        ch.y = try a.take(cap * hd * 2);
-        ch.qr = try a.take(cap * l0.wq_a.n * 2);
+        ch.y = if (ga_rc) |r| r.addr(.g_y) else try a.take(cap * hd * 2);
+        ch.qr = if (ga_rc) |r| r.addr(.g_qr) else try a.take(cap * l0.wq_a.n * 2);
         ch.q = try a.take(cap * hl * hd * 2);
         ch.wsrc = try a.take((c.window - 1 + cap) * hd * 2);
         ch.wlo = try a.take(8);
@@ -432,8 +447,8 @@ pub const Chunk = struct {
         ch.xf = try a.take(cap * d * 4);
         ch.gate_f = try a.take(c.experts * d * 4);
         ch.logits = try a.take(cap * c.experts * 4);
-        ch.pick = try a.take(cap * sl * 4);
-        ch.wts = try a.take(cap * sl * 4);
+        ch.pick = if (ga_rc) |r| r.addr(.g_pick) else try a.take(cap * sl * 4);
+        ch.wts = if (ga_rc) |r| r.addr(.g_wts) else try a.take(cap * sl * 4);
         ch.pick_vl = try a.take(cap * sl * 4);
         ch.wts_vl = try a.take(cap * sl * 4);
         ch.pm = if (rc) |r| r.addr(.psum) else try a.take(cap * d * 4); // (attention's and the MoE's partials never coexist: one buffer)
@@ -444,6 +459,7 @@ pub const Chunk = struct {
             ch.qhc_g = try a.take(e.world * (cap / e.comm.world) * d * 4);
             ch.qhc_part = try a.take((cap / e.comm.world) * tri_basic.hc_blocks * 32 * 4);
         }
+        ch.boundary_done = false;
         if (e.two) |t| {
         }
         // compressed layers: the smallest ratio sets the most compressed entries a row can see
@@ -473,7 +489,7 @@ pub const Chunk = struct {
             ch.keys = try a.take(ke * 8);
             ch.score = try a.take(ke * 4);
             ch.tmax = try a.take((ke / tri_index.tile + cap) * 8);
-            ch.cidx = try a.take(cap * c.index_topk * 8);
+            ch.cidx = if (ga_rc) |r| r.addr(.g_cidx) else try a.take(cap * c.index_topk * 8);
             ch.ktop = try a.take(cap * c.index_topk * 8);
             ch.cidxp = try a.take(cap * (c.index_topk + 16) * 8);
             // the pool: only past candidate_blocks blocks, so a row block holds at most key_elems / 2048 rows there
@@ -646,8 +662,10 @@ fn mxScratch(e: *const Engine, ch: *Chunk, a: *Arena, cap: usize) !void {
     var x: mx.ExpertScratch = undefined;
     x.rows = cap;
     x.slots = sl;
+    // TF_DS_ROCI_GATHERS: the routing's codes and scales are the arena's regions, which the transport gathers
     const ga_rc: ?*roci_engine.Roci = if (e.two) |t| t.rc else null;
     inline for (.{ "q", "s", "cnt", "off", "fill", "act", "nact", "ent", "erow", "hq", "hs", "out" }, 0..) |f, j| {
+        @field(x, f) = if (ga_rc) |r| (if (j == 0) r.addr(.g_q) else if (j == 1) r.addr(.g_s) else try a.take(es[j])) else try a.take(es[j]);
     }
     // the prefill tiles' list (mx.gateUp / down of a prompt chunk)
     x.tiles = try a.take(mx.ExpertScratch.tileBytes(cap, sl, e_max));
@@ -915,13 +933,29 @@ pub const GatherStep = struct { owned: QRows };
 /// pre / x globally and is never sharded: replayCut truncates ch.n there for the decoder's own, unchanged path).
 /// node g of `world` owns rows [g * q, (g + 1) * q), q = cap / world. A short chunk, a resumed chunk under cap
 /// The owned rows of this rank: its slab of the chunk (slab_plan.slab), empty for a rank beyond the chunk's rows.
+fn anySlab(e: *const Engine, ch: *const Chunk) QRows {
+    const s = slab_plan.slab(ch.n, e.comm.rank);
+    return .{ .start = s.start, .n = s.n };
+}
+
 /// The rows between the starts of two ranks' slabs: a quarter of the chunk's own rows (slab_plan.q). The stride of every owned block in the arena, whatever rows the last slab holds.
+pub fn ownQ(e: *const Engine, ch: *const Chunk) usize {
     _ = e;
     return slab_plan.q(ch.n);
+}
+
+/// The rows of rank `k`'s slab (ownQ rows when every slab is whole).
+pub fn slabN(e: *const Engine, ch: *const Chunk, k: usize) usize {
     _ = e;
     return slab_plan.slab(ch.n, k).n;
+}
+
+/// The transport's plan for this chunk's owned exchanges, `x` the event's extra number (rocinante.buildEventX).
+pub fn rociShape(e: *const Engine, ch: *const Chunk, x: usize) !roci_engine.Shape {
     _ = e;
     return roci_engine.Roci.shapeFor(ch.n, ch.cap, true, x);
+}
+
 fn qhcRange(e: *const Engine, ch: *const Chunk, li: usize) ?QRows {
     if (e.two == null) return null;
     // the decoder half and the head (li = layers) on this rank's slab of the decoder rows, once the boundary has handed them over
@@ -930,13 +964,19 @@ fn qhcRange(e: *const Engine, ch: *const Chunk, li: usize) ?QRows {
     return anySlab(e, ch);
 }
 
+    if (li != e.c.layers / 2) return null;
     if (e.two == null) return null;
     // every chunk's boundary is on owned rows (a chunk with decoder rows hands them their rows after it: handoff)
     return if (!ch.boundary_done) anySlab(e, ch) else null;
     if (e.two == null) return null;
     if (e.two == null or e.mx == null) return null;
     if (e.two == null) return null;
+    ch.boundary_done = false;
+    ch.own1_sent = false;
+/// The plan shape of a pass whose gathers ride the transport (TF_DS_ROCI_GATHERS): a whole chunk of a size the transport has
 /// plans for. Null: the chunk has no plan (an error at the call). Every rank decides alike (the chunk and its cap are the same on all).
+pub fn gathersShape(e: *const Engine, ch: *const Chunk) ?roci_engine.Shape {
+    const t = e.two orelse return null;
     if (t.rc == null) return null;
     return rociShape(e, ch, 0) catch null;
 }
@@ -945,9 +985,30 @@ fn qhcRange(e: *const Engine, ch: *const Chunk, li: usize) ?QRows {
 /// no other transport).
 fn needShape(e: *const Engine, ch: *const Chunk) !roci_engine.Shape {
     return gathersShape(e, ch) orelse error.RociNoShape;
+}
+
+/// The plan shape of a pass whose codes ride the transport (TF_DS_ROCI_CODES): a whole chunk of a size the transport has plans for,
 /// and a pack of exactly the rows the arena's regions hold. Null: the chunk has no plan (an error at the call). Every rank decides alike.
+pub fn codesShape(e: *const Engine, ch: *const Chunk) ?roci_engine.Shape {
+    const t = e.two orelse return null;
     if (t.rc == null) return null;
     return rociShape(e, ch, 0) catch null;
+}
+
+/// One family's gather of a full pass over the transport: each node's slab of the family's tensors, produced in place in the
+/// arena, goes to the three other nodes as RDMA WRITEs, and the consumers wait for the three slabs that land.
+fn rociGather(e: *const Engine, class: roci_engine.Class, shape: roci_engine.Shape) !void {
+    const rc = e.two.?.rc.?;
+    try rc.send(e.s, class, shape);
+    try rc.wait(e.s, class);
+}
+
+/// Whether layer `li`'s attention gathers x (at its owned rows): its front is not on owned rows (frontRange) and it is not the
+/// boundary layer on owned rows.
+fn xGathered(e: *const Engine, ch: *const Chunk, li: usize) bool {
+    return frontRange(e, ch, li) == null and boundaryRange(e, ch, li) == null;
+}
+
 /// WP4: `full` (fp32 [e.world, ch.cap, D], i.e. ch.ga or ch.gm) repacked at rows [r.start, r.start + r.n) of every
 /// plane into ch.qhc_g, tightly strided [e.world, r.n, D] -- see ch.qhc_g's own comment for why. A local
 /// device-to-device copy, one per plane.
@@ -968,14 +1029,18 @@ fn qhcRepackG(e: *const Engine, ch: *Chunk, full: u64, r: anytype) !void {
 pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
     const lay = e.w.layers[li];
     const c = e.c;
-    if (ch.pending) {
-        const src = try tri_hc.hcPrePf(e.t, ch.h, lay.hc_attn[0], lay.hc_attn[1], lay.hc_attn[2], ch.pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, ch.x, ch.pre_a, ch.post, ch.comb, ch.part, .{ .gathered = ch.gm, .world = e.world, .h_out = ch.h_alt, .rs = ch.gm_rs }, ch.n, c.hidden);
+    // TF_DS_ROCI_GATHERS: the layers whose x the transport gathers keep it in the arena, the others in the device buffer
+    if (ch.x_g != 0) ch.x = ch.x_dev;
+        if (ch.x_g != 0 and xGathered(e, ch, li) and gathersShape(e, ch) != null) ch.x = ch.x_g;
         const row_h = c.hc * c.hidden * 2;
         const row_p = c.hc * 4;
         const row_c = c.hc * c.hc * 4;
         if (ch.pending) {
+            // (a rank beyond the chunk's rows under TF_DS_ROCI_ANY owns none: no launch, the streams swap and the gathers go on)
+            if (r.n != 0) {
                 const posted = try ownedPosted(e, ch, .moe, r, ch.h_alt + r.start * row_h);
                 _ = try tri_hc.hcPrePf(e.t, ch.h + r.start * row_h, lay.hc_attn[0], lay.hc_attn[1], lay.hc_attn[2], ch.pre + r.start * row_p, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, ch.x + r.start * c.hidden * 2, ch.pre_a + r.start * row_p, ch.post + r.start * row_p, ch.comb + r.start * row_c, ch.qhc_part, posted, r.n, c.hidden);
+            }
             // swapStreams asserts its argument is exactly ch.h_alt (the whole buffer); the kernel's `h_out` here was
             // offset to this node's own rows (correct for the write it actually did), so swap the base pointers
             // directly instead of going through that helper's assert.
@@ -983,8 +1048,11 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
             ch.h = ch.h_alt;
             ch.h_alt = old_h;
             ch.pending = false;
+        } else if (r.n != 0) {
         }
+        if (xGathered(e, ch, li)) {
             try rociGather(e, .ga, try needShape(e, ch));
+        }
     } else if (ch.pending) {
         const src = try tri_hc.hcPrePf(e.t, ch.h, lay.hc_attn[0], lay.hc_attn[1], lay.hc_attn[2], ch.pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, ch.x, ch.pre_a, ch.post, ch.comb, ch.part, .{ .gathered = ch.gm, .world = e.world, .h_out = ch.h_alt }, ch.n, c.hidden);
         swapStreams(ch, src);
@@ -1211,6 +1279,8 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     pmark(e, .a_woa);
     dump(e, li, "u", ch.u, n * uw * 2);
     if (e.two) |t| {
+        // 2D: the column partner's groups first, then this pair's columns; with TF_DS_ROCI_SENT_FIRST the GEMM that rings the first part's doorbell
+        if (attnSentFirst(e, ch, li)) _ = try t.woBSentFirst(e, ch, lay) else try t.woB(e, ch, lay);
         dump(e, li, "u_full", t.u_full, n * (t.uw[0] + t.uw[1]) * 2);
         dump(e, li, "pa", ch.pa, n * lay.wo_b.n * 4);
         return;
@@ -1219,6 +1289,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
 }
 
 /// gathered over the transport (rociGather). qr and y then hold the whole chunk's front, the bytes
+    if (r.n != 0) try frontRows(e.mx.?, e.t, e.s, ch.mxs, lay, ch.x, e.c.hidden, r, ch.qa, ch.y, ch.qr, e.c.head_dim, e.c.eps);
     return rociGather(e, .gf, try needShape(e, ch));
 pub fn frontOwnedOff(gpa: std.mem.Allocator, finds: anytype, native: bool, layers: []const weights.Layer, half: usize, eps: f32, qs: []const usize, world: usize) !?[]const u8 {
     return frontOwnedOffAt(gpa, finds, native, layers, half, eps, rows);
@@ -1288,35 +1359,81 @@ fn visBlock(e: *const Engine, ch: *const Chunk, r0: usize, m: usize) !u64 {
     if (view % 16 == 0) return view;
     try e.ops.copyRows(e.s, view, m * 8, ch.vis_blk, m * 8, m * 8, 1);
     return ch.vis_blk;
+    if (r.n != 0) try kvSourceAt(e, ch, cs, sh, li, ch.x + r.start * c.hidden * 2, ch.start + r.start, r.n) else sh.kv_layer = li;
     return boundaryRociAny(e, cs, li, ch, try needShape(e, ch));
 }
 
-/// The indexer of a layer with index queries (switch "prompt_keys", layers before the candidate source): the
-/// queries (idx_wq_b of q's latent, RoPE, fp4_qd's bytes), the heads' weights (x.float() @ idx_proj.t() through cuBLAS,
-/// to bf16, times idx_dim ** -0.5 * idx_heads ** -0.5), each row's int64 keys of the kv source's index keys and the
-/// top-k selection into cidx.
-fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize, wqb: weights.Linear, src: usize, n_comp_end: usize, rope: Rope) !void {
-    const lay = e.w.layers[li];
-    const c = e.c;
-    const n = ch.n;
-    const ih = c.index_heads;
-    const id = c.index_head_dim;
-    if (n_comp_end == 0) { // cidx [n, 0]: no compressed entry yet (a one-token prompt), the attention reads none
-        sh.kk = 0;
-        return;
-    }
-    if (n_comp_end > ch.max_comp) return error.ChunkTooLong;
-    try mm(e, ch, wqb, ch.qr, lay.wq_a.n, ch.iq, .bf16, ih * id);
-    try tri_norm.ropeHeads(e.t, ch.iq, rope.cos, rope.sin, ch.pos, c.rope_dim, false, n, ih, id);
-    // switch "idx": fp4_qd's bytes in one launch
-    try tri_attn.fp4QdP2(e.t, ch.iq, ch.iq4, n * ih * id);
-    if (n <= tri.decode_rows) {
-        // a decode-sized chunk: the row-invariant matmul of the fp16 projection (rowmm2)
-        try tri_norm.rowmm2(e.t, ch.x, c.hidden, lay.idx_proj_h, ch.wl, n, c.hidden, ih);
-    } else {
-        try e.ops.toF32(e.s, ch.x, ch.xf, n * c.hidden);
-        try e.blas.xwTRows(ch.xf, lay.idx_proj, ch.wl, n, c.hidden, ih, gemm_rows);
+/// One device-to-device copy of the boundary's staging.
+pub const BoundaryCopy = struct { dst: u64, src: u64, bytes: usize };
+
+/// The boundary's slab of node `k` in the arena's boundary region at `base`: `slab` bytes (r.n rows of the four arrays).
+pub fn boundarySlab(base: u64, slab: usize, k: usize) u64 {
+    return base + k * slab;
+}
+
 /// The copies that stage this node's rows of the four cache arrays (parts: boundaryGathers, the in-place layout: rank k's part
+/// of an array is at buf + k * bytes) into its slab of the arena, array after array.
+pub fn boundaryOut(parts: *const [4]comm.InPlace, base: u64, slab: usize, rank: usize) [4]BoundaryCopy {
+    var out: [4]BoundaryCopy = undefined;
+    var at = boundarySlab(base, slab, rank);
+    for (&out, parts) |*cp, pt| {
+        cp.* = .{ .dst = at, .src = pt.buf + rank * pt.bytes, .bytes = pt.bytes };
+        at += pt.bytes;
+    }
+    return out;
+}
+
+/// The copies that put the slab of node `k` (landed in the arena) into its rows of the four arrays.
+pub fn boundaryIn(parts: *const [4]comm.InPlace, base: u64, slab: usize, k: usize) [4]BoundaryCopy {
+    var out: [4]BoundaryCopy = undefined;
+    var at = boundarySlab(base, slab, k);
+    for (&out, parts) |*cp, pt| {
+        cp.* = .{ .dst = pt.buf + k * pt.bytes, .src = at, .bytes = pt.bytes };
+        at += pt.bytes;
+    }
+    return out;
+}
+
+/// The four cache arrays' rows (bytes a row) of the boundary layer, array after array: compressed codes and scales, index codes and scales.
+pub fn boundaryRowBytes(hd: usize, id: usize) [4]usize {
+    return .{ hd / 2, hd / 16, id / 2, id / 32 };
+}
+
+/// The copies between rank `k`'s `nk` rows of the four arrays (`bufs`: each array at the chunk's first row; rank k's rows start k q rows in)
+/// and its slab of the arena's boundary region at `base`, each array `q` rows apart inside it (the slab's `q` rows are the stride of any
+/// chunk's slabs, the last one short): out stages them, else they are copied back. An empty slab has no copy.
+pub fn boundaryCopiesAny(bufs: [4]u64, rb: [4]usize, base: u64, q: usize, k: usize, nk: usize, out: bool) [4]BoundaryCopy {
+    var res: [4]BoundaryCopy = undefined;
+    var at = base + k * q * roci.gb_row;
+    for (&res, bufs, rb) |*cp, buf, row| {
+        const arr = buf + k * q * row;
+        cp.* = if (out) .{ .dst = at, .src = arr, .bytes = nk * row } else .{ .dst = arr, .src = at, .bytes = nk * row };
+        at += q * row;
+    }
+    return res;
+}
+
+/// boundaryRoci for a chunk of any row count (TF_DS_ROCI_ANY): each rank's slab is `q` rows apart in the region, the last one short.
+fn boundaryRociAny(e: *const Engine, cs: *const Caches, li: usize, ch: *const Chunk, shape: roci_engine.Shape) !void {
+    const rc = e.two.?.rc.?;
+    const c = e.c;
+    const rb = boundaryRowBytes(c.head_dim, c.index_head_dim);
+    var bufs: [4]u64 = .{ cs.comp_codes[li], cs.comp_scales[li], cs.idx_codes[li], cs.idx_scales[li] };
+    for (&bufs, rb) |*b, row| b.* += ch.start * row;
+    const q = slab_plan.q(ch.n);
+    const base = rc.addr(.g_b);
+    const mine: usize = e.comm.rank;
+    const nk = slab_plan.slab(ch.n, mine).n;
+    if (nk != 0) for (boundaryCopiesAny(bufs, rb, base, q, mine, nk, true)) |cp| try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(cp.dst, cp.src, cp.bytes, e.s.handle), "cuMemcpyDtoDAsync");
+    try rociGather(e, .gb, shape);
+    for (0..e.comm.world) |k| {
+        if (k == mine) continue;
+        const nj = slab_plan.slab(ch.n, k).n;
+        if (nj == 0) continue;
+        for (boundaryCopiesAny(bufs, rb, base, q, k, nj, false)) |cp| try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(cp.dst, cp.src, cp.bytes, e.s.handle), "cuMemcpyDtoDAsync");
+    }
+}
+
 pub fn boundaryOwnedOff(lay: weights.Layer) ?[]const u8 {
 /// WP6(b) (docs/prefill-plan.md, indexer row-sharding): this layer's owned row range on this node, when
 /// TF_DS_IDX_SHARD applies -- a full-cap 2D chunk, strictly before the candidate-source layer (li <
@@ -1350,6 +1467,11 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
         return;
     }
     if (n_comp_end > ch.max_comp) return error.ChunkTooLong;
+    if (pr.n != 0) {
+    }
+    if (pr.n == 0) {
+        // (an empty owned slab: nothing to project, the scorer below reads none either)
+    } else if (e.mx) |k| {
         // Format.native: weights_proj, a bf16 Linear, times the scale (Indexer.forward), at any row count
     } else {
         if (n <= tri.decode_rows) {
@@ -1419,9 +1541,12 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     // place (in place: send == recv + rank * count), the same pattern qhcGatherRows already uses
     // for ch.x. Bytes, not a typed count: cidx's per-row width (kk int64 keys) is uniform across rows for this
     // call, so a raw byte gather needs no element-type opinion.
+    if (idxr) |r| {
         // (the transport's plan holds the top-k at index_topk keys a row, the rows' stride in the arena; fewer keys, an error at the call; with
+        // TF_DS_ROCI_ANY the plan carries the rows' width in keys, any)
         _ = r;
         try rociGather(e, .gi, try rociShape(e, ch, kk));
+    }
     sh.kk = kk;
 }
 
@@ -1481,37 +1606,85 @@ fn ownerGatherRoci(e: *const Engine, ch: *Chunk, rc: *roci_engine.Roci, src: u64
     const t = e.two.?;
     const w = t.ow[t.p];
     if (src != rc.addr(.psum)) return error.RociNotInArena;
+    const shape = try rociShape(e, ch, 0);
     howOf(ch, sub).blocks = true;
+    if (ch.own1_sent) ch.own1_sent = false else try rc.send(e.s, .own1, shape);
     try rc.wait(e.s, .own1);
+    try rociPart2(e, rc, src, ownQ(e, ch), ownRows(e, ch), w, shape, .stage, .send2, .blk, .own2);
+}
+
+/// The rows of the two blocks an owner sum's part 2 adds: this node's slab, then its column partner's (equal to ownQ unless a chunk's
+/// last slab is short, TF_DS_ROCI_ANY).
+fn ownRows(e: *const Engine, ch: *const Chunk) [2]usize {
+    const t = e.two.?;
+    const g: u32 = @intCast(t.r + 2 * t.p);
     return .{ slabN(e, ch, t.rank_of[g]), slabN(e, ch, t.rank_of[g ^ 2]) };
 }
 
 /// Part 2 of an owner sum on the arena: this node's partial at the plan's rows plus the stage's block, rounded to bf16
+/// (add2Bf16: one fp32 add), k = 0 into this pair's block of `blk` (this node's rows), k = 1 into `send2` (the column partner's).
+fn rociAdd(e: *const Engine, rc: *roci_engine.Roci, src: u64, q: usize, rows: usize, w: usize, k: usize, comptime stage: roci_engine.Region, comptime send2: roci_engine.Region, comptime blk: roci_engine.Region) !void {
     const t = e.two.?;
     const pl = prompt2d.ownerPlan(@intCast(t.r + 2 * t.p), t.rank_of, q);
     const out = if (k == 0) rc.addr(blk) + t.p * q * w * 2 else rc.addr(send2);
-}
+    if (rows == 0) return; // (a slab beyond the chunk's rows)
+    try e.ops.add2Bf16(e.s, src + pl.recv1[k] * w * 4, rc.addr(stage) + k * q * w * 4, out, rows * w);
 }
 
+/// An owner sum's parts 2 and 3 on the arena once part 1's blocks have landed: the adds, the second part's send and wait.
+/// With TF_DS_ROCI_P2_FIRST the add that makes the second part (k = 1) runs first and the send follows it at once, ahead of
+/// the add of this node's own block (k = 0), which only the readers need: the same two adds on the same operands into the same
+/// outputs (their order moves no bit: they read the partial and the stage, write disjoint buffers, and the second
+/// part's source is no operand of the own block's add), and the send reads `send2` alone, which add k = 0 does not write.
+fn rociPart2(e: *const Engine, rc: *roci_engine.Roci, src: u64, q: usize, rows: [2]usize, w: usize, shape: roci_engine.Shape, comptime stage: roci_engine.Region, comptime send2: roci_engine.Region, comptime blk: roci_engine.Region, comptime class: roci_engine.Class) !void {
+    if (e.two.?.p2First()) {
+        try rociAdd(e, rc, src, q, rows[1], w, 1, stage, send2, blk);
+        try rc.send(e.s, class, shape);
+        try rociAdd(e, rc, src, q, rows[0], w, 0, stage, send2, blk);
+    } else {
+        try rociAdd(e, rc, src, q, rows[0], w, 0, stage, send2, blk);
+        try rociAdd(e, rc, src, q, rows[1], w, 1, stage, send2, blk);
+        try rc.send(e.s, class, shape);
+    }
+    try rc.wait(e.s, class);
+}
+
+/// Engram's part 1 over the Rocinante transport: the projection's blocks to the row partner (one stream write behind
+/// the projection, after the collect copy with TF_DS_ROCI_COLLECT).
+fn engramSend1Roci(e: *const Engine, ch: *const Chunk, rc: *roci_engine.Roci, r: QRows) !void {
     _ = r;
     if (ch.ek != rc.addr(.ek)) return error.RociNotInArena;
+    const shape = try rociShape(e, ch, 0);
     try rc.send(e.s, .eng1, shape);
+}
+
+/// Engram's owner sums over the Rocinante transport: `ek` (the projection's fp32 partials, in the arena) the
+/// same way as ownerGatherRoci. The gate reads the two blocks of `eng_blk` where they lie.
+fn engramSumsRoci(e: *const Engine, ch: *const Chunk, rc: *roci_engine.Roci, r: QRows, sent1: bool) !void {
+    const t = e.two.?;
+    const w = t.ew[t.p];
+    if (!sent1) try engramSend1Roci(e, ch, rc, r);
+    const shape = try rociShape(e, ch, 0);
     try rc.wait(e.s, .eng1);
+    try rociPart2(e, rc, ch.ek, ownQ(e, ch), ownRows(e, ch), w, shape, .eng_stage, .eng_send2, .eng_blk, .eng2);
 }
 
 /// `sub`'s sums at owned rows `r` as a mix posts them into the streams: the transport's two blocks when the gather left
 /// them there, else the tight buffer of fp32 planes.
 fn ownedPosted(e: *const Engine, ch: *Chunk, sub: Sub, r: QRows, h_out: u64) !tri_hc.Posted {
+    if (howOf(ch, sub).blocks) return .{ .gathered = e.two.?.rc.?.addr(.blk), .world = e.world, .h_out = h_out, .blk_rs = ownQ(e, ch) * e.two.?.ow[e.two.?.p] };
 }
 
 /// hcPost of the pending gather `sub` at owned rows `r`, in place on the streams.
 fn hcPostOwned(e: *const Engine, ch: *Chunk, sub: Sub, r: QRows) !void {
+    if (r.n == 0) return;
     const c = e.c;
     const row_h = c.hc * c.hidden * 2;
     const row_p = c.hc * 4;
     const row_c = c.hc * c.hc * 4;
     if (howOf(ch, sub).blocks) {
         const t = e.two.?;
+        return tri_basic.hcPost2b(e.t, t.rc.?.addr(.blk), ownQ(e, ch) * t.ow[t.p], ch.h + r.start * row_h, ch.post + r.start * row_p, ch.comb + r.start * row_c, ch.h + r.start * row_h, r.n, c.hidden);
     }
     const g = try ownedPartials(e, ch, sub, r);
 }
@@ -1521,12 +1694,14 @@ fn hcPostOwned(e: *const Engine, ch: *Chunk, sub: Sub, r: QRows) !void {
 pub fn ffnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
     const lay = e.w.layers[li];
     const c = e.c;
-    const src = try tri_hc.hcPrePf(e.t, ch.h, lay.hc_ffn[0], lay.hc_ffn[1], lay.hc_ffn[2], ch.pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, ch.x, ch.pre_f, ch.post, ch.comb, ch.part, .{ .gathered = ch.ga, .world = e.world, .h_out = ch.h_alt, .rs = ch.ga_rs }, ch.n, c.hidden);
+    if (ch.x_g != 0) ch.x = ch.x_dev; // (TF_DS_ROCI_GATHERS: the MoE reads the device x; attention's was the arena's on a gathered layer)
         const row_h = c.hc * c.hidden * 2;
         const row_p = c.hc * 4;
         const row_c = c.hc * c.hc * 4;
+        if (r.n != 0) {
             const posted = try ownedPosted(e, ch, .attn, r, ch.h_alt + r.start * row_h);
             _ = try tri_hc.hcPrePf(e.t, ch.h + r.start * row_h, lay.hc_ffn[0], lay.hc_ffn[1], lay.hc_ffn[2], ch.pre_a + r.start * row_p, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, ch.x + r.start * c.hidden * 2, ch.pre_f + r.start * row_p, ch.post + r.start * row_p, ch.comb + r.start * row_c, ch.qhc_part, posted, r.n, c.hidden);
+        }
         const old_h = ch.h;
         ch.h = ch.h_alt;
         ch.h_alt = old_h;
@@ -1537,12 +1712,109 @@ pub fn ffnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
     swapStreams(ch, src);
 }
 
+/// Whether layer li's MoE partials take TF_DS_ROCI_COMBINE_FIRST (or TF_DS_ROCI_COMBINE_DOOR, whose one launch rings the doorbell itself):
+/// it is in effect, the transport carries the partials' owner sums (gatherStep's owner path at the owned rows of the layer that reads
+/// them, whole pass quarters) and the partials are not collected into the arena by a copy that would have to follow the whole sum.
+fn fixedPlan(ch: *const Chunk) bool {
+    _ = roci_engine.Roci.shapeOf(ch.cap) catch return false;
+    return true;
+}
+
+fn moeSendFirst(e: *const Engine, ch: *const Chunk, li: usize) bool {
+    const t = e.two orelse return false;
     if (!t.combineDoor() or t.rc == null) return false;
+    const r = ownedRange(e, ch, li + 1) orelse return false;
+    // (a whole pass the transport has a fixed plan for: the kernels' quarters are q = cap / world rows, the same on every rank; under
+    // TF_DS_ROCI_ANY a chunk of fewer rows takes the plain path, whatever its slab holds on this rank)
+    const whole_quarters = r.n * e.comm.world == ch.cap and ch.n == ch.cap and fixedPlan(ch);
+    if (!whole_quarters) return false;
+    if (t.combineDoor()) {
+        const k = e.mx orelse return false;
+        const q = ch.cap / e.comm.world;
         const pl = prompt2d.ownerPlan(@intCast(t.r + 2 * t.p), t.rank_of, q);
+        return k.combine_door != null and ch.n == ch.cap and mx.quarterOrder(pl.send1, pl.recv1, q, e.w.layers[li].experts.down_n) != null;
+    }
+    return true;
+}
+
+/// The part-1 send of the MoE's owner sum, queued from inside moe once the rows it sends are summed.
+const MoeRing = struct {
+    e: *const Engine,
+    ch: *Chunk,
+
+    fn send(ctx: *anyopaque) anyerror!void {
+        const self: *MoeRing = @ptrCast(@alignCast(ctx));
+        const t = self.e.two.?;
+        try t.rc.?.send(self.e.s, .own1, try roci_engine.Roci.shapeOf(self.ch.cap));
+        self.ch.own1_sent = true;
+    }
+
+    /// TF_DS_ROCI_SENT_FIRST: the ticket of the part-1 send, reserved right before the launch that rings it.
+    fn door(ctx: *anyopaque) anyerror!mx.Door {
+        const self: *MoeRing = @ptrCast(@alignCast(ctx));
+        const rc = self.e.two.?.rc.?;
+        const rs = try rc.reserve(.own1, try roci_engine.Roci.shapeOf(self.ch.cap));
+        self.ch.own1_sent = true;
+        return .{ .cnt = rs.cnt, .door = rs.door, .ticket = rs.ticket };
+    }
+};
+
+/// The routed sum's two stages for the owner sums over `q`-row quarters: the quarters part 1 sends (the row partner's and its
+/// column partner's rows, ownerPlan's send1) first, the quarters this node keeps (recv1) last.
+fn moeCombineFirst(e: *const Engine, q: usize, ring: *MoeRing) mx.CombineFirst {
+    const t = e.two.?;
     const pl = prompt2d.ownerPlan(@intCast(t.r + 2 * t.p), t.rank_of, q);
+    return .{ .rows = q, .first = pl.send1, .last = pl.recv1, .ctx = ring, .between = MoeRing.send, .door = if (t.combineDoor()) MoeRing.door else null };
+}
+
+/// Whether layer li's attention partial takes TF_DS_ROCI_SENT_FIRST's wo_b: gatherStep's owner path on the arena at the layer's owned
+/// rows, a full pass.
+fn attnSentFirst(e: *const Engine, ch: *const Chunk, li: usize) bool {
+    const t = e.two orelse return false;
+    const rc = t.rc orelse return false;
     if (!t.sentFirst() or ch.n != ch.cap or ch.pa != rc.addr(.psum) or !fixedPlan(ch)) return false;
+    const r = ownedRange(e, ch, li) orelse return false;
+    return r.n * e.comm.world == ch.cap;
+}
+
+/// wo_b's GEMM (`l` on x, the bf16 rows of width ldx) into the arena's psum in one launch that runs the row quarters part 1 of the owner
+/// sum sends first and rings that part's doorbell from inside, once their tiles are stored (mx.linearSentFirst): the host reserves the
+/// ticket and queues the launch directly behind the quantization, so the proxies see tickets in the order the stream reaches them.
+/// The gather that follows sends nothing for the part (own1_sent). False, with nothing launched or reserved, when the kernels do not
+/// take the shape (mx.sentFirstTakes).
+pub fn mmSentFirst(e: *const Engine, ch: *Chunk, t: *const prompt2d.Two, l: weights.Linear, x: u64, ldx: usize, out: u64) !bool {
+    const k = e.mx orelse return false;
+    const rc = t.rc orelse return false;
+    if (!mx.sentFirstTakes(k, l, ch.mxs.q, l.k, ch.mxs.s, l.k / 32, out, l.n, ch.n)) return false;
+    const q = ch.cap / e.comm.world;
     const pl = prompt2d.ownerPlan(@intCast(t.r + 2 * t.p), t.rank_of, q);
+    const ro = mx.rowOrder(pl.send1, pl.recv1, q, l.n / 128) orelse return false;
+    const shape = try roci_engine.Roci.shapeOf(ch.cap);
+    const rs = try rc.reserve(.own1, shape);
+    try mx.linearSentFirst(k, e.s, ch.mxs, l, x, .bf16, ldx, ch.n, out, l.n, ro, .{ .cnt = rs.cnt, .door = rs.door, .ticket = rs.ticket });
+    ch.own1_sent = true;
+    return true;
+}
+
+/// mmSentFirst's launch on the codes TF_DS_ROCI_CODES landed: wo_b's GEMM (`l` on the input codes `q` [n, k] and scales `s`
+/// [n, k / 32], both pairs' columns in place) into the arena's psum in the one launch that runs the row quarters part 1 of the
+/// owner sum sends first and rings that part's doorbell itself. The host reserves the ticket and queues the launch directly behind
+/// the copies, as mmSentFirst does. False, with nothing launched or reserved, when the kernels do not take the shape.
+pub fn codesGemmSentFirst(e: *const Engine, ch: *Chunk, t: *const prompt2d.Two, l: weights.Linear, q: u64, s: u64) !bool {
+    const k = e.mx orelse return false;
+    const rc = t.rc orelse return false;
+    const out = ch.pa;
+    if (!mx.sentFirstTakes(k, l, q, l.k, s, l.k / 32, out, l.n, ch.n)) return false;
+    const qq = ch.cap / e.comm.world;
     const pl = prompt2d.ownerPlan(@intCast(t.r + 2 * t.p), t.rank_of, qq);
+    const ro = mx.rowOrder(pl.send1, pl.recv1, qq, l.n / 128) orelse return false;
+    const shape = try roci_engine.Roci.shapeOf(ch.cap);
+    const rs = try rc.reserve(.own1, shape);
+    try mx.gemmSentFirst(k, e.s, l, q, l.k, s, l.k / 32, ch.n, out, l.n, ch.mxs.z, ro, .{ .cnt = rs.cnt, .door = rs.door, .ticket = rs.ticket });
+    ch.own1_sent = true;
+    return true;
+}
+
 /// Model.moe of a prompt chunk: the gate's logits in fp32 (x.float() @ gate_w.float().t(), one cuBLAS GEMM as torch
 /// issues it), the routing (the shared expert in every row's last slot) and the routed experts: the partial pm [n, D].
 pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
@@ -1563,6 +1835,14 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
         dump(e, li, "pick", ch.pick, n * sl * 4);
         dump(e, li, "wts", ch.wts, n * sl * 4);
         if (e.two) |t| {
+            var ring: MoeRing = undefined;
+            var first: mx.CombineFirst = undefined;
+            const cf: ?*const mx.CombineFirst = if (moeSendFirst(e, ch, li)) blk: {
+                ring = .{ .e = e, .ch = ch };
+                first = moeCombineFirst(e, ch.cap / e.comm.world, &ring);
+                break :blk &first;
+            } else null;
+            try t.experts(e, ch, lay, own != null, cf);
             const pack = lay.experts.width + t.ir;
             dump(e, li, "xd", ch.xs.xd, n * sl * pack * 2);
             dump(e, li, "xd_full", t.xd_full, n * sl * lay.experts.down_k * 2);
@@ -1583,7 +1863,7 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
         try tri_norm.route(e.t, ch.logits, 0, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick, ch.wts, n, c.experts, sl);
     }
     try routeSpans(e, ch, lay, shared_id, sl, kc);
-    if (e.two) |t| return t.experts(e, ch, lay); // 2D: gate / up here, the intermediate's exchange, down here
+    if (e.two) |t| return t.experts(e, ch, lay, false, null); // 2D: gate / up here, the intermediate's exchange, down here
     // routed(): a chunk of fewer than EXACT_ROWS rows takes the decode window's fused path and scratch
     if (n < exl3_experts.exact_rows) return exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
     try exl3_experts.prompt(e.ex, e.s, lay.experts, ch.xs, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
@@ -1611,6 +1891,8 @@ fn routeSpans(e: *const Engine, ch: *Chunk, lay: weights.Layer, shared_id: usize
 }
 
 /// place over the transport (rociGather). The MoE then reads the bytes the baseline routing and group() leave (every kernel
+    if (r.n != 0) {
+    }
     return rociGather(e, .gm, try needShape(e, ch));
 pub fn ffnCodesOff(gpa: std.mem.Allocator, finds: anytype, native: bool, layers: []const weights.Layer, half: usize, ne: usize, top_k: usize, scale_: f32, sl: usize, qs: []const usize, world: usize) !?[]const u8 {
     return ffnCodesOffAt(gpa, finds, native, layers, half, ne, top_k, scale_, sl, rows);
@@ -1988,6 +2270,18 @@ pub fn engramWorkerRows(eh: *EngramHost, j: usize, start: usize, chunk: usize) !
 }
 
     return &pr.wk[((start - eh.wk_start) / chunk) % eh.wk_slots][j];
+    try engramPending(e, ch, li);
+    try engramProject(e, ch, eh, li, seq);
+    try engramFinish(e, ch, eh, li, false);
+}
+
+/// Layer li's pending MoE post into the streams (engramApply's first step).
+pub fn engramPending(e: *const Engine, ch: *Chunk, li: usize) !void {
+    const lay = e.w.layers[li];
+    if (lay.engram_wkv == null) return;
+    const c = e.c;
+    const n = ch.n;
+    if (ch.pending) {
             // WP4: the same row-sharded flush as attnMixes's pending branch (hcPost alone is _hc_mix_pf's "posted"
             // finisher without the RMSNorm finish; same G-buffer stride gotcha, same repack).
             try hcPostOwned(e, ch, .moe, r);
@@ -1996,22 +2290,118 @@ pub fn engramWorkerRows(eh: *EngramHost, j: usize, start: usize, chunk: usize) !
         }
         ch.pending = false;
     }
+}
+
+/// The Engram rows of layer li on the GPU and their projection into ek (engramApply's second step: the n-grams' rows, read or
+/// taken from the read-ahead, uploaded, one GEMM). Nothing here reads the streams.
+pub fn engramProject(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq: []const i32) !void {
+    const lay = e.w.layers[li];
+    const ew = lay.engram_wkv orelse return;
+    const c = e.c;
+    const n = ch.n;
+    const li32: u16 = @intCast(li);
+    const l = std.mem.indexOfScalar(u16, c.engram_layers.slice(), li32) orelse return error.NotAnEngramLayer;
+    const t = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
+    const cols = eh.hasher.cols();
+    const k = eh.hi - eh.lo;
+    const m = n * k;
+    const prof = eh.io != null;
+    var tq = if (prof) pstamp(e, eh) else 0;
             if (eh.pk) |pr| try pr.chunkApplyOn(eh.use_stage[u].?, nu, e.s, at, ch.lane) else try upload(e, at, eh.use_rows[u].?.ptr, nu * ew.k * 2);
         try pr.chunkApply(st, n, e.s, ch.eb);
+}
+
+/// Whether layer li's Engram sums run on the transport at owned rows (TF_DS_ROCI_ENGRAM_AHEAD hoists those alone).
+pub fn engramOnRoci(e: *const Engine, ch: *const Chunk, li: usize) bool {
+    const t = e.two orelse return false;
+    return t.rc != null and engramOwned(e, ch, li) != null;
+}
+
+/// Layer li's part 1 sent right behind its projection (TF_DS_ROCI_ENGRAM_AHEAD): the projection is done a layer ahead.
+pub fn engramSendAhead(e: *const Engine, ch: *const Chunk, li: usize) !void {
+    const r = engramOwned(e, ch, li) orelse return;
+    try engramSend1Roci(e, ch, e.two.?.rc.?, r);
+}
+
+/// Layer li's Engram from its projection on: the sums (part 1 already sent when `sent1`), the gate into the streams.
+pub fn engramFinish(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, sent1: bool) !void {
+    const lay = e.w.layers[li];
+    const ew = lay.engram_wkv orelse return;
+    const c = e.c;
+    const n = ch.n;
+    const prof = eh.io != null;
+    var tq = if (prof) pstamp(e, eh) else 0;
+    // 2D (model.py esum): this node's columns of its rank's projection; the quarters give both ranks' whole ones
+    const en = if (e.two) |two| two.engramWidth() else ew.n;
     // the sums at this node's rows alone, over the transport (engramSumsRoci)
     const r = own orelse return error.NoOwnedRows;
     try engramSumsRoci(e, ch, e.two.?.rc orelse return error.RociNoShape, r, sent1);
     if (own != null and e.two.?.rc != null) {
         // the key and value rows lie in the transport's two blocks: block stride = the slab's rows x a pair's width
+        if (rows.n != 0) try tri_basic.engramGate2b(e.t, ch.h + rows.start * rowb, e.two.?.rc.?.addr(.eng_blk), ownQ(e, ch) * e.two.?.ew[e.two.?.p], lay.engram_qk, ch.h_alt + rows.start * rowb, c.eps, rows.n, c.hidden);
     } else try engramGateRows(e.t, lay.engram_qk, ch.h, ch.kv, ch.h_alt, rows, c.eps, c.hidden, rowb, en * 2);
     swapStreams(ch, ch.h_alt);
     // image spans take no Engram contribution: their rows keep the streams they came with (engram_mask)
     for (ch.spans) |sp| {
+    }
+}
+
 pub fn engramOwnerSumOff(gpa: std.mem.Allocator, finds: anytype, ew: [2]usize, layers: []const weights.Layer, half: usize, eps: f32, d: usize, hc: usize, qs: []const usize, world: usize) !?[]const u8 {
     return engramOwnerSumOffAt(gpa, finds, ew, layers, half, eps, d, hc, rows);
 pub fn engramOwnerSumOffAt(gpa: std.mem.Allocator, finds: anytype, ew: [2]usize, layers: []const weights.Layer, half: usize, eps: f32, d: usize, hc: usize, rows: []const QRows) !?[]const u8 {
+    _ = host_pos;
+    const first = @max(ch.start, replay) - ch.start;
     // the boundary on owned rows (the mixes, the kv-source update of the owned rows, the cache rows gathered), then the rows the
     // decoder half reads handed to every node (handoff) in place of the all-row mixes and update
+    const r = boundaryRange(e, ch, li).?;
+    try boundaryUpdate(e, ch, cs, sh, li, r);
+    if (first >= ch.n) return false;
+    try handoff(e, ch, first);
+    try cutRows(e, ch, first, true);
+    return true;
+}
+
+/// The decoder rows' handoff (TF_DS_ROCI_ANY): each node's owned rows from `first` on of the streams h and of pre are copied into the
+/// arena's handoff regions at row (row - first), and the node's window goes to the three other nodes; empty windows send their word.
+pub fn handoff(e: *const Engine, ch: *Chunk, first: usize) !void {
+    const rc = e.two.?.rc.?;
+    const c = e.c;
+    const d = ch.n - first;
+    if (d > roci.hand_rows) return error.ChunkTooLong;
+    const s = slab_plan.slab(ch.n, e.comm.rank);
+    const lo = @max(first, s.start);
+    const hi = @min(ch.n, s.start + s.n);
+    if (hi > lo) {
+        const row_h = c.hc * c.hidden * 2;
+        const row_p = c.hc * 4;
+        try e.ops.copyRows(e.s, ch.h + lo * row_h, row_h, rc.addr(.hand_h) + (lo - first) * row_h, row_h, row_h, hi - lo);
+        try e.ops.copyRows(e.s, ch.pre + lo * row_p, row_p, rc.addr(.hand_pre) + (lo - first) * row_p, row_p, row_p, hi - lo);
+    }
+    try rc.sendX(e.s, .gh, ch.n, d);
+    try rc.wait(e.s, .gh);
+}
+
+/// The cut of replayCut: the chunk's rows from `first` on only, with their streams and pre (h[first:], pre[first:]) copied down, from
+/// the chunk's own buffers or, `handed` (TF_DS_ROCI_ANY), from the handoff regions where every node's rows have landed. The decoder layers
+/// then run on those rows with no window key before replay.
+fn cutRows(e: *const Engine, ch: *Chunk, first: usize, handed: bool) !void {
+    const c = e.c;
+    const n = ch.n - first;
+    const row_h = c.hc * c.hidden * 2;
+    const row_p = c.hc * 4;
+    if (handed) {
+        const rc = e.two.?.rc.?;
+        try e.ops.copyRows(e.s, rc.addr(.hand_h), row_h, ch.h_alt, row_h, row_h, n);
+        try e.ops.copyRows(e.s, rc.addr(.hand_pre), row_p, ch.pre_f, row_p, row_p, n);
+        ch.boundary_done = true;
+    } else {
+        try e.ops.copyRows(e.s, ch.h + first * row_h, row_h, ch.h_alt, row_h, row_h, n);
+        try e.ops.copyRows(e.s, ch.pre + first * row_p, row_p, ch.pre_f, row_p, row_p, n);
+    }
+    std.mem.swap(u64, &ch.h, &ch.h_alt);
+    std.mem.swap(u64, &ch.pre, &ch.pre_f);
+    ch.start += first;
+    ch.n = n;
     // pos[first:]: a view, first * 8 bytes in (its alignment is the one the served kernels were specialized for). An odd
     // `first` leaves it off a 16-byte boundary, and the kit has no variant for some launches with such a view (a short
     // chunk's split attention: _sparse_attn_part with SPLITS > 1 and no row bases); the same positions copied, in the
@@ -2069,6 +2459,33 @@ pub fn tapRows(e: *const Engine, ch: *const Chunk, j: usize) u64 {
     return ch.taps + j * e.c.hidden * 2;
 }
 
+/// TF_DS_QGATE_CANARY 2 or 3 in effect (Model.open: the same canary asked on every rank, with the checkpoint's own
+/// kernels): layer body_layer's MoE partials, each rank's own before their gather, perturbed on purpose in every prompt
+/// chunk and every round (mx.qgateBody): one more FP8 step, act_quant's quant-dequant of each 32-value group (body_fp8),
+/// or each nonzero finite value one fp32 ulp away from zero (body_ulp: a reduction order's size). A quality gate's floor,
+/// never a serving setting. The gather sums the perturbed partials, so every rank reads the same streams. Off: nothing
+/// launches.
+pub var qgate_body: prompt2d.Qgate = .off;
+
+/// The layer whose MoE partials the body canary perturbs: the first, so every later layer, the keys they store and
+/// the head read perturbed streams.
+pub const body_layer: usize = 0;
+
+/// The body canary at layer `li`'s MoE partials `pm` (fp32 [rows, moeWidth], this rank's, before their gather): nothing
+/// unless it is in effect (qgate_body) and li is body_layer. A chunk whose owner sum's part 1 already left in the MoE's
+/// own launch (own1_sent: TF_DS_ROCI_COMBINE_DOOR / TF_DS_ROCI_SENT_FIRST) cannot be perturbed after the fact: refused,
+/// never a canary that perturbs nothing.
+pub fn bodyCanary(e: *const Engine, ch: ?*const Chunk, pm: u64, rows: usize, li: usize) !void {
+    if (qgate_body == .off or li != body_layer) return;
+    const k = e.mx orelse return error.NotAnMxCheckpoint;
+    if (ch) |c| if (c.own1_sent) return error.CanaryAfterSend;
+    return mx.qgateBody(k, e.s, pm, rows * moeWidth(e.two, e.c.hidden), @backingInt(qgate_body));
+}
+
+/// The columns of a rank's MoE partials (the experts' down output, its row stride): its node's down columns on a 2D
+/// node (Two.dw), the hidden size otherwise.
+pub fn moeWidth(two: ?*const prompt2d.Two, hidden: usize) usize {
+    return if (two) |t| t.dw[t.p] else hidden;
 }
 
 /// The head on the chunk's last row (_forward_k without all_logits): the pending MoE post, collapse_norm of the row with
@@ -2350,12 +2767,122 @@ test "TF_DS_ROCI's readers check: every two-block reader launch of a full pass's
     try std.testing.expect((try rociReadersOff(gpa, FakeFinds{ .asked = &n, .missing = "_engram_gate_2b" }, &[_]usize{1024}, 5120, 12800, 1e-20, 1e-6, 20)) != null);
     try std.testing.expect((try rociReadersOff(gpa, FakeFinds{ .asked = &n, .missing = "_hc_mix_pf_2b" }, &[_]usize{1024}, 5120, 12800, 1e-20, 1e-6, 20)) != null);
 }
+
+test "TF_DS_ROCI_P2_FIRST: the second part's add and send come before the own block's add; off, both adds then the send" {
+    const src = @embedFile("prompt.zig");
+    const body = src[std.mem.indexOf(u8, src, "fn rociPart2(").?..];
+    const on = body[std.mem.indexOf(u8, body, "if (e.two.?.p2First()) {").?..];
+    const k1 = std.mem.indexOf(u8, on, "try rociAdd(e, rc, src, q, rows[1], w, 1,").?;
+    const sd = std.mem.indexOf(u8, on, "try rc.send(e.s, class, shape);").?;
+    const k0 = std.mem.indexOf(u8, on, "try rociAdd(e, rc, src, q, rows[0], w, 0,").?;
+    try std.testing.expect(k1 < sd and sd < k0);
+    const off = on[std.mem.indexOf(u8, on, "} else {").?..];
+    const o0 = std.mem.indexOf(u8, off, "try rociAdd(e, rc, src, q, rows[0], w, 0,").?;
+    const o1 = std.mem.indexOf(u8, off, "try rociAdd(e, rc, src, q, rows[1], w, 1,").?;
+    const os = std.mem.indexOf(u8, off, "try rc.send(e.s, class, shape);").?;
+    try std.testing.expect(o0 < o1 and o1 < os);
+    // the wait comes after both
+    try std.testing.expect(std.mem.indexOf(u8, body, "try rc.wait(e.s, class);").? > std.mem.indexOf(u8, body, "try rociAdd(e, rc, src, q, rows[0], w, 0,").?);
+}
+
+test "TF_DS_ROCI_COMBINE_FIRST: the sent quarters come first for every node and node order, the kept ones last, all four once" {
+    const orders = [_][4]u32{ .{ 0, 1, 2, 3 }, .{ 2, 0, 3, 1 }, .{ 3, 2, 1, 0 } };
+    var dummy: u8 = 0;
+    const F = struct {
+        fn f(_: *anyopaque) anyerror!void {}
+    };
     for (orders) |rank_of| for (0..4) |g| {
         const pl = prompt2d.ownerPlan(@intCast(g), rank_of, 1024);
+        const cf: mx.CombineFirst = .{ .rows = 1024, .first = pl.send1, .last = pl.recv1, .ctx = &dummy, .between = F.f };
+        try std.testing.expect(cf.covers(4096));
+        // what part 1 sends is the first stage's, what the adds read from this node's own partial is the last's
         try std.testing.expectEqual(@as(usize, rank_of[g ^ 1]) * 1024, cf.first[0]);
         try std.testing.expectEqual(@as(usize, rank_of[g ^ 3]) * 1024, cf.first[1]);
         try std.testing.expectEqual(@as(usize, rank_of[g]) * 1024, cf.last[0]);
         try std.testing.expectEqual(@as(usize, rank_of[g ^ 2]) * 1024, cf.last[1]);
+    };
+}
+
+test "TF_DS_ROCI_ENGRAM_AHEAD: engramApply is the pending post, the projection, then the rest, in the baseline order; the early part sends only on the transport" {
+    const src = @embedFile("prompt.zig");
+    const ap = src[std.mem.indexOf(u8, src, "pub fn engramApply(").?..];
+    const a = std.mem.indexOf(u8, ap, "try engramPending(e, ch, li);").?;
+    const b = std.mem.indexOf(u8, ap, "try engramProject(e, ch, eh, li, seq);").?;
+    const c = std.mem.indexOf(u8, ap, "try engramFinish(e, ch, eh, li, false);").?;
+    try std.testing.expect(a < b and b < c and c < 400);
+    // the projection reads no stream: it names neither the streams' buffers nor a gather
+    const pr = src[std.mem.indexOf(u8, src, "pub fn engramProject(").?..std.mem.indexOf(u8, src, "pub fn engramOnRoci(").?];
+    try std.testing.expect(std.mem.indexOf(u8, pr, "ch.h") == null and std.mem.indexOf(u8, pr, "ch.pending") == null);
+    // the early send exists only where the sums are on the transport at owned rows
+    const sa = src[std.mem.indexOf(u8, src, "pub fn engramSendAhead(").?..];
+    try std.testing.expect(std.mem.indexOf(u8, sa, "engramOwned(e, ch, li) orelse return") != null);
+}
+
+
+test "TF_DS_ROCI_ANY: the transport's plan of a chunk is the fixed plan at a whole pass and the rows' plan otherwise, with the top-k width riding along" {
+    try std.testing.expectEqual(@as(u8, 0), (try roci_engine.Roci.shapeFor(4096, 4096, true, 0)).id);
+    try std.testing.expectEqual(@as(u8, 1), (try roci_engine.Roci.shapeFor(2048, 2048, true, 0)).id);
+    const s = try roci_engine.Roci.shapeFor(500, 2048, true, 100);
+    try std.testing.expectEqual(roci.any_shape, s.id);
+    try std.testing.expectEqual(@as(u16, 500), s.n);
+    try std.testing.expectEqual(@as(u16, 100), s.x);
+    // off: the cap's fixed plan (the callers check that the chunk is a whole pass); no plan for a cap the transport does not plan
+    try std.testing.expectEqual(@as(u8, 1), (try roci_engine.Roci.shapeFor(500, 2048, false, 0)).id);
+    try std.testing.expectError(error.NoPlanForRows, roci_engine.Roci.shapeFor(500, 3000, false, 0));
+    try std.testing.expectError(error.NoPlanForRows, roci_engine.Roci.shapeFor(0, 2048, true, 0));
+}
+
+test "TF_DS_ROCI_ANY: the boundary's copies stage each rank's rows in a q-row stride per array and stay inside the slab and the region" {
+    const rb = boundaryRowBytes(512, 128);
+    try std.testing.expectEqual(@as(usize, roci.gb_row), rb[0] + rb[1] + rb[2] + rb[3]);
+    for ([_]usize{ 13, 500, 1087, 3000, 4096 }) |n| {
+        const q = slab_plan.q(n);
+        for (0..4) |k| {
+            const nk = slab_plan.slab(n, k).n;
+            const bufs = [4]u64{ 0x1000_0000, 0x2000_0000, 0x3000_0000, 0x4000_0000 };
+            const outs = boundaryCopiesAny(bufs, rb, 0x9000_0000, q, k, nk, true);
+            const ins = boundaryCopiesAny(bufs, rb, 0x9000_0000, q, k, nk, false);
+            var at: u64 = 0x9000_0000 + k * q * roci.gb_row;
+            for (outs, ins, 0..) |o, i, a| {
+                try std.testing.expectEqual(at, o.dst);
+                try std.testing.expectEqual(bufs[a] + k * q * rb[a], o.src);
+                try std.testing.expectEqual(nk * rb[a], o.bytes);
+                try std.testing.expectEqual(o.dst, i.src);
+                try std.testing.expectEqual(o.src, i.dst);
+                at += q * rb[a];
+            }
+            try std.testing.expectEqual(0x9000_0000 + (k + 1) * q * roci.gb_row, at);
+        }
+    }
+}
+
+test "TF_DS_ROCI_ANY with SENT_FIRST and COMBINE_DOOR: only a whole pass of a planned size takes the door launches, on every rank alike" {
+    // a chunk of 2,040 rows in a 2,048-row pass: three ranks own 512 rows (= cap / 4), the fourth 504; the rank-local test r.n * 4 == cap
+    // would split the ranks (three send from inside the GEMM, one not): the whole-pass test is the chunk's alone
+    var ch: Chunk = undefined;
+    ch.cap = 2048;
+    ch.n = 2040;
+    var split: usize = 0;
+    for (0..4) |k| split += @intFromBool(slab_plan.slab(ch.n, k).n * 4 == ch.cap);
+    try std.testing.expectEqual(@as(usize, 3), split);
+    try std.testing.expect(!(ch.n == ch.cap and fixedPlan(&ch)));
+    ch.n = 2048;
+    try std.testing.expect(ch.n == ch.cap and fixedPlan(&ch));
+    ch.cap = 4096;
+    ch.n = 4096;
+    try std.testing.expect(fixedPlan(&ch));
+    // a tail pass (cap 2,236) is a whole chunk with no fixed plan: the plain path
+    ch.cap = 2236;
+    ch.n = 2236;
+    try std.testing.expect(!fixedPlan(&ch));
+    // and its owner exchanges take the rows' plan
+    try std.testing.expectEqual(roci.any_shape, (try roci_engine.Roci.shapeFor(2236, 2236, true, 0)).id);
+    const src = @embedFile("prompt.zig");
+    const a = src[std.mem.indexOf(u8, src, "fn attnSentFirst(").?..std.mem.indexOf(u8, src, "pub fn mmSentFirst(").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, a, "!fixedPlan(ch)"));
+    const m = src[std.mem.indexOf(u8, src, "fn moeSendFirst(").?..std.mem.indexOf(u8, src, "const MoeRing = struct").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, m, "ch.n == ch.cap and fixedPlan(ch)"));
+}
 test "TF_DS_ATTN_EPILOGUE: the switch, the kernel's shapes and the chunk's scratch decide the epilogue" {
     var two: prompt2d.Two = undefined;
     var cfg: Config = undefined;
@@ -2559,4 +3086,39 @@ fn hostEngine(two: *const prompt2d.Two, cfg: *Config, cm: *comm.Comm) Engine {
     e.comm = cm;
     e.world = 2;
     return e;
+}
+
+test "layer 0's MoE partials take the body canary right before their gather, in a prompt chunk and in a round; off, nothing launches" {
+    const p = @embedFile("prompt.zig");
+    const m = @embedFile("model.zig");
+    const r = @embedFile("round.zig");
+    try std.testing.expectEqual(@as(usize, 0), body_layer);
+    // the off path returns before any launch: not in effect, or another layer
+    const at = std.mem.indexOf(u8, p, "pub fn bodyCanary(").?;
+    const body = p[at .. at + std.mem.indexOf(u8, p[at..], "\n}\n").?];
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\n    if (qgate_body == .off or li != body_layer) return;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "mx.qgateBody(k, e.s, pm, rows * moeWidth(e.two, e.c.hidden), @backingInt(qgate_body))") != null);
+    // a part 1 already sent by the MoE's launch is refused before the launch
+    const sent = std.mem.indexOf(u8, body, "if (c.own1_sent) return error.CanaryAfterSend;").?;
+    const launch = std.mem.indexOf(u8, body, "mx.qgateBody(").?;
+    try std.testing.expect(sent < launch);
+    // both prompt layer loops: the MoE, then the canary on its partials, then their gather
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, m, "try prompt.moe(e, ch, li);\n            if (pt) |t| try t.mark(e.s, .moe);\n            try prompt.bodyCanary(e, ch, ch.pm, ch.n, li);\n            try prompt.gather(e, ch, ch.pm, .moe, li + 1);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, m, "try prompt.moe(e, ch, li);\n        try prompt.bodyCanary(e, ch, ch.pm, ch.n, li);\n        try prompt.gather(e, ch, ch.pm, .moe, li + 1);"));
+    // a round's (every verify row, the drafted ones too): the MoE, its probe, the canary, the gather
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r, "try Probe.check(probe, .moe_out, l, rd.pm);\n        try prompt.bodyCanary(e, null, rd.pm, R, l);\n        if (e.two) |tw| try tw.quarters(e, rd.pm, rd.gm, R, tw.dw, 4) else try e.gatherF32(rd.pm, rd.gm, R * d);"));
+    // no other caller, and the switch is read by bodyCanary alone (round.zig never names it; model.zig's useQgateCanary sets it)
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, m, "prompt.bodyCanary("));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r, "prompt.bodyCanary("));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, r, "qgate_body"));
+}
+
+test "a rank's MoE partials are its node's down columns on a 2D node, the hidden size otherwise" {
+    var t: prompt2d.Two = undefined;
+    t.dw = .{ 2560, 2048 };
+    t.p = 0;
+    try std.testing.expectEqual(@as(usize, 2560), moeWidth(&t, 5120));
+    t.p = 1;
+    try std.testing.expectEqual(@as(usize, 2048), moeWidth(&t, 5120));
+    try std.testing.expectEqual(@as(usize, 5120), moeWidth(null, 5120));
 }

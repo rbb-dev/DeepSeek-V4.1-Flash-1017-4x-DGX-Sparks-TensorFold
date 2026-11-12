@@ -13,6 +13,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const prompt = @import("prompt.zig");
+const comm_mod = @import("comm.zig");
 const weights = @import("weights.zig");
 const tri = @import("tri.zig");
 const tri_basic = @import("tri_basic.zig");
@@ -1231,6 +1232,7 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
         try moe(e, rd, ch, l);
         try rd.mark(e, .moe);
         try Probe.check(probe, .moe_out, l, rd.pm);
+        try prompt.bodyCanary(e, null, rd.pm, R, l);
         if (e.two) |tw| try tw.quarters(e, rd.pm, rd.gm, R, tw.dw, 4) else try e.gatherF32(rd.pm, rd.gm, R * d);
         try rd.mark(e, .gather_m);
         if (rd.clk_layers) try rd.clock(e, @intCast(64 + l));

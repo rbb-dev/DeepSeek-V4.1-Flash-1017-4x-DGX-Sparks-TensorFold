@@ -98,6 +98,8 @@
    "seed": "name",
    "first_use": "families/dsv41/model.zig:1896",
    "secret": false
+   "label": "Quality gate's canary (changes replies)",
+   "doc": "Diagnostics for the quality gate only, never a serving setting: 1 the output head reads its rows after one more FP8 rounding step (the gate's ruler); 2 layer 0's MoE partials take one more FP8 step before their gather; 3 they move one fp32 ulp away from zero (a reduction order's size). A known small change the gate must detect; it changes replies. Every node must use the same setting (a start whose nodes differ is refused). Leave unset.",
   },
   {
    "id": 981,

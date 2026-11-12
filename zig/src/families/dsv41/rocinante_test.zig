@@ -36,6 +36,9 @@ test "the arena: 25 regions on pages, 639,893,504 bytes, the offsets of the desi
         .{ .r = .g_s, .off = 626_393_088, .len = 2_621_440 },
         .{ .r = .g_pick, .off = 629_014_528, .len = 114_688 },
         .{ .r = .g_wts, .off = 629_129_216, .len = 114_688 },
+        .{ .r = .g_b, .off = 629_243_904, .len = 1_458_176 },
+        .{ .r = .hand_h, .off = 630_702_080, .len = 5_242_880 },
+        .{ .r = .hand_pre, .off = 635_944_960, .len = 2_048 },
         .{ .r = .g_taps, .off = 635_949_056, .len = 3_932_160 },
         .{ .r = .head_x, .off = 639_881_216, .len = 10_240 },
     };
@@ -89,6 +92,8 @@ fn srcRegion(c: C) []const R {
         .ga => &.{.g_x},
         .gm => &.{ .g_q, .g_s, .g_pick, .g_wts },
         .gi => &.{.g_cidx},
+        .gb => &.{.g_b},
+        .gh => &.{ .hand_h, .hand_pre },
         .gt => &.{.g_taps},
         .hx => &.{.head_x},
     };
@@ -145,6 +150,7 @@ test "every event of every node, both orders and caps: pieces inside their regio
     try eachNode(eventsAreSound);
 }
 
+test "the per-pass counts of the design: 974 data writes, 512 words, 2,590,060,544 bytes each way" {
     var events: u64 = 0;
     for (0..roci.world) |g| {
         var writes: u64 = 0;
@@ -160,6 +166,10 @@ test "every event of every node, both orders and caps: pieces inside their regio
                 bytes += n * e.chains[k][r].bytes();
             };
         }
+        try std.testing.expectEqual(@as(u64, 168), events);
+        try std.testing.expectEqual(@as(u64, 974), writes);
+        try std.testing.expectEqual(@as(u64, 512), words);
+        try std.testing.expectEqual(@as(u64, 2_590_060_544), bytes);
     }
 }
 
@@ -555,12 +565,187 @@ test "control: waiting on rail A's word alone while rail B is late reads stale b
     for (ok.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
 }
 
+// -- the gathers -----------------------------------------------------------------------------------------------------
+
+test "four nodes: a layer's gathers (qr and y, x, the routing's four tensors, the top-k, the boundary's rows) land every slab at its place on the three other nodes, both caps and orders" {
+    for ([_]roci.Order{ roci.identity, perm }) |order| {
+        const net = try Net.open(.{}, .{ .nap = false, .gathers = true }, order);
+        defer net.close();
+        try net.start();
+        const classes = [_]C{ .gf, .ga, .gm, .gi, .gb };
+        const run = try runProgram(net, &classes, 4, order, false);
+        for (run.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+        for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+        for (&net.nodes) |*nd| {
+            const c = nd.t.counters();
+            try std.testing.expectEqual(@as(u64, classes.len * 4), c.wait_groups);
+            try std.testing.expectEqual(@as(?@TypeOf(nd.t.failure().?), null), nd.t.failure());
+        }
+    }
+}
+
+test "four nodes: wo_b's and the pack's codes land every byte of the column partner's part, generation after generation, both caps and orders" {
+    for ([_]roci.Order{ roci.identity, perm }) |order| {
+        const net = try Net.open(.{}, .{ .nap = false, .codes = true }, order);
+        defer net.close();
+        try net.start();
+        const run = try runProgram(net, &.{ .wob, .pack }, 4, order, false);
+        for (run.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+        for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+        for (&net.nodes) |*nd| {
+            const c = nd.t.counters();
+            try std.testing.expectEqual(@as(u64, 8), c.wait_groups);
+            try std.testing.expectEqual(@as(?@TypeOf(nd.t.failure().?), null), nd.t.failure());
+        }
+    }
+}
+
+test "control: a NIC that writes the pack's word before its codes lets a consumer read stale codes" {
     const net = try Net.open(.{ .word_first = true, .hold_data = true }, .{ .nap = false, .codes = true }, roci.identity);
+    defer net.close();
+    try net.start();
+    const run = try runProgram(net, &.{.pack}, 1, roci.identity, false);
+    var bad: u64 = 0;
+    for (run.bad) |b| bad += b;
+    try std.testing.expect(bad > 0);
+}
+
+test "the codes' parts: the send region's bytes to the same offset of the land region, in two halves on the rails, to the column partner alone" {
+    for ([_]roci.Order{ roci.identity, perm }) |order| for (0..roci.world) |g| {
+        const l = roci.layout();
+        for ([_]struct { c: C, s: roci.Region, d: roci.Region, bytes: u64 }{ .{ .c = .wob, .s = .wob_send, .d = .wob_land, .bytes = 4096 * 2304 }, .{ .c = .pack, .s = .pack_send, .d = .pack_land, .bytes = 7 * 4096 * 720 } }) |x| {
+            const e = roci.buildEvent(x.c, 4096, g, order);
+            try std.testing.expectEqual(@as(u8, 1), e.n_peers);
+            try std.testing.expectEqual(@as(u8, @intCast(g ^ 2)), e.peers[0]);
+            const a = e.chains[0][0].pieces[0];
+            const b = e.chains[0][1].pieces[0];
+            try std.testing.expectEqual(l.at(x.s), a.src);
+            try std.testing.expectEqual(l.at(x.d), a.dst);
+            try std.testing.expectEqual(a.src + a.len, b.src);
+            try std.testing.expectEqual(x.bytes, a.len + b.len);
+            try std.testing.expectEqual(x.bytes, l.bytes(x.s));
+            try std.testing.expectEqual(@as(u64, 0), a.len % roci.page);
+        }
+    };
+}
+
+test "control: a NIC that writes the boundary's word before its rows lets a consumer read stale rows" {
     const net = try Net.open(.{ .word_first = true, .hold_data = true }, .{ .nap = false, .gathers = true }, roci.identity);
+    defer net.close();
+    try net.start();
+    const run = try runProgram(net, &.{.gb}, 1, roci.identity, false);
+    var bad: u64 = 0;
+    for (run.bad) |b| bad += b;
+    try std.testing.expect(bad > 0);
+}
+
 test "the boundary's slab: one node's rows of the four cache arrays, array after array, at its rank's place, in halves on the rails" {
+    for ([_]roci.Order{ roci.identity, perm }) |order| for (0..roci.world) |g| {
+        const l = roci.layout();
+        const e = roci.buildEvent(.gb, 4096, g, order);
+        try std.testing.expectEqual(@as(u8, 3), e.n_peers);
+        const slab: u64 = 1024 * roci.gb_row;
+        try std.testing.expectEqual(@as(u64, 364_544), slab);
+        for (0..3) |k| {
+            try std.testing.expectEqual(@as(u8, 1), e.chains[k][0].n);
+            try std.testing.expectEqual(@as(u8, 1), e.chains[k][1].n);
+            const a = e.chains[k][0].pieces[0];
+            const b = e.chains[k][1].pieces[0];
+            try std.testing.expectEqual(l.at(.g_b) + order[g] * slab, a.src);
+            try std.testing.expectEqual(a.src, a.dst);
+            try std.testing.expectEqual(a.src + a.len, b.src);
+            try std.testing.expectEqual(slab, a.len + b.len);
+        }
+    };
+}
+
+/// A word of a stamp: the tag names the event instance and its sender, the index the word.
+fn stampWord(tag: u64, i: usize) u64 {
+    return tag *% 0x9e3779b97f4a7c15 +% @as(u64, i);
+}
+
+const stamp_stride: usize = 509;
+
+/// Writes the stamp's words at every 509th word of `buf` and at its last (the other words are never read).
+fn stampPiece(buf: []u8, tag: u64) void {
+    const words = std.mem.bytesAsSlice(u64, buf[0 .. buf.len / 8 * 8]);
+    var i: usize = 0;
+    while (i < words.len) : (i += stamp_stride) words[i] = stampWord(tag, i);
+    if (words.len > 0) words[words.len - 1] = stampWord(tag, words.len - 1);
+}
+
+/// The stamped words of `buf` that do not hold `tag`'s.
+fn badPiece(buf: []const u8, tag: u64) u64 {
+    const words = std.mem.bytesAsSlice(u64, buf[0 .. buf.len / 8 * 8]);
+    var bad: u64 = 0;
+    var i: usize = 0;
+    while (i < words.len) : (i += stamp_stride) bad += @intFromBool(words[i] != stampWord(tag, i));
+    if (words.len > 0) bad += @intFromBool(words[words.len - 1] != stampWord(tag, words.len - 1));
+    return bad;
+}
+
+/// The tag of the `n`th event of the program sent by node `s`, for the piece starting at source offset `src`.
+fn eventTag(n: u64, s: usize, src: u64) u64 {
+    return (n << 40) ^ (@as(u64, s) << 36) ^ src;
+}
+
+/// The layers' program of the gathers, the codes and the owner sums over shared regions, with the readers where the engine has them: each
+/// rank stamps its sources before a send, checks the landed pieces at the wait and again where a later reader reads them (the
+/// top-k six layers on), while ranks sleep random times between events so any rank can run ahead of the others.
+const Layers = struct {
+    net: *Net,
+    layers: usize,
+    /// A rank that waits for nothing and never sleeps: it runs ahead of the fences (the control).
+    runaway: ?usize = null,
     /// The control's order: the other ranks start their program once the runaway has posted every event of every layer, so
     /// each landed piece they check has been written over by a later event, whatever the machine is doing.
     ahead_done: std.atomic.Value(u32) = .init(0),
+    bad: [roci.world]std.atomic.Value(u64) = @splat(.init(0)),
+    err: [roci.world]?anyerror = @splat(null),
+
+    const a_layers = [_]usize{ 2, 8 };
+
+    fn isA(l: usize) bool {
+        return std.mem.indexOfScalar(usize, &a_layers, l) != null;
+    }
+};
+
+const Seen = struct {
+    /// The sequence number of the latest event of each class this rank sent.
+    n: [roci.n_classes]u64 = @splat(0),
+};
+
+fn landed(r: *Layers, nd: *Node, class: C, n: u64, cap: usize, order: roci.Order) u64 {
+    var bad: u64 = 0;
+    var srcs: [roci.world]u8 = undefined;
+    for (roci.sourcesOf(class, nd.me, &srcs)) |s| {
+        const e = roci.buildEvent(class, cap, s, order);
+        const k = std.mem.indexOfScalar(u8, e.peerSlice(), nd.me).?;
+        for (0..roci.rails) |rail| for (e.chains[k][rail].slice()) |p| {
+            bad += badPiece(nd.arena[p.dst..][0..p.len], eventTag(n, s, p.src));
+        };
+    }
+    _ = r;
+    return bad;
+}
+
+fn layersMain(r: *Layers, g: usize) void {
+    layersBody(r, g) catch |e| {
+        r.err[g] = e;
+    };
+}
+
+fn layersBody(r: *Layers, g: usize) !void {
+    const nd = &r.net.nodes[g];
+    const s: FakeStream = .{};
+    const cap: usize = 2048;
+    const order = perm;
+    var rng = std.Random.DefaultPrng.init(0x5eed0000 + g);
+    var seen: Seen = .{};
+    var seq: u64 = 0;
+    var last_i: ?u64 = null; // the latest top-k event's sequence number
+    var last_i_layer: usize = 0;
+    const run_ahead = r.runaway != null and r.runaway.? == g;
     if (r.runaway != null and !run_ahead) {
         var waited: u64 = 0;
         while (r.ahead_done.load(.acquire) == 0) : (waited += 1) {
@@ -569,7 +754,232 @@ test "the boundary's slab: one node's rows of the four cache arrays, array after
         }
     }
     defer if (run_ahead) r.ahead_done.store(1, .release);
+    const events = struct {
+        fn send(rr: *Layers, nn: *Node, ss: FakeStream, class: C, sq: *u64, sn: *Seen, rn: *std.Random.DefaultPrng, ahead: bool, c: usize, o: roci.Order) !void {
+            _ = rr;
+            sq.* += 1;
+            sn.n[@backingInt(class)] = sq.*;
+            if (!ahead and rn.random().uintLessThan(u32, 3) == 0) sleep(rn.random().uintLessThan(u64, 1_500_000));
+            const e = roci.buildEvent(class, c, nn.me, o);
+            for (0..e.n_peers) |k| for (0..roci.rails) |rail| for (e.chains[k][rail].slice()) |p| stampPiece(nn.arena[p.src..][0..p.len], eventTag(sq.*, nn.me, p.src));
+            try nn.t.send(ss, class, 1);
+        }
+    };
+    for (0..r.layers) |l| {
+        // attention's front: x gathered at an index layer, else qr and y; the top-k at an index layer
+        if (Layers.isA(l)) {
+            try events.send(r, nd, s, .ga, &seq, &seen, &rng, run_ahead, cap, order);
+            if (!run_ahead) try nd.t.wait(s, .ga);
+            if (!run_ahead) _ = r.bad[g].fetchAdd(landed(r, nd, .ga, seen.n[@backingInt(C.ga)], cap, order), .monotonic);
+            try events.send(r, nd, s, .gi, &seq, &seen, &rng, run_ahead, cap, order);
+            if (!run_ahead) try nd.t.wait(s, .gi);
+            last_i = seen.n[@backingInt(C.gi)];
+            last_i_layer = l;
+        } else {
+            try events.send(r, nd, s, .gf, &seq, &seen, &rng, run_ahead, cap, order);
+            if (!run_ahead) try nd.t.wait(s, .gf);
+        }
+        if (!run_ahead) {
+            if (!Layers.isA(l)) _ = r.bad[g].fetchAdd(landed(r, nd, .gf, seen.n[@backingInt(C.gf)], cap, order), .monotonic);
+            // the top-k's readers: this layer and the five after it
+            if (last_i) |n| if (l - last_i_layer < 6) {
+                _ = r.bad[g].fetchAdd(landed(r, nd, .gi, n, cap, order), .monotonic);
+            };
+        }
+        // wo_b's codes, then the attention's owner sum
+        try events.send(r, nd, s, .wob, &seq, &seen, &rng, run_ahead, cap, order);
+        if (!run_ahead) try nd.t.wait(s, .wob);
+        if (!run_ahead) _ = r.bad[g].fetchAdd(landed(r, nd, .wob, seen.n[@backingInt(C.wob)], cap, order), .monotonic);
+        for ([_]C{ .own1, .own2 }) |c| {
+            try events.send(r, nd, s, c, &seq, &seen, &rng, run_ahead, cap, order);
+            if (!run_ahead) try nd.t.wait(s, c);
+            if (!run_ahead) _ = r.bad[g].fetchAdd(landed(r, nd, c, seen.n[@backingInt(c)], cap, order), .monotonic);
+        }
+        // the routing's gather, then the MoE's owner sum
+        try events.send(r, nd, s, .gm, &seq, &seen, &rng, run_ahead, cap, order);
+        if (!run_ahead) try nd.t.wait(s, .gm);
+        if (!run_ahead) _ = r.bad[g].fetchAdd(landed(r, nd, .gm, seen.n[@backingInt(C.gm)], cap, order), .monotonic);
+        // the experts' pack, then the MoE's owner sum
+        try events.send(r, nd, s, .pack, &seq, &seen, &rng, run_ahead, cap, order);
+        if (!run_ahead) try nd.t.wait(s, .pack);
+        if (!run_ahead) _ = r.bad[g].fetchAdd(landed(r, nd, .pack, seen.n[@backingInt(C.pack)], cap, order), .monotonic);
+        for ([_]C{ .own1, .own2 }) |c| {
+            try events.send(r, nd, s, c, &seq, &seen, &rng, run_ahead, cap, order);
+            if (!run_ahead) try nd.t.wait(s, c);
+            if (!run_ahead) _ = r.bad[g].fetchAdd(landed(r, nd, c, seen.n[@backingInt(c)], cap, order), .monotonic);
+        }
+        // the routing's tensors are read by the experts until the MoE's sum: checked again where the combine reads them
+        if (!run_ahead) _ = r.bad[g].fetchAdd(landed(r, nd, .gm, seen.n[@backingInt(C.gm)], cap, order), .monotonic);
+    }
+}
+
+fn runLayers(layers: usize, runaway: ?usize) !u64 {
+    const net = try Net.open(.{}, .{ .nap = false, .gathers = true }, perm);
+    defer net.close();
+    try net.start();
+    var r: Layers = .{ .net = net, .layers = layers, .runaway = runaway };
+    var th: [roci.world]std.Thread = undefined;
+    for (&th, 0..) |*t, g| t.* = try std.Thread.spawn(.{}, layersMain, .{ &r, g });
+    for (th) |t| t.join();
+    var bad: u64 = 0;
+    for (r.err, 0..) |e, g| if (runaway == null or runaway.? != g) try std.testing.expectEqual(@as(?anyerror, null), e);
+    for (&r.bad, 0..) |*b, g| if (runaway == null or runaway.? != g) {
+        bad += b.load(.monotonic);
+    };
+    return bad;
+}
+
+test "the dataflow of the gathers and the codes: shared regions across layers, ranks skewed by random sleeps, no landed slab is overwritten before its last reader" {
+    try std.testing.expectEqual(@as(u64, 0), try runLayers(11, null));
+}
+
+test "control: a rank that waits for no fence and never sleeps runs ahead and overwrites slabs the others still read" {
+    // rank 2 posts every event of every layer at once; the others, delayed by their sleeps, read the top-k of an index layer
+    // after the next index layer's slabs have landed on top of it
+    const bad = try runLayers(11, 2);
+    try std.testing.expect(bad > 0);
+}
+
+// -- events of any row count -----------------------------------------------------------------------------------------------------
+
+const slabp = @import("slab_plan.zig");
+
+fn sameEvent(a: roci.Event, b: roci.Event) !void {
+    try std.testing.expectEqual(a.class, b.class);
+    try std.testing.expectEqual(a.n_peers, b.n_peers);
+    try std.testing.expectEqualSlices(u8, a.peerSlice(), b.peerSlice());
+    for (0..a.n_peers) |k| for (0..roci.rails) |r| {
+        try std.testing.expectEqual(a.chains[k][r].n, b.chains[k][r].n);
+        for (a.chains[k][r].slice(), b.chains[k][r].slice()) |x, y| try std.testing.expectEqual(x, y);
+    };
+}
+
+test "the plan of any row count is the two fixed plans at 4,096 and 2,048 rows, piece for piece, for every class, node and row order" {
+    for ([_]roci.Order{ roci.identity, perm }) |order| for (0..roci.world) |g| for (0..roci.n_classes) |ci| {
+        const class: C = @fromBackingInt(@intCast(ci));
         if (class == .gh or class == .gt or class == .hx) continue; // (no full-cap plan: their rows are a decoder window's)
+        for ([_]usize{ 4096, 2048 }) |cap| try sameEvent(roci.buildEvent(class, cap, g, order), roci.buildEventN(class, cap, g, order));
+    };
+}
+
+test "control: the plan of 4,095 rows is not the plan of 4,096" {
+    const a = roci.buildEvent(.own1, 4096, 0, roci.identity);
+    const b = roci.buildEventN(.own1, 4095, 0, roci.identity);
+    try std.testing.expect(a.chains[0][1].pieces[0].len != b.chains[0][1].pieces[0].len or a.chains[0][0].pieces[0].len != b.chains[0][0].pieces[0].len);
+}
+
+/// What a node receives of an event class, summed over its sources: bytes into each region, and every piece inside its regions.
+fn receivedBytes(class: C, n: usize, d: usize, order: roci.Order) !struct { bytes: u64, pieces: usize } {
+    const l = roci.layout();
+    var bytes: u64 = 0;
+    var pieces: usize = 0;
+    var srcs: [roci.world]u8 = undefined;
+    for (roci.sourcesOf(class, d, &srcs)) |s| {
+        const e = roci.buildEventN(class, n, s, order);
+        const k = std.mem.indexOfScalar(u8, e.peerSlice(), @intCast(d)).?;
+        for (0..roci.rails) |r| for (e.chains[k][r].slice()) |p| {
+            try std.testing.expect(inside(l, srcRegion(class), p.src, p.len));
+            try std.testing.expect(inside(l, dstRegion(class), p.dst, p.len));
+            bytes += p.len;
+            pieces += 1;
+        };
+    }
+    return .{ .bytes = bytes, .pieces = pieces };
+}
+
+test "every row count from 1 to 4,096: the slabs of a gather land every row of every other node once, the owner parts carry the partners' rows, the codes all rows, empty slabs send no data" {
+    const rows_of = [_]struct { c: C, row: u64 }{ .{ .c = .gf, .row = 2560 + 1024 }, .{ .c = .ga, .row = 10240 }, .{ .c = .gm, .row = 5120 + 640 + 28 + 28 }, .{ .c = .gi, .row = 4096 }, .{ .c = .gb, .row = roci.gb_row } };
+    var n: usize = 1;
+    while (n <= 4096) : (n += if (n < 130 or n > 4000) 1 else 7) {
+        for ([_]roci.Order{ roci.identity, perm }) |order| for (0..roci.world) |d| {
+            for (rows_of) |x| {
+                const got = try receivedBytes(x.c, n, d, order);
+                // every row the other three nodes own, once
+                try std.testing.expectEqual((n - slabp.slab(n, order[d]).n) * x.row, got.bytes);
+            }
+            // the owner sums: part 1 brings this node's rows and its column partner's from the row partner, part 2 the pair's sums at this node's rows
+            const o1 = try receivedBytes(.own1, n, d, order);
+            try std.testing.expectEqual((slabp.slab(n, order[d]).n + slabp.slab(n, order[d ^ 2]).n) * 2560 * 4, o1.bytes);
+            const o2 = try receivedBytes(.own2, n, d, order);
+            try std.testing.expectEqual(slabp.slab(n, order[d]).n * 2560 * 2, o2.bytes);
+            const w = try receivedBytes(.wob, n, d, order);
+            try std.testing.expectEqual(n * 2304, w.bytes);
+            const p = try receivedBytes(.pack, n, d, order);
+            try std.testing.expectEqual(7 * n * 720, p.bytes);
+            // a node with no rows (n small) sends no data WRITE of a gather, only its words
+            for (0..roci.world) |g| if (slabp.slab(n, order[g]).n == 0) {
+                const e = roci.buildEventN(.gm, n, g, order);
+                try std.testing.expectEqual(@as(u8, 3), e.n_peers);
+                for (0..3) |k| for (0..roci.rails) |r| try std.testing.expectEqual(@as(u8, 0), e.chains[k][r].n);
+            };
+        };
+    }
+}
+
+const Run2 = struct {
+    net: *Net,
+    bar: *Barrier,
+    classes: []const C,
+    ns: []const usize,
+    order: roci.Order,
+    bad: [roci.world]u64 = @splat(0),
+    err: [roci.world]?anyerror = @splat(null),
+};
+
+fn runAny(net: *Net, classes: []const C, ns: []const usize, order: roci.Order) !Run2 {
+    var bar: Barrier = .{};
+    var run: Run2 = .{ .net = net, .bar = &bar, .classes = classes, .ns = ns, .order = order };
+    var th: [roci.world]std.Thread = undefined;
+    for (&th, 0..) |*t, g| t.* = try std.Thread.spawn(.{}, rankAny2, .{ &run, g });
+    for (th) |t| t.join();
+    return run;
+}
+
+fn rankAny2(run: *Run2, g: usize) void {
+    rankAny2Body(run, g) catch |e| {
+        run.err[g] = e;
+    };
+}
+
+fn rankAny2Body(run: *Run2, g: usize) !void {
+    const nd = &run.net.nodes[g];
+    const s: FakeStream = .{};
+    for (run.ns) |n| for (run.classes) |class| {
+        const e = roci.buildEventN(class, n, nd.me, run.order);
+        for (0..e.n_peers) |k| for (0..roci.rails) |r| for (e.chains[k][r].slice()) |p| pattern(nd.arena[p.src..][0..p.len], n *% 1000003 +% @as(u64, nd.me) *% 7919 +% p.src);
+        run.bar.wait(roci.world);
+        try nd.t.sendN(s, class, n);
+        try nd.t.wait(s, class);
+        var srcs: [roci.world]u8 = undefined;
+        for (roci.sourcesOf(class, nd.me, &srcs)) |src| {
+            const se = roci.buildEventN(class, n, src, run.order);
+            const k = std.mem.indexOfScalar(u8, se.peerSlice(), nd.me).?;
+            for (0..roci.rails) |r| for (se.chains[k][r].slice()) |p| {
+                const want = try gpa.alloc(u8, p.len);
+                defer gpa.free(want);
+                pattern(want, n *% 1000003 +% @as(u64, src) *% 7919 +% p.src);
+                const m = p.len / 8 * 8;
+                if (!std.mem.eql(u8, want[0..m], nd.arena[p.dst..][0..m])) run.bad[g] += 1;
+            };
+        }
+        run.bar.wait(roci.world);
+    };
+}
+
+test "four nodes: every class at row counts from 1 to 4,096 in turn (zero-row slabs included) lands every byte, the words keep their order" {
+    for ([_]roci.Order{ roci.identity, perm }) |order| {
+        const net = try Net.open(.{}, .{ .nap = false, .gathers = true, .codes = true }, order);
+        defer net.close();
+        try net.start();
+        const classes = [_]C{ .own1, .own2, .wob, .pack, .gf, .ga, .gm, .gi, .gb, .eng1, .eng2 };
+        const ns = [_]usize{ 13, 1, 500, 4096, 63, 64, 65, 2048, 1087, 17, 3000 };
+        const run = try runAny(net, &classes, &ns, order);
+        for (run.err) |e| try std.testing.expectEqual(@as(?anyerror, null), e);
+        for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
+        for (&net.nodes) |*nd| try std.testing.expectEqual(@as(?@TypeOf(nd.t.failure().?), null), nd.t.failure());
+    }
+}
+
 // -- failure ---------------------------------------------------------------------------------------------------------
 
 test "a peer that never answers: the watchdog names it, every queued wait is released, the next enqueue refuses" {
@@ -821,14 +1231,25 @@ test "the device chain: a stream memset into write-combined host memory, the doo
 }
 
 test "the start line names the Rocinante transport, the arena and the layout hash" {
+    var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try roci.startLine(&w, 2, "mlx5_0,mlx5_2", 3, .{}, .write);
     const text = w.buffered();
+}
+
 test "the start line says what the transport carries: the owner sums, and the codes and the gathers where the arena holds their regions; the event counts follow" {
+    var buf: [1024]u8 = undefined;
     try std.testing.expectEqualStrings("the owner sums of full passes (attention, MoE, Engram)", roci.carriesText(&buf, false, false));
+    const g = roci.carriesText(&buf, false, true);
     try std.testing.expectEqualStrings("the owner sums of full passes (attention, MoE, Engram), the gathers (qr and y, x, the routing's codes and picks, the indexer's top-k, the boundary's cache rows)", g);
+    const c = roci.carriesText(&buf, true, false);
     try std.testing.expectEqualStrings("the owner sums of full passes (attention, MoE, Engram), the codes families (wo_b's and the expert pack's)", c);
+    const both = roci.carriesText(&buf, true, true);
     try std.testing.expect(std.mem.indexOf(u8, both, "NCCL") == null and std.mem.indexOf(u8, both, "the codes families") != null and std.mem.endsWith(u8, both, "the boundary's cache rows)"));
+    try std.testing.expectEqual(@as(u64, 84), roci.eventsPerPass(false, false));
+    try std.testing.expectEqual(@as(u64, 124), roci.eventsPerPass(true, false));
+    try std.testing.expectEqual(@as(u64, 128), roci.eventsPerPass(false, true));
+    try std.testing.expectEqual(@as(u64, 168), roci.eventsPerPass(true, true));
 }
 
 test "a batched stream wait of six words (a gather's three peers on both rails) holds the stream until the last one arrives" {
@@ -906,6 +1327,7 @@ test "a pass of 84 owner events: each rail's proxy prints its line and times eve
         }
     }
 }
+
 // -- two lanes: the second pass of a prompt in flight (TF_DS_ROCI_STAGGER) -------------------------------------------
 
 /// Two nets of four nodes, node g of each the two lanes of one rank: each fails the other.
@@ -1342,6 +1764,105 @@ test "the pair's cache gate: pass B's read of a layer's cache waits pass A's eve
         // gated: B read A's write; ungated: B read the old bytes (the control is live)
         if (gated) try std.testing.expectEqual(@as(u32, 0), bad) else try std.testing.expect(bad != 0);
     }
+}
+// -- the top-k at fewer keys, and the decoder rows' handoff ------------------------------------------------------------------------
+
+test "the top-k gather at kk keys a row: every other node's rows once, contiguous at k q kk 8 bytes, kk = 512 the region's own plan" {
+    const l = roci.layout();
+    for ([_]usize{ 1, 7, 64, 255, 511, 512 }) |kk| {
+        var n: usize = 1;
+        while (n <= 4096) : (n += if (n < 70 or n > 4000) 1 else 61) {
+            for ([_]roci.Order{ roci.identity, perm }) |order| for (0..roci.world) |g| {
+                const e = roci.buildEventX(.gi, n, kk, g, order);
+                try std.testing.expectEqual(@as(u8, 3), e.n_peers);
+                const k = order[g];
+                const q = slabp.q(n);
+                const nk = slabp.slab(n, k).n;
+                for (0..3) |j| {
+                    var bytes: u64 = 0;
+                    for (0..roci.rails) |r| for (e.chains[j][r].slice()) |p| {
+                        try std.testing.expect(p.src == p.dst);
+                        try std.testing.expect(p.src >= l.at(.g_cidx) + k * q * kk * 8 and p.src + p.len <= l.at(.g_cidx) + (k * q + nk) * kk * 8);
+                        try std.testing.expect(inside(l, &.{.g_cidx}, p.src, p.len));
+                        bytes += p.len;
+                    };
+                    try std.testing.expectEqual(nk * kk * 8, bytes);
+                }
+            };
+        }
+    }
+    for (0..roci.world) |g| try sameEvent(roci.buildEventN(.gi, 1000, g, roci.identity), roci.buildEventX(.gi, 1000, 512, g, roci.identity));
+}
+
+test "control: the top-k plan of 100 keys is not the plan of 512" {
+    const a = roci.buildEventX(.gi, 1000, 100, 0, roci.identity);
+    const b = roci.buildEventX(.gi, 1000, 512, 0, roci.identity);
+    try std.testing.expect(a.chains[0][0].bytes() != b.chains[0][0].bytes());
+}
+
+/// How many of the senders' windows (or this node's own, node 0 keeping its rows) cover each of the last 128 rows of a chunk of `n`
+/// rows, for the handoff event of `d` rows: index i is row n - 128 + i (rows before the chunk's start count nothing).
+fn handCover(n: usize, d: usize, order: roci.Order) ![128]u8 {
+    var cover: [128]u8 = @splat(0);
+    const first = n - d;
+    for (0..roci.world) |s| {
+        const sl = slabp.slab(n, order[s]);
+        const lo = @max(first, sl.start);
+        const hi = @min(n, sl.start + sl.n);
+        if (s != 0) {
+            const e = roci.buildEventX(.gh, n, d, s, order);
+            try std.testing.expectEqual(@as(u8, 3), e.n_peers);
+            const j = std.mem.indexOfScalar(u8, e.peerSlice(), 0).?;
+            var hb: u64 = 0;
+            for (0..roci.rails) |r| for (e.chains[j][r].slice()) |p| {
+                try std.testing.expect(p.src == p.dst);
+                if (inside(roci.layout(), &.{.hand_h}, p.src, p.len)) hb += p.len else try std.testing.expect(inside(roci.layout(), &.{.hand_pre}, p.src, p.len));
+            };
+            const m: u64 = if (hi > lo) hi - lo else 0;
+            try std.testing.expectEqual(m * roci.hand_h_row, hb);
+            if (m == 0) for (0..3) |jj| for (0..roci.rails) |r| try std.testing.expectEqual(@as(u8, 0), e.chains[jj][r].n);
+        }
+        if (hi > lo) for (lo..hi) |row| {
+            if (row + 128 >= n) cover[row + 128 - n] += 1;
+        };
+    }
+    return cover;
+}
+
+test "the handoff of the last d rows: the four nodes' windows cover [n - d, n) once at row (row - first), empty windows send only their word" {
+    for ([_]usize{ 1, 2, 13, 16, 17, 48, 49, 64, 65, 127, 128, 129, 500, 1087, 2048, 3000, 4096 }) |n| {
+        for ([_]usize{ 1, 2, 5, 17, 64, 100, 127, 128 }) |d| {
+            if (d > n) continue;
+            for ([_]roci.Order{ roci.identity, perm }) |order| {
+                const cover = try handCover(n, d, order);
+                for (0..128) |i| {
+                    // index i is row n - 128 + i: a row of the window once, any other row (before it) not at all
+                    const in_window = i + d >= 128;
+                    try std.testing.expectEqual(@as(u8, if (in_window) 1 else 0), cover[i]);
+                }
+            }
+        }
+    }
+}
+
+test "control: a handoff event of d - 1 rows leaves the window's first row uncovered" {
+    const cover = try handCover(500, 100, roci.identity);
+    const short = blk: {
+        // the senders' windows of 99 rows against a window of 100
+        var c: [128]u8 = @splat(0);
+        const first = 500 - 99;
+        for (0..roci.world) |s| {
+            const sl = slabp.slab(500, s);
+            const lo = @max(first, sl.start);
+            const hi = @min(500, sl.start + sl.n);
+            if (hi > lo) for (lo..hi) |row| {
+                c[row + 128 - 500] += 1;
+            };
+        }
+        break :blk c;
+    };
+    try std.testing.expectEqual(@as(u8, 1), cover[128 - 100]);
+    try std.testing.expectEqual(@as(u8, 0), short[128 - 100]);
 }
 
 // -- a decoder window's taps and head row (classes gt, hx) ----------------------------------------------------------------

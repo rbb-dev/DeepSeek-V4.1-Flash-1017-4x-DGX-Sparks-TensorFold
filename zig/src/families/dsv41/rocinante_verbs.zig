@@ -318,6 +318,37 @@ comptime {
     std.debug.assert(@sizeOf(Info) % 8 == 0);
 }
 
+/// Whether a NIC accepts a block of memory as a memory region, with the access the arena is registered with: the device opened once,
+/// one protection domain, `try_` registers and at once deregisters.
+pub const RegProbe = struct {
+    v: Verbs,
+    ctx: *vabi.Context,
+    pd: *vabi.Pd,
+
+    pub fn open(device: []const u8) !RegProbe {
+        var v = try Verbs.open(null);
+        errdefer v.close();
+        const ctx = try v.openDevice(device);
+        errdefer _ = v.api.ibv_close_device(ctx);
+        const pd = v.api.ibv_alloc_pd(ctx) orelse return error.VerbsFailed;
+        return .{ .v = v, .ctx = ctx, .pd = pd };
+    }
+
+    pub fn close(p: *RegProbe) void {
+        _ = p.v.api.ibv_dealloc_pd(p.pd);
+        _ = p.v.api.ibv_close_device(p.ctx);
+        p.v.close();
+    }
+
+    /// Null when ibv_reg_mr accepted [ptr, ptr + len) (and it is deregistered again), else the errno it left.
+    pub fn refused(p: *const RegProbe, ptr: *anyopaque, len: usize) ?c_int {
+        std.c._errno().* = 0;
+        const mr = p.v.api.ibv_reg_mr(p.pd, ptr, len, vabi.access_local_write | vabi.access_remote_write) orelse return std.c._errno().*;
+        _ = p.v.api.ibv_dereg_mr(mr);
+        return null;
+    }
+};
+
 test "the atomic signal's start-up check refuses by name a card without ATOMICs or without room for one in flight; the WRITE signal asks nothing" {
     var buf: [256]u8 = undefined;
     // the CX-7's answers: atomic_cap 1 (the card's own atomics), 16 responder / 16 requester in flight

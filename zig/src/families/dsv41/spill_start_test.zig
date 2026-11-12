@@ -1,3 +1,4 @@
+const math: start.Math = .{ .pair_sum = true, .qhc = true, .owner_gather = true, .idx_shard = true, .idx_rb = 2, .negzero = false, .replay_floor = true, .owner_yx = true, .cat_partner = true, .front_owned = true, .ffn_codes = true, .pack_codes = true, .engram_owner_sum = true, .boundary_owned = true, .cat_codes = true, .pf_split = "C7", .woa_w8 = true, .quant_once = true, .pf_gemm5 = true, .group_tiles = true, .topk_tiles = true, .idx_proj_owned = true, .bf16_rows = true, .pf_run128 = true, .pass_rows = 4096, .pass_from = 8192, .pass_tail = true, .decode_fuse = true, .attn_u = true, .idx_u = true, .mma_sf = true, .mma_sf_exact = true, .roci = true, .roci_collect = true, .idx_v = true, .gemm_w16 = true, .assemble_quant = true, .attn_epilogue = true, .hc_stride = true, .hc_fused = true, .attn_epi_fused = true, .gemm_r2 = true, .gemm_halves = true, .qgate_canary = 1, .hc_2s = true, .pf_raster = 8 };
     try std.testing.expectEqualStrings("packed=1 owned=0 instream=0 aio=1", c.engram_switches);
     try std.testing.expectEqualStrings("packed=1 owned=0 instream=0 aio=0", odd.engram_switches);
 
@@ -5,10 +6,30 @@
     var off = math;
     off.roci = false;
     off.roci_collect = false;
+    off.qgate_canary = 0;
     const text = try start.mathText(&buf, off);
     try std.testing.expect(std.mem.indexOf(u8, text, "roci") == null);
     try std.testing.expect(std.mem.endsWith(u8, text, "mma_sf_exact=1"));
     var buf2: [1024]u8 = undefined;
     const on = try start.mathText(&buf2, math);
     try std.testing.expectEqualStrings(text, on[0..text.len]);
+}
+    on.qgate_canary = 1;
+
+test "the canary in the tier's math is a number: the head's 1 keeps its old name, the body's 2 and 3 name themselves, and none is the same text as before" {
+    var base_buf: [1024]u8 = undefined;
+    var m = math;
+    m.pf_raster = 0; // (its group comes last: the canary joins before it)
+    m.qgate_canary = 0;
+    const none = try start.mathText(&base_buf, m);
+    try std.testing.expect(std.mem.indexOf(u8, none, "qgate_canary") == null);
+    for ([_]u8{ 1, 2, 3 }) |c| {
+        var buf: [1024]u8 = undefined;
+        m.qgate_canary = c;
+        const t = try start.mathText(&buf, m);
+        var want: [32]u8 = undefined;
+        // after the other optional switches, before pf_raster
+        try std.testing.expect(std.mem.indexOf(u8, t, try std.fmt.bufPrint(&want, " qgate_canary={d}", .{c})) != null);
+        try std.testing.expectEqualStrings(none, t[0..none.len]);
+    }
 }

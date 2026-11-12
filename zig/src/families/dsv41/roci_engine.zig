@@ -10,9 +10,14 @@ const cd = @import("rocinante_cd.zig");
 const mx = @import("mlx5_devx.zig");
 const nap = @import("rdma_nap.zig");
 const prompt2d = @import("prompt2d.zig");
+const rdma = @import("rdma.zig");
 
 pub const Region = roci.Region;
 pub const Class = roci.Class;
+
+/// What the transport needs to know of an event: a fixed plan's index (`id`), or `any_shape` with the chunk's rows `n` and the event's extra
+/// number `x` (roci.buildEventX).
+pub const Shape = struct { id: u8, n: u16 = 0, x: u16 = 0 };
 
 const host_portable: c_uint = 0x01;
 const host_mapped: c_uint = 0x02;
@@ -37,6 +42,34 @@ const HostMem = struct {
 /// How the transport's arena (the regions it sends from and lands into) is allocated: `mmap` anonymous pages, locked, registered with
 /// cuMemHostRegister (mapped, portable), the type the decode rings use; `wc` cuMemHostAlloc, mapped and write-combined, which only the
 /// transport's own host tests open. The bytes the engine computes do not depend on it.
+pub const Pages = enum { wc, mmap };
+
+/// The arena's memory of one kind, and what releases it.
+const Arena = struct {
+    mem: HostMem,
+    pinned: ?rdma.Pinned = null,
+    hr: ?rdma.HostReg = null,
+
+    fn alloc(d: *const cuda.Driver, len: usize, pages: Pages) !Arena {
+        switch (pages) {
+            .wc => return .{ .mem = try HostMem.alloc(d, len, host_portable | host_mapped | host_wc) },
+            .mmap => {
+                var hr = try rdma.HostReg.open();
+                errdefer hr.lib.close();
+                const pin = try rdma.Pinned.alloc(d, &hr, len);
+                return .{ .mem = .{ .bytes = pin.mem[0..len], .dev = pin.dev }, .pinned = pin, .hr = hr };
+            },
+        }
+    }
+
+    fn free(a: *Arena, d: *const cuda.Driver) void {
+        if (a.pinned) |*p| {
+            p.free(&a.hr.?);
+            a.hr.?.lib.close();
+        } else _ = d.api.cuMemFreeHost(a.mem.bytes.ptr);
+    }
+};
+
 /// The NIC a lane runs on: the verbs one, or (TF_DS_ROCI_WAIT=1) the one whose queue pairs wait in the card.
 const NicBox = union(enum) {
     verbs: *rv.VerbsNic,
@@ -77,12 +110,14 @@ pub const Roci = struct {
     g: u8,
     layout: roci.Layout,
     arena: HostMem,
+    arena_mem: Arena,
     /// The second lane of a rank borrows the first lane's allocation (its second half): only the first frees it.
     owns_arena: bool = true,
     /// This lane (0, 1 or 2 for the prompt lanes of a rank, 3 the host lane) and the device addresses [lo, hi) of the whole allocation the
     /// prompt lanes' arenas lie in.
     lane: u8 = 0,
     span: [2]u64 = .{ 0, 0 },
+    pages: Pages,
     ctl_mem: HostMem,
     verbs: fabric.verbs.Verbs,
     /// libmlx5, loaded when the queue pairs wait in the card (TF_DS_ROCI_WAIT=1).
@@ -91,6 +126,9 @@ pub const Roci = struct {
     t: *roci.Transport,
     passes: u64 = 0,
     prev: roci.Counters = .{},
+    /// The arrival count of a producer kernel that rings a doorbell itself (TF_DS_ROCI_SENT_FIRST): one device word, zero
+    /// between launches (the ringing CTA zeroes it).
+    sent_cnt: cuda.DeviceBuffer = undefined,
 
     /// open for the lanes of a rank: `lanes` 2 or 3 allocates the lanes' arenas as one block (so mx.Kernels' one range tests them all) and
     /// lane 0 takes the first part; with `first` (the lane 0 Roci) `lanes` is this lane's place in the group (2: lane 1, 3: lane 2) and it opens
@@ -121,6 +159,9 @@ pub const Roci = struct {
         errdefer _ = d.api.cuMemFreeHost(r.ctl_mem.bytes.ptr);
         const ctl: *roci.Control = @ptrCast(r.ctl_mem.bytes.ptr);
         ctl.* = .{};
+        r.sent_cnt = try cuda.DeviceBuffer.alloc(d, 256);
+        errdefer r.sent_cnt.free();
+        try d.check(d.api.cuMemsetD8_v2(r.sent_cnt.ptr, 0, r.sent_cnt.len), "cuMemsetD8");
         r.verbs = try fabric.verbs.Verbs.open(null);
         errdefer r.verbs.close();
         const t0 = nowNs();
@@ -188,6 +229,7 @@ pub const Roci = struct {
 
     pub fn close(r: *Roci) void {
         r.t.deinit();
+        r.sent_cnt.free();
         r.nic.close();
         if (r.mlx) |*m| m.close();
         r.verbs.close();
@@ -207,13 +249,46 @@ pub const Roci = struct {
     }
 
     /// The plan a chunk of `cap` rows takes (roci.Transport.shape_caps), else it has none.
+    pub fn shapeOf(cap: usize) !Shape {
+        for (roci.Transport.shape_caps, 0..) |c, i| if (c == cap) return .{ .id = @intCast(i) };
         return error.NoPlanForRows;
     }
 
-    /// The send of an event on `s`, queued behind the producer: one stream write.
+    /// The plan of a chunk of `n` rows: the fixed plan of a whole pass (a chunk of exactly `cap` rows), else with `any` (TF_DS_ROCI_ANY)
+    /// the plan of its rows (buildEventX); `x` the event's extra number.
+    pub fn shapeFor(n: usize, cap: usize, any: bool, x: usize) !Shape {
+        if (!any) return shapeOf(cap);
+        if (n == cap) {
+            if (shapeOf(cap)) |fixed| return fixed else |_| {}
+        }
+        if (n == 0 or n > roci.max_cap) return error.NoPlanForRows;
+        return .{ .id = roci.any_shape, .n = @intCast(n), .x = @intCast(x) };
     }
 
+    /// The send of an event of `n` rows of any count (1 to 4,096) on `s`: the owned rows' plan of that count.
+    pub fn sendN(r: *Roci, s: cuda.Stream, class: Class, n: usize) !void {
+        try r.t.sendN(s, class, n);
+    }
+
+    /// The send of an event of `n` rows with the event's extra number `x` (the top-k's keys for gi, the decoder rows for gh).
+    pub fn sendX(r: *Roci, s: cuda.Stream, class: Class, n: usize, x: usize) !void {
+        try r.t.sendX(s, class, n, x);
+    }
+
+    /// The send of an event on `s`, queued behind the producer: one stream write.
+    pub fn send(r: *Roci, s: cuda.Stream, class: Class, shape: Shape) !void {
+        if (shape.id == roci.any_shape) return r.t.sendX(s, class, shape.n, shape.x);
+        try r.t.send(s, class, shape.id);
+    }
+
+    /// The host's half of a send whose doorbell a producer kernel rings (mx.Door): the ticket, and the device addresses of the
+    /// doorbell line and of the kernel's arrival count.
+    pub fn reserve(r: *Roci, class: Class, shape: Shape) !struct { ticket: u64, door: u64, cnt: u64 } {
+        const ticket = if (shape.id == roci.any_shape) try r.t.reserveX(class, shape.n, shape.x) else try r.t.reserve(class, shape.id);
         if (r.t.set.wait_qp) return .{ .ticket = r.t.go(ticket), .door = r.t.doorbellAddr(), .cnt = r.sent_cnt.ptr };
+        return .{ .ticket = ticket, .door = r.t.doorbellAddr(), .cnt = r.sent_cnt.ptr };
+    }
+
     /// The consumers on `s` wait for the event's words from every source, on both rails.
     pub fn wait(r: *Roci, s: cuda.Stream, class: Class) !void {
         try r.t.wait(s, class);
@@ -332,6 +407,42 @@ pub fn gatherOverLinks(fan: *const prompt2d.Fan, rank: u32, world: u32, mine: []
         @memcpy(table, got);
     }
 }
+
+// -- TF_DS_ROCI_PAGES ------------------------------------------------------------------------------------------------------
+
+test "TF_DS_ROCI_PAGES: either arena is host memory the CPU and the GPU read and write alike; mmap's pages are registered with the driver" {
+    var driver = cuda.Driver.open() catch return error.SkipZigTest;
+    defer driver.close();
+    var cx = cuda.Context.init(&driver, 0) catch return error.SkipZigTest;
+    defer cx.deinit();
+    // (not a multiple of 64 KiB: the mmap kind rounds its pages up and hands back exactly `len` bytes)
+    const len: usize = (6 << 20) + 4096;
+    for ([_]Pages{ .wc, .mmap }) |kind| {
+        var a = try Arena.alloc(&driver, len, kind);
+        defer a.free(&driver);
+        try std.testing.expectEqual(len, a.mem.bytes.len);
+        try std.testing.expect(a.mem.dev != 0);
+        try std.testing.expectEqual(kind == .mmap, a.pinned != null);
+        if (kind == .mmap) try std.testing.expectEqual(@as(usize, 0), @intFromPtr(a.mem.bytes.ptr) % std.heap.page_size_min);
+        // the CPU writes, the GPU reads the same bytes through the device address
+        for (a.mem.bytes, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+        const back = try gpa_test.alloc(u8, len);
+        defer gpa_test.free(back);
+        try driver.check(driver.api.cuMemcpyDtoH_v2(back.ptr, a.mem.dev, len), "cuMemcpyDtoH");
+        try std.testing.expectEqualSlices(u8, a.mem.bytes, back);
+        // the GPU writes, the CPU reads them
+        try driver.check(driver.api.cuMemsetD8_v2(a.mem.dev, 0xa7, len), "cuMemsetD8");
+        for (a.mem.bytes) |b| try std.testing.expectEqual(@as(u8, 0xa7), b);
+        // control: one CPU write after it is what the GPU reads next (the comparison is live)
+        a.mem.bytes[12345] = 0x11;
+        var one: [1]u8 = undefined;
+        try driver.check(driver.api.cuMemcpyDtoH_v2(&one, a.mem.dev + 12345, 1), "cuMemcpyDtoH");
+        try std.testing.expectEqual(@as(u8, 0x11), one[0]);
+        try std.testing.expect(one[0] != 0xa7);
+    }
+}
+
+const gpa_test = std.testing.allocator;
 
 test "TF_DS_ROCI_WAIT: unset and 1 are the card's WAIT, 0 is the proxies; unset falls back to the proxies with its reason where the WAIT cannot run, 1 refuses there" {
     // unset: the default

@@ -54,6 +54,7 @@ const roci_pair = @import("roci_pair.zig");
 const pair_spans = @import("pair_spans.zig");
 const pass_meter = @import("pass_meter.zig");
 const pair_nap = @import("rdma_nap.zig");
+const any_check = @import("any_check.zig");
 const rdma = @import("rdma.zig");
 const tri_index = @import("tri_index.zig");
 
@@ -713,11 +714,69 @@ fn nactWrite(m: *Model, b: cuda.DeviceBuffer) void {
     if (rdma.diagWriteFile("TF_DS_NACT_DIR", file, text)) std.log.info("TF_DS_NACT_LOG: {d} launches written ({s})", .{ n, file });
 }
 
+/// TF_DS_QGATE_CANARY's canary (prompt2d.qgateAsked); text that is no canary runs none, said once.
+fn readQgate() prompt2d.Qgate {
+    const v: ?[]const u8 = if (std.c.getenv("TF_DS_QGATE_CANARY")) |x| std.mem.span(x) else null;
+    const q = prompt2d.qgateAsked(v);
+    if (q == .off) if (v) |t| if (t.len != 0 and !std.mem.eql(u8, t, "0"))
+        std.log.info("TF_DS_QGATE_CANARY={s}: not a canary (1 the head, 2 or 3 the body): none", .{t});
+    return q;
+}
+
+/// TF_DS_QGATE_CANARY `asked` (any canary on every rank alike: the start-up Settings' kernel bit) the same canary on
+/// every rank, else the start is refused, the ranks named. No collective when none is asked.
+fn agreeQgateCanary(d: *const cuda.Driver, comm: *const comm_mod.Comm, stream: cuda.Stream, asked: prompt2d.Qgate) !void {
+    if (asked == .off) return;
+    const differ = try prompt2d.ranksDiffer(d, comm, stream, @backingInt(asked));
+    if (differ == 0) return;
+    var buf: [64]u8 = undefined;
+    std.log.err("TF_DS_QGATE_CANARY={d}: {s} asked another canary than rank 0: the start is refused", .{ @backingInt(asked), prompt2d.rankList(differ, &buf) });
+    return error.CanariesDiffer;
+}
+
+/// TF_DS_QGATE_CANARY `asked` in effect with the checkpoint's own kernels (`native`), one line when asked: the head's
+/// canary (prompt.qgate_canary: every row's logits the head's on rows one more FP8 step away, a quality gate's ruler) or
+/// the body's (prompt.qgate_body: layer 0's MoE partials perturbed before their gather, a quality gate's floor), or off
+/// and why. Never a serving setting.
+fn useQgateCanary(asked: prompt2d.Qgate, native: bool) void {
+    prompt.qgate_body = .off;
+    if (asked == .off) return;
+    if (!native) return std.log.info("TF_DS_QGATE_CANARY={d}: off: needs the checkpoint's own FP8 / MXFP4 kernels (act_quant)", .{@backingInt(asked)});
+    switch (asked) {
+        .off => {},
+        .head => {
+        },
+        .body_fp8 => {
+            prompt.qgate_body = .body_fp8;
+            std.log.info("TF_DS_QGATE_CANARY=2: layer 0's MoE partials take one more FP8 step (act_quant's quant-dequant) before their gather, in every prompt chunk and every round: the body perturbed on purpose, a quality gate's floor, not a serving setting", .{});
+        },
+        .body_ulp => {
+            prompt.qgate_body = .body_ulp;
+            std.log.info("TF_DS_QGATE_CANARY=3: layer 0's MoE partials move one fp32 ulp away from zero (a reduction order's size) before their gather, in every prompt chunk and every round: the body perturbed on purpose, a quality gate's floor, not a serving setting", .{});
+        },
+    }
 /// Why the decode exchanges cannot all ride the rings on this rank (null: they can): the rings are open and every decode exchange fits
 /// them (prompt2d.decodeOff).
 pub fn decodeOff(rings: bool, shape: prompt2d.DecodeShape) ?[]const u8 {
+    if (!rings) return "needs the rails' devices (TF_DS_RDMA_DEVICES): the decode rings";
+    return prompt2d.decodeOff(shape);
+}
+
+/// TF_DS_ROCI_DECODE's start line: what rides where.
+fn decodeLine(rank: u32, order: []const u8) []const u8 {
+    const S = struct {
+        var buf: [512]u8 = undefined;
+    };
     return std.fmt.bufPrint(&S.buf, "Rocinante decode: every decode round and drafter pass exchange rides the RDMA rings (the drafter's per-step bests over the four nodes' ring in rank order {s}); a ring that cannot take an exchange ends it by name; on every rank (this one: {d})", .{ order, rank }) catch S.buf[0..0];
+}
+
 fn rankOrderText(order: *const [4]u32) []const u8 {
+    const S = struct {
+        var buf: [16]u8 = undefined;
+    };
+    return std.fmt.bufPrint(&S.buf, "{d},{d},{d},{d}", .{ order[0], order[1], order[2], order[3] }) catch S.buf[0..0];
+}
+
 pub fn startSettings(o: Options) prompt2d.Settings {
     return .{
         .world = o.world,
@@ -731,6 +790,8 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         .replay_floor = @intFromBool(prompt.replay_floor),
     };
 }
+
+const EngramPhase = enum { all, pre, finish };
 
 const pair_guard_bytes: usize = 6 << 30;
 
@@ -886,6 +947,12 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     _ = std.c.close(fd);
 }
 
+    vfan: prompt2d.Fan, // the host collectives' links (prompt2d.hostLinksAsked), else none
+    star_busy: std.atomic.Value(bool), // star.Star's guard against two threads in one collective
+    comm: comm_mod.Comm,
+    rdma_mod: ?cuda.Module = null, // the RDMA kernels (TP2's ring or world 4's rings)
+    ring: ?*rdma.Ring = null,
+    set: cuda.aot.Set,
     mxk: ?mx.Kernels = null, // Format.native: DeepSeek's own FP8 / MXFP4 checkpoint's kernels (mx.zig)
     rope_buf: cuda.DeviceBuffer,
     arena: prompt.Arena,
@@ -960,6 +1027,10 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         // never captured RB above 2. Off (RB=1, today's behavior) unless set; validate on your own ring first.
         if (std.c.getenv("TF_DS_IDX_RB")) |v| tri_index.idx_rb = std.fmt.parseInt(usize, std.mem.span(v), 10) catch tri_index.idx_rb;
         if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
+        prompt2d.roci_p2_first_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ROCI_P2_FIRST")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.roci_engram_ahead_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ROCI_ENGRAM_AHEAD")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.roci_sent_first_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ROCI_SENT_FIRST")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        prompt2d.roci_combine_door_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ROCI_COMBINE_DOOR")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         prompt2d.roci_stagger_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_ROCI_STAGGER")) |v| std.mem.span(v) else null); // every rank alike (Settings)
         {
             const text: ?[]const u8 = if (std.c.getenv("TF_DS_ROCI_STAGGER_LANES")) |v| std.mem.span(v) else null;
@@ -1014,6 +1085,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             prompt2d.ring_wait_asked = false;
         }
         prompt2d.ring_wait_explicit = ring_wait_text != null;
+        prompt2d.qgate_canary_asked = readQgate(); // every rank alike (Settings: any canary; the canary itself, agreeQgateCanary)
         if (std.c.getenv("TF_DS_ROCI_XLOG")) |v| rdma.xlog = std.mem.eql(u8, std.mem.span(v), "1");
         if (std.c.getenv("TF_DS_L2_DN_MB")) |v| round.l2_dn_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dn_mb;
         if (std.c.getenv("TF_DS_L2_DEC_MB")) |v| round.l2_dec_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dec_mb;
@@ -1052,6 +1124,11 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         m.host_pos_c = &.{};
         m.pair_bytes = 0;
         m.rdma_rings = null;
+        m.vfan = .{};
+        m.star_busy = .init(false);
+        const d = ctx.d;
+        m.cfg = try Config.read(a, io, o.model_dir);
+        const c = &m.cfg;
         // TF_DS_ROCI_STAGGER_PRIO: pass A's stream (this one, which every other piece of work also runs on) at the priority the mode gives it
         m.pair_prio = roci_pair.prioOf(if (std.c.getenv("TF_DS_ROCI_STAGGER_PRIO")) |v| std.mem.span(v) else null);
         m.stream = if (prompt2d.roci_stagger_asked and m.pair_prio != .equal) blk: {
@@ -1064,7 +1141,10 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         m.fan = try prompt2d.Fan.listenAt(o.master, o.listen, o.port, o.rank, o.world);
         m.fan.share_digests = o.world > 1; // a rank's store is named from all four weight files
         errdefer m.fan.close();
+        // the host collectives' own links (TF_DS_ROCI_STARTUP / TF_DS_ROCI_SSD), listening the same way: they never carry a
+        // step frame, so a vote or a table can never be read in place of one
         m.vfan = try prompt2d.Fan.listenAt(o.master, o.listen, o.port + prompt2d.host_links_port_offset, o.rank, o.world);
+        errdefer m.vfan.close();
         // world 4: the 2D node this rank serves (TF_DS_2D_ORDER; its weight file is that node's)
         const ord = if (o.world == 4) try prompt2d.order() else [4]u32{ 0, 1, 2, 3 };
         const role: u32 = if (o.world == 4) ord[o.rank] else o.rank;
@@ -1142,7 +1222,10 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
                 const readers: bool = if (m.extra) |*x| try prompt.rociReadersOff(gpa, SetLookups{ .set = x }, &[_]usize{m.pass_rows / m.comm.world}, c.hidden, m.two.?.ew[m.two.?.p], c.eps, c.hc_eps, c.hc_iters) == null else false;
                 const why = prompt2d.rociOff(m.two.?.ow, m.pass_rows, readers) orelse if (o.rdma_devices == null) @as(?[]const u8, "needs the rails' devices (TF_DS_RDMA_DEVICES)") else null;
                 try Two.require(d, &m.comm, m.stream, "the owner sums over Rocinante", why);
+                if (m.two.?.combineDoor()) std.log.info("TF_DS_ROCI_COMBINE_DOOR=1: the MoE's routed sum runs in one launch whose first CTAs are the row quarters an owner sum's first part sends, and the last of those CTAs rings the part's doorbell itself, on every rank", .{});
                 if (m.two.?.sentFirst()) std.log.info("TF_DS_ROCI_SENT_FIRST=1: wo_b runs in one launch whose first CTAs are the row quarters an owner sum's first part sends, and the last of those CTAs rings the part's doorbell itself (needs TF_DS_MMA_SF_EXACT), on every rank", .{});
+                if (m.two.?.engramAhead()) std.log.info("TF_DS_ROCI_ENGRAM_AHEAD=1: an Engram layer's rows, projection and part-1 send run at the start of the layer before it, on every rank", .{});
+                if (m.two.?.p2First()) std.log.info("TF_DS_ROCI_P2_FIRST=1: an owner sum's second part is sent as soon as its add has made it, before the add of this node's own block, on every rank", .{});
                 const devs = o.rdma_devices.?;
                 var pit = std.mem.splitScalar(u8, devs, ',');
                 const rails: [2][]const u8 = .{ pit.next() orelse return error.RociRails, pit.next() orelse return error.RociRails };
@@ -1167,8 +1250,12 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             }
             // the decode exchanges: each rank's start check (the rings, the shapes), then on every rank or the start ends
             {
+                const hc = head_cand.layout(round.max_rows, head_cand.kFor(sampling.max_candidates)).bytes;
+                const shape = m.two.?.decodeShape(c.hidden, o.round_rows, c.top_k + 1, ring_bytes, hc);
                 try Two.require(d, &m.comm, m.stream, "the decode exchanges on the rings", decodeOff(m.two.?.rings != null, shape));
                 std.log.info("{s}", .{decodeLine(o.rank, rankOrderText(&m.two.?.rank_of))});
+            }
+        }
             // (the switches are on by default: only one that was set says it changed nothing)
             if (ringNoRingNote(prompt2d.ring_word_asked, prompt2d.ring_word_explicit)) std.log.info("TF_DS_RING_WORD=1: off: no RDMA ring (TF_RDMA_DEVICES unset)", .{});
             if (ringNoRingNote(prompt2d.ring_wait_asked, prompt2d.ring_wait_explicit)) std.log.info("TF_DS_RING_WAIT=1: off: no RDMA ring (TF_RDMA_DEVICES unset)", .{});
@@ -1176,6 +1263,8 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         logPdlControls(m.comm.rank);
         std.log.info("transport: Rocinante carries every exchange between the Sparks; no NCCL is loaded or made (rank {d})", .{o.rank});
         if (m.mxk) |*x| m.eng.mx = x;
+        try agreeQgateCanary(d, &m.comm, m.stream, prompt2d.qgate_canary_asked);
+        if (prompt.qgate_body != .off) try m.mxk.?.useQgateBody();
         errdefer m.rd.dropPar();
         errdefer m.rd.dropPrefetch();
         errdefer m.rd.dropSide(&m.eng);
@@ -1286,6 +1375,12 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         m.set.deinit();
         if (m.two) |*t| if (t.rc) |rc| rc.close();
         m.comm.deinit();
+        m.vfan.close();
+        m.fan.close();
+        m.w.deinit();
+        m.cache_file.close(m.io);
+        m.ix.deinit();
+        m.cache_dir.close(m.io);
     /// The decode plan's G0.2 controls (TF_DS_DEC_PDL, TF_DS_RDMA_PDL, TF_DS_TRITON_PDL_ATTR, TF_DS_PDL), one line on each
     /// rank when any is off, so a run can show that every rank has the same ones.
     fn logPdlControls(rank: usize) void {
@@ -1494,8 +1589,61 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         try m.pairJoin();
         m.fill_t0 = m.now();
         m.pair_in_fill = 0;
+    /// Layer li's Engram on the chunk, in phases: all (the baseline order: the pending MoE post, the rows and their projection, the
+    /// sums and the gate), pre (TF_DS_ROCI_ENGRAM_AHEAD: the rows and the projection, then the part-1 send, a layer early) and finish
+    /// (the pending post, the sums, the gate).
+    fn engramLayer(m: *Model, e: *const prompt.Engine, ch: *prompt.Chunk, seq: []const i32, start: usize, n: usize, li: usize, use_wk: bool, ahead: *?std.Thread, phase: EngramPhase) !void {
+        const c = e.c;
+        const eh = if (m.eh) |*x| x else return error.NoEngramTables;
+        if (phase == .finish) {
+            try prompt.engramPending(e, ch, li);
+            return prompt.engramFinish(e, ch, eh, li, true);
+        }
+        const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)).?;
+        if (use_wk and j < 2) {
+            // the worker's resume units of the pass in order: its rows, or its records with packed shards
+            // (engram_rows.zig)
+            const first = (start - eh.wk_start) / chunk_rows;
+            const units = (n + chunk_rows - 1) / chunk_rows;
+            if (units > eh.use_rows.len) return error.BadChunk;
+            defer {
+                eh.use_n = 0;
+            }
+            for (0..units) |u| {
+                if (eh.pk != null) {
+                    eh.use_stage[u] = try prompt.engramWorkerStage(eh, j, start + u * chunk_rows, chunk_rows);
+                } else eh.use_rows[u] = try prompt.engramWorkerRows(eh, j, start + u * chunk_rows, chunk_rows);
+            }
+            eh.use_n = units;
+            eh.use_unit = chunk_rows;
             const t_apply = m.now();
+            if (phase == .pre) {
+                try prompt.engramProject(e, ch, eh, li, seq);
+                try prompt.engramSendAhead(e, ch, li);
+            } else try prompt.engramApply(e, ch, eh, li, seq);
             eh.inst_apply_ns += m.now() - t_apply;
+        } else {
+            if (ahead.*) |th| {
+                ahead.* = null;
+            }
+            if (eh.ahead_err) |err| return err;
+            if (phase == .pre) {
+                try prompt.engramProject(e, ch, eh, li, seq);
+                try prompt.engramSendAhead(e, ch, li);
+            } else try prompt.engramApply(e, ch, eh, li, seq);
+            const ne = @min(2, c.engram_layers.slice().len);
+            if (j + 1 < ne) {
+                if (!eh.ahead_ready[j + 1])
+                    ahead.* = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, j + 1 }) catch null;
+            }
+        }
+    }
+
+    /// The prompt's chunk of n rows from position `start` (seq: the stream's ids through the chunk's end) through every
+    /// layer with the served bounded replay (replay = the prompt's length - the window: an encoder-only chunk stops at
+    /// the decoder's first layer). A chunk that reaches the head leaves the logits of its last row in ch.head_g and,
+    /// drafting, its DSpark taps absorbed into the slot's drafter rings. True when it reached the head.
+    pub fn fillChunk(m: *Model, seq: []const i32, start: usize, n: usize, replay: usize) !bool {
         try m.pairJoin();
         const c = e.c;
         const ch = &m.ch;
@@ -1532,8 +1680,16 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
                 if (ahead != null and (eh.ahead_start != start or eh.ahead_n != n)) {
             }
         }
+        var engram_pre: ?usize = null;
         for (0..c.layers) |li| {
+            try m.issueLead(e.s);
+            // TF_DS_ROCI_ENGRAM_AHEAD: the next layer's Engram, when it runs its sums on the transport at owned rows, starts here
+            if (m.two) |*t| if (t.engramAhead() and li + 1 < c.layers and e.w.layers[li + 1].engram_wkv != null and prompt.engramOnRoci(e, ch, li + 1)) {
+                try m.engramLayer(e, ch, seq, start, n, li + 1, use_wk, &ahead, .pre);
+                engram_pre = li + 1;
+            };
             if (li == c.layers / 2) {
+                if (if (prompt.boundaryRange(e, ch, li)) |r| (if (ch.encoder_only) r else null) else null) |r| {
                 if (!try prompt.replayCut(e, ch, &m.view, &shared, li, replay, m.host_pos)) {
                     // encoder-only: no synchronize either (as at the chunk's end below), so the next chunk's host steps
                     // run while this one's last layers do; the profile alone waits
@@ -1547,15 +1703,18 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
                 kv_done = li;
             }
             if (e.w.layers[li].engram_wkv != null) {
-                const eh = if (m.eh) |*x| x else return error.NoEngramTables;
-                if (ahead) |th| {
-                    th.join();
-                    ahead = null;
+                // TF_DS_ROCI_ENGRAM_AHEAD: the rows, projection and part-1 send were done at the start of the layer before
+                const phase: EngramPhase = if (engram_pre == li) .finish else .all;
+                try m.engramLayer(e, ch, seq, start, n, li, use_wk, &ahead, phase);
+                if (pt) |t| try t.mark(e.s, .engram);
+            }
+            // a DSpark tap reads the streams after the layer's Engram (_forward_k's order)
             if (taps) if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| try prompt.tap(e, ch, j, li);
             try prompt.attnMixes(e, ch, li);
             if (pt) |t| try t.mark(e.s, .mix_attn);
             try prompt.attention(e, ch, &m.view, &shared, li, m.ring_view[li], floor, kv_done != null and kv_done.? == li);
             if (pt) |t| try t.mark(e.s, .attn);
+            try prompt.bodyCanary(e, ch, ch.pm, ch.n, li);
             // The gathers' own output, both sublayers, at every requested layer of the first chunk of at least 64 rows
             // (prompt.dump_layers; dump_done stops it after that chunk, below). The >= 64 guard keeps a smoke test or
             // validate.py's short prompts from spending the one-shot dump on a chunk too short to compare.
@@ -1759,6 +1918,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         try prompt.gather(e, ch, ch.pa, .attn, li);
         try prompt.ffnMixes(e, ch, li);
         try prompt.moe(e, ch, li);
+        try prompt.bodyCanary(e, ch, ch.pm, ch.n, li);
         try prompt.gather(e, ch, ch.pm, .moe, li + 1);
         prompt.endLayer(ch);
     }
@@ -1923,8 +2083,47 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     pub fn pass(m: *Model, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize) !void {
         try m.pairJoin();
 
+    for ([_]prompt2d.Qgate{ .head, .body_fp8, .body_ulp }) |q| {
+        prompt2d.qgate_canary_asked = q;
+    }
+    prompt2d.qgate_canary_asked = .off;
         }
         return true;
+    const keep_b = prompt.qgate_body;
+    defer prompt.qgate_body = keep_b;
+    for ([_]prompt2d.Qgate{ .off, .head, .body_fp8, .body_ulp }) |q| {
+        // not asked, or no FP8 kernels (an EXL3 checkpoint): no canary
+        prompt.qgate_body = .body_ulp;
+        useQgateCanary(q, false);
+        try std.testing.expect(!prompt.qgate_canary);
+        try std.testing.expectEqual(prompt2d.Qgate.off, prompt.qgate_body);
+        // with them: the head's (1) or the body's (2, 3), never both
+        useQgateCanary(q, true);
+        try std.testing.expectEqual(q == .head, prompt.qgate_canary);
+        try std.testing.expectEqual(if (q == .body_fp8 or q == .body_ulp) q else prompt2d.Qgate.off, prompt.qgate_body);
+    }
+    // Model.open: the switch read with the others; once the checkpoint's kernels are the engine's, every rank's canary
+    // the same (else the start is refused), in effect, and the body's kernel loaded when it is the body's
+    const read = std.mem.indexOf(u8, body, "prompt2d.qgate_canary_asked = readQgate();").?;
+    const agree = std.mem.indexOf(u8, body, "try agreeQgateCanary(d, &m.comm, m.stream, prompt2d.qgate_canary_asked);").?;
+    const load = std.mem.indexOf(u8, body, "if (prompt.qgate_body != .off) try m.mxk.?.useQgateBody();").?;
+    try std.testing.expect(read < kernels and kernels < agree and agree < use and use < load);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "useQgateBody("));
+}
+
+test "TF_DS_QGATE_CANARY: the text read once (none asked, no collective); another canary on a rank refuses the start" {
+    const src = @embedFile("model.zig");
+    var at = std.mem.indexOf(u8, src, "fn readQgate() prompt2d.Qgate {").?;
+    var body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n}\n").?];
+    try std.testing.expect(std.mem.indexOf(u8, body, "prompt2d.qgateAsked(v)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "std.c.getenv(\"TF_DS_QGATE_CANARY\")") != null);
+    at = std.mem.indexOf(u8, src, "fn agreeQgateCanary(").?;
+    body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n}\n").?];
+    const off = std.mem.indexOf(u8, body, "    if (asked == .off) return;\n").?;
+    const gather = std.mem.indexOf(u8, body, "try prompt2d.ranksDiffer(d, comm, stream, @backingInt(asked))").?;
+    const same = std.mem.indexOf(u8, body, "    if (differ == 0) return;\n").?;
+    const refuse = std.mem.indexOf(u8, body, "return error.CanariesDiffer;").?;
+    try std.testing.expect(off < gather and gather < same and same < refuse);
     const open = std.mem.indexOf(u8, code, "m.rdma_rings = try ring2d.Rings.open(gpa, d, rk, devices.items, role, ord, .{ .max_bytes = ring_bytes, .gid_index = rdmaGid(), .pdl = rdmaPdl(), .collect_peers = peers and rk.collect_peers != null, .wc = sw.wc, .inplace = sw.inplace, .roci = ringWordOf(), .roci_deadline_ns = ringWordDeadlineNs(), .wait = ring_wait_on, .wait_explicit = prompt2d.ring_wait_explicit }, &m.comm, m.stream, !weights.draft_4way);") orelse return error.TestUnexpectedResult;
 test "TF_DS_RING_WORD_SIGNAL: unset and atomic name the fetch-and-add (the guaranteed arrival), word the inline word, other text is refused" {
     try std.testing.expectEqual(@as(?rdma.Roci, .atomic), Model.ringWordSignal(null));
@@ -2363,6 +2562,7 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
         for (q0, slots) |q, s| pool.absorbed[@intCast(s)] = @intCast(q);
         try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
     // the partner split: the refusal is the operator's branch, the warning and the cleared flag the default's, and no lane is opened before either
+    const refused = std.mem.indexOf(u8, body[v..], "return error.PartnerRefused;").?;
     const warn = std.mem.indexOf(u8, body[v..], "std.log.warn(\"TF_DS_ENGRAM_PARTNER: off:").?;
     const kv = std.mem.indexOf(u8, kb, "speed_defaults.verdict(why, speed_defaults.defaulted(\"TF_DS_ENGRAM_KEEP_AHEAD\")) == .fallback").?;
     const kwarn = std.mem.indexOf(u8, kb[kv..], "std.log.warn(\"TF_DS_ENGRAM_KEEP_AHEAD: rank").?;
@@ -2373,6 +2573,7 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
     try std.testing.expect(passRowsFallback(null, true, 64 * gib) == null);
 }
 
+    const refused = std.mem.indexOf(u8, body[v..], "return error.StaggerRefused;").?;
     const warn = std.mem.indexOf(u8, body[v..], "std.log.warn(\"TF_DS_ROCI_STAGGER: off:").?;
     try std.testing.expect(refuse < refused and refused < warn and warn < off); // the refusal is the operator's branch, the fallback the other
     // the fallback names what it costs and runs before any allocation of the second pass

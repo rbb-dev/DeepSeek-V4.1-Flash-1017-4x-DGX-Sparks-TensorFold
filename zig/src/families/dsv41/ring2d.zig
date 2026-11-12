@@ -171,6 +171,14 @@ pub const Rings = struct {
             return rs.pairGather(stream, mine, dst, rows, w[0] + w[1], esize);
         };
         try a4.gatherInto(stream, src, @intCast(rows), try float4s(w[rs.p] * esize), &dsts);
+    /// One part of `rows` rows of 16 bytes (four fp32) from every node into `dst` [4, rows, 16 bytes], the parts in
+    /// `slot_of[node]` order (the communicator's rank order, which Markov's pick reads): the four nodes' ring, no copy after
+    /// it.
+    pub fn nodesGather(rs: *const Rings, stream: cuda.Stream, src: u64, dst: u64, rows: usize, slot_of: [4]u32) !void {
+        const dsts = nodesDsts(dst, rows, slot_of);
+        try rs.all4.gatherInto(stream, src, @intCast(rows), 1, &dsts);
+    }
+
     }
 
     /// cat_rank (Comm2D.cat_rank): `src` [rows, w[p]] -> `dst` [rows, w0 + w1], pair 0's part then pair 1's, from the
@@ -189,6 +197,13 @@ pub const Rings = struct {
         try rs.pair.gatherInto(stream, src, @intCast(rows), try float4s(width * esize), &dsts);
     }
 };
+
+/// Where each node's part of nodesGather lands: node q's `rows` rows of one float4 at slot `slot_of[q]` of `dst`.
+pub fn nodesDsts(dst: u64, rows: usize, slot_of: [4]u32) [4]rdma.Ring.Dst {
+    var dsts: [4]rdma.Ring.Dst = undefined;
+    for (0..4) |q| dsts[q] = .{ .ptr = dst + @as(u64, slot_of[q]) * rows * 16, .row4 = 1, .stride4 = 1 };
+    return dsts;
+}
 
 /// Where node q's word j of part `kind` lands, for the checks: (TP2 rank, pair) of the node owning it.
 pub fn owner(q: u32) [2]u32 {
@@ -235,4 +250,21 @@ test "two hops: each partner's ring takes the devices cabled to it, in subnet or
     try std.testing.expectEqualStrings("rdma0", back[0]); // .110 meets the first node's .110
     try std.testing.expectEqualStrings("rdma1", back[1]);
     try std.testing.expectEqual(@as(usize, 0), pick(a8, a5, &out, &nb)); // the second and third: no cable
+
+test "nodesDsts: a node's rows land at its communicator rank's slot, contiguous, whatever the ring order" {
+    const dst: u64 = 1 << 32;
+    // the identity order, then one where nodes 1 and 2 swap (TF_DS_2D_ORDER 0,2,1,3)
+    for ([_][4]u32{ .{ 0, 1, 2, 3 }, .{ 0, 2, 1, 3 }, .{ 3, 2, 1, 0 } }) |order| {
+        const d = nodesDsts(dst, 5, order);
+        var seen: [4]bool = @splat(false);
+        for (0..4) |q| {
+            try std.testing.expectEqual(dst + order[q] * 5 * 16, d[q].ptr);
+            try std.testing.expectEqual(@as(u32, 1), d[q].row4);
+            try std.testing.expectEqual(@as(u32, 1), d[q].stride4);
+            seen[order[q]] = true;
+        }
+        for (seen) |x| try std.testing.expect(x);
+    }
+    // control: the order matters, the slots of two different orders differ
+    try std.testing.expect(nodesDsts(dst, 5, .{ 0, 1, 2, 3 })[1].ptr != nodesDsts(dst, 5, .{ 0, 2, 1, 3 })[1].ptr);
 }

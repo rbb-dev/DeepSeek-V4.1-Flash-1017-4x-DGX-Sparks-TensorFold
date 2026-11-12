@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const nap = @import("rdma_nap.zig");
+const slabs = @import("slab_plan.zig");
 
 pub const world: usize = 4;
 pub const rails: usize = 2;
@@ -56,18 +57,30 @@ pub const Region = enum(u8) {
     g_s,
     g_pick,
     g_wts,
+    g_b, // the boundary layer's cache rows: each rank's slab holds the four arrays' rows, array after array
+    hand_h, // the handoff of a chunk with decoder rows: the streams h (bf16 [hc][hidden] a row) of the rows from `first`, at row (row - first)
+    hand_pre, // ... and their pre (fp32 [hc] a row)
     g_taps, // a decoder window's DSpark taps: bf16 [hand_rows][3][hidden], the three taps of a row side by side; each rank's slab at its rows
     head_x, // the head's input row (bf16 [hidden]): the collapse of the window's last row, from the rank that owns it
 };
 
+/// The most rows a handoff carries: the decoder rows of a chunk (the window and the drafter's rows).
+pub const hand_rows: usize = 128;
+/// One row of the handoff's streams: hc = 4 streams of 5,120 bf16 values; and its pre: 4 fp32 values.
+pub const hand_h_row: usize = 4 * 5120 * 2;
+pub const hand_pre_row: usize = 16;
 /// One row of the decoder window's taps: the three tap layers' means side by side (the drafter's row: taps * hidden bf16).
 pub const taps_row: usize = 3 * 5120 * 2;
 /// The head's input row: hidden bf16 values.
 pub const head_row: usize = 5120 * 2;
+
 pub const n_regions = std.enums.values(Region).len;
 
 pub const pair_w: usize = 2560; // a pair's columns of the hidden state
 pub const eng_w: usize = 12800; // an Engram part's columns
+/// One boundary-layer row of the four cache arrays: compressed codes (head_dim / 2) and scales (head_dim / 16), index codes
+/// (index_head_dim / 2) and scales (index_head_dim / 32), for head_dim 512 and index_head_dim 128.
+pub const gb_row: usize = 256 + 32 + 64 + 4;
 
 /// A region's bytes at `cap` rows (cap a multiple of 4): the row-shaped sizes the maps give, before page rounding.
     const q = cap / world;
@@ -89,6 +102,9 @@ pub const eng_w: usize = 12800; // an Engram part's columns
         .g_q => cap * 5120,
         .g_s => cap * 160 * 4,
         .g_pick, .g_wts => cap * 7 * 4,
+        .g_b => cap * gb_row,
+        .hand_h => hand_rows * hand_h_row,
+        .hand_pre => hand_rows * hand_pre_row,
         .g_taps => hand_rows * taps_row,
         .head_x => head_row,
     };
@@ -104,6 +120,9 @@ pub fn rowBytes(r: Region) usize {
         .g_q => 5120,
         .g_s => 160 * 4,
         .g_pick, .g_wts => 7 * 4,
+        .g_b => gb_row,
+        .hand_h => hand_h_row,
+        .hand_pre => hand_pre_row,
         .g_taps => taps_row,
         .head_x => head_row,
         else => unreachable,
@@ -249,10 +268,13 @@ pub fn buildEvent(class: Class, cap: usize, g: usize, order: Order) Event {
             for (0..rails) |rail| e.chains[0][rail].add(pieces[rail]);
         },
         .gh, .gt, .hx => {}, // the handoff, the taps and the head's row have no full-cap plan: their rows are a decoder window's (buildEventX)
+        .gf, .ga, .gm, .gi, .gb => {
             const regs: []const Region = switch (class) {
                 .gf => &.{ .g_qr, .g_y },
                 .ga => &.{.g_x},
                 .gm => &.{ .g_q, .g_s, .g_pick, .g_wts },
+                .gi => &.{.g_cidx},
+                else => &.{.g_b},
             };
             var k: u8 = 0;
             for ([_]usize{ 1, 2, 3 }) |x| {
@@ -271,9 +293,74 @@ pub fn buildEvent(class: Class, cap: usize, g: usize, order: Order) Event {
     return e;
 }
 
+/// The event `class` of node `g` for a chunk of `n` rows of any count (1 to max_cap), the owned rows' plan of slab_plan.zig: rank k of
+/// `order` owns the rows [k q, k q + n_k), q = slabs.q(n). The owner sums and the gathers move those slabs (a rank without rows
+/// sends no WRITE, only its word), the codes move all `n` rows. For n = 4,096 and 2,048 it is buildEvent's event, piece for piece.
+pub fn buildEventN(class: Class, n: usize, g: usize, order: Order) Event {
+    return buildEventX(class, n, 0, g, order);
+}
+
+/// buildEventN with the event's one extra number `x`: the indexer's top-k width in keys for gi (0: the region's 512), the decoder rows for
+/// gh (the handoff of the rows [n - x, n) of the chunk's streams, each owner's rows in that window at row (row - (n - x)) of the region).
 /// For gt and hx, `n` is a decoder window's rows (1 to hand_rows): gt moves each rank's slab of the window's taps, its rows of the three
 /// taps side by side, to the other three; hx the head's row from the rank whose slab holds the window's last row (headOwner), the others
 /// sending their word alone.
+pub fn buildEventX(class: Class, n: usize, x: usize, g: usize, order: Order) Event {
+    const L = layout();
+    const q: u64 = slabs.q(n);
+    var e: Event = .{ .class = class };
+    switch (class) {
+        .own1, .eng1 => {
+            const w: u64 = if (class == .own1) pair_w else eng_w;
+            const src_r: Region = if (class == .own1) .psum else .ek;
+            const dst_r: Region = if (class == .own1) .stage else .eng_stage;
+            const row = w * 4;
+            e.peers[0] = @intCast(g ^ 1);
+            e.n_peers = 1;
+            const rows = [rails]usize{ g ^ 1, g ^ 3 };
+            for (0..rails) |rail| {
+                const k = order[rows[rail]];
+                e.chains[0][rail].add(.{ .src = L.at(src_r) + k * q * row, .dst = L.at(dst_r) + rail * q * row, .len = slabs.slab(n, k).n * row });
+            }
+        },
+        .own2, .eng2 => {
+            const w: u64 = if (class == .own2) pair_w else eng_w;
+            const src_r: Region = if (class == .own2) .send2 else .eng_send2;
+            const dst_r: Region = if (class == .own2) .blk else .eng_blk;
+            const row = w * 2;
+            e.peers[0] = @intCast(g ^ 2);
+            e.n_peers = 1;
+            const pieces = split(L.at(src_r), L.at(dst_r) + (g >> 1) * q * row, slabs.slab(n, order[g ^ 2]).n * row);
+            for (0..rails) |rail| e.chains[0][rail].add(pieces[rail]);
+        },
+        .wob, .pack => {
+            const s: Region = if (class == .wob) .wob_send else .pack_send;
+            const d: Region = if (class == .wob) .wob_land else .pack_land;
+            const len: u64 = if (class == .wob) n * 2304 else 7 * n * 720;
+            e.peers[0] = @intCast(g ^ 2);
+            e.n_peers = 1;
+            const pieces = split(L.at(s), L.at(d), len);
+            for (0..rails) |rail| e.chains[0][rail].add(pieces[rail]);
+        },
+        .gh => {
+            const first: u64 = n - @min(x, n);
+            const k = order[g];
+            const sl = slabs.slab(n, k);
+            const lo: u64 = @max(first, sl.start);
+            const hi: u64 = @min(n, sl.start + sl.n);
+            const m: u64 = if (hi > lo) hi - lo else 0;
+            var j: u8 = 0;
+            for ([_]usize{ 1, 2, 3 }) |xx| {
+                e.peers[j] = @intCast(g ^ xx);
+                for ([_]Region{ .hand_h, .hand_pre }) |r| {
+                    const at = L.at(r) + (lo - @min(lo, first)) * rowBytes(r);
+                    const pieces = split(at, at, m * rowBytes(r));
+                    for (0..rails) |rail| e.chains[j][rail].add(pieces[rail]);
+                }
+                j += 1;
+            }
+            e.n_peers = j;
+        },
         .gt, .hx => {
             std.debug.assert(n <= hand_rows);
             const sl = slabs.slab(n, order[g]);
@@ -288,6 +375,43 @@ pub fn buildEvent(class: Class, cap: usize, g: usize, order: Order) Event {
             }
             e.n_peers = j;
         },
+        .gf, .ga, .gm, .gi, .gb => {
+            const regs: []const Region = switch (class) {
+                .gf => &.{ .g_qr, .g_y },
+                .ga => &.{.g_x},
+                .gm => &.{ .g_q, .g_s, .g_pick, .g_wts },
+                .gi => &.{.g_cidx},
+                else => &.{.g_b},
+            };
+            const k = order[g];
+            const nk: u64 = slabs.slab(n, k).n;
+            var j: u8 = 0;
+            for ([_]usize{ 1, 2, 3 }) |px| {
+                e.peers[j] = @intCast(g ^ px);
+                if (class == .gb and nk != q) {
+                    // a short slab: the four arrays' rows, each array's q-row stride apart inside the slab
+                    const rows_of = [4]u64{ 256, 32, 64, 4 };
+                    var at: u64 = k * q * gb_row;
+                    for (rows_of) |rb| {
+                        const pieces = split(L.at(.g_b) + at, L.at(.g_b) + at, nk * rb);
+                        for (0..rails) |rail| e.chains[j][rail].add(pieces[rail]);
+                        at += q * rb;
+                    }
+                } else for (regs) |r| {
+                    // the top-k's rows are `x` keys of 8 bytes, contiguous (a short compressed history), else the region's 512
+                    const rb: u64 = if (class == .gi and x != 0) x * 8 else rowBytes(r);
+                    const slab = k * q * rb;
+                    const pieces = split(L.at(r) + slab, L.at(r) + slab, nk * rb);
+                    for (0..rails) |rail| e.chains[j][rail].add(pieces[rail]);
+                }
+                j += 1;
+            }
+            e.n_peers = j;
+        },
+    }
+    return e;
+}
+
 /// The rank (slab plan index, as `order` gives a node's) whose slab holds the last row of a window of `n` rows: the head's row is its.
 pub fn headOwner(n: usize) usize {
     return (n - 1) / slabs.q(n);
@@ -355,12 +479,22 @@ pub const Control = extern struct {
     abort: Word = .{},
     done: [rails]Word = @splat(.{}),
     sched: [sched_len]u64 align(line) = @splat(0),
+    /// An entry's extra number (buildEventX's x), stored before the entry itself is.
+    sched_x: [sched_len]u32 = @splat(0),
     recv: [n_classes][world][rails]Word = @splat(@splat(@splat(.{}))),
 };
 
 /// A scheduling entry: the send's ticket (so a reader can tell the entry is there) and its event.
 pub fn schedEntry(ticket: u64, class: Class, shape: u8) u64 {
     return (ticket & 0xffff_ffff) | (@as(u64, @backingInt(class)) << 32) | (@as(u64, shape) << 40);
+}
+/// The plan of an event of `n` rows of any count (shape any_shape, the rows in the entry's high 16 bits).
+pub const any_shape: u8 = 255;
+pub fn schedEntryN(ticket: u64, class: Class, n: usize) u64 {
+    return schedEntry(ticket, class, any_shape) | (@as(u64, @intCast(n)) << 48);
+}
+pub fn schedRows(e: u64) usize {
+    return @intCast(e >> 48);
 }
 pub fn schedTicket(e: u64) u32 {
     return @truncate(e);
@@ -428,11 +562,25 @@ pub const Counters = struct {
 /// The transport's name, as its start line prints it.
 pub const transport_name = "Rocinante transport";
 
+/// What the transport carries, as the start line says it: the owner sums of full passes always, the codes families and the gathers
 /// when the arena holds their regions.
+pub fn carriesText(buf: []u8, codes: bool, gathers: bool) []const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    w.writeAll("the owner sums of full passes (attention, MoE, Engram)") catch {};
+    if (codes) w.writeAll(", the codes families (wo_b's and the expert pack's)") catch {};
+    if (gathers) w.writeAll(", the gathers (qr and y, x, the routing's codes and picks, the indexer's top-k, the boundary's cache rows)") catch {};
+    return w.buffered();
+}
 
 /// An owner pass (attention x20, MoE x20: two parts each; Engram x2: two parts each) sends this many events; the proxies print
 /// their rail's line every time they have posted that many.
 pub const events_per_pass: u64 = 84;
+
+/// The events of a full pass with the codes families (wo_b's and the pack's, 20 each) and the gathers (qr and y 17, x 3, the
+/// routing's 20, the top-k 3, the boundary 1) on the transport as well.
+pub fn eventsPerPass(codes: bool, gathers: bool) u64 {
+    return events_per_pass + (if (codes) @as(u64, 40) else 0) + (if (gathers) @as(u64, 44) else 0);
+}
 
 /// The time from a proxy's post of an event to the last of its peers' words on that rail seen by the same proxy (it looks every
 /// wake: at most the backstop late). It holds the wire and the peers' lateness; per class.
@@ -452,6 +600,7 @@ pub fn signalText(signal: Signal) []const u8 {
 /// The start line (once, on every rank): the name, the arena, the rails and the plan hash.
 pub fn startLine(w: *std.Io.Writer, g: usize, rails_text: []const u8, gid_index: u8, s: Settings, signal: Signal) !void {
     const l = layout();
+    var cb: [512]u8 = undefined;
     try w.print("{s} (Roci) on: node {d}, arena {d} bytes in {d} regions, control block {d} bytes, rails {s} (GID {d}), layout hash {x}, watchdog {d} ms, backstop {d} us, idle park {d} us, housekeeping every {d} turns, arrival signal {s}, carrying {s}{s}\n", .{ transport_name, g, l.total, n_regions, @sizeOf(Control), rails_text, gid_index, l.hash(), s.dead_ms, s.backstop_us, s.idle_park_us, s.housekeep_every, signalText(signal), carriesText(&cb, s.codes, s.gathers), if (s.wait_qp) ", waiting in the card (TF_DS_ROCI_WAIT, the default; =0 for the proxy threads: every chain pre-posted behind a WAIT on the doorbell, no proxy threads, one janitor)" else "" });
 }
 
@@ -462,6 +611,10 @@ pub const Settings = struct {
     dead_ms: u64 = 5_000,
     /// The two rails' proxies nap on the doorbell (TF_DS_RDMA_WFE's way) or poll.
     nap: bool = true,
+    /// The codes families and the gathers of full passes ride the transport as well (TF_DS_ROCI_CODES, TF_DS_ROCI_GATHERS): the
+    /// start line says so and the proxies' lines come once a pass of that many events.
+    codes: bool = false,
+    gathers: bool = false,
     /// The queue pairs wait in the card (TF_DS_ROCI_WAIT, rocinante_cd.zig): the engine thread writes every chain into its send queue behind a
     /// WAIT for the GPU's doorbell write when it reserves the send, so no proxy thread runs; one janitor thread, which sleeps in the kernel
     /// between 100 ms looks, watches the peers and reaps the completions. The proxy-only settings above are not read.
@@ -554,7 +707,12 @@ pub const Transport = struct {
     /// The sender's side of an event, queued behind the producer on `stream`: the scheduling entry, then one stream
     /// write of the ticket. `stream` has writeValue64(addr, value).
     pub fn send(t: *Transport, stream: anytype, class: Class, shape: u8) !void {
+        const ticket = try t.reserve(class, shape);
         if (t.set.wait_qp) return t.sendBig(stream, ticket);
+        try stream.writeValue64(t.devAddr(&t.ctl.doorbell.v), ticket);
+        t.host.stream_writes += 1;
+    }
+
     /// The stream write of a send's ticket in the card-waiting mode: the doorbell word that says it (see `go`).
     fn sendBig(t: *Transport, stream: anytype, ticket: u64) !void {
         try stream.writeValue64(t.devAddr(&t.ctl.doorbell.v), t.go(ticket));
@@ -573,12 +731,44 @@ pub const Transport = struct {
         return if (t.set.wait_qp) std.mem.bigToNative(u64, w) else w;
     }
 
+    /// The host's half of a send whose doorbell a kernel rings (a producer that stores `ticket` into the doorbell line itself,
+    /// once its sent rows are written): the half-ring backpressure, the next ticket and its scheduling entry, in the same order
+    /// `send` makes them. The proxies take tickets in order, so the kernel that rings this one must be launched before the
+    /// next reserve and its ring must follow every earlier ticket's: one launch after the other on one stream does both. A
+    /// ticket reserved and never rung ends in the watchdog's failure, like a stream write that never ran.
+    pub fn reserve(t: *Transport, class: Class, shape: u8) !u64 {
+        return t.reserveEntry(class, shape, 0, 0);
+    }
+
+    /// reserve for an event of `n` rows of any count (buildEventN's plan): the rows ride in the scheduling entry.
+    pub fn reserveN(t: *Transport, class: Class, n: usize) !u64 {
+        return t.reserveEntry(class, any_shape, n, 0);
+    }
+
+    /// reserveN for an event with buildEventX's extra number.
+    pub fn reserveX(t: *Transport, class: Class, n: usize, x: usize) !u64 {
+        return t.reserveEntry(class, any_shape, n, x);
+    }
+
+    /// send for an event of `n` rows of any count.
+    pub fn sendN(t: *Transport, stream: anytype, class: Class, n: usize) !void {
+        try t.sendX(stream, class, n, 0);
+    }
+
+    /// send for an event of `n` rows with buildEventX's extra number `x`.
+    pub fn sendX(t: *Transport, stream: anytype, class: Class, n: usize, x: usize) !void {
+        const ticket = try t.reserveX(class, n, x);
         if (t.set.wait_qp) return t.sendBig(stream, ticket);
+        try stream.writeValue64(t.devAddr(&t.ctl.doorbell.v), ticket);
+        t.host.stream_writes += 1;
+    }
+
         if (t.set.wait_qp) {
             @atomicStore(u64, &t.ctl.doorbell.v, t.go(ticket), .release);
             t.host.stream_writes += 1;
             return;
         }
+    fn reserveEntry(t: *Transport, class: Class, shape: u8, rows: usize, x: usize) !u64 {
         if (t.set.wait_qp) return t.reserveWait(class, shape, rows, x);
         try t.check();
         // the host may run ahead of the proxies by half the ring: past that it waits for them (they advance as the stream
@@ -597,8 +787,12 @@ pub const Transport = struct {
         }
         t.ticket += 1;
         const slot = &t.ctl.sched[t.ticket % sched_len];
+        @atomicStore(u32, &t.ctl.sched_x[t.ticket % sched_len], @intCast(x), .monotonic);
         t.host.events += 1;
         t.host.doorbells += 1;
+        return t.ticket;
+    }
+
     /// The event a scheduling entry names, as a proxy builds it: the host lane's record events, the plan of any row count, or a fixed plan.
     /// (Settings.wait_qp only: the engine thread builds the chains the proxies would have.)
     fn eventOf(t: *Transport, e: u64, x: usize, built: *Event) *const Event {
@@ -670,6 +864,9 @@ pub const Transport = struct {
     /// design forbids (every armed WAIT would release its chain), to see that the ordering test can fail.
     pub var abort_doorbell_first: bool = false;
 
+    /// The device address of the doorbell line (where a stream write, or a kernel's ring, stores a ticket).
+    pub fn doorbellAddr(t: *const Transport) u64 {
+        return t.devAddr(&t.ctl.doorbell.v);
     }
 
     /// The receiver's side: the next consumer on `stream` waits for every source's words on both rails.
@@ -894,6 +1091,10 @@ fn nowNs() u64 {
                 std.atomic.spinLoopHint();
                 e = @atomicLoad(u64, &t.ctl.sched[i % sched_len], .acquire);
             }
+            var built: Event = undefined;
+                built = buildEventX(schedClass(e), schedRows(e), @atomicLoad(u32, &t.ctl.sched_x[i % sched_len], .monotonic), t.g, t.order);
+                break :blk &built;
+            } else &t.events[schedShape(e)][@backingInt(schedClass(e))];
             const cls = @backingInt(ev.class);
             t.sent[rail][cls] += 1;
             for (ev.peerSlice(), 0..) |peer, k| {
@@ -913,6 +1114,7 @@ fn nowNs() u64 {
                 t.pending[rail][t.pend_tail[rail] % pending_len] = .{ .class = @intCast(cls), .t_ns = nowNs(), .want = t.sent[rail][cls] };
                 t.pend_tail[rail] += 1;
             }
+            if (done % eventsPerPass(t.set.codes, t.set.gathers) == 0) t.railLine(rail);
         }
         ctr.post_ns_max = @max(ctr.post_ns_max, nowNs() - t0);
         last_progress = nowNs();

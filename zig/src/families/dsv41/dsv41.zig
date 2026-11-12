@@ -66,7 +66,13 @@ pub const rocinante_cd = @import("rocinante_cd.zig");
 pub const ring_wait = @import("ring_wait.zig");
 /// Rocinante inside the engine.
 pub const roci_engine = @import("roci_engine.zig");
+/// The grouped experts' tiles in an order that starts on a node's own rows.
+pub const local_first = @import("local_first.zig");
+/// Collectives of the ranks' host threads over the engine's own links.
+pub const star = @import("star.zig");
 
+/// The SSD landing's broadcast as the WRITEs Rocinante would post.
+pub const land_writes = @import("land_writes.zig");
 
 test {
     // every declaration of every file, so functions no test calls are still compiled
@@ -123,11 +129,15 @@ test {
     refAll(rocinante_cd);
     refAll(ring_wait);
     refAll(roci_engine);
+    refAll(local_first);
+    refAll(star);
+    refAll(land_writes);
     _ = @import("roci_pair.zig");
     _ = @import("pair_spans.zig");
     _ = @import("pass_meter.zig");
     _ = @import("rocinante_test.zig");
     _ = @import("rocinante_cd_test.zig");
+    _ = @import("any_check.zig");
     refAll(replay_runner);
     _ = @import("ring_hotpath_test.zig");
 }

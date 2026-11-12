@@ -13,6 +13,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const ring_wait = @import("ring_wait.zig");
 const prompt = @import("prompt.zig");
+const comm_mod = @import("comm.zig");
 const weights = @import("weights.zig");
 const plan = @import("plan.zig");
 const tri_basic = @import("tri_basic.zig");
@@ -251,6 +252,7 @@ const MarkovGather = struct {
         const g: *MarkovGather = @ptrCast(@alignCast(ctx));
         // the four nodes' ring carries the bests (rows x 16 bytes a node), in the communicator's rank order
         const tw = g.e.two orelse return error.DecodeNeedsRings;
+        try tw.nodesGather(g.e, send, g.dst, rows);
         return g.dst;
     }
 };

@@ -1,12 +1,59 @@
+//! The start check of the owned path at any row count (TF_DS_ROCI_ANY): every launch the encoder half makes at a slab of any chunk of
+//! 1 to 4,096 rows must have a variant in this rank's kernel set, looked up the way a launch finds it. A missing one refuses the switch for
 //! everyone, naming the launch and the slab. The decoder half's (decoderOff): every launch of every layer at a slab of a decoder window,
 //! 1 row to the window's.
+
+const std = @import("std");
+const slab_plan = @import("slab_plan.zig");
+const prompt = @import("prompt.zig");
+const weights = @import("weights.zig");
+const config_mod = @import("config.zig");
+const tri = @import("tri.zig");
+const tri_hc = @import("tri_hc.zig");
+const tri_basic = @import("tri_basic.zig");
+
+const QRows = prompt.QRows;
+
+pub fn layers(lays: *[40]weights.Layer, cfg: config_mod.Config) void {
+    const one: weights.Linear = .{ .words = 0, .k = 1, .n = 1 };
+    for (lays, 0..) |*l, i| {
+        l.* = .{ .idx = @intCast(i), .ratio = cfg.ratios[i] };
+        l.comp_wkv = if (cfg.kv_sources.has(i)) one else null;
+        l.idx_wq_b = if (cfg.index_sources.has(i)) one else null;
+        l.engram_wkv = if (cfg.engram_layers.has(i)) one else null;
+        l.engram_qk = 0x9000 + i * 0x1000;
+        l.wq_a = .{ .words = 0, .k = 5120, .n = 1280, .fmt = .fp8 };
+        l.wkv = .{ .words = 0, .k = 5120, .n = 512, .fmt = .fp8 };
+        l.q_norm = 0x7000 + i * 0x1000;
+        l.hc_attn = .{ 0x10000, 0x10100, 0x10200 };
+        l.hc_ffn = .{ 0x11000, 0x11100, 0x11200 };
+        l.attn_norm = 0x12000;
+        l.ffn_norm = 0x13000;
+        l.gate_b = 0x14000;
+        l.gate_b_vl = 0x15000;
+        l.gate_w = 0x16000;
+    }
+}
+
 /// The mixes' launches on `r`'s rows (attnMixes / ffnMixes / the layers' hc_post), as the owned path makes them: the sums posted from
 /// the fp32 planes, and from the transport's two blocks of a slab plan of stride `q` rows (the kit's extra set's two-block readers).
 pub fn mixes(t: tri.Tri, cfg: config_mod.Config, lay: weights.Layer, r: QRows, q: usize) !void {
+    const row_h: u64 = cfg.hc * cfg.hidden * 2;
+    const row_p: u64 = cfg.hc * 4;
+    const row_c: u64 = cfg.hc * cfg.hc * 4;
+    const base_h: u64 = 1 << 32;
+    const alt_h: u64 = 2 << 32;
     const blk: u64 = 10 << 32;
     const blk_rs = q * (cfg.hidden / 2);
+    for ([_][3]u64{ lay.hc_attn, lay.hc_ffn }) |f| {
+        _ = try tri_hc.hcPrePf(t, base_h + r.start * row_h, f[0], f[1], f[2], (3 << 32) + r.start * row_p, lay.attn_norm, cfg.eps, cfg.hc_eps, cfg.hc_iters, (4 << 32) + r.start * cfg.hidden * 2, (5 << 32) + r.start * row_p, (6 << 32) + r.start * row_p, (7 << 32) + r.start * row_c, 8 << 32, .{ .gathered = 9 << 32, .world = 2, .h_out = alt_h + r.start * row_h }, r.n, cfg.hidden);
         _ = try tri_hc.hcPrePf(t, base_h + r.start * row_h, f[0], f[1], f[2], (3 << 32) + r.start * row_p, lay.attn_norm, cfg.eps, cfg.hc_eps, cfg.hc_iters, (4 << 32) + r.start * cfg.hidden * 2, (5 << 32) + r.start * row_p, (6 << 32) + r.start * row_p, (7 << 32) + r.start * row_c, 8 << 32, .{ .gathered = blk, .world = 2, .h_out = alt_h + r.start * row_h, .blk_rs = blk_rs }, r.n, cfg.hidden);
+        try tri_basic.hcPre(t, base_h + r.start * row_h, f[0], f[1], f[2], (3 << 32) + r.start * row_p, lay.attn_norm, cfg.eps, cfg.hc_eps, cfg.hc_iters, (4 << 32) + r.start * cfg.hidden * 2, (5 << 32) + r.start * row_p, (6 << 32) + r.start * row_p, (7 << 32) + r.start * row_c, 8 << 32, r.n, cfg.hidden);
+    }
+    try tri_basic.hcPost(t, 9 << 32, base_h + r.start * row_h, (6 << 32) + r.start * row_p, (7 << 32) + r.start * row_c, base_h + r.start * row_h, 2, r.n, cfg.hidden);
     try tri_basic.hcPost2b(t, blk, blk_rs, base_h + r.start * row_h, (6 << 32) + r.start * row_p, (7 << 32) + r.start * row_c, base_h + r.start * row_h, r.n, cfg.hidden);
+}
+
 /// Whether `finds` has the variant a logged launch looks up: `finds.has` for the main set's launches, `finds.hasExtra` for the extra set's
 /// (the two-block readers). Every lookup declares both, publicly (a lookup of the main set alone says what its hasExtra answers); there is
 /// no dispatch on whether one exists (@hasDecl does not see a private method, and would skip it silently).
@@ -16,15 +63,39 @@ fn found(finds: anytype, l: tri.Log.Kept) bool {
 /// Every launch of one slab `r` (of a plan of stride `q` rows) on layers `lays[0..half]`, as a reason (null: all found). `encoder`: the
 /// encoder half's launches as well (the Engram sums and gate, the indexer's owned projections), which the decoder half has none of.
 pub fn slabOff(gpa: std.mem.Allocator, finds: anytype, cfg: config_mod.Config, lays: []const weights.Layer, half: usize, encoder: bool, r: QRows, q: usize) !?[]const u8 {
+    const one = [_]QRows{r};
     if (try prompt.frontOwnedOffAt(gpa, finds, true, lays, half, cfg.eps, &one)) |w| return w;
     if (try prompt.ffnCodesOffAt(gpa, finds, true, lays, half, cfg.experts, cfg.top_k, cfg.routed_scaling, cfg.top_k + 1, &one)) |w| return w;
+    if (encoder) {
         if (try prompt.engramOwnerSumOffAt(gpa, finds, .{ 12800, 12800 }, lays, half, cfg.eps, cfg.hidden, cfg.hc, &one)) |w| return w;
+        if (try prompt.idxProjOwnedOffAt(gpa, finds, true, true, lays, cfg.candidate_source, cfg.rope_dim, cfg.index_heads, cfg.index_head_dim, &one)) |w| return w;
+    }
+    var log: tri.Log = .{ .gpa = gpa };
+    defer log.deinit();
+    const t: tri.Tri = .{ .log = &log };
     for (lays[0..@min(half, lays.len)]) |lay| try mixes(t, cfg, lay, r, q);
     for (log.items.items) |l| if (!found(finds, l)) return l.name;
+    return null;
+}
+
+/// The reason the owned path cannot run at any row count on this rank (null: every launch of every slab of chunks of 1 to `max_rows`
+/// rows on layers `lays[0..half]` has a variant), allocated from `a`: which launch, at how many rows, in which chunk first met.
 /// `finds.has(name, args, consts)` is the engine's lookup (`finds.hasExtra`, when it has one, the extra set's). `encoder`: slabOff's.
 pub fn anyOwnedOff(gpa: std.mem.Allocator, a: std.mem.Allocator, finds: anytype, cfg: config_mod.Config, lays: []const weights.Layer, half: usize, encoder: bool, max_rows: usize) !?[]const u8 {
+    const seen = try gpa.alloc(bool, max_rows + 1);
+    defer gpa.free(seen);
+    @memset(seen, false);
+    var rows: usize = 1;
+    while (rows <= max_rows) : (rows += 1) for (slab_plan.slabs(rows)) |s| {
+        if (s.n == 0 or seen[s.n]) continue;
+        seen[s.n] = true;
         if (try slabOff(gpa, finds, cfg, lays, half, encoder, .{ .start = s.start, .n = s.n }, slab_plan.q(rows))) |w| {
             return try std.fmt.allocPrint(a, "no kernel variant for {s} at a slab of {d} rows (the first {s} with such a slab has {d} rows)", .{ w, s.n, if (encoder) "chunk" else "decoder window", rows });
+        }
+    };
+    return null;
+}
+
 /// The decoder half's start check: the reason layers 20 to 39 cannot run on owned rows (null: they can), anyOwnedOff over every layer
 /// with the decoder half's launches at every slab of a decoder window of 1 row to the window's (`cfg.window`: the rows a chunk's
 /// decoder half runs at most, prompt.decoderRows).
@@ -32,11 +103,32 @@ pub fn decoderOff(gpa: std.mem.Allocator, a: std.mem.Allocator, finds: anytype, 
     return anyOwnedOff(gpa, a, finds, cfg, lays, lays.len, false, cfg.window);
 }
 
+const AcceptAll = struct {
+    reject: ?[]const u8 = null,
+    pub fn has(f: AcceptAll, name: []const u8, _: anytype, _: anytype) bool {
+        if (f.reject) |r| return !std.mem.eql(u8, r, name);
+        return true;
+    }
     pub fn hasExtra(f: AcceptAll, name: []const u8, args: anytype, consts: anytype) bool {
         return f.has(name, args, consts);
     }
+};
+
+test "the start check at any row count passes a kernel set that has every variant and names the launch and the slab when one is missing" {
+    const gpa = std.testing.allocator;
+    var why: config_mod.Why = .{};
+    const cfg = try config_mod.parse(gpa, config_mod.test_config, &why);
+    var lays: [40]weights.Layer = undefined;
+    layers(&lays, cfg);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
     try std.testing.expectEqual(@as(?[]const u8, null), try anyOwnedOff(gpa, arena.allocator(), AcceptAll{}, cfg, &lays, 20, true, 130));
+    for ([_][]const u8{ "_rmsnorm", "_route", "_hc_mix_pf", "_hc_post" }) |name| {
         const w = (try anyOwnedOff(gpa, arena.allocator(), AcceptAll{ .reject = name }, cfg, &lays, 20, true, 130)).?;
+        try std.testing.expect(std.mem.indexOf(u8, w, "slab of 1 rows") != null or std.mem.indexOf(u8, w, "slab of") != null);
+        try std.testing.expect(std.mem.indexOf(u8, w, "no kernel variant for") != null);
+    }
+}
 
 /// A kernel set without one launch: by name in the main set, by name in the extra set (the two-block readers), by name at one
 /// row count (its `rows` argument), or the front's q RMSNorm of the layers from one on (each layer's norm weight lies at

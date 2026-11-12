@@ -3,9 +3,13 @@
 //! Rocinante's (rocinante.zig) or the decode rings'; there is no other transport.
 const std = @import("std");
 const cuda = @import("cuda");
-const Link = @import("link.zig").Link;
+const star_mod = @import("star.zig");
 
 /// Where the ranks' host collectives go: `star` is the engine's own links, opened when the start-up joins them.
+pub const Host = struct {
+    star: ?star_mod.Star = null,
+};
+
 /// One in-place all-gather part: every rank's `bytes` at `buf + rank * bytes`, gathered into `buf` rank after rank (the plan of a
 /// gather: the transport's own plans carry the same shape).
 pub const InPlace = struct { buf: u64, bytes: usize };
@@ -13,11 +17,13 @@ pub const InPlace = struct { buf: u64, bytes: usize };
 /// TF_DS_TWO_HOP=1 (model.zig sets it, every rank alike; off by default): four nodes cabled as a ring, where node g
 /// reaches only its column partner g ^ 2 and its row partner g ^ 1 (no cross links between the two pairs). A world-4
 /// exchange then goes between direct partners only (ring2d.zig's rings; this engine's all-gathers are the RDMA rings' and
+/// the host collectives', never NCCL's, so only the rings read this switch).
 pub var two_hop: bool = false;
 
 pub const Comm = struct {
     rank: u32,
     world: u32,
+    host: Host = .{},
 
     pub fn init(rank: u32, world: u32) Comm {
         return .{ .rank = rank, .world = world };
@@ -31,48 +37,106 @@ pub const Comm = struct {
     /// drained, the device bytes read, every rank's gathered by rank 0, written into `recv`). Synchronous, for a caller that
     /// synchronizes at once, as all of them do.
     pub fn gatherHost(c: Comm, d: *const cuda.Driver, send: u64, recv: u64, bytes: usize, stream: cuda.Stream) !void {
+        const star = c.host.star orelse return error.NoHostLinks;
         return gatherVia(star, DriverMem{ .d = d, .stream = stream }, send, recv, bytes);
     }
 
     /// `count` bytes at `buf` made, byte by byte, the largest of every rank's, in place, over the links (the stream drained
     /// first): the graph captures' votes.
     pub fn maxHost(c: Comm, d: *const cuda.Driver, buf: u64, count: usize, stream: cuda.Stream) !void {
+        const star = c.host.star orelse return error.NoHostLinks;
         return maxVia(star, DriverMem{ .d = d, .stream = stream }, buf, count);
-    }
-
-    /// `count` elements of `dtype` to rank `peer` and `rcount` from it, in one NCCL group (point to point).
-    pub fn exchange(c: Comm, send: u64, count: usize, recv: u64, rcount: usize, dtype: nccl.DataType, peer: u32, stream: cuda.Stream) !void {
-        try c.lib.check(c.lib.api.ncclGroupStart(), "ncclGroupStart");
-        const s = c.lib.api.ncclSend(send, count, dtype, @intCast(peer), c.comm, stream.handle);
-        const r = c.lib.api.ncclRecv(recv, rcount, dtype, @intCast(peer), c.comm, stream.handle);
-        try c.lib.check(c.lib.api.ncclGroupEnd(), "ncclGroupEnd");
-        try c.lib.check(s, "ncclSend");
-        try c.lib.check(r, "ncclRecv");
     }
 };
 
-test "two hops on a ring of four: every rank ends with every slice in rank order, partners only" {
-    // four ranks' recv buffers, slot q holding rank q's slice once it arrived (0: not yet)
-    var have: [4][4]u8 = @splat(@splat(0));
-    for (0..4) |g| have[g][g] = @intCast(g + 1);
-    for (0..2) |step| {
-        var next = have;
-        for (0..4) |g| {
-            const h = hops(@intCast(g))[step];
-            try std.testing.expect(h.peer == g ^ 1 or h.peer == g ^ 2); // a direct partner, never g ^ 3
-            const back = hops(h.peer)[step];
-            try std.testing.expectEqual(@as(u32, @intCast(g)), back.peer);
-            try std.testing.expectEqual(h.n, back.n);
-            // what g posts to receive is, in order, what its peer posts to send, and it already holds them
-            for (0..h.n) |i| {
-                try std.testing.expectEqual(h.recv[i], back.send[i]);
-                try std.testing.expect(have[h.peer][back.send[i]] != 0);
-                next[g][h.recv[i]] = have[h.peer][back.send[i]];
+/// The device memory a host collective reads and writes: the driver, after the stream is drained.
+const DriverMem = struct {
+    d: *const cuda.Driver,
+    stream: cuda.Stream,
+
+    fn settle(m: DriverMem) !void {
+        try m.stream.synchronize();
+    }
+
+    fn read(m: DriverMem, dst: []u8, src: u64) !void {
+        try m.d.check(m.d.api.cuMemcpyDtoH_v2(dst.ptr, src, dst.len), "cuMemcpyDtoH");
+    }
+
+    fn write(m: DriverMem, dst: u64, src: []const u8) !void {
+    }
+};
+
+/// `bytes` at device address `send` from every rank, gathered over `star` into `recv` rank after rank. `mem` is the device
+/// memory (settle, read, write): the driver in the engine, plain memory in a test.
+fn gatherVia(star: star_mod.Star, mem: anytype, send: u64, recv: u64, bytes: usize) !void {
+    if (bytes > star_mod.max_part) return error.BadPart;
+    var mine: [star_mod.max_part]u8 = undefined;
+    var table: [4 * star_mod.max_part]u8 = undefined;
+    const all = table[0 .. star.world * bytes];
+    try mem.settle();
+    try mem.read(mine[0..bytes], send);
+    try star.allGather(mine[0..bytes], all);
+    try mem.write(recv, all);
+}
+
+/// `count` bytes at device address `buf` made, byte by byte, the largest of every rank's, in place.
+fn maxVia(star: star_mod.Star, mem: anytype, buf: u64, count: usize) !void {
+    if (count > star_mod.max_part) return error.BadPart;
+    var bytes: [star_mod.max_part]u8 = undefined;
+    try mem.settle();
+    try mem.read(bytes[0..count], buf);
+    try star.maxBytes(bytes[0..count]);
+    try mem.write(buf, bytes[0..count]);
+}
+
 // -- the host collectives ------------------------------------------------------------------------------------------------
+
+/// Plain memory standing for device memory in the tests of gatherVia and maxVia: an address is a pointer.
+const PlainMem = struct {
+    fn settle(_: PlainMem) !void {}
+    fn read(_: PlainMem, dst: []u8, src: u64) !void {
+        @memcpy(dst, @as([*]const u8, @ptrFromInt(src))[0..dst.len]);
+    }
+    fn write(_: PlainMem, dst: u64, src: []const u8) !void {
+        @memcpy(@as([*]u8, @ptrFromInt(dst))[0..src.len], src);
+    }
+};
+
+test "gatherVia: every rank's bytes land in recv rank after rank on every rank" {
+    try star_mod.runRanks(struct {
+        fn f(s: star_mod.Star, g: u32) !void {
+            var send: [6]u8 = .{ @intCast(g), 1, 2, 3, 4, @intCast(g + 100) };
+            var recv: [24]u8 = @splat(0xee);
+            try gatherVia(s, PlainMem{}, @intFromPtr(&send), @intFromPtr(&recv), send.len);
+            for (0..4) |r| {
+                try std.testing.expectEqual(@as(u8, @intCast(r)), recv[r * 6]);
+                try std.testing.expectEqual(@as(u8, @intCast(r + 100)), recv[r * 6 + 5]);
+            }
+        }
+    }.f);
+}
+
+test "maxVia: the vote of a failed capture reaches every rank, and all-clear stays clear" {
+    try star_mod.runRanks(struct {
+        fn f(s: star_mod.Star, g: u32) !void {
+            // the capture's flag byte: 1 is a failure; rank 2 alone failed
+            var flag = [_]u8{if (g == 2) 1 else 0};
+            try maxVia(s, PlainMem{}, @intFromPtr(&flag), 1);
+            try std.testing.expectEqual(@as(u8, 1), flag[0]);
+            var clear = [_]u8{ 0, 0 };
+            try maxVia(s, PlainMem{}, @intFromPtr(&clear), 2);
+            try std.testing.expectEqualSlices(u8, &.{ 0, 0 }, &clear);
+        }
+    }.f);
+}
+
 test "a host collective on a rank without links fails by name: nothing else could carry it" {
     const c = Comm.init(1, 4);
+    const stream: cuda.Stream = .{ .d = undefined, .handle = null };
+    const d: *const cuda.Driver = undefined;
     try std.testing.expectError(error.NoHostLinks, c.gatherHost(d, 0x1000, 0x2000, 1, stream));
     try std.testing.expectError(error.NoHostLinks, c.maxHost(d, 0x3000, 1, stream));
+}
             }
         }
     }

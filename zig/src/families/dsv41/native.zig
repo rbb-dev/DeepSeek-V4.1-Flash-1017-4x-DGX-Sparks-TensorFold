@@ -48,6 +48,13 @@
 //!   TF_DS_NO_COPIES=1                           a drafted stream proposes no suffix-lookup copy windows
 //!   TF_DS_PASS_ROWS=N, TF_DS_PASS_FROM=P        a prompt pass's rows at most (a multiple of 2,048 up to the build's
 //!                                               pass rows), passes of 2,048 below position P (8192 unless set)
+//!   TF_DS_QGATE_CANARY=2 or 3                   not a serving setting: layer 0's MoE partials, each rank's before
+//!                                               their gather, in every prompt chunk and every round, take one more
+//!                                               FP8 step (2: act_quant's quant-dequant of each 32-value group) or
+//!                                               move one fp32 ulp away from zero (3: a reduction order's size): the
+//!                                               body perturbed on purpose, a quality gate's floors; with the
+//!                                               checkpoint's own kernels; every rank the same canary (a start whose
+//!                                               ranks differ is refused)
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the
@@ -236,6 +243,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .cat_codes = two != null,
         .roci = two != null,
         .roci_collect = false,
+        .qgate_canary = if (prompt.qgate_canary) 1 else @backingInt(prompt.qgate_body),
     if (world > 1 and !reconciled) abstainBare(st.gpa, st.m);
     if (world > 1) {
     if (world > 1)
@@ -276,12 +284,23 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.SettingsDiffer => "a follower rank runs other settings than this server (the line above says which): give every rank the same TF_DS_STREAMS (the followers: --streams), TF_DS_ROUND_ROWS (--round-rows), RDMA devices, drafter, TF_DS_REPLAY_FLOOR and TF_DS_IDX_SPLIT, and every follower a --pool of at least the window (--context, or TF_DS_WINDOW)",
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
+        error.CanariesDiffer => "TF_DS_QGATE_CANARY: the ranks asked different canaries (the lines above say which): set the same on every rank (a quality gate's runs, never a serving setting)",
         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
         else => null,
     };
 }
 
     @setEvalBranchQuota(20000);
+    // TF_DS_QGATE_CANARY: the canary in effect, the head's 1, the body's 2 or 3, none 0
+    const keep_qb = prompt.qgate_body;
+    defer prompt.qgate_body = keep_qb;
+    prompt.qgate_body = .off;
+    try std.testing.expectEqual(@as(u8, 1), tierMath(null, null).qgate_canary);
+    try std.testing.expectEqual(@as(u8, 0), tierMath(null, null).qgate_canary);
+    prompt.qgate_body = .body_fp8;
+    try std.testing.expectEqual(@as(u8, 2), tierMath(null, null).qgate_canary);
+    prompt.qgate_body = .body_ulp;
+    try std.testing.expectEqual(@as(u8, 3), tierMath(null, null).qgate_canary);
 test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
@@ -290,6 +309,7 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_REPLAY_FLOOR") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_RING_WORD") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "TF_DS_RING_WORD_SIGNAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.CanariesDiffer) orelse "", "TF_DS_QGATE_CANARY") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
 }
 

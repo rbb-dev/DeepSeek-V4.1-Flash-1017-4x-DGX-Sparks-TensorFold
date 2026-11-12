@@ -246,6 +246,10 @@ pub const Kernels = struct {
     st_fold: ?cuda.Function = null,
     st_gemm5: ?cuda.Function = null,
     st_split: [4]?cuda.Function = @splat(null),
+    // tf_dsn_combine over a row-quarter order with the doorbell rung from inside (useStaged)
+    combine_door: ?cuda.Function = null,
+    // TF_DS_QGATE_CANARY 2 or 3 in effect (useQgateBody): the body canary's kernel (qgateBody); null until then
+    qgate_body_fn: ?cuda.Function = null,
 
     pub fn load(d: *const cuda.Driver, image: []const u8) !Kernels {
         var m = try cuda.Module.load(d, image);
@@ -307,6 +311,11 @@ pub const Kernels = struct {
         return f;
     }
 
+    /// TF_DS_QGATE_CANARY 2 or 3 (prompt.qgate_body): the body canary's kernel, for qgateBody.
+    pub fn useQgateBody(k: *Kernels) !void {
+        k.qgate_body_fn = try k.module.function("tf_dsn_qgate_body_kernel");
+    }
+
     /// The dense GEMMs' whole-line twins for a y in [lo, hi) (the transport's arena): the _st kernels of the tile, fold, 5-stage
     /// and split configurations, then the range. An error leaves the range empty.
     pub fn useStaged(k: *Kernels, lo: u64, hi: u64) !void {
@@ -315,6 +324,8 @@ pub const Kernels = struct {
         k.st_gemm5 = try pfFunction(k.module, "tf_dsn_pf_gemm5_st_kernel", pf_gemm5_smem);
         for (&k.st_split, split_st_kernels, split_smem) |*f, name, smem| f.* = try pfFunction(k.module, name, smem);
         if (k.sfk) |*sk| try sk.useStaged();
+        // the GPU-scope release with the last arrival's system fence (door_arrive_cta<2>)
+        k.combine_door = try k.module.function("tf_dsn_combine_door_g_kernel");
         k.wc = .{ lo, hi };
     }
 
@@ -390,8 +401,16 @@ const split_st_kernels = [4][:0]const u8{ "tf_dsn_pf_gemm_splitA_st_kernel", "tf
     st_gemm: [2]?cuda.Function = @splat(null),
     st_split64: [2]?cuda.Function = @splat(null),
     st_split128: [2]?cuda.Function = @splat(null),
+    // wo_b's exact whole-line kernel with the CTAs in a row-quarter order and the doorbell rung from inside (sentFirstTakes)
+    st_door: ?cuda.Function = null,
+    // the same kernel on the activation rows' two bases (gemmTwo)
+    st_two: ?cuda.Function = null,
 
     fn useStaged(sk: *SfKernels) !void {
+        // the GPU-scope release with the last arrival's system fence (door_arrive_cta<2>), as combine's door: the per-thread system fence of the
+        // twin before it held every sent CTA's slot until its stores drained (LEDGER: 1.300 ms a launch against the plain launch's 1.143)
+        sk.st_door = try Kernels.pfFunction(sk.module, "tf_dsn_sf_split128_exact_st_door_g_kernel", sf_split128_smem);
+        sk.st_two = Kernels.pfFunction(sk.module, "tf_dsn_sf_split128_exact_st_two_kernel", sf_split128_smem) catch null;
         const pf = Kernels.pfFunction;
         sk.st_gemm = .{ try pf(sk.module, "tf_dsn_sf_gemm_st_kernel", sf_gemm_smem), try pf(sk.module, "tf_dsn_sf_gemm_exact_st_kernel", sf_gemm_smem) };
         sk.st_split64 = .{ try pf(sk.module, "tf_dsn_sf_split64_st_kernel", sf_split64_smem), try pf(sk.module, "tf_dsn_sf_split64_exact_st_kernel", sf_split64_smem) };
@@ -406,6 +425,121 @@ pub fn stagedY(k: *const Kernels, y: u64, ldy: usize, y_dtype: DType, accumulate
     const stage = stagedY(k, y, ldy, y_dtype, accumulate) and kind != .zsplit and sk.st_gemm[x] != null;
         .gemm => try launchShared(if (stage) sk.st_gemm[x].? else sk.gemm[x], s, .{ cdiv(m, 128), l.n / 128, 1 }, sf_gemm_smem, &args),
             ra.add(@as(c_int, @backingInt(y_dtype)));
+/// native_sf.cu's sf::RowOrder: the order of a dense launch's CTAs by row quarter (see sf::tile_row).
+pub const RowOrder = extern struct { quarters: u32, tpq_log2: u32, per_log2: u32, span: u32 };
+/// native.cu's QuarterOrder: the order of tf_dsn_combine_door's CTAs by row quarter.
+pub const QuarterOrder = extern struct { quarters: u32, unit: u32, span: u32 };
+/// native.cu's Door: where a producer kernel rings the transport's doorbell (the arrival count, the doorbell line, the ticket).
+pub const Door = extern struct { cnt: u64, door: u64, ticket: u64 };
+
+/// The quarters (row start / q) of the four row blocks in launch order, one byte each, or null unless they are the four quarters of
+/// four `q`-row blocks, each once.
+fn packQuarters(first: [2]usize, last: [2]usize, q: usize) ?u32 {
+    if (q == 0) return null;
+    var seen = [4]bool{ false, false, false, false };
+    var x: u32 = 0;
+    for ([_]usize{ first[0], first[1], last[0], last[1] }, 0..) |row0, i| {
+        if (row0 % q != 0 or row0 / q >= 4 or seen[row0 / q]) return null;
+        seen[row0 / q] = true;
+        x |= @as(u32, @intCast(row0 / q)) << @intCast(8 * i);
+    }
+    return x;
+}
+
+fn pow2Log(n: usize) ?u32 {
+    if (n == 0 or n & (n - 1) != 0) return null;
+    return @ctz(n);
+}
+
+/// The CTA order of a dense launch of 4 `q`-row quarters (128-row tiles, `col_tiles` columns of them) that runs the two quarters
+/// starting at rows `first` before the two at `last`: every column of the first two quarters' row tiles first. Null unless a
+/// quarter is a power of two row tiles.
+pub fn rowOrder(first: [2]usize, last: [2]usize, q: usize, col_tiles: usize) ?RowOrder {
+    if (q % 128 != 0) return null;
+    const tpq = pow2Log(q / 128) orelse return null;
+    const quarters = packQuarters(first, last, q) orelse return null;
+    return .{ .quarters = quarters, .tpq_log2 = tpq, .per_log2 = tpq + 1, .span = @intCast(2 * (q / 128) * col_tiles) };
+}
+
+/// The order of a launch of `rows` rows that is the baseline: every column's row tiles in turn (one phase; `rows` / 128 a power of two,
+/// at least four).
+pub fn identityRowOrder(rows: usize, col_tiles: usize) ?RowOrder {
+    if (rows % 128 != 0) return null;
+    const per = pow2Log(rows / 128) orelse return null;
+    if (per < 2) return null;
+    return .{ .quarters = 0x03020100, .tpq_log2 = per - 2, .per_log2 = per, .span = @intCast((rows / 128) * col_tiles) };
+}
+
+/// The row tile and column tile the CTA that is `order`th in a launch runs (sf::tile_row, sf::tile_col).
+pub fn tileOf(ro: RowOrder, order: u32) struct { row: u32, col: u32 } {
+    const phase: u32 = @intFromBool(order >= ro.span);
+    const w = order - (if (phase != 0) ro.span else 0);
+    const pos = (phase << @intCast(ro.per_log2)) + (w & ((@as(u32, 1) << @intCast(ro.per_log2)) - 1));
+    const q = (ro.quarters >> @intCast(8 * (pos >> @intCast(ro.tpq_log2)))) & 0xff;
+    return .{ .row = (q << @intCast(ro.tpq_log2)) | (pos & ((@as(u32, 1) << @intCast(ro.tpq_log2)) - 1)), .col = w >> @intCast(ro.per_log2) };
+}
+
+/// The order of tf_dsn_combine_door's CTAs for `q`-row quarters of `n` columns (a CTA is 256 elements): the quarters at rows `first`
+/// before the ones at `last`. Null unless q * n is a multiple of 256 and the blocks are the four quarters.
+pub fn quarterOrder(first: [2]usize, last: [2]usize, q: usize, n: usize) ?QuarterOrder {
+    if ((q * n) % 256 != 0) return null;
+    const quarters = packQuarters(first, last, q) orelse return null;
+    const unit: u32 = @intCast(q * n / 256);
+    return .{ .quarters = quarters, .unit = unit, .span = 2 * unit };
+}
+
+/// Whether wo_b's GEMM (`l` on the quantized rows q / sc, `m` rows, fp32 y in the arena) can ring its first part's doorbell
+/// itself: the exact block-scaled kernels in effect and taking it on the 128-row tiles, y a whole-line store, the door kernel loaded.
+pub fn sentFirstTakes(k: *const Kernels, l: weights.Linear, q: u64, ldq: usize, sc: u64, lds: usize, y: u64, ldy: usize, m: usize) bool {
+    const sk = k.sfk orelse return false;
+    if (!stagedY(k, y, ldy, .f32, false)) return false;
+    const kind = sfRoute(k, l, q, ldq, sc, lds, y, ldy, false, m) orelse return false;
+    return kind == .split128;
+}
+
+/// sfGemm's split128 launch in the order `ro` with the doorbell rung by the first `ro.span` CTAs' last arrival (sentFirstTakes).
+pub fn gemmSentFirst(k: *const Kernels, s: cuda.Stream, l: weights.Linear, q: u64, ldq: usize, sc: u64, lds: usize, m: usize, y: u64, ldy: usize, z: u64, ro: RowOrder, door: Door) !void {
+    const sk = k.sfk orelse return error.NoMmaSfKernels;
+    const sp = splits(l.k, l.n);
+    const a: MxArgs = .{ .q = q, .s = sc, .ldq = @intCast(ldq), .lds = @intCast(lds), .w = l.w, .ws = l.s, .ldw = l.k, .ldws = l.k / 32, .fmt = 0, .M = @intCast(m), .N = @intCast(l.n), .K = @intCast(l.k), .splits = @intCast(sp), .kblocks = @intCast(cdiv(l.k / 32, sp)), .z = z, .y = y, .ldy = @intCast(ldy), .y_dtype = @backingInt(DType.f32), .accumulate = 0 };
+    var args: cuda.Args = .{};
+    args.add(a);
+    args.add(ro);
+    args.add(door);
+    try launchShared(f, s, .{ cdiv(m, 128), l.n / 128, 1 }, sf_split128_smem, &args);
+}
+
+/// The second base of the activation rows (native_sf.cu sf::Part2): the K blocks from `kb_split` on.
+pub const Part2 = extern struct { q1: u64, s1: u64, kb_split: u32 };
+
+/// Whether gemmTwo takes a GEMM: the exact whole-line kernel (sfRoute's split128 route, y in the arena), and both bases' rows alike
+/// strided.
+pub fn twoTakes(k: *const Kernels, l: weights.Linear, q: u64, ldq: usize, sc: u64, lds: usize, y: u64, ldy: usize, m: usize) bool {
+    const sk = k.sfk orelse return false;
+    if (!stagedY(k, y, ldy, .f32, false)) return false;
+    const kind = sfRoute(k, l, q, ldq, sc, lds, y, ldy, false, m) orelse return false;
+    return kind == .split128;
+}
+
+/// sfGemm's split128 exact whole-line launch with the activation rows' K blocks [0, kb_split) at (q, sc) and [kb_split, K / 32) at
+/// (p.q1, p.s1) block kb - kb_split, both with the strides ldq / lds (twoTakes).
+pub fn gemmTwo(k: *const Kernels, s: cuda.Stream, l: weights.Linear, q: u64, ldq: usize, sc: u64, lds: usize, p: Part2, m: usize, y: u64, ldy: usize, z: u64) !void {
+    const sk = k.sfk orelse return error.NoMmaSfKernels;
+    const sp = splits(l.k, l.n);
+    const a: MxArgs = .{ .q = q, .s = sc, .ldq = @intCast(ldq), .lds = @intCast(lds), .w = l.w, .ws = l.s, .ldw = l.k, .ldws = l.k / 32, .fmt = 0, .M = @intCast(m), .N = @intCast(l.n), .K = @intCast(l.k), .splits = @intCast(sp), .kblocks = @intCast(cdiv(l.k / 32, sp)), .z = z, .y = y, .ldy = @intCast(ldy), .y_dtype = @backingInt(DType.f32), .accumulate = 0 };
+    var args: cuda.Args = .{};
+    args.add(a);
+    args.add(p);
+    try launchShared(f, s, .{ cdiv(m, 128), l.n / 128, 1 }, sf_split128_smem, &args);
+}
+
+/// linear's quantization of x and then gemmSentFirst: the bytes `linear` writes into y, the doorbell rung from inside.
+pub fn linearSentFirst(k: *const Kernels, s: cuda.Stream, sc: Scratch, l: weights.Linear, x: u64, x_dtype: DType, ldx: usize, m: usize, y: u64, ldy: usize, ro: RowOrder, door: Door) !void {
+    if (m > sc.rows or l.k > sc.max_k) return error.ScratchTooSmall;
+    try quant(k, s, x, x_dtype, ldx, m, l.k, sc.q, l.k, sc.s, l.k / 32);
+    try gemmSentFirst(k, s, l, sc.q, l.k, sc.s, l.k / 32, m, y, ldy, sc.z, ro, door);
+}
+
 /// A decode-size bf16 linear's K splits (16-column steps), from its shape alone, as splits() for the MX GEMM.
 pub fn bfSplits(k: usize, n: usize) usize {
     const steps = k / 16;
@@ -628,6 +762,22 @@ pub fn quantDec(k: *const Kernels, s: cuda.Stream, x: u64, x_dtype: DType, ldx: 
     a.add(sc);
     a.add(@as(i64, @intCast(lds)));
     try cuda.launch.launch(k.dec_quant, .{ .grid = .{ .x = @intCast(cdiv(m * (kdim / 32) * 32, 256)), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &a);
+}
+
+/// A quality gate's body canary on x (fp32 [n] in place, n whole 32-value groups), `mode` (prompt.qgate_body): 2 one more
+/// FP8 step, act_quant's quant-dequant of each 32-value group (the value rounded to bf16, its E4M3 code at the group's
+/// power-of-two scale, back: exact in fp32, the value fake writes); 3 each nonzero finite value one ulp away from zero
+/// (its bits plus one; the largest finite values, zeros, infinities and NaN kept). Its kernel from useQgateBody.
+pub fn qgateBody(k: *const Kernels, s: cuda.Stream, x: u64, n: usize, mode: u8) !void {
+    const f = k.qgate_body_fn orelse return error.NoQgateBodyKernel;
+    if (mode != 2 and mode != 3) return error.BadCanaryMode;
+    if (n % 32 != 0) return error.CanaryRows;
+    if (n == 0) return;
+    var a: cuda.Args = .{};
+    a.add(x);
+    a.add(@as(i64, @intCast(n)));
+    a.add(@as(c_int, mode));
+    try launch(f, s, .{ cdiv(n, 256), 1, 1 }, 256, &a);
 }
 
 /// act_quant(..., inplace=True): x's quant-dequant rows into out [m, kdim] bf16 (row stride ldo).
@@ -1198,7 +1348,23 @@ fn pfExperts(k: *const Kernels, sc: ExpertScratch, kdim: usize, n: usize, main: 
 /// id order into out [r, down_n] fp32 (row stride ldo; accumulate: added to it).
 /// split: a decode launch, the GEMV kernel (as gateUp).
 pub fn down(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScratch, h: u64, ldh: usize, pick: u64, r: usize, out: u64, ldo: usize, accumulate: bool, split: bool) !void {
+    return downOf(k, s, ex, sc, h, ldh, pick, r, out, ldo, accumulate, split, false, null);
+    return downOf(k, s, ex, sc, 0, ex.down_k, pick, r, out, ldo, accumulate, true, true, null);
+    return downOf(k, s, ex, sc, 0, ex.down_k, pick, r, out, ldo, accumulate, false, true, null);
+/// down of a prompt chunk with its routed sum in two stages (TF_DS_ROCI_COMBINE_FIRST): the same launches as `down`, the
+/// last one (tf_dsn_combine) over the row blocks of `cf` in its order.
+pub fn downFirst(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScratch, h: u64, ldh: usize, pick: u64, r: usize, out: u64, ldo: usize, accumulate: bool, cf: *const CombineFirst) !void {
+    return downOf(k, s, ex, sc, h, ldh, pick, r, out, ldo, accumulate, false, false, cf);
+}
+
+/// downCodes with its routed sum in two stages: downFirst for an intermediate whose codes are in sc.hq / sc.hs already.
+pub fn downCodesFirst(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScratch, pick: u64, r: usize, out: u64, ldo: usize, accumulate: bool, cf: *const CombineFirst) !void {
+    return downOf(k, s, ex, sc, 0, ex.down_k, pick, r, out, ldo, accumulate, false, true, cf);
+}
+
+fn downOf(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertScratch, h: u64, ldh: usize, pick: u64, r: usize, out: u64, ldo: usize, accumulate: bool, split: bool, coded: bool, cf: ?*const CombineFirst) !void {
     const nx = ex.native orelse return error.NotNativeExperts;
+    if (cf != null and split) return error.CombineFirstOnDecode;
     const i: usize = ex.down_k;
     const n: usize = ex.down_n;
     const p = r * sc.slots;
@@ -1246,6 +1412,7 @@ pub fn down(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertSc
         const t = @min(tiles(r), 2);
         try launch(k.dn[t], s, .{ cdiv(n / 32, 4), ny, 1 }, 128, &args);
     }
+    if (cf) |f| return combineFirst(k, s, sc, pick, r, ex.count, n, out, ldo, accumulate, f);
     var ca: cuda.Args = .{};
     ca.add(sc.out);
     ca.add(@as(i64, @intCast(n)));
@@ -1259,6 +1426,71 @@ pub fn down(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: ExpertSc
     try launch(k.combine, s, .{ cdiv(r * n, 256), 1, 1 }, 256, &ca);
 }
 
+/// The routed sum of a prompt chunk in two stages (TF_DS_ROCI_COMBINE_FIRST). The chunk's rows are four blocks of `rows` rows;
+/// `first` are the starts (in rows) of the two blocks the owner sums' first part sends, `last` the starts of the other two.
+/// The sum of the `first` blocks is launched, then `between` runs on the host (it queues the send behind them on the stream),
+/// then the sum of the `last` blocks is launched.
+pub const CombineFirst = struct {
+    rows: usize,
+    first: [2]usize,
+    last: [2]usize,
+    ctx: *anyopaque,
+    between: *const fn (ctx: *anyopaque) anyerror!void,
+    /// TF_DS_ROCI_SENT_FIRST: one launch of tf_dsn_combine_door in this order instead of the four, the doorbell rung from inside
+    /// it: called right before the launch for the Door (the ticket reserved there), `between` not called.
+    door: ?*const fn (ctx: *anyopaque) anyerror!Door = null,
+
+    /// Whether the four blocks are the four row quarters of `r` rows, each once.
+    pub fn covers(cf: CombineFirst, r: usize) bool {
+        if (cf.rows == 0 or cf.rows * 4 != r) return false;
+        var seen: [4]bool = .{ false, false, false, false };
+        for ([_][2]usize{ cf.first, cf.last }) |pair| for (pair) |row0| {
+            if (row0 % cf.rows != 0 or row0 / cf.rows >= 4 or seen[row0 / cf.rows]) return false;
+            seen[row0 / cf.rows] = true;
+        };
+        return true;
+    }
+};
+
+/// tf_dsn_combine over the rows [row0, row0 + rows) of a chunk: the kernel indexes its rows relative to its arguments, so a row
+/// start is an offset of the entries' outputs (sc.out, n columns a row and sc.slots rows an entry), of the picks and of the
+/// output. Each output row is the sum the one launch over all the rows makes of it.
+pub fn combineRows(k: *const Kernels, s: cuda.Stream, sc: ExpertScratch, pick: u64, row0: usize, rows: usize, experts: usize, n: usize, out: u64, ldo: usize, accumulate: bool) !void {
+    var part = sc;
+    part.out = sc.out + row0 * sc.slots * n * 4;
+    try combine(k, s, part, pick + row0 * sc.slots * 4, rows, experts, n, out + row0 * ldo * 4, ldo, accumulate);
+}
+
+/// tf_dsn_combine over all `r` rows in the quarter order of `qo`, the doorbell rung by its first qo.span CTAs' last arrival.
+pub fn combineDoor(k: *const Kernels, s: cuda.Stream, sc: ExpertScratch, pick: u64, r: usize, experts: usize, n: usize, out: u64, ldo: usize, accumulate: bool, qo: QuarterOrder, door: Door) !void {
+    const f = k.combine_door orelse return error.NoMmaSfKernels;
+    var ca: cuda.Args = .{};
+    ca.add(sc.out);
+    ca.add(@as(i64, @intCast(n)));
+    ca.add(pick);
+    ca.add(@as(c_int, @intCast(r)));
+    ca.add(@as(c_int, @intCast(sc.slots)));
+    ca.add(@as(c_int, @intCast(experts)));
+    ca.add(@as(c_int, @intCast(n)));
+    ca.add(out);
+    ca.add(@as(i64, @intCast(ldo)));
+    ca.add(@as(c_int, @intFromBool(accumulate)));
+    ca.add(qo);
+    ca.add(door);
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(r * n / 256), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &ca);
+}
+
+pub fn combineFirst(k: *const Kernels, s: cuda.Stream, sc: ExpertScratch, pick: u64, r: usize, experts: usize, n: usize, out: u64, ldo: usize, accumulate: bool, cf: *const CombineFirst) !void {
+    if (!cf.covers(r)) return error.CombineFirstRows;
+    if (cf.door) |get_door| {
+        const qo = quarterOrder(cf.first, cf.last, cf.rows, n) orelse return error.CombineFirstRows;
+        return combineDoor(k, s, sc, pick, r, experts, n, out, ldo, accumulate, qo, try get_door(cf.ctx));
+    }
+    for (cf.first) |row0| try combineRows(k, s, sc, pick, row0, cf.rows, experts, n, out, ldo, accumulate);
+    try cf.between(cf.ctx);
+    for (cf.last) |row0| try combineRows(k, s, sc, pick, row0, cf.rows, experts, n, out, ldo, accumulate);
+}
+
 test "splits depend on the shape alone and fill the GPU" {
     try std.testing.expectEqual(@as(usize, 16), splits(5120, 1280)); // wq_a: 10 CTAs, 10 K blocks a split
     try std.testing.expectEqual(@as(usize, 16), splits(5120, 512)); // wkv
@@ -1269,7 +1501,109 @@ test "splits depend on the shape alone and fill the GPU" {
     try std.testing.expectEqual(@as(usize, 16), bfSplits(5120, 384)); // the router
     try std.testing.expectEqual(@as(usize, 16), bfSplits(4096, 1024)); // a wo_a group
 }
+test "TF_DS_ROCI_COMBINE_FIRST: the two stages' blocks are the four row quarters, each once" {
+    var dummy: u8 = 0;
+    const F = struct {
+        fn f(_: *anyopaque) anyerror!void {}
+    };
+    const base: CombineFirst = .{ .rows = 1024, .first = .{ 1024, 3072 }, .last = .{ 0, 2048 }, .ctx = &dummy, .between = F.f };
+    try std.testing.expect(base.covers(4096));
+    try std.testing.expect(!base.covers(4097)); // not four quarters of the rows
+    try std.testing.expect(!base.covers(2048));
+    var dup = base;
+    dup.last = .{ 0, 1024 }; // a quarter twice, one never
+    try std.testing.expect(!dup.covers(4096));
+    var off = base;
+    off.first = .{ 1000, 3072 }; // not a whole quarter's start
+    try std.testing.expect(!off.covers(4096));
+    var out = base;
+    out.last = .{ 0, 4096 }; // past the rows
+    try std.testing.expect(!out.covers(4096));
+}
+
+test "TF_DS_ROCI_COMBINE_FIRST: a stage's launch is the combine's launch at row offsets; the host step comes between the stages; decode launches refuse it" {
+    const src = @embedFile("mx.zig");
+    const at = std.mem.indexOf(u8, src, "pub fn combineRows(").?;
+    const body = src[at .. at + std.mem.indexOf(u8, src[at..], "\n}\n").?];
+    for ([_][]const u8{ "part.out = sc.out + row0 * sc.slots * n * 4;", "pick + row0 * sc.slots * 4, rows, experts, n, out + row0 * ldo * 4, ldo, accumulate);" }) |line| {
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, line));
+    }
+    const cf = src[std.mem.indexOf(u8, src, "fn combineFirst(").?..];
+    const a = std.mem.indexOf(u8, cf, "for (cf.first) |row0|").?;
+    const b = std.mem.indexOf(u8, cf, "try cf.between(cf.ctx);").?;
+    const c = std.mem.indexOf(u8, cf, "for (cf.last) |row0|").?;
+    try std.testing.expect(a < b and b < c);
+    const dn = src[std.mem.indexOf(u8, src, "fn downOf(").?..];
+    try std.testing.expect(std.mem.indexOf(u8, dn, "if (cf != null and split) return error.CombineFirstOnDecode;").? < 300);
+}
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "return downOf(k, s, ex, sc, 0, ex.down_k, pick, r, out, ldo, accumulate, true, true, null);"));
     const d: Kernels = .{ .module = undefined, .act_quant = undefined, .attn_epilogue = undefined, .gemm = undefined, .reduce = undefined, .count = undefined, .scan = undefined, .place = undefined, .gu = undefined, .dn = undefined, .gu_finish = undefined, .dn_finish = undefined, .gu_gemv = undefined, .dn_gemv = undefined, .gemv = undefined, .mx_sab = undefined, .gu_sab = undefined, .dn_sab = undefined, .sab = false, .dec = undefined, .dec_group = undefined, .dec_group2 = undefined, .nact_log = null, .group2 = false, .dec_quant = undefined, .dec_l2pf = undefined, .dec_on = true, .dec_pdl = true, .expert_exit = false, .counters = undefined, .combine = undefined, .bf16 = undefined, .bf_reduce = undefined, .to_f16 = undefined, .pf_gemm = undefined, .pf_gemm_fold = undefined, .pf_gu = undefined, .pf_dn = undefined, .pf_tiles = undefined, .pf_bf16 = undefined, .pf_off = false };
+
+test "TF_DS_ROCI_SENT_FIRST: a launch in a row-quarter order runs every tile once, the sent quarters' tiles in its first phase" {
+    for ([_]usize{ 4096, 2048 }) |rows| {
+        const q = rows / 4;
+        const cols: usize = 20;
+        const row_tiles = rows / 128;
+        for (0..4) |g| {
+            // the plan's sent quarters of node g (rows of g ^ 1 and g ^ 3), the kept ones (g, g ^ 2)
+            const first = [2]usize{ (g ^ 1) * q, (g ^ 3) * q };
+            const last = [2]usize{ g * q, (g ^ 2) * q };
+            const ro = rowOrder(first, last, q, cols).?;
+            try std.testing.expectEqual(@as(u32, @intCast(row_tiles / 2 * cols)), ro.span);
+            var seen = try std.testing.allocator.alloc(bool, row_tiles * cols);
+            defer std.testing.allocator.free(seen);
+            @memset(seen, false);
+            for (0..row_tiles * cols) |o| {
+                const t = tileOf(ro, @intCast(o));
+                try std.testing.expect(t.row < row_tiles and t.col < cols);
+                const at = t.row * cols + t.col;
+                try std.testing.expect(!seen[at]);
+                seen[at] = true;
+                // the first span CTAs hold the rows of the two sent quarters, every column of them
+                const quarter = t.row / (row_tiles / 4);
+                const sent = quarter == (g ^ 1) or quarter == (g ^ 3);
+                try std.testing.expectEqual(o < ro.span, sent);
+            }
+            for (seen) |b| try std.testing.expect(b);
+            // within a phase the row tiles go fastest: the first per CTAs are the first column's tiles
+            try std.testing.expectEqual(@as(u32, 0), tileOf(ro, 0).col);
+            try std.testing.expectEqual(@as(u32, 0), tileOf(ro, @intCast(row_tiles / 2 - 1)).col);
+            try std.testing.expectEqual(@as(u32, 1), tileOf(ro, @intCast(row_tiles / 2)).col);
+            try std.testing.expectEqual(@as(u32, 0), tileOf(ro, ro.span).col);
+        }
+        // the baseline order is the identity order
+        const id = identityRowOrder(rows, cols).?;
+        for (0..row_tiles * cols) |o| {
+            const t = tileOf(id, @intCast(o));
+            try std.testing.expectEqual(@as(u32, @intCast(o % row_tiles)), t.row);
+            try std.testing.expectEqual(@as(u32, @intCast(o / row_tiles)), t.col);
+        }
+    }
+}
+
+test "TF_DS_ROCI_SENT_FIRST: an order refuses what is not four quarters each once, a quarter that is not whole power-of-two row tiles" {
+    try std.testing.expect(rowOrder(.{ 1024, 3072 }, .{ 0, 2048 }, 1024, 20) != null);
+    try std.testing.expectEqual(@as(?RowOrder, null), rowOrder(.{ 1024, 3072 }, .{ 0, 0 }, 1024, 20)); // a quarter twice
+    try std.testing.expectEqual(@as(?RowOrder, null), rowOrder(.{ 1024, 3072 }, .{ 0, 4096 }, 1024, 20)); // a fifth
+    try std.testing.expectEqual(@as(?RowOrder, null), rowOrder(.{ 1024, 3072 }, .{ 0, 2000 }, 1024, 20)); // not on a quarter
+    try std.testing.expectEqual(@as(?RowOrder, null), rowOrder(.{ 384, 1152 }, .{ 0, 768 }, 384, 20)); // 3 row tiles a quarter
+    try std.testing.expectEqual(@as(?RowOrder, null), rowOrder(.{ 100, 300 }, .{ 0, 200 }, 100, 20)); // not whole row tiles
+    try std.testing.expectEqual(@as(?RowOrder, null), identityRowOrder(3 * 128, 20));
+    // the combine's: 1,024 rows x 2,560 columns = 10,240 CTAs a quarter, the sent ones first
+    const qo = quarterOrder(.{ 1024, 3072 }, .{ 0, 2048 }, 1024, 2560).?;
+    try std.testing.expectEqual(@as(u32, 10240), qo.unit);
+    try std.testing.expectEqual(@as(u32, 20480), qo.span);
+    try std.testing.expectEqual(@as(u32, 0x02_00_03_01), qo.quarters);
+    try std.testing.expectEqual(@as(?QuarterOrder, null), quarterOrder(.{ 100, 300 }, .{ 0, 200 }, 100, 2561)); // 256000+ elements not whole CTAs
+    try std.testing.expectEqual(@as(?QuarterOrder, null), quarterOrder(.{ 1024, 1024 }, .{ 0, 2048 }, 1024, 2560));
+}
+
+test "TF_DS_ROCI_SENT_FIRST: the kernels' argument structs are the device structs' size" {
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(RowOrder));
+    try std.testing.expectEqual(@as(usize, 12), @sizeOf(QuarterOrder));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(Door));
+}
 
 test "the expert-count log: device words decode to records in call order, empty slots left out, and out.len bounds them" {
     // the kernel's ring: word 0 the call counter, 8 words of header, then four words a record {index + 1, rows << 32 | active, shared << 32 | owned, 0}
@@ -1294,4 +1628,14 @@ test "the expert-count log file: a header naming the rank and the layout, then t
     const text = try nactRender(gpa, 2, 4, &recs);
     defer gpa.free(text);
     try std.testing.expectEqualStrings("# TF_DS_NACT_LOG v1 rank=2 world=4 records=2 columns=call rows active owned shared (shared: 0 not active, 1 active and unowned, 2 active and owned)\n8 2 10 4 0\n9 2 11 5 2\n", text);
+}
+
+test "wo_b's door GEMM is the twin whose CTAs release the count at GPU scope (the system fence by the last arrival alone), as combine's door is" {
+    const src = @embedFile("mx.zig");
+    const at = std.mem.indexOf(u8, src, "fn useStaged(sk: *SfKernels) !void {").?;
+    const body = src[at..][0..900];
+    try std.testing.expect(std.mem.indexOf(u8, body, "sk.st_door = try Kernels.pfFunction(sk.module, \"tf_dsn_sf_split128_exact_st_door_g_kernel\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tf_dsn_sf_split128_exact_st_door_kernel") == null);
+    // and combine's door is the same release
+    try std.testing.expect(std.mem.indexOf(u8, src, "k.combine_door = try k.module.function(\"tf_dsn_combine_door_g_kernel\")") != null);
 }

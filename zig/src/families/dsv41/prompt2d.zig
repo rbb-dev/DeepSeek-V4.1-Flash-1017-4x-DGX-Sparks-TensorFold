@@ -113,6 +113,9 @@ pub const Fan = struct {
     /// of a stream past its own and rank 0 waits for it in an exchange for good). Each answer carries the follower's weight
     /// digest (`digest`: this rank's); `heard` gets rank 0's Settings and the digests. The Comm it returns holds the rank and
     /// the world; its host links are the caller's to set.
+    pub fn settingsChecked(f: *const Fan, rank: u32, world: u32, mine: ?Settings, digest: Digest, heard: ?*Heard) !Comm {
+        var local: Heard = .{};
+        const h = heard orelse &local;
         if (world > 1) {
             var why: [1024]u8 = undefined;
             const differ = try f.exchange(rank, mine, digest, &why, h);
@@ -120,20 +123,13 @@ pub const Fan = struct {
                 std.debug.print("tf-dsv41: the ranks' settings differ: {s}\n", .{differ});
                 return error.SettingsDiffer;
             }
-        } else try lib.check(lib.api.ncclGetUniqueId(&id), "ncclGetUniqueId");
-        var c: nccl.Comm = null;
-        try lib.check(lib.api.ncclCommInitRank(&c, @intCast(world), id, @intCast(rank)), "ncclCommInitRank");
-        return .{ .lib = lib, .comm = c, .rank = rank, .world = world };
+        } else {
+            h.* = .{ .lead = mine };
+            h.weights[0] = digest;
+        }
+        return Comm.init(rank, world);
     }
 
-    /// Rank 0: the id, and after it `mine` when given, down every link; then every follower's answer. "" when each one
-    /// can follow, else the first one's words (in `why`).
-    fn lead(f: *const Fan, id: []const u8, mine: ?Settings, why: []u8) ![]const u8 {
-        var frame: [id_max + @sizeOf(Settings)]u8 = undefined;
-        if (id.len > id_max) return error.BadUniqueId;
-        @memcpy(frame[0..id.len], id);
-        var n = id.len;
-        return Comm.init(rank, world);
     /// The links' part of settingsChecked: rank 0 sends `mine` down every link and hears every answer (lead), a follower reads
     /// it, checks and answers (follow). `heard` starts over with this rank's own digest at its rank. "" when every rank can
     /// follow, else the first follower's words (in `why`).
@@ -238,6 +234,10 @@ pub const Settings = extern struct {
     fn sepIf(w: *const std.Io.Writer, sep: []const u8) []const u8 {
         return if (w.end > 0) sep else "";
     }
+pub const exch_roci_p2_first: u32 = 1 << 8;
+pub const exch_roci_engram_ahead: u32 = 1 << 9;
+pub const exch_roci_sent_first: u32 = 1 << 11;
+pub const exch_roci_combine_door: u32 = 1 << 18;
 pub const exch_roci_stagger: u32 = 1 << 21;
 pub const exch_ring_word: u32 = 1 << 25;
 pub const exch_ring_word_atomic: u32 = 1 << 26; // the switch's signal is the atomic fetch-and-add (unset: the inline word)
@@ -251,9 +251,24 @@ pub fn switchDefaultOn(text: ?[]const u8) bool {
 }
 
 /// TF_DS_ROCI_P2_FIRST as Model.open read it (switchAsked), once (Settings.exch; Two.p2First): an owner sum's
+/// second part is sent as soon as its add has made it, before the add of this node's own block.
+pub var roci_p2_first_asked: bool = false;
+
 /// TF_DS_ROCI_ENGRAM_AHEAD as Model.open read it (switchAsked), once (Settings.exch; Two.engramAhead): an
+/// Engram layer's rows, projection and part-1 send run at the start of the layer before it.
+pub var roci_engram_ahead_asked: bool = false;
+
 /// TF_DS_ROCI_SENT_FIRST as Model.open read it (switchAsked), once (Settings.exch; Two.sentFirst): wo_b runs in
+/// one launch with the row quarters an owner sum's first part sends first, and that launch rings the part's doorbell itself when those
+/// quarters are stored.
+pub var roci_sent_first_asked: bool = false;
+/// The second set of links' port is the first's plus this: rank 0 listens on it for each follower, as it does on the first.
+pub const host_links_port_offset: u16 = 32;
+
 /// TF_DS_ROCI_COMBINE_DOOR as Model.open read it (switchAsked), once (Settings.exch; Two.combineDoor): the MoE's
+/// routed sum runs in one launch with the quarters the first part sends first, and that launch rings the part's doorbell itself.
+pub var roci_combine_door_asked: bool = false;
+
 /// TF_DS_ROCI_STAGGER as Model.open read it (switchAsked), once (Settings.exch; effective with every Rocinante switch and TF_DS_ENGRAM_PINNED): two
 /// consecutive whole passes of a prompt in flight, each on its own lane (a second Rocinante, chunk, stream and cuBLAS handle).
 pub var roci_stagger_asked: bool = false;
@@ -265,11 +280,16 @@ pub var roci_stagger_lanes: usize = 2;
 pub var roci_stagger3_asked: bool = false;
 pub var roci_stagger_lanes_set: bool = false;
 
+    if (roci_p2_first_asked) x |= exch_roci_p2_first;
+    if (roci_engram_ahead_asked) x |= exch_roci_engram_ahead;
+    if (roci_sent_first_asked) x |= exch_roci_sent_first;
+    if (roci_combine_door_asked) x |= exch_roci_combine_door;
     if (roci_stagger_asked) x |= exch_roci_stagger;
     if (roci_stagger3_asked) x |= exch_roci_stagger_lanes;
     if (ring_word_asked) x |= exch_ring_word;
     if (ring_word_atomic_asked) x |= exch_ring_word_atomic;
     if (ring_wait_asked) x |= exch_ring_wait;
+/// text "1", switchAsked; TF_DS_QGATE_CANARY's "1", "2" or "3", qgateAsked); an empty name is a reserved bit (kern_reserved). Each is read once by Model.open, before the
 };
 
 
@@ -294,6 +314,27 @@ pub var ring_wait_asked: bool = false;
 /// that cannot wait in the card refuses by name.
 pub var ring_wait_explicit: bool = false;
 
+/// TF_DS_QGATE_CANARY's canaries, a quality gate's known perturbations, never a serving setting: the head's rows one
+/// more FP8 step (1: the ruler), or layer 0's MoE partials before their gather one more FP8 step (2) or one fp32 ulp
+/// away from zero (3: a reduction order's size), the body's floors.
+pub const Qgate = enum(u8) { off = 0, head = 1, body_fp8 = 2, body_ulp = 3 };
+
+/// TF_DS_QGATE_CANARY's text: "1", "2" or "3" its canary; unset or any other text none.
+pub fn qgateAsked(text: ?[]const u8) Qgate {
+    const v = text orelse return .off;
+    if (v.len != 1) return .off;
+    return switch (v[0]) {
+        '1' => .head,
+        '2' => .body_fp8,
+        '3' => .body_ulp,
+        else => .off,
+    };
+}
+
+/// TF_DS_QGATE_CANARY as Model.open read it (qgateAsked), once (Settings.kern: any canary; every rank's the same
+/// canary, Model.open's agreement; prompt.qgate_canary, prompt.qgate_body).
+pub var qgate_canary_asked: Qgate = .off;
+    if (qgate_canary_asked != .off) x |= kern_qgate_canary;
 /// TF_DS_2D_ORDER: the 2D node (role) each rank serves, "g0,g1,g2,g3" (rank 0 must serve node 0: it serves the
 /// API); unset, rank g serves node g. On four GB10s cabled as a ring 0-1-2-3-0 without a switch, "0,1,3,2" makes every
 /// node's row partner (g ^ 1) and column partner (g ^ 2) its cabled neighbours, and the transport's plans run over
@@ -341,7 +382,59 @@ fn len(r: ?[2]usize) usize {
 
 /// A 2D node's part of the prompt path and the decode rounds: the pairs' widths of each split output and the exchange
 /// buffers.
+/// The widths and sizes of a node's decode exchanges, for decodeOff.
+pub const DecodeShape = struct {
+    ow: [2]usize, // wo_b's output columns a pair (fp32 partials)
+    dw: [2]usize, // down's output columns a pair
+    hw: [2]usize, // the head's columns a pair
+    ew: [2]usize, // Engram's projection columns a pair (0, 0: none)
+    uw: [2]usize, // wo_a's output a pair (bf16)
+    gu: [2]usize, // gate / up's columns a pair (bf16)
+    ir: usize, // the parity split's rest columns (0: none)
+    hidden: usize, // the drafter's pair gather width (fp32)
+    rows: usize, // a round's rows at most
+    slots: usize, // expert slots a row
+    slot: usize, // a ring's slot, in bytes
+    cand_bytes: usize, // the head's candidate part of a round of `rows` rows
+    pair_ring: bool, // the row pair's ring is open (the drafter's pair gather)
+};
+
 /// Why a node's decode exchanges cannot all ride the RDMA rings (null: every one can): each
+/// quarters gather in row blocks of at most max_decode_blocks, each part a whole number of 16 bytes and in one slot.
+pub fn decodeOff(x: DecodeShape) ?[]const u8 {
+    const quarters = struct {
+        fn fits(w: [2]usize, rows: usize, slot: usize) bool {
+            if ((w[0] * 4) % 16 != 0 or (w[1] * 4) % 16 != 0) return false;
+            var bb: [max_decode_blocks][2]usize = undefined;
+            _ = decodeBlocks(rows, @max(w[0], w[1]) * 4, slot, &bb) catch return false;
+            return true;
+        }
+    }.fits;
+    const cat = struct {
+        fn fits(w: [2]usize, rows: usize, slot: usize) bool {
+            for (w) |v| {
+                if ((v * 2) % 16 != 0 or rows * v * 2 > slot) return false;
+            }
+            return true;
+        }
+    }.fits;
+    if (!quarters(x.ow, x.rows, x.slot)) return "the attention gather does not ride the ring (a part not whole 16 bytes, or wider than a slot in 8 row blocks)";
+    if (!quarters(x.dw, x.rows, x.slot)) return "the MoE gather does not ride the ring";
+    if (!quarters(x.hw, x.rows, x.slot)) return "the head's gather does not ride the ring";
+    if (x.ew[0] + x.ew[1] != 0 and !quarters(x.ew, x.rows, x.slot)) return "Engram's gather does not ride the ring";
+    if (x.cand_bytes > x.slot or x.cand_bytes % 16 != 0) return "the head's candidates do not fit a ring slot";
+    if (!cat(x.uw, x.rows, x.slot)) return "wo_a's partner gather does not ride the column ring";
+    if (x.ir == 0) {
+        if (!cat(x.gu, x.rows * x.slots, x.slot)) return "the experts' partner gather does not ride the column ring";
+    } else for (0..2) |p| {
+        const width = x.gu[p] + x.ir;
+        if ((width * 2) % 16 != 0 or x.rows * x.slots * width * 2 > x.slot) return "the parity experts' pack does not ride the column ring";
+    }
+    if (x.pair_ring and ((x.hidden * 4) % 16 != 0 or x.rows * x.hidden * 4 > x.slot)) return "the drafter's pair gather does not ride the row ring";
+    if (x.rows * 16 > x.slot) return "the drafter's bests do not fit a ring slot";
+    return null;
+}
+
 pub const Two = struct {
     r: usize,
     p: usize,
@@ -552,15 +645,23 @@ pub const Two = struct {
     /// TF_DS_ROCI_P2_FIRST in effect: asked (the start-up Settings made it the same on every rank).
     pub fn p2First(_: *const Two) bool {
         return roci_p2_first_asked;
+    }
+
     /// TF_DS_ROCI_ENGRAM_AHEAD in effect: asked (the start-up Settings made it the same on every rank).
     pub fn engramAhead(_: *const Two) bool {
         return roci_engram_ahead_asked;
+    }
+
     /// TF_DS_ROCI_SENT_FIRST in effect: asked (the start-up Settings made it the same on every rank).
     pub fn sentFirst(_: *const Two) bool {
         return roci_sent_first_asked;
+    }
+
     /// TF_DS_ROCI_COMBINE_DOOR in effect: asked (the start-up Settings made it the same on every rank).
     pub fn combineDoor(_: *const Two) bool {
         return roci_combine_door_asked;
+    }
+
     /// This node's decode exchanges (decodeOff's input) for rounds of `rows` rows, rings of `slot` bytes, and a head
     /// candidate part of `cand_bytes`.
     pub fn decodeShape(t: *const Two, hidden: usize, rows: usize, slots: usize, slot: usize, cand_bytes: usize) DecodeShape {
@@ -577,6 +678,7 @@ pub const Two = struct {
         std.log.err("{s}: {s} cannot run it (this rank: {s}); not started", .{ name, rankList(cannot, &buf), why orelse "can" });
         return error.RociCannot;
     }
+
     /// Every rank's node order (TF_DS_2D_ORDER, `rank_of`) and gather widths (`ow`) gathered over the host links and checked against
     /// this rank's own: a rank alone on a different permutation would address different partners under the same role numbers (the
     /// transport's plans, the rings and the node's weights all follow it), so the start ends by name. Before any prompt.
@@ -601,8 +703,12 @@ pub const Two = struct {
                 return error.TopologyMismatch;
             }
         }
-        const wmax = try t.allParts(e, src, n, .{ width, width }, esize);
-        try e.ops.copyRows(e.s, t.parts + 2 * t.p * n * wmax * esize, wmax * esize, dst, width * esize, width * esize, 2 * n);
+    }
+
+    /// The drafter's per-step gather (Markov's bests): `rows` rows of four fp32 from every node into `dst` [4, rows, 4] in the
+    /// communicator's rank order, over the four nodes' ring. The bytes comm.allGather of the same parts gives.
+    pub fn nodesGather(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, rows: usize) !void {
+        const rs = t.rings orelse return error.DecodeNeedsRings;
         try rs.nodesGather(e.s, src, dst, rows, t.rank_of);
     pub fn node(t: *const Two) u32 {
         const rs = t.rings orelse return error.DecodeNeedsRings;
@@ -617,10 +723,25 @@ pub const Two = struct {
     /// wo_2d after wo_a: the rank's four groups (this node's two in ch.u [n, uw[p]], the partner's two), then wo_b
     /// for this pair's output columns: ch.pa [n, ow[p]] fp32, the matching columns of TP2's partial.
     pub fn woB(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer) !void {
-        try t.catRank(e, ch.u, t.u_full, ch.n, t.uw, 2);
-        try prompt.mm(e, ch, lay.wo_b, t.u_full, t.uw[0] + t.uw[1], ch.pa, .fp32, lay.wo_b.n);
+        _ = try t.woBOf(e, ch, lay, false);
+    }
+
+    /// woB with TF_DS_ROCI_SENT_FIRST's launch where it applies: the GEMM runs in one launch with the row quarters an owner
+    /// sum's first part sends first and rings that part's doorbell itself (prompt.mmSentFirst), and the part is marked sent.
+    /// Returns whether it did; otherwise woB's launches ran as woB's.
+    pub fn woBSentFirst(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer) !bool {
+        return t.woBOf(e, ch, lay, true);
+    }
+
+    fn woBOf(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer, sent_first: bool) !bool {
         return t.woBCodes(e, ch, lay, sent_first);
+    ///
+    /// TF_DS_ROCI_CODES, a whole pass: the part is quantized into the arena's send region, goes to the column partner as RDMA WRITEs
     /// into its land region, and the copies read the partner's part there (the exchange is the transport's).
+    ///
+    /// With TF_DS_ROCI_SENT_FIRST (`sent_first`, the caller's owner-sum conditions held) beside TF_DS_ROCI_CODES the GEMM on the landed
+    /// codes is the one-launch kernel that rings the owner sum's first part itself (prompt.codesGemmSentFirst): true when it ran.
+    pub fn woBCodes(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer, sent_first: bool) !bool {
         const shape = prompt.codesShape(e, ch) orelse return error.RociNoShape;
         const rc = t.rc.?;
         const send = rc.addr(.wob_send);
@@ -629,16 +750,24 @@ pub const Two = struct {
         try rc.send(e.s, .wob, shape);
         try rc.wait(e.s, .wob);
         if (sent_first) {
+            try catCodesCopies(e.ops, e.s, pl);
+            if (try prompt.codesGemmSentFirst(e, ch, t, lay.wo_b, pl.q, pl.s)) return true;
+            try mx.gemm(k, e.s, lay.wo_b, pl.q, pl.k, pl.s, pl.k / 32, ch.n, ch.pa, lay.wo_b.n, .f32, false, ch.mxs.z);
+            return false;
+        }
+        return false;
     }
 
     /// moe_2d's experts after the routing: this node's gate / up blocks, the rank's whole intermediate assembled, down
     /// for this node's output columns: ch.pm [n, dw[p]] fp32. A chunk of fewer than EXACT_ROWS rows takes the decode
     /// window's fused path and scratch (experts2d.fused_ok), as the rounds do.
     pub fn experts(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer) !void {
+    pub fn experts(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer, x_codes: bool, cf: ?*const mx.CombineFirst) !void {
         const c = e.c;
         const n = ch.n;
             // the pack as codes over the transport (the decode rounds' experts are expertsNative's, through the rings)
             return t.expertsCodes(e, ch, lay.experts, ch.x, c.hidden, ch.pick, ch.wts, ch.xs.xd, ch.pm, n, x_codes, cf);
+        if (x_codes or cf != null) return error.NotNativeExperts;
         if (n < exl3_experts.exact_rows) return round2d.experts(t, e, lay.experts, ch.xsd, ch.x, c.hidden, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
         try exl3_experts2d.gateUp(e.ex, e.s, lay.experts, ch.xs, ch.x, c.hidden, ch.pick, n, c.swiglu_limit);
         if (t.ir != 0) {
@@ -654,19 +783,28 @@ pub const Two = struct {
     /// Format.native's experts on a 2D node, chunk or round alike: this node's pack of every expert's gate / up (its main
     /// blocks, its rest block for the experts whose rest is this pair's) into xd [rows * slots, pack] bf16, the rank's
     /// whole intermediate assembled from the two pairs' packs (the same bytes moved as the EXL3 path's fp16 rows), down
+    pub fn expertsNative(t: *const Two, e: *const prompt.Engine, ch: *const prompt.Chunk, ex: weights.Experts, x: u64, ldx: usize, pick: u64, wts: u64, xd: u64, out: u64, rows: usize, split_k: bool, x_codes: bool, cf: ?*const mx.CombineFirst) !void {
         const k = e.mx.?;
         if (!split_k) if (prompt.ptimer) |pt| pt.mark(e.s, .m_gu) catch {};
         }
         if (t.ir != 0) try t.assembleParity(e, ex, xd, pick, rows * ch.mxe.slots) else try t.catRank(e, xd, t.xd_full, rows * ch.mxe.slots, t.gu, 2);
         if (!split_k) if (prompt.ptimer) |pt| pt.mark(e.s, .m_x) catch {};
+        if (cf) |f| {
+            if (split_k) return error.CombineFirstOnDecode;
+            return mx.downFirst(k, e.s, ex, ch.mxe, t.xd_full, ex.down_k, pick, rows, out, t.dw[t.p], false, f);
         }
         try mx.down(k, e.s, ex, ch.mxe, t.xd_full, ex.down_k, pick, rows, out, t.dw[t.p], false, split_k);
     }
 
+    pub fn expertsCodes(t: *const Two, e: *const prompt.Engine, ch: *const prompt.Chunk, ex: weights.Experts, x: u64, ldx: usize, pick: u64, wts: u64, xd: u64, out: u64, rows: usize, x_codes: bool, cf: ?*const mx.CombineFirst) !void {
         const mine = t.rc.?.addr(.pack_send);
         const theirs = t.rc.?.addr(.pack_land);
         try t.rc.?.send(e.s, .pack, shape);
+        try t.rc.?.wait(e.s, .pack);
+        const part0 = if (t.p == 0) mine else theirs;
+        const part1 = if (t.p == 1) mine else theirs;
         if (t.gu[0] == t.gu[1] and mx.threeTakes(k, ex, ch.mxe, t.gu[t.p], t.ir)) {
+        if (cf) |f| return mx.downCodesFirst(k, e.s, ex, ch.mxe, pick, rows, out, t.dw[t.p], false, f);
     }
 
     /// Engram's projection summed over the ranks from its column quarters (model.py esum): the gathered width.
@@ -678,6 +816,30 @@ pub const Two = struct {
 /// The ranks of `comm` whose `can` is false, a bit each (bit k: rank k), from one gather of every rank's word over the
 /// host links on `stream`: a start-up agreement, called by every rank together.
     try comm.gatherHost(d, dev.ptr, dev.ptr + 4, 4, stream);
+/// The ranks whose `word` differs from rank 0's, a bit each (every rank's word gathered over the host links: every rank
+/// the same mask); 0 when every rank gave rank 0's.
+pub fn ranksDiffer(d: *const cuda.Driver, comm: *const Comm, stream: cuda.Stream, word: u32) !u32 {
+    const w = comm.world;
+    var all: [8]u32 = undefined;
+    if (w > all.len) return error.WorldTooLarge;
+    var dev = try cuda.DeviceBuffer.alloc(d, (1 + w) * 4);
+    defer dev.free();
+    try dev.uploadAsync(0, std.mem.asBytes(&word), stream.handle);
+    try comm.gatherHost(d, dev.ptr, dev.ptr + 4, 4, stream);
+    try stream.synchronize();
+    try dev.download(4, std.mem.sliceAsBytes(all[0..w]));
+    return differMask(all[0..w]);
+}
+
+/// The ranks whose word is not rank 0's (words[0]), a bit each.
+pub fn differMask(words: []const u32) u32 {
+    var m: u32 = 0;
+    for (words, 0..) |x, k| {
+        if (x != words[0]) m |= @as(u32, 1) << @intCast(k);
+    }
+    return m;
+}
+
 /// Why the owner sums over Rocinante cannot run on this rank (null: it can): attention, MoE and Engram all at owned rows,
 pub fn rociOff(ow: [2]usize, pass_rows: usize, readers: bool) ?[]const u8 {
     if (ownerYxOff(ow)) |why| return why;
@@ -695,9 +857,39 @@ pub fn rociDecOff(quant_once: bool, taps: usize, hidden: usize) ?[]const u8 {
     return null;
 }
 
+/// Why TF_DS_ROCI_CODES cannot run on this rank (null: it can): the codes exchanges of TF_DS_CAT_CODES and TF_DS_PACK_CODES are the
+/// ones it carries, and the arena's two parts hold wo_b's part of 2,304 bytes a row (2,048 codes and their 64 scales) for both pairs
+/// and the pack's 720 bytes a slot row (640 codes, 80 scales) for 7 slots a row.
 pub fn rociCodesOff(uw: [2]usize, gu: [2]usize, ir: usize, slots: usize) ?[]const u8 {
+    if (uw[0] != uw[1] or catCodesBytes(1, uw[0]) != 2304) return "the arena holds wo_b's part as 2,304 bytes a row (equal pairs of 2,048 columns)";
+    if (slots != 7) return "the arena holds the pack for 7 slots a row";
+    for (gu) |g| {
+        const pc = packCodesPlan(1, g, ir) catch return "the pack is not whole 32-value groups";
+        if (pc.bytes != 720) return "the arena holds the pack as 720 bytes a slot row";
+    }
+    return null;
+}
+
+/// Why TF_DS_ROCI_GATHERS cannot run on this rank (null: it can): the gathers it carries are the owned front's (qr, y), the owned
+/// routing's, the indexer's top-k and the boundary's, so those switches must be in effect on the checkpoint's own weights; the
+/// arena's regions hold rows of x 10,240 bytes, qr 2,560, y 1,024, top-k 4,096 (512 keys), the routing's codes 5,120, scales
+/// 640, picks and weights 28, and the boundary's four cache arrays 356 bytes a row.
 pub fn rociGathersOff(native: bool, hidden: usize, qw: usize, hd: usize, index_topk: usize, id: usize, dims: usize, slots: usize) ?[]const u8 {
+    if (!native) return "needs the checkpoint's own FP8 / MXFP4 weights";
+    if (hidden * 2 != 10240 or qw * 2 != 2560 or hd * 2 != 1024) return "the arena holds x, qr and y rows of 10,240, 2,560 and 1,024 bytes";
+    if (index_topk != 512) return "the arena holds the top-k as 512 keys a row";
+    if (dims != 5120 or slots != 7) return "the arena holds the routing's codes as 5,120 bytes and 7 picks a row";
+    if (hd / 2 + hd / 16 + id / 2 + id / 32 != 356) return "the arena holds the boundary's cache arrays as 356 bytes a row";
+    return null;
+}
+
 pub fn catCodesOff(native: bool, layers: []const weights.Layer, uw: [2]usize) ?[]const u8 {
+/// Both pairs' codes and scales into wo_b's input (pl.copies).
+pub fn catCodesCopies(o: *const ops_mod.Ops, s: cuda.Stream, pl: CatCodes) !void {
+    for (pl.copies) |cp| try o.copyRows(s, cp.src, cp.src_stride, cp.dst, cp.dst_stride, cp.width, cp.rows);
+}
+
+    try catCodesCopies(o, s, pl);
 /// woBCodes of node g (2 p + r) under ranks `rank_of`, n rows: this node's u [n, uw[p]] bf16 quantized into
 pub fn catCodesPlan(g: u32, rank_of: [4]u32, n: usize, uw: [2]usize, u: u64, codes: u64, stage: u64, wob_q: u64, wob_s: u64) CatCodes {
         .peer = rank_of[g ^ 2],
@@ -1165,4 +1357,27 @@ test "a default-on switch (TF_DS_ROCI_WAIT, TF_DS_RING_WAIT): unset and 1 are on
     try std.testing.expect(!switchAsked(null));
     try std.testing.expect(switchAsked("1"));
 }
+
+test "TF_DS_QGATE_CANARY's text: 1 the head, 2 and 3 the body; unset or other text none; any canary is kern bit 31" {
+    try std.testing.expectEqual(Qgate.off, qgateAsked(null));
+    try std.testing.expectEqual(Qgate.head, qgateAsked("1"));
+    try std.testing.expectEqual(Qgate.body_fp8, qgateAsked("2"));
+    try std.testing.expectEqual(Qgate.body_ulp, qgateAsked("3"));
+    for ([_][]const u8{ "", "0", "4", "12", "2 ", " 3", "yes", "true" }) |t| try std.testing.expectEqual(Qgate.off, qgateAsked(t));
+    const keep = qgate_canary_asked;
+    defer qgate_canary_asked = keep;
+    for ([_]Qgate{ .head, .body_fp8, .body_ulp }) |q| {
+        qgate_canary_asked = q;
+        try std.testing.expectEqual(kern_qgate_canary, kernAsked() & kern_qgate_canary);
+    }
+    qgate_canary_asked = .off;
+    try std.testing.expectEqual(@as(u32, 0), kernAsked() & kern_qgate_canary);
+}
+
+test "the ranks whose word is not rank 0's, a bit each" {
+    try std.testing.expectEqual(@as(u32, 0), differMask(&.{ 2, 2, 2, 2 }));
+    try std.testing.expectEqual(@as(u32, 0b0010), differMask(&.{ 2, 3, 2, 2 }));
+    try std.testing.expectEqual(@as(u32, 0b1110), differMask(&.{ 1, 2, 3, 3 }));
+    try std.testing.expectEqual(@as(u32, 0b1000), differMask(&.{ 3, 3, 3, 1 }));
+    try std.testing.expectEqual(@as(u32, 0), differMask(&.{3}));
 }

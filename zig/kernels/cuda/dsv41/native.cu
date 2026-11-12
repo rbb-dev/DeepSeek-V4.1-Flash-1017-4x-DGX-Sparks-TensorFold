@@ -113,6 +113,30 @@ extern "C" __global__ void tf_dsn_act_quant_kernel(const void* __restrict__ x, i
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// A quality gate's body canary (TF_DS_QGATE_CANARY 2 / 3, never a serving setting): x [n] fp32 perturbed in place on
+// purpose, n whole 32-value groups. mode 2: one more FP8 step, act_quant's quant-dequant of each group (the value rounded
+// to bf16, its E4M3 code at the group's power-of-two scale, back: exact in fp32, what fake writes); mode 3: each
+// nonzero finite value one ulp away from zero (its bits plus one), the largest finite values, zeros, infinities and NaN
+// kept. A warp a 32-group, as act_quant.
+extern "C" __global__ void tf_dsn_qgate_body_kernel(float* __restrict__ x, int64_t n, int mode) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;  // (n whole groups: a warp's lanes are all in or all out)
+    const float v = x[i];
+    if (mode == 2) {
+        const float b = bf16r(v);
+        float amax = fabsf(b);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        const float sc = round_scale(fmaxf(amax, 1e-4f));
+        x[i] = bf16r(from_e4m3(to_e4m3(b / sc)) * sc);
+    } else if (mode == 3) {
+        const uint32_t u = __float_as_uint(v);
+        const uint32_t mag = u & 0x7fffffffu;
+        if (mag != 0u && mag < 0x7f7fffffu) x[i] = __uint_as_float(u + 1u);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // The MX GEMM: y [M, N] = sum over K blocks kb of (q[m, kb] . w[n, kb]) * s[m, kb] * ws(n, kb).
 // A CTA is 4 warps; a warp owns 32 output columns (four m16n8 tiles) and MT m16 row tiles, over its K split's blocks.
 // Within a 32-wide block the K order is permuted the same way for both operands (each thread reads 8 contiguous bytes
@@ -538,6 +562,202 @@ extern "C" __global__ void tf_dsn_combine_kernel(const float* __restrict__ out, 
         }
         for (int j = 0; j < k; j++) v += out[size_t(r * S + order[j]) * ldo + n];
     y[size_t(r) * ldy + n] = v;
+}
+
+// A producer kernel that rings the transport's doorbell itself, once a set of its CTAs ("the sent CTAs", the first `span` in the
+// launch) have stored their outputs: every thread fences its stores to the system, the CTA's threads meet, and the CTA's arrival
+// is counted in `cnt` (device memory, zero between launches); the last arrival fences again, zeroes the count and stores `ticket`
+// (the value a stream write would have stored) into the doorbell line `door` (host-mapped memory the proxy naps on).
+struct Door {
+    unsigned* cnt;
+    unsigned long long* door;
+    unsigned long long ticket;
+};
+
+__device__ __forceinline__ unsigned long long gtimer() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+// The CTA's arrival at the count (thread 0), the last one ringing. Returns whether this CTA rang.
+__device__ __forceinline__ bool door_arrive(const Door& d, unsigned span) {
+    if (atomicAdd(d.cnt, 1u) != span - 1) return false;
+    *d.cnt = 0;
+    __threadfence_system();
+    *reinterpret_cast<volatile unsigned long long*>(d.door) = d.ticket;
+    return true;
+}
+
+// The CTA's arrival. MODE 0: every thread fences its own stores before the barrier (the sequence that has been shown to hold; each
+// thread's fence waits for its stores to drain). MODE 1, the block-level release: the CTA's threads meet (their stores are ordered before
+// thread 0 by the barrier), thread 0 fences them to the system once and counts the CTA in. MODE 2: thread 0 counts the CTA in with a
+// release at GPU scope, which does not wait for the stores to reach the host; the last arrival, having acquired every earlier
+// arrival, fences to the system before it rings, which orders everything it has acquired before the ring. In every mode the last
+// arrival zeroes the count and rings as door_arrive does.
+template <int MODE>
+__device__ __forceinline__ bool door_arrive_cta(const Door& d, unsigned span) {
+    if constexpr (MODE == 1) {
+        __syncthreads();
+        if (threadIdx.x != 0) return false;
+        __threadfence_system();
+    } else if constexpr (MODE == 0) {
+        __threadfence_system();
+        __syncthreads();
+        if (threadIdx.x != 0) return false;
+    } else {
+        __syncthreads();
+        if (threadIdx.x != 0) return false;
+        unsigned old;
+        asm volatile("atom.add.acq_rel.gpu.global.u32 %0, [%1], 1;" : "=r"(old) : "l"(d.cnt) : "memory");
+        if (old != span - 1) return false;
+        *d.cnt = 0;
+        __threadfence_system();
+        *reinterpret_cast<volatile unsigned long long*>(d.door) = d.ticket;
+        return true;
+    }
+    return door_arrive(d, span);
+}
+
+// The order of a launch's CTAs by quarter: the quarter of position i (8 bits each in `quarters`), `unit` CTAs a quarter,
+// the first `span` CTAs the sent ones.
+struct QuarterOrder {
+    unsigned quarters;
+    unsigned unit;
+    unsigned span;
+};
+
+// tf_dsn_combine over a launch whose CTAs run the row quarters in `qo`'s order (a CTA is 256 consecutive elements of one row
+// block: its place in the launch gives the quarter by position, the offset within it unchanged), and the first qo.span CTAs ring
+// the doorbell (Door). R * N a multiple of 256. EARLY: the arrival is counted before the CTA's stores (a hazard: the control
+// that must be seen); TIMED: also each CTA's %globaltimer at its begin and end in ts[2 * b], ts[2 * b + 1] and the ring's in
+// ts[2 * gridDim.x].
+template <bool EARLY, bool TIMED, int BLOCK>
+__device__ __forceinline__ void combine_door(const float* __restrict__ out, int64_t ldo, const int* __restrict__ pick, int R, int S,
+                                             int E, int N, float* __restrict__ y, int64_t ldy, int accumulate, const QuarterOrder& qo,
+                                             const Door& d, unsigned long long* ts) {
+    const unsigned b = blockIdx.x;
+    const bool sent = b < qo.span;
+    if constexpr (TIMED) {
+        if (threadIdx.x == 0) ts[2 * b] = gtimer();
+    }
+    if constexpr (EARLY) {
+        if (sent && threadIdx.x == 0) door_arrive(d, qo.span);
+    }
+    if constexpr (EARLY) {
+        // the control must be able to see the hazard: a sent CTA stores 300 us after it has been counted, so the CTAs counted last have
+        // stored nothing yet when the doorbell shows
+        if (sent) {
+            if (threadIdx.x == 0) {
+                const unsigned long long t0 = gtimer();
+                while (gtimer() - t0 < 300000ull) {}
+            }
+            __syncthreads();
+        }
+    }
+    const unsigned pos = b / qo.unit;
+    const unsigned pb = ((qo.quarters >> (8 * pos)) & 0xffu) * qo.unit + (b - pos * qo.unit);
+    const int64_t i = int64_t(pb) * blockDim.x + threadIdx.x;
+    const int r = int(i / N), n = int(i % N);
+        int order[16];
+        int k = 0;
+        for (int s = 0; s < S && s < 16; s++) {
+            const int e = pick[r * S + s];
+            if (e < 0 || e >= E) continue;
+            int j = k++;
+            while (j > 0 && pick[r * S + order[j - 1]] > e) { order[j] = order[j - 1]; j--; }
+            order[j] = s;
+        }
+        for (int j = 0; j < k; j++) v += out[size_t(r * S + order[j]) * ldo + n];
+    y[size_t(r) * ldy + n] = v;
+    if constexpr (!EARLY) {
+        if (sent) {
+            if (door_arrive_cta<BLOCK>(d, qo.span)) {
+                if constexpr (TIMED) ts[2 * gridDim.x] = gtimer();
+            }
+        }
+    }
+    if constexpr (TIMED) {
+        __syncthreads();
+        if (threadIdx.x == 0) ts[2 * b + 1] = gtimer();
+    }
+}
+
+// The block-level release (BLOCK) is the engine's; _pt fences every thread's stores; _early is the control; _t stamps.
+extern "C" __global__ void tf_dsn_combine_door_kernel(const float* __restrict__ out, int64_t ldo, const int* __restrict__ pick, int R,
+                                                      int S, int E, int N, float* __restrict__ y, int64_t ldy, int accumulate,
+                                                      QuarterOrder qo, Door d) {
+    combine_door<false, false, 1>(out, ldo, pick, R, S, E, N, y, ldy, accumulate, qo, d, nullptr);
+}
+extern "C" __global__ void tf_dsn_combine_door_g_kernel(const float* __restrict__ out, int64_t ldo, const int* __restrict__ pick, int R,
+                                                      int S, int E, int N, float* __restrict__ y, int64_t ldy, int accumulate,
+                                                      QuarterOrder qo, Door d) {
+    combine_door<false, false, 2>(out, ldo, pick, R, S, E, N, y, ldy, accumulate, qo, d, nullptr);
+}
+extern "C" __global__ void tf_dsn_combine_door_g_early_kernel(const float* __restrict__ out, int64_t ldo, const int* __restrict__ pick, int R,
+                                                            int S, int E, int N, float* __restrict__ y, int64_t ldy, int accumulate,
+                                                            QuarterOrder qo, Door d) {
+    combine_door<true, false, 2>(out, ldo, pick, R, S, E, N, y, ldy, accumulate, qo, d, nullptr);
+}
+extern "C" __global__ void tf_dsn_combine_door_pt_kernel(const float* __restrict__ out, int64_t ldo, const int* __restrict__ pick, int R,
+                                                      int S, int E, int N, float* __restrict__ y, int64_t ldy, int accumulate,
+                                                      QuarterOrder qo, Door d) {
+    combine_door<false, false, 0>(out, ldo, pick, R, S, E, N, y, ldy, accumulate, qo, d, nullptr);
+}
+extern "C" __global__ void tf_dsn_combine_door_early_kernel(const float* __restrict__ out, int64_t ldo, const int* __restrict__ pick, int R,
+                                                      int S, int E, int N, float* __restrict__ y, int64_t ldy, int accumulate,
+                                                      QuarterOrder qo, Door d) {
+    combine_door<true, false, 1>(out, ldo, pick, R, S, E, N, y, ldy, accumulate, qo, d, nullptr);
+}
+extern "C" __global__ void tf_dsn_combine_door_t_kernel(const float* __restrict__ out, int64_t ldo, const int* __restrict__ pick, int R,
+                                                      int S, int E, int N, float* __restrict__ y, int64_t ldy, int accumulate,
+                                                      QuarterOrder qo, Door d, unsigned long long* __restrict__ ts) {
+    combine_door<false, true, 1>(out, ldo, pick, R, S, E, N, y, ldy, accumulate, qo, d, ts);
+}
+extern "C" __global__ void tf_dsn_combine_door_pt_t_kernel(const float* __restrict__ out, int64_t ldo, const int* __restrict__ pick, int R,
+                                                      int S, int E, int N, float* __restrict__ y, int64_t ldy, int accumulate,
+                                                      QuarterOrder qo, Door d, unsigned long long* __restrict__ ts) {
+    combine_door<false, true, 0>(out, ldo, pick, R, S, E, N, y, ldy, accumulate, qo, d, ts);
+}
+
+// The replay's observer of a doorbell: one CTA waits for the doorbell line to show `want` (at most timeout_ns), and then reads two
+// word ranges (got0 / got1 of `words` each, bypassing the caches) against their references, counting the words that differ in
+// out[0]; out[1] says whether the doorbell showed. Launched on a stream beside a producer that rings the doorbell, it sees the
+// producer's output exactly as complete as it is when the doorbell shows.
+extern "C" __global__ void __launch_bounds__(1024) tf_dsn_door_watch_kernel(const unsigned long long* door, unsigned long long want,
+                                                                           const unsigned* ref0, const unsigned* got0,
+                                                                           const unsigned* ref1, const unsigned* got1,
+                                                                           unsigned long long words, unsigned* out,
+                                                                           unsigned long long timeout_ns) {
+    __shared__ int seen;
+    if (threadIdx.x == 0) {
+        const unsigned long long t0 = gtimer();
+        int ok = 0;
+        while (gtimer() - t0 < timeout_ns) {
+            if (*reinterpret_cast<const volatile unsigned long long*>(door) == want) {
+                ok = 1;
+                break;
+            }
+        }
+        seen = ok;
+    }
+    __syncthreads();
+    unsigned bad = 0;
+    if (seen) {
+        // from the last word of the last range backwards: the CTAs that ring last are the ones that store last
+        for (int w = 1; w >= 0; w--) {
+            const unsigned* ref = w ? ref1 : ref0;
+            const unsigned* got = w ? got1 : got0;
+            for (unsigned long long i = threadIdx.x; i < words; i += blockDim.x) {
+                const unsigned long long j = words - 1 - i;
+                unsigned g;
+                asm volatile("ld.global.cv.u32 %0, [%1];" : "=r"(g) : "l"(got + j));
+                bad += g != ref[j];
+            }
+        }
+    }
+    if (bad) atomicAdd(&out[0], bad);
+    if (threadIdx.x == 0) out[1] = seen;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1105,10 +1325,17 @@ struct Ops {
     int64_t ldw, ldws;
     int n0;
     int stream;  // 1: the weights stream through once (grouped experts): they evict first, the activation rows last
+    // a second base of the activation rows from K block kb_split on (load_stage<C, true>): the K blocks from kb_split read q1 / s1 at
+    // block kb - kb_split, with the strides ldq / lds of the first
+    const uint8_t* q1;
+    const float* s1;
+    int kb_split;
     __device__ __forceinline__ const uint8_t* w(int i) const { return i ? w1 : w0; }
     __device__ __forceinline__ const uint8_t* ws(int i) const { return i ? ws1 : ws0; }
 };
 
+    }
+    }
     char* A = st;
     char* B = A + C::A_BYTES;
     char* AS = B + C::B_BYTES;
