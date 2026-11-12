@@ -1,4 +1,15 @@
 const math: start.Math = .{ .pair_sum = true, .qhc = true, .owner_gather = true, .idx_shard = true, .idx_rb = 2, .negzero = false, .replay_floor = true, .owner_yx = true, .cat_partner = true, .front_owned = true, .ffn_codes = true, .pack_codes = true, .engram_owner_sum = true, .boundary_owned = true, .cat_codes = true, .pf_split = "C7", .woa_w8 = true, .quant_once = true, .pf_gemm5 = true, .group_tiles = true, .topk_tiles = true, .idx_proj_owned = true, .bf16_rows = true, .pf_run128 = true, .pass_rows = 4096, .pass_from = 8192, .pass_tail = true, .decode_fuse = true, .attn_u = true, .idx_u = true, .mma_sf = true, .mma_sf_exact = true, .roci = true, .roci_collect = true, .idx_v = true, .gemm_w16 = true, .assemble_quant = true, .attn_epilogue = true, .hc_stride = true, .hc_fused = true, .attn_epi_fused = true, .gemm_r2 = true, .gemm_halves = true, .qgate_canary = 1, .hc_2s = true, .pf_raster = 8 };
+test "the math text holds every switch at the widest TF_DS_IDX_RB" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{}" });
+    var widest = math;
+    widest.idx_rb = std.math.maxInt(usize);
+    var texts: start.Texts = .{};
+    const c = try start.common(io, Env{ .pairs = &recipe_env }, facts(&tmp), widest, &texts);
+    try std.testing.expect(std.mem.indexOf(u8, c.math, "idx_rb=18446744073709551615 ") != null);
+}
+
     try std.testing.expectEqualStrings("packed=1 owned=0 instream=0 aio=1", c.engram_switches);
     try std.testing.expectEqualStrings("packed=1 owned=0 instream=0 aio=0", odd.engram_switches);
 

@@ -11,6 +11,14 @@
 //!     assembled (prompt2d.packAssemble) against the baseline assembly of the values (assembleRest) and down's quant of it,
 //!     at a full chunk's slot rows and a partial chunk's: down's codes and scales byte-equal; one pack value set to 64
 //!     differs.
+//!   - the Engram gate (TF_DS_ENGRAM_OWNER_SUM): prompt.engramGateRows at every owned block of 512, 256 and 1,024
+//!     rows against the whole chunk's launch (engramApply's), on random streams, kv and qk: the gated streams
+//!     byte-equal; one stream value set to 64 differs.
+//!   - wo_b's input as codes (TF_DS_CAT_CODES): two column partners' parts quantized (prompt2d.catCodesQuant), each
+//!     one's codes and scales copied into the other's stage (the exchange), placed and wo_b's GEMM run
+//!     (prompt2d.catCodesGemm), against mx.linear of the assembled bf16 input, at a full chunk's rows, a partial
+//!     chunk's past the column ring's 1,088 and a small chunk's 40: wo_b's input codes, scales and output byte-equal
+//!     on both nodes; one value of pair 1's part set to 64 differs.
 //! Exit 0 when every check holds, 1 otherwise, 2 for a usage or build problem.
 const std = @import("std");
 const cuda = @import("cuda");
@@ -33,6 +41,8 @@ const SCALE: f32 = 1.5; // routed_scaling_factor
 const IG: usize = 512; // a pair's main block of a slot row (gate / up's pack)
 const IR: usize = 128; // the rest block
 const E: usize = NE + 1; // the experts' ids, the shared expert last
+const UW: usize = 2048; // a pair's part of wo_b's input (its two groups of o_lora)
+const OW: usize = 2560; // wo_b's output columns on a pair
 
 /// CUDA's __float2bfloat16_rn of a non-NaN value: round to nearest, ties to even.
 fn bf16Rne(x: f32) u16 {
@@ -264,6 +274,111 @@ fn pack(r: *Run, ops: *const dsv41.ops.Ops, rng: std.Random, keep: *std.ArrayLis
     r.report(try std.fmt.bufPrint(&line, "pack rows={d} control: one pack value set to 64", .{rows}), n_off, false);
 }
 
+/// TF_DS_ENGRAM_OWNER_SUM's gate: prompt.engramGateRows at every owned block of q rows against the whole chunk's.
+fn gate(r: *Run, rng: std.Random, keep: *std.ArrayList(cuda.DeviceBuffer)) !void {
+    const d = r.d;
+    const a = r.a;
+    const hc: usize = 4;
+    const h_row = hc * D * 2;
+    const kv_row = (hc + 1) * D * 2;
+    const h_host = try bf16s(CAP * hc * D, rng, 0.5, a);
+    const h = try upload(d, h_host);
+    const kv = try upload(d, try bf16s(CAP * (hc + 1) * D, rng, 0.5, a));
+    const qk_host = try a.alloc(f32, hc * D);
+    for (qk_host) |*v| v.* = rng.floatNorm(f32) * 0.05;
+    const qk = try upload(d, std.mem.sliceAsBytes(qk_host));
+    var outs: [2]cuda.DeviceBuffer = undefined; // the whole chunk's, the owned blocks'
+    for (&outs) |*b| b.* = try cuda.DeviceBuffer.alloc(d, CAP * h_row);
+    for ([_]cuda.DeviceBuffer{ h, kv, qk } ++ outs) |b| try keep.append(a, b);
+    try prompt.engramGateRows(r.t, qk.ptr, h.ptr, kv.ptr, outs[0].ptr, .{ .start = 0, .n = CAP }, EPS, D, h_row, kv_row);
+    try r.s.synchronize();
+    const whole = try get(outs[0].ptr, CAP * h_row, d, a);
+    for (QS) |q| {
+        try clear(outs[1], d, r.s);
+        var k: usize = 0;
+        while (k * q < CAP) : (k += 1) try prompt.engramGateRows(r.t, qk.ptr, h.ptr, kv.ptr, outs[1].ptr, .{ .start = k * q, .n = q }, EPS, D, h_row, kv_row);
+        try r.s.synchronize();
+        var line: [96]u8 = undefined;
+        r.report(try std.fmt.bufPrint(&line, "gate q={d}: the gated streams at every owned block against the whole chunk's", .{q}), differs(whole, try get(outs[1].ptr, whole.len, d, a)), true);
+    }
+    // control: one stream value of row 700 set to 64, its owned block of 512 rows again
+    const off = try a.dupe(u8, h_host);
+    std.mem.bytesAsSlice(u16, off)[700 * hc * D + 4321] = 0x4280;
+    try prompt.engramGateRows(r.t, qk.ptr, h.ptr, kv.ptr, outs[1].ptr, .{ .start = 512, .n = 512 }, EPS, D, h_row, kv_row);
+    try r.s.synchronize();
+    r.report("gate control: one stream value of row 700 set to 64", differs(whole, try get(outs[1].ptr, whole.len, d, a)), false);
+}
+
+/// woBCodes' steps for two column partners on one device: each one's quant, the exchange (each send span into the
+/// other's receive span), each one's copies and GEMM into its `pa`.
+fn catRun(r: *Run, ops: *const dsv41.ops.Ops, wo_b: weights.Linear, plans: [2]dsv41.prompt2d.CatCodes, rows: usize, pa: [2]u64, z: u64) !void {
+    for (plans) |pl| try dsv41.prompt2d.catCodesQuant(r.k, r.s, pl);
+    for (plans, 0..) |pl, i| {
+        const to = plans[1 - i].recv;
+        if (to.len != pl.send.len) return error.UnsupportedShape;
+        try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(to.addr, pl.send.addr, pl.send.len, r.s.handle), "cuMemcpyDtoDAsync");
+    }
+    for (plans, pa) |pl, y| try dsv41.prompt2d.catCodesGemm(r.k, ops, r.s, wo_b, pl, rows, y, z);
+}
+
+/// TF_DS_CAT_CODES' wo_b: the column partners' codes path (nodes 0 and 2, TP2 rank 0 of each pair) against mx.linear
+/// of the rank's assembled input.
+fn cat(r: *Run, ops: *const dsv41.ops.Ops, rng: std.Random, keep: *std.ArrayList(cuda.DeviceBuffer), rows: usize) !void {
+    const d = r.d;
+    const a = r.a;
+    const kk = 2 * UW;
+    const wo_b = try fp8Linear(d, OW, kk, rng, a, keep);
+    var part_host: [2][]u8 = undefined;
+    var parts: [2]cuda.DeviceBuffer = undefined;
+    for (&part_host, &parts) |*h, *b| {
+        h.* = try bf16s(rows * UW, rng, 0.5, a);
+        b.* = try upload(d, h.*);
+        try keep.append(a, b.*);
+    }
+    // the rank's whole input: row i is pair 0's part, then pair 1's (catRank's bytes)
+    const full_host = try a.alloc(u8, rows * kk * 2);
+    for (0..rows) |i| for (0..2) |pg| @memcpy(full_host[(i * kk + pg * UW) * 2 ..][0 .. UW * 2], part_host[pg][i * UW * 2 ..][0 .. UW * 2]);
+    const full = try upload(d, full_host);
+    try keep.append(a, full);
+    // baseline: mx.linear (its quant into the scratch, then its GEMM)
+    var bufs: [4]cuda.DeviceBuffer = undefined; // the scratch's q, s and z; the baseline pa
+    for (&bufs, [_]usize{ CAP * kk, CAP * (kk / 32) * 4, @max(mx.zFloats(wo_b, CAP), 1) * 4, rows * OW * 4 }) |*b, n| {
+        b.* = try cuda.DeviceBuffer.alloc(d, n);
+        try keep.append(a, b.*);
+    }
+    const sc: mx.Scratch = .{ .q = bufs[0].ptr, .s = bufs[1].ptr, .z = bufs[2].ptr, .fake = 0, .rows = CAP, .max_k = kk };
+    try mx.linear(r.k, r.s, sc, wo_b, full.ptr, .bf16, kk, rows, bufs[3].ptr, OW, .f32, false, null);
+    // the codes path: each node's codes, stage, wob_q, wob_s and pa (Chunk.init's sizes)
+    var node: [2][5]cuda.DeviceBuffer = undefined;
+    var plans: [2]dsv41.prompt2d.CatCodes = undefined;
+    for (&node, &plans, 0..) |*nb, *pl, pg| {
+        for (nb, [_]usize{ dsv41.prompt2d.catCodesBytes(CAP, UW), CAP * UW * 2, CAP * kk, CAP * (kk / 32) * 4, rows * OW * 4 }) |*b, n| {
+            b.* = try cuda.DeviceBuffer.alloc(d, n);
+            try keep.append(a, b.*);
+            try clear(b.*, d, r.s);
+        }
+        pl.* = dsv41.prompt2d.catCodesPlan(@intCast(2 * pg), .{ 0, 1, 2, 3 }, rows, .{ UW, UW }, parts[pg].ptr, nb[0].ptr, nb[1].ptr, nb[2].ptr, nb[3].ptr);
+    }
+    try catRun(r, ops, wo_b, plans, rows, .{ node[0][4].ptr, node[1][4].ptr }, sc.z);
+    try r.s.synchronize();
+    const hq = try get(bufs[0].ptr, rows * kk, d, a);
+    const hs = try get(bufs[1].ptr, rows * (kk / 32) * 4, d, a);
+    const hp = try get(bufs[3].ptr, rows * OW * 4, d, a);
+    var line: [128]u8 = undefined;
+    for (node, 0..) |nb, pg| {
+        r.report(try std.fmt.bufPrint(&line, "cat rows={d} node {d}: wo_b's input codes from the parts' codes against mx.linear's quant", .{ rows, 2 * pg }), differs(hq, try get(nb[2].ptr, hq.len, d, a)), true);
+        r.report(try std.fmt.bufPrint(&line, "cat rows={d} node {d}: wo_b's input scales from the parts' codes against mx.linear's quant", .{ rows, 2 * pg }), differs(hs, try get(nb[3].ptr, hs.len, d, a)), true);
+        r.report(try std.fmt.bufPrint(&line, "cat rows={d} node {d}: wo_b's output on them against mx.linear's", .{ rows, 2 * pg }), differs(hp, try get(nb[4].ptr, hp.len, d, a)), true);
+    }
+    // control: one value of pair 1's part, row 5, set to 64 (its group's scale another), the codes path again
+    const off = try a.dupe(u8, part_host[1]);
+    std.mem.bytesAsSlice(u16, off)[5 * UW + 3] = 0x4280;
+    try catRun(r, ops, wo_b, plans, rows, .{ node[0][4].ptr, node[1][4].ptr }, sc.z);
+    try r.s.synchronize();
+    const n_off = differs(hq, try get(node[0][2].ptr, hq.len, d, a)) + differs(hp, try get(node[0][4].ptr, hp.len, d, a));
+    r.report(try std.fmt.bufPrint(&line, "cat rows={d} control: one value of pair 1's part set to 64", .{rows}), n_off, false);
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
     const io = init.io;
@@ -292,6 +407,8 @@ pub fn main(init: std.process.Init) !u8 {
     try front(&r, prng.random(), &keep);
     try ffn(&r, prng.random(), &keep);
     for ([_]usize{ CAP, 1000 }) |rows| try pack(&r, &ops, prng.random(), &keep, rows);
+    try gate(&r, prng.random(), &keep);
+    for ([_]usize{ CAP, 1100, 40 }) |rows| try cat(&r, &ops, prng.random(), &keep, rows);
     if (r.ok) {
         return 0;
     }

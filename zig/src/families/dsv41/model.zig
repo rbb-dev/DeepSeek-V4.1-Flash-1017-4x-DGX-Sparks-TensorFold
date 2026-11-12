@@ -1614,6 +1614,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         defer prompt.ptimer = null;
         if (pt) |t| try t.mark(e.s, .start);
         try prompt.begin(e, ch, m.ids64[0..n], start, m.host_pos);
+        ch.encoder_only = prompt.encoderOnly(start, n, replay);
         if (ch.spans.len > 0) try prompt.embedSpans(e, ch);
         if (pt) |t| try t.mark(e.s, .embed);
         const taps = m.dr != null;
@@ -1658,6 +1659,15 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             };
             if (li == c.layers / 2) {
                 if (if (prompt.boundaryRange(e, ch, li)) |r| (if (ch.encoder_only) r else null) else null) |r| {
+                    // TF_DS_BOUNDARY_OWNED: an encoder-only full chunk's boundary on owned rows, its cache rows
+                    // gathered; the chunk stops here, as replayCut stops it
+                    try prompt.boundaryUpdate(e, ch, &m.view, &shared, li, r);
+                    if (pt) |t| {
+                        try e.s.synchronize();
+                        try t.finish();
+                    }
+                    return false;
+                }
                 if (!try prompt.replayCut(e, ch, &m.view, &shared, li, replay, m.host_pos)) {
                     // encoder-only: no synchronize either (as at the chunk's end below), so the next chunk's host steps
                     // run while this one's last layers do; the profile alone waits

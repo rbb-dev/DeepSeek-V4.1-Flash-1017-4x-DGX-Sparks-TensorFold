@@ -56,6 +56,8 @@ pub const lanes = @import("lanes.zig");
 pub const ring_watch = @import("ring_watch.zig");
 /// Where this rank's host is, for a failure that names it.
 pub const where = @import("where.zig");
+/// The owned-rows plan of a chunk of any row count.
+pub const slab_plan = @import("slab_plan.zig");
 pub const any_check = @import("any_check.zig");
 pub const replay_runner = @import("replay_runner.zig");
 /// Rocinante: the zero-copy two-rail transport.
@@ -129,6 +131,7 @@ test {
     refAll(lanes);
     refAll(ring_watch);
     refAll(where);
+    refAll(slab_plan);
     refAll(rocinante);
     refAll(rocinante_verbs);
     refAll(mlx5_devx);
@@ -143,6 +146,7 @@ test {
     _ = @import("pass_meter.zig");
     _ = @import("rocinante_test.zig");
     _ = @import("rocinante_cd_test.zig");
+    _ = @import("kset_test.zig");
     _ = @import("any_check.zig");
     refAll(replay_runner);
     _ = @import("ring_hotpath_test.zig");

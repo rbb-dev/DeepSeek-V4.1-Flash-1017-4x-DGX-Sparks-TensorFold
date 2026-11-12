@@ -377,6 +377,9 @@ pub const Chunk = struct {
     ga_how: Gathered = .{},
     gm_how: Gathered = .{},
     tight_neg: bool = false,
+    // the chunk runs no decoder row (replay >= start + n: it stops at the boundary layer), set by fillChunk before
+    // layer 0 from the frame's replay; host-side, reset by begin
+    encoder_only: bool = false,
     /// TF_DS_ROCI_ANY: the boundary layer's owned update and the handoff of the decoder rows are done; the layers after it are not owned
     boundary_done: bool = false,
     // TF_DS_OWNER_YX in effect: the owner sums' stage (prompt2d.OwnStage for cap / world rows); 0 otherwise
@@ -384,7 +387,15 @@ pub const Chunk = struct {
     /// TF_DS_ROCI_COMBINE_FIRST: the MoE's partials' part-1 send was queued inside moe (behind the rows it sends); the gather that follows
     /// takes it as sent, once.
     own1_sent: bool = false,
+    // TF_DS_CAT_PARTNER in effect: the column partner's part of wo_b's input, bf16 [cap, uw[1 - p]] (TF_DS_CAT_CODES:
+    // its codes and scales, prompt2d.catCodesBytes, fewer bytes); 0 otherwise
     cat_stage: u64 = 0,
+    // TF_DS_CAT_CODES in effect: this node's part of wo_b's input as codes and scales (prompt2d.catCodesBytes for cap
+    // rows of uw[p]), and wo_b's input assembled from both pairs' (codes [cap, uw0 + uw1], scales [cap, (uw0 + uw1) /
+    // 32] fp32); 0 otherwise
+    cat_codes: u64 = 0,
+    wob_q: u64 = 0,
+    wob_s: u64 = 0,
     // TF_DS_PACK_CODES in effect: this node's expert pack as codes and scales, and its column partner's
     // (prompt2d.PackCodes for cap * slots slot rows each); 0 otherwise
     pack_codes: u64 = 0,
@@ -500,9 +511,15 @@ pub const Chunk = struct {
             ch.qhc_part = try a.take((cap / e.comm.world) * tri_basic.hc_blocks * 32 * 4);
         }
         resetGathers(&ch);
+        ch.encoder_only = false;
         ch.boundary_done = false;
         ch.own_stage = 0;
+        ch.wob_q = 0;
+        ch.wob_s = 0;
         if (e.two) |t| {
+            const k = t.uw[0] + t.uw[1];
+            ch.wob_q = try a.take(cap * k);
+            ch.wob_s = try a.take(cap * (k / 32) * 4);
         }
         // compressed layers: the smallest ratio sets the most compressed entries a row can see
         var min_ratio: usize = 0;
@@ -1014,7 +1031,23 @@ fn qhcRange(e: *const Engine, ch: *const Chunk, li: usize) ?QRows {
     return anySlab(e, ch);
 }
 
+/// Layer `li`'s owned rows on this node (qhcRange; at the boundary layer of an encoder-only chunk with
+/// TF_DS_BOUNDARY_OWNED, boundaryRange): the rows a gather for li's readers produces at the owner path and the rows
+/// those readers take, one function for both.
 pub fn ownedRange(e: *const Engine, ch: *const Chunk, li: usize) ?QRows {
+    return qhcRange(e, ch, li) orelse boundaryRange(e, ch, li);
+}
+
+/// Whether a chunk of `n` rows from `start` runs no decoder row: the prompt's replay (its length less the window) at or
+/// past the chunk's end, the chunk replayCut stops at the boundary layer.
+pub fn encoderOnly(start: usize, n: usize, replay: usize) bool {
+    return replay >= start + n;
+}
+
+/// The boundary layer's owned rows on this node (TF_DS_BOUNDARY_OWNED in effect, an encoder-only full quarter-HC
+/// chunk): its mixes and kv-source update run there (boundaryUpdate), and the gather before it (layer layers / 2 - 1's
+/// MoE partials) produces them.
+pub fn boundaryRange(e: *const Engine, ch: *const Chunk, li: usize) ?QRows {
     if (li != e.c.layers / 2) return null;
     if (e.two == null) return null;
     // every chunk's boundary is on owned rows (a chunk with decoder rows hands them their rows after it: handoff)
@@ -1044,7 +1077,13 @@ pub fn ffnRange(e: *const Engine, ch: *const Chunk, li: usize) ?QRows {
     return ownedRange(e, ch, li);
 }
 
+/// Layer `li`'s owned rows when its Engram sums and gate run on them (owned rows): engramApply's gate and image-span
+/// copies then take those rows alone.
+pub fn engramOwned(e: *const Engine, ch: *const Chunk, li: usize) ?QRows {
     if (e.two == null) return null;
+    return ownedRange(e, ch, li);
+}
+
 /// The gathered planes of `sub` (ga or gm).
 fn fullOf(ch: *const Chunk, sub: Sub) u64 {
     return switch (sub) {
@@ -1066,6 +1105,7 @@ pub fn beginHost(ch: *Chunk, n: usize, start: usize) void {
     ch.n = n;
     ch.start = start;
     ch.pending = false;
+    ch.encoder_only = false;
     ch.boundary_done = false;
     resetGathers(ch);
 }
@@ -1172,6 +1212,7 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
         } else if (r.n != 0) {
         }
         // the owned front (frontRange) reads x's own rows alone
+        // (the boundary on owned rows, boundaryRange, reads them alone as well)
         if (xGathered(e, ch, li)) {
             try rociGather(e, .ga, try needShape(e, ch));
         }
@@ -1424,6 +1465,16 @@ fn frontOwned(e: *const Engine, ch: *Chunk, lay: weights.Layer, r: QRows) !void 
 /// The owned front's kernels at rows `r` of x [*, ldx] bf16: x's rows quantized once (act_quant: a row's 32-value
 /// groups each on its own) into the linears' scratch, wq_a and wkv on the codes (mx.linear's GEMM, a row's bits at any
 /// row count) into qa's rows r [*, wq_a.n] and y's [*, hd], then the q RMSNorm of qa's rows r into qr's (frontNorm).
+/// The owned rows of every rank when each owns `q` of a chunk: rank k's [k q, (k + 1) q), for each q of `qs` (the start
+/// checks' row sets). Caller frees.
+pub fn ownedRows(gpa: std.mem.Allocator, qs: []const usize, world: usize) ![]QRows {
+    const out = try gpa.alloc(QRows, qs.len * world);
+    for (qs, 0..) |q, i| for (0..world) |k| {
+        out[i * world + k] = .{ .start = k * q, .n = q };
+    };
+    return out;
+}
+
 /// wq_a and wkv FP8 / FP4 on one K (frontOwnedOff checks it at the start).
 pub fn frontRows(k: *const mx.Kernels, t: tri.Tri, s: cuda.Stream, sc: mx.Scratch, lay: weights.Layer, x: u64, ldx: usize, r: QRows, qa: u64, y: u64, qr: u64, hd: usize, eps: f32) !void {
     if (!frontCodes(lay)) return error.NotAnMxLinear;
@@ -1458,7 +1509,11 @@ pub fn frontNorm(t: tri.Tri, lay: weights.Layer, qa: u64, qr: u64, r: QRows, eps
 /// each row count in `qs` found in this rank's kernel set: `finds.has(name, args, consts)` (the engine's: aot.Set.find,
 /// as a launch finds its variant).
 pub fn frontOwnedOff(gpa: std.mem.Allocator, finds: anytype, native: bool, layers: []const weights.Layer, half: usize, eps: f32, qs: []const usize, world: usize) !?[]const u8 {
+    const rows = try ownedRows(gpa, qs, world);
+    defer gpa.free(rows);
     return frontOwnedOffAt(gpa, finds, native, layers, half, eps, rows);
+}
+
 pub fn frontOwnedOffAt(gpa: std.mem.Allocator, finds: anytype, native: bool, layers: []const weights.Layer, half: usize, eps: f32, rows: []const QRows) !?[]const u8 {
     if (!native) return "needs the checkpoint's own FP8 / MXFP4 weights";
     var log: tri.Log = .{ .gpa = gpa };
@@ -1470,6 +1525,7 @@ pub fn frontOwnedOffAt(gpa: std.mem.Allocator, finds: anytype, native: bool, lay
     for (layers[0..@min(half, layers.len)]) |lay| {
         if (!frontOwnable(lay.comp_wkv != null, lay.idx_wq_b != null)) continue;
         if (!frontCodes(lay)) return "wq_a and wkv are not FP8 / FP4 on one K";
+        for (rows) |r| try frontNorm(t, lay, qa, qr, r, eps);
     }
     return null;
 }
@@ -1479,6 +1535,11 @@ pub fn frontOwnedOffAt(gpa: std.mem.Allocator, finds: anytype, native: bool, lay
 /// positional store's last RAW rows, then the index keys (RMSNorm of idx_wk's projection, RoPE) and the RoPE'd latents
 /// into the caches as FP4 (fp4_store).
 fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize) !void {
+    return kvSourceAt(e, ch, cs, sh, li, ch.x, ch.start, ch.n);
+}
+
+/// kvSourceUpdate of `n` rows of x [*, hidden] bf16 from position `start`: the compressor on those rows, their groups
+/// into the layer's caches (the whole chunk's: ch.x, ch.start, ch.n; the boundary's owned rows: theirs).
     const lay = e.w.layers[li];
     const c = e.c;
     const hd = c.head_dim;
@@ -1488,12 +1549,12 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
     if (start % r != 0) return notPorted(@src()); // the group's earlier rows from the positional store
     const full = n / r;
     if (r == 1) {
-        try mm(e, ch, cwkv, ch.x, c.hidden, ch.lat2, .bf16, hd);
+        try mmRows(e, ch, n, cwkv, x, c.hidden, ch.lat2, .bf16, hd);
         try e.exact.rmsNorm(e.s, ch.lat2, hd, lay.comp_norm, ch.lat, hd, n, hd, c.eps);
     } else {
         if (r != 2) return notPorted(@src());
-        try mm(e, ch, cwkv, ch.x, c.hidden, ch.kvc, .fp32, hd);
-        try mm(e, ch, lay.comp_wgate.?, ch.x, c.hidden, ch.scc, .fp32, hd);
+        try mmRows(e, ch, n, cwkv, x, c.hidden, ch.kvc, .fp32, hd);
+        try mmRows(e, ch, n, lay.comp_wgate.?, x, c.hidden, ch.scc, .fp32, hd);
         // rk[pw] = kv[-keep:], rs[pw] = score[-keep:]: pw = positions start + n - keep .. % RAW
         const keep: usize = @min(n, raw_rows);
         var idx: [raw_rows]i64 = undefined;
@@ -1533,12 +1594,15 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
     try tri_attn.fp4Store(e.t, ch.lat2, hd, cs.comp_codes[li], cs.comp_scales[li], ch.groups, full, hd, 16, true);
 }
 
-/// vis[r0..][0..m] at a 16-byte-aligned address, as the kit's indexer variants take VIS: the view, else a copy.
-fn visBlock(e: *const Engine, ch: *const Chunk, r0: usize, m: usize) !u64 {
-    const view = ch.vis + r0 * 8;
-    if (view % 16 == 0) return view;
-    try e.ops.copyRows(e.s, view, m * 8, ch.vis_blk, m * 8, m * 8, 1);
-    return ch.vis_blk;
+/// TF_DS_BOUNDARY_OWNED's boundary for an encoder-only full chunk at owned rows `r` (boundaryRange), in place of the
+/// resync and replayCut: the layer's mixes on r (attnMixes' owned branch: the gathered MoE partials of the layer
+/// before posted there, no x gather), its kv-source update of x's rows r (kvSourceAt: the compressor, the index keys,
+/// both caches' groups start + r.start ..), then every rank's rows of the layer's four cache arrays all-gathered in
+/// place (boundaryGathers): the caches hold the whole chunk's groups, the bytes replayCut leaves; the chunk stops here.
+pub fn boundaryUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize, r: QRows) !void {
+    try attnMixes(e, ch, li);
+    if (e.w.layers[li].comp_wkv == null) return error.NoKvSource;
+    const c = e.c;
     if (r.n != 0) try kvSourceAt(e, ch, cs, sh, li, ch.x + r.start * c.hidden * 2, ch.start + r.start, r.n) else sh.kv_layer = li;
     return boundaryRociAny(e, cs, li, ch, try needShape(e, ch));
 }
@@ -1614,7 +1678,25 @@ fn boundaryRociAny(e: *const Engine, cs: *const Caches, li: usize, ch: *const Ch
     }
 }
 
+/// The boundary's gathers: the layer's compressed codes [*, hd / 2] and scales [*, hd / 16] and index codes [*, id / 2]
+/// and scales [*, id / 32] (bytes a group: a group a row at compress ratio 1), every rank's groups start + r.start ..
+/// in place over the chunk's groups from `start` (rank k's part at buf + k * bytes: its owned rows, r.start = k r.n).
+pub fn boundaryGathers(cs: *const Caches, li: usize, start: usize, r: QRows, hd: usize, id: usize) [4]comm.InPlace {
+    const arrays = [4]u64{ cs.comp_codes[li], cs.comp_scales[li], cs.idx_codes[li], cs.idx_scales[li] };
+    const rows = [4]usize{ hd / 2, hd / 16, id / 2, id / 32 };
+    var parts: [4]comm.InPlace = undefined;
+    for (&parts, arrays, rows) |*pt, buf, row| pt.* = .{ .buf = buf + start * row, .bytes = r.n * row };
+    return parts;
+}
+
+/// Why TF_DS_BOUNDARY_OWNED, asked for, stays off (null: it runs): owned rows need quarter-HC, and the owned update is
+/// the boundary layer `lay`'s at compress ratio 1 with its index keys (one group a row, no positional store: its four
+/// cache arrays are the layer's whole kept state from an encoder-only chunk).
 pub fn boundaryOwnedOff(lay: weights.Layer) ?[]const u8 {
+    if (lay.ratio != 1 or lay.comp_wkv == null or lay.idx_wk == null) return "needs a boundary layer of compress ratio 1 with its index keys";
+    return null;
+}
+
 /// WP6(b) (docs/prefill-plan.md, indexer row-sharding): this layer's owned row range on this node, when
 /// TF_DS_IDX_SHARD applies -- a full-cap 2D chunk, strictly before the candidate-source layer (li <
 /// c.candidate_source). That bound is not coincidental: it is the indexer's own switch point, after which the
@@ -1745,6 +1827,13 @@ fn splitKeyed(e: *const Engine, ch: *Chunk, k: tri_index.IndexK, n_comp_end: usi
     try idx_split.nodeTop(e.t, e.ops, e.s, ch.iq4, k, ch.iw, ch.split_vis, ch.vis_blk, sp, ch.keys, ch.tmax, ch.pbufs, top, ch.split_top, n, rb, kk, c.index_heads, c.index_head_dim);
     try e.comm.allGather(ch.split_top, ch.keys, n * kk, .i64, e.s);
     try idx_split.merge(e.t, e.ops, e.s, ch.keys, ch.keys + world * n * kk * 8, world, n, kk, ch.vis, ch.cidx, top);
+    const rows = try ownedRows(gpa, qs, world);
+    defer gpa.free(rows);
+    return idxProjOwnedOffAt(gpa, finds, native, idx_shard, layers, candidate_source, rd, ih, id, rows);
+}
+
+pub fn idxProjOwnedOffAt(gpa: std.mem.Allocator, finds: anytype, native: bool, idx_shard: bool, layers: []const weights.Layer, candidate_source: usize, rd: usize, ih: usize, id: usize, rows: []const QRows) !?[]const u8 {
+        for (rows) |r| try idxQueries(t, iq, iq4, cos, sin, pos, r, rd, ih, id);
 }
 
 /// topk_select's torch step, keys.topk(k).values: the top-k set of the unique int64 keys (ops.topkI64).
@@ -2134,7 +2223,11 @@ pub fn ffnRoute(t: tri.Tri, lay: weights.Layer, logits: u64, pick: u64, wts: u64
 /// owned rows of each row count in `qs`, for every layer below `half`, found in this rank's kernel set
 /// (`finds.has`, as frontOwnedOff's).
 pub fn ffnCodesOff(gpa: std.mem.Allocator, finds: anytype, native: bool, layers: []const weights.Layer, half: usize, ne: usize, top_k: usize, scale_: f32, sl: usize, qs: []const usize, world: usize) !?[]const u8 {
+    const rows = try ownedRows(gpa, qs, world);
+    defer gpa.free(rows);
     return ffnCodesOffAt(gpa, finds, native, layers, half, ne, top_k, scale_, sl, rows);
+}
+
 pub fn ffnCodesOffAt(gpa: std.mem.Allocator, finds: anytype, native: bool, layers: []const weights.Layer, half: usize, ne: usize, top_k: usize, scale_: f32, sl: usize, rows: []const QRows) !?[]const u8 {
     if (!native) return "needs the checkpoint's own FP8 / MXFP4 weights";
     var log: tri.Log = .{ .gpa = gpa };
@@ -2145,6 +2238,7 @@ pub fn ffnCodesOffAt(gpa: std.mem.Allocator, finds: anytype, native: bool, layer
     const pick: u64 = 2 << 32;
     const wts: u64 = 3 << 32;
     for (layers[0..@min(half, layers.len)]) |lay| {
+        for (rows) |r| try ffnRoute(t, lay, logits, pick, wts, r, ne, top_k, scale_, ne, sl);
     }
     return null;
 }
@@ -2594,8 +2688,14 @@ pub fn engramFinish(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, se
     // 2D (model.py esum): this node's columns of its rank's projection; the quarters give both ranks' whole ones
     const en = if (e.two) |two| two.engramWidth() else ew.n;
     // the sums at this node's rows alone, over the transport (engramSumsRoci)
+    const own = engramOwned(e, ch, li);
     const r = own orelse return error.NoOwnedRows;
     try engramSumsRoci(e, ch, e.two.?.rc orelse return error.RociNoShape, r, sent1);
+    if (prof) eh.p_x += lap(e, eh, &tq);
+    // the gate on every row, or with the owned sums on those rows alone (no other row of the streams is read before
+    // the boundary's resync)
+    const rows: QRows = own orelse .{ .start = 0, .n = n };
+    const rowb = c.hc * c.hidden * 2;
     if (own != null and e.two.?.rc != null) {
         // the key and value rows lie in the transport's two blocks: block stride = the slab's rows x a pair's width
         if (rows.n != 0) try tri_basic.engramGate2b(e.t, ch.h + rows.start * rowb, e.two.?.rc.?.addr(.eng_blk), ownQ(e, ch) * e.two.?.ew[e.two.?.p], lay.engram_qk, ch.h_alt + rows.start * rowb, c.eps, rows.n, c.hidden);
@@ -2603,12 +2703,92 @@ pub fn engramFinish(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, se
     swapStreams(ch, ch.h_alt);
     // image spans take no Engram contribution: their rows keep the streams they came with (engram_mask)
     for (ch.spans) |sp| {
+        const o = rowsIn(overlap(sp, ch.start, n) orelse continue, rows) orelse continue;
+        try e.ops.copyRows(e.s, ch.h_alt + o[0] * rowb, rowb, ch.h + o[0] * rowb, rowb, rowb, o[1] - o[0]);
+    }
+    if (prof) {
+        eh.p_gate += lap(e, eh, &tq);
+        eh.p_calls += 1;
     }
 }
 
+/// The Engram gate on rows `r` of the streams h [*, hc, d] bf16 (`h_row` bytes a row) with kv [*, (hc + 1) d] bf16
+/// (`kv_row` bytes a row) into out's rows r: the whole chunk's _engram_gate launch at the rows' offsets (one program a
+/// row and stream).
+pub fn engramGateRows(t: tri.Tri, qk: u64, h: u64, kv: u64, out: u64, r: QRows, eps: f32, d: usize, h_row: usize, kv_row: usize) !void {
+    try tri_basic.engramGate(t, h + r.start * h_row, kv + r.start * kv_row, qk, out + r.start * h_row, eps, r.n, d);
+}
+
+/// TF_DS_ENGRAM_OWNER_SUM's start check on this rank (null: it can run; else the reason, for
+/// Two.agreeEngramOwnerSum): quarter-HC, Engram layers of equal pair widths `ew` (the owner sums' parts take one width),
+/// no ring links (the owner sums' exchanges are the world communicator's), and every gate launch engramGateRows makes at
+/// each of the `world` ranks' owned rows of each row count in `qs`, for every Engram layer below `half`, found in this
+/// rank's kernel set (`finds.has`, as frontOwnedOff's).
 pub fn engramOwnerSumOff(gpa: std.mem.Allocator, finds: anytype, ew: [2]usize, layers: []const weights.Layer, half: usize, eps: f32, d: usize, hc: usize, qs: []const usize, world: usize) !?[]const u8 {
+    const rows = try ownedRows(gpa, qs, world);
+    defer gpa.free(rows);
     return engramOwnerSumOffAt(gpa, finds, ew, layers, half, eps, d, hc, rows);
+}
+
 pub fn engramOwnerSumOffAt(gpa: std.mem.Allocator, finds: anytype, ew: [2]usize, layers: []const weights.Layer, half: usize, eps: f32, d: usize, hc: usize, rows: []const QRows) !?[]const u8 {
+    if (ew[0] == 0 or ew[0] != ew[1]) return "needs Engram layers of equal pair widths";
+    var log: tri.Log = .{ .gpa = gpa };
+    defer log.deinit();
+    const t: tri.Tri = .{ .log = &log };
+    // h, kv and out as the arena aligns a chunk's buffers (256 bytes)
+    const h: u64 = 1 << 32;
+    const kv: u64 = 2 << 32;
+    const out: u64 = 3 << 32;
+    for (layers[0..@min(half, layers.len)]) |lay| {
+        if (lay.engram_wkv == null) continue;
+        for (rows) |r| try engramGateRows(t, lay.engram_qk, h, kv, out, r, eps, d, hc * d * 2, (ew[0] + ew[1]) * 2);
+    }
+    return null;
+}
+
+/// A profile's clock after the stream drains (prompt Engram split).
+fn pstamp(e: *const Engine, eh: *const EngramHost) u64 {
+    e.s.synchronize() catch {};
+    return @intCast(std.Io.Timestamp.now(eh.io.?, .awake).nanoseconds);
+}
+
+fn lap(e: *const Engine, eh: *const EngramHost, t: *u64) u64 {
+    const now = pstamp(e, eh);
+    defer t.* = now;
+    return now - t.*;
+}
+
+/// A chunk's rows `ids` of table `t` by AIO (the pool's bytes, at ~0.07 s for 24,576 rows where the pool's preads take
+/// ~0.5 s on one GB10 node): batches of a quarter of the ring's slots (two reads a row), all submitted (a submit reaps while the
+/// ring is full), then waited for in order.
+fn aioGather(aio: *engram_aio.Aio, t: engram_io.Table, ids: []const i64, out_w: []u8, out_s: []u8) !void {
+    const per = @max(aio.slots / 4, 1);
+    var batch: [64]u64 = undefined;
+    var nb: usize = 0;
+    var at: usize = 0;
+    errdefer for (batch[0..nb]) |id| aio.wait(id) catch {};
+    while (at < ids.len) : (at += per) {
+        const n = @min(per, ids.len - at);
+        if (nb == batch.len) return error.TooManyRows;
+        batch[nb] = try aio.start(t, ids[at..][0..n], out_w[at * t.row_w ..][0 .. n * t.row_w], out_s[at * t.row_s ..][0 .. n * t.row_s]);
+        nb += 1;
+    }
+    for (batch[0..nb], 0..) |id, i| {
+        aio.wait(id) catch |err| {
+            for (batch[i + 1 .. nb]) |rest| aio.wait(rest) catch {};
+            nb = 0;
+            return err;
+        };
+    }
+    nb = 0;
+}
+
+/// The decoder's bounded replay at its first layer (_forward_k's `replay`, CED's prefill): the layer's attention mixes
+/// (the pending MoE post fused in) and its kv-source update over every row of the chunk, then the chunk cut to its rows
+/// at positions >= replay, the streams and their pre copied down (h[first:], pre[first:]). The decoder layers then run
+/// on those rows with no window key before replay and this layer's update done. False: an encoder-only chunk (no
+/// row at or past replay), which ends here.
+pub fn replayCut(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize, replay: usize, host_pos: []i64) !bool {
     _ = host_pos;
     const first = @max(ch.start, replay) - ch.start;
     // the boundary on owned rows (the mixes, the kv-source update of the owned rows, the cache rows gathered), then the rows the
@@ -2967,6 +3147,40 @@ test "the owned routing's text-bias routing is the whole chunk's _route launch a
     }
 }
 
+test "the Engram gate at a row range is the whole chunk's _engram_gate launch at the rows' offsets, and the baseline at every row" {
+    var log: tri.Log = .{ .gpa = std.testing.allocator };
+    defer log.deinit();
+    const t: tri.Tri = .{ .log = &log };
+    const d = 5120;
+    const h_row = 4 * d * 2;
+    const kv_row = 5 * d * 2;
+    const h: u64 = 0x100000;
+    const kv: u64 = 0x4000000;
+    const out: u64 = 0x9000000;
+    const qk: u64 = 0x7000;
+    try tri_basic.engramGate(t, h, kv, qk, out, 1e-20, 2048, d); // engramApply's whole-chunk launch
+    try engramGateRows(t, qk, h, kv, out, .{ .start = 0, .n = 2048 }, 1e-20, d, h_row, kv_row);
+    try engramGateRows(t, qk, h, kv, out, .{ .start = 1536, .n = 512 }, 1e-20, d, h_row, kv_row);
+    try std.testing.expectEqual(@as(usize, 3), log.items.items.len);
+    const all = log.items.items[0];
+    // every row: the baseline launch, argument for argument
+    try std.testing.expectEqualDeep(all, log.items.items[1]);
+    // owned rows: the same kernel and constexprs, grid 512, H, KV and OUT moved by 1,536 rows
+    const own = log.items.items[2];
+    try std.testing.expectEqualStrings(all.name, own.name);
+    try std.testing.expectEqual([3]u32{ 512, 4, 1 }, own.grid);
+    try std.testing.expectEqualDeep(all.consts, own.consts);
+    try std.testing.expectEqual(all.args.len, own.args.len);
+    for (all.args, own.args) |a, b| {
+        try std.testing.expectEqualStrings(a.name, b.name);
+        const row: u64 = if (std.mem.eql(u8, a.name, "H") or std.mem.eql(u8, a.name, "OUT")) h_row else if (std.mem.eql(u8, a.name, "KV")) kv_row else 0;
+        switch (a.value) {
+            .ptr => |pa| try std.testing.expectEqual(pa.addr + 1536 * row, b.value.ptr.addr),
+            else => try std.testing.expectEqualDeep(a.value, b.value),
+        }
+    }
+}
+
 test "the boundary's in-place gathers put every rank's owned groups of the four cache arrays where the whole chunk's update puts them" {
     const n = 16;
     const world = 4;
@@ -2985,6 +3199,33 @@ test "the boundary's in-place gathers put every rank's owned groups of the four 
     const whole = struct {
         fn byte(buf: u64, i: usize) u8 {
             return @truncate(buf / 3 + i * 17 + 1);
+        }
+    }.byte;
+    // rank k holds the whole update's bytes at its own groups, nothing else
+    var mem: [world][16384]u8 = undefined;
+    var parts: [world][4]comm.InPlace = undefined;
+    for (&mem, &parts, 0..) |*m, *pk, k| {
+        @memset(m, 0xee);
+        for (arrays, rows) |buf, row| for ((start + k * q) * row..(start + k * q + q) * row) |i| {
+            m[buf + i] = whole(buf, i);
+        };
+        pk.* = boundaryGathers(&cs, li, start, .{ .start = k * q, .n = q }, hd, id);
+    }
+    for (0..4) |j| {
+        for (parts) |pk| try std.testing.expectEqualDeep(parts[0][j], pk[j]);
+        const pt = parts[0][j];
+        var recv: [16384]u8 = undefined;
+        for (0..world) |k| @memcpy(recv[k * pt.bytes ..][0..pt.bytes], mem[k][pt.buf + k * pt.bytes ..][0..pt.bytes]);
+        for (&mem) |*m| @memcpy(m[pt.buf..][0 .. world * pt.bytes], recv[0 .. world * pt.bytes]);
+    }
+    // every rank: the chunk's groups of every array hold the whole update's bytes, the groups around them untouched
+    for (mem) |m| for (arrays, rows) |buf, row| {
+        for (start * row..(start + n) * row) |i| try std.testing.expectEqual(whole(buf, i), m[buf + i]);
+        for (0..start * row) |i| try std.testing.expectEqual(@as(u8, 0xee), m[buf + i]);
+        for ((start + n) * row..(start + n + 4) * row) |i| try std.testing.expectEqual(@as(u8, 0xee), m[buf + i]);
+    };
+}
+
 /// The worker (greedy, blocked by its slot guard) against the host consuming a pair's units in the pair's issue order: A's layer-1
 /// Engram units, B's, A's layer-14, B's. Returns how many of the worker's steps were done when the host first consumed B's layer-14
 /// units, and whether the host ever waited on a step the worker could not take (a deadlock).

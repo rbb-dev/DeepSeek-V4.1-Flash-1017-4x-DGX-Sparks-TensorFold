@@ -761,6 +761,7 @@ pub const Two = struct {
     /// for this pair's output columns: ch.pa [n, ow[p]] fp32, the matching columns of TP2's partial.
     /// TF_DS_CAT_PARTNER: the rank's four groups from the column partner's part alone (partnerCat), into the same
     /// bytes of u_full.
+    /// TF_DS_CAT_CODES: as FP8 codes and scales when the column ring does not take the bf16 part (woBCodes).
     pub fn woB(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer) !void {
         _ = try t.woBOf(e, ch, lay, false);
     }
@@ -774,6 +775,14 @@ pub const Two = struct {
 
     fn woBOf(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer, sent_first: bool) !bool {
         return t.woBCodes(e, ch, lay, sent_first);
+    }
+
+    /// TF_DS_CAT_CODES' wo_b of a prompt chunk (the column ring not taking the bf16 part): this node's part of wo_b's
+    /// input quantized as wo_b's own quant quantizes the rank's whole input (act_quant: each 32-value group of a row
+    /// lies in one pair's part), the codes and scales exchanged with the column partner in place of the bf16 part
+    /// (Two.exchange), both pairs' codes and scales copied into ch.wob_q / ch.wob_s (catCodesPlan), then the GEMM
+    /// mx.linear runs after its own quant, on them: ch.pa [n, ow[p]] fp32, the bytes woB gives. ch.mxs' codes and
+    /// scales are not written (its split partials serve the GEMM as in mx.linear).
     ///
     /// TF_DS_ROCI_CODES, a whole pass: the part is quantized into the arena's send region, goes to the column partner as RDMA WRITEs
     /// into its land region, and the copies read the partner's part there (the exchange is the transport's).
@@ -781,11 +790,14 @@ pub const Two = struct {
     /// With TF_DS_ROCI_SENT_FIRST (`sent_first`, the caller's owner-sum conditions held) beside TF_DS_ROCI_CODES the GEMM on the landed
     /// codes is the one-launch kernel that rings the owner sum's first part itself (prompt.codesGemmSentFirst): true when it ran.
     pub fn woBCodes(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer, sent_first: bool) !bool {
+        const k = e.mx orelse return error.NotAnMxLinear;
         const shape = prompt.codesShape(e, ch) orelse return error.RociNoShape;
         const rc = t.rc.?;
         const send = rc.addr(.wob_send);
         const land = rc.addr(.wob_land);
         const pl = catCodesPlan(t.node(), t.rank_of, ch.n, t.uw, ch.u, send, land, ch.wob_q, ch.wob_s);
+        if (lay.wo_b.k != pl.k) return error.UnsupportedShape;
+        try catCodesQuant(k, e.s, pl);
         try rc.send(e.s, .wob, shape);
         try rc.wait(e.s, .wob);
         if (sent_first) {
@@ -796,6 +808,7 @@ pub const Two = struct {
         }
         // (the GEMM reading the two pairs' parts where they lie, the two-base read, measured slower on the transport's host pages: 1.860 ms a launch
         // against the copies and the plain GEMM's 1.302, the A operand's re-reads by the 20 column tiles not served by L2: it stays off)
+        try catCodesGemm(k, e.ops, e.s, lay.wo_b, pl, ch.n, ch.pa, ch.mxs.z);
         return false;
     }
 
@@ -1034,16 +1047,76 @@ pub fn packAssemble(o: *const ops_mod.Ops, s: cuda.Stream, part0: u64, part1: u6
     try o.assembleRestBytes(s, part0 + pc.scales, part1 + pc.scales, pick, owner, sc.hs, pc.p, pc.ig / 32 * 4, pc.ir / 32 * 4);
 }
 
+/// Why TF_DS_CAT_CODES, asked for, stays off (null: it runs): the codes ride TF_DS_CAT_PARTNER's partner exchange (its
+/// stage holds the partner's codes), they are wo_b's own input codes (the checkpoint's own weights, an FP8 wo_b on
+/// every layer), and wo_b's K is both pairs' parts, each of whole 32-value groups.
 pub fn catCodesOff(native: bool, layers: []const weights.Layer, uw: [2]usize) ?[]const u8 {
+    if (!native) return "needs the checkpoint's own FP8 / MXFP4 weights";
+    for (layers) |lay| if (lay.wo_b.fmt != .fp8) return "needs an FP8 wo_b on every layer (the checkpoint's own)";
+    const groups = "needs wo_b's input as both pairs' parts, each of whole 32-value groups";
+    if (uw[0] % 32 != 0 or uw[1] % 32 != 0) return groups;
+    for (layers) |lay| if (lay.wo_b.k != uw[0] + uw[1]) return groups;
+    return null;
+}
+
+/// One act_quant launch: x [m, kdim] bf16 (row stride ldx) into the codes q (row stride ldq) and the scales s (row
+/// stride lds).
+pub const QuantCall = struct { x: u64, ldx: usize, m: usize, kdim: usize, q: u64, ldq: usize, s: u64, lds: usize };
+
+/// woBCodes' launches and exchange: the quant of this node's part, one span of its codes then scales to its column
+/// partner and one of the partner's into the stage, the four copies (pair 0's codes, pair 1's, pair 0's scales, pair
+/// 1's) into wo_b's input, then the GEMM's operands: q [n, k] codes (row stride k), s [n, k / 32] fp32 scales (row
+/// stride k / 32), k = uw0 + uw1: mx.linear's own layout after its quant.
+pub const CatCodes = struct { quant: QuantCall, peer: u32, send: Span, recv: Span, copies: [4]RowCopy, q: u64, s: u64, k: usize };
+
+/// woBCodes' first step: this node's part quantized into its codes and scales (pl.quant: act_quant, as wo_b's own).
+pub fn catCodesQuant(k: *const mx.Kernels, s: cuda.Stream, pl: CatCodes) !void {
+    const q = pl.quant;
+    try mx.quant(k, s, q.x, .bf16, q.ldx, q.m, q.kdim, q.q, q.ldq, q.s, q.lds);
+}
+
 /// Both pairs' codes and scales into wo_b's input (pl.copies).
 pub fn catCodesCopies(o: *const ops_mod.Ops, s: cuda.Stream, pl: CatCodes) !void {
     for (pl.copies) |cp| try o.copyRows(s, cp.src, cp.src_stride, cp.dst, cp.dst_stride, cp.width, cp.rows);
 }
 
+/// woBCodes' last step, after the exchange: both pairs' codes and scales into place (pl.copies), then wo_b's GEMM on
+/// them, the call mx.linear makes after its quant: y [n, wo_b.n] fp32 (z: the split partials, mx.Scratch.z).
+pub fn catCodesGemm(k: *const mx.Kernels, o: *const ops_mod.Ops, s: cuda.Stream, wo_b: weights.Linear, pl: CatCodes, n: usize, y: u64, z: u64) !void {
     try catCodesCopies(o, s, pl);
+    try mx.gemm(k, s, wo_b, pl.q, pl.k, pl.s, pl.k / 32, n, y, wo_b.n, .f32, false, z);
+}
+
+/// Bytes of n rows of w values as codes and scales (a part of catCodesPlan's): n w codes, then n w / 32 fp32 scales.
+pub fn catCodesBytes(n: usize, w: usize) usize {
+    return n * w + n * (w / 32) * 4;
+}
+
 /// woBCodes of node g (2 p + r) under ranks `rank_of`, n rows: this node's u [n, uw[p]] bf16 quantized into
+/// `codes` (its codes [n, uw[p]], then its scales [n, uw[p] / 32]: catCodesBytes), the column partner's in the same
+/// layout into `stage`, then each pair's codes into wob_q [n, k] and its scales into wob_s [n, k / 32] at its columns
+/// (pair 0's first, as partnerPlan places the bf16 parts).
 pub fn catCodesPlan(g: u32, rank_of: [4]u32, n: usize, uw: [2]usize, u: u64, codes: u64, stage: u64, wob_q: u64, wob_s: u64) CatCodes {
+    const p = g / 2;
+    const k = uw[0] + uw[1];
+    var pl: CatCodes = .{
+        .quant = .{ .x = u, .ldx = uw[p], .m = n, .kdim = uw[p], .q = codes, .ldq = uw[p], .s = codes + n * uw[p], .lds = uw[p] / 32 },
         .peer = rank_of[g ^ 2],
+        .send = .{ .addr = codes, .len = catCodesBytes(n, uw[p]) },
+        .recv = .{ .addr = stage, .len = catCodesBytes(n, uw[1 - p]) },
+        .copies = undefined,
+        .q = wob_q,
+        .s = wob_s,
+        .k = k,
+    };
+    for (0..2) |pg| {
+        const part = if (pg == p) codes else stage;
+        pl.copies[pg] = .{ .src = part, .src_stride = uw[pg], .dst = wob_q + pg * uw[0], .dst_stride = k, .width = uw[pg], .rows = n };
+        pl.copies[2 + pg] = .{ .src = part + n * uw[pg], .src_stride = uw[pg] / 32 * 4, .dst = wob_s + pg * (uw[0] / 32) * 4, .dst_stride = k / 32 * 4, .width = uw[pg] / 32 * 4, .rows = n };
+    }
+    return pl;
+}
+
 /// One copyRows: `rows` rows of `width` bytes from `src` (rows `src_stride` bytes apart) to `dst` (`dst_stride` apart).
 pub const RowCopy = struct { src: u64, src_stride: usize, dst: u64, dst_stride: usize, width: usize, rows: usize };
 
@@ -1249,9 +1322,97 @@ test "the pack's codes assembled into down's input are down's quant of the assem
     try std.testing.expectError(error.UnsupportedShape, ops_mod.restUnits(24, 16));
 }
 
+/// Every layer's wo_b as the checkpoint loads it on a 2D node: FP8, this TP2 rank's 4,096 input rows, this pair's
+/// 2,560 output columns.
+fn woBLayers(lays: []weights.Layer) void {
+    for (lays, 0..) |*l, i| {
+        l.* = .{ .idx = @intCast(i), .ratio = 0 };
+        l.wo_b = .{ .words = 0, .k = 4096, .n = 2560, .fmt = .fp8 };
+    }
+}
+
+test "TF_DS_CAT_CODES at a full chunk: 4,718,592 bytes each way in place of the bf16 part's 8,388,608, wo_b's input 9,437,184, the partner's codes inside cat_stage" {
+    try std.testing.expectEqual(@as(usize, 4_718_592), catCodesBytes(2048, 2048));
+    try std.testing.expectEqual(@as(usize, 9_437_184), catCodesBytes(2048, 4096));
+    // cat_stage, sized by TF_DS_CAT_PARTNER for the bf16 part, holds the codes at every row count
+    for ([_]usize{ 1, 63, 1000, 1089, 2048 }) |n| try std.testing.expect(catCodesBytes(n, 2048) <= n * 2048 * 2);
+    const u: u64 = 0x1000;
+    const codes: u64 = 0x10_0000;
+    const stage: u64 = 0x100_0000;
+    const wq: u64 = 0x1000_0000;
+    const ws: u64 = 0x2000_0000;
+    for (0..4) |g| {
         const pl = catCodesPlan(@intCast(g), rankOf(orders[0]), 2048, .{ 2048, 2048 }, u, codes, stage, wq, ws);
+        try std.testing.expectEqual(@as(u32, @intCast(g ^ 2)), pl.peer);
+        try std.testing.expectEqual(Span{ .addr = codes, .len = 4_718_592 }, pl.send);
+        try std.testing.expectEqual(Span{ .addr = stage, .len = 4_718_592 }, pl.recv);
+        // this node's u rows quantized as wo_b's own quant reads them: bf16 rows of uw[p] values, 64 groups a row
+        try std.testing.expectEqual(QuantCall{ .x = u, .ldx = 2048, .m = 2048, .kdim = 2048, .q = codes, .ldq = 2048, .s = codes + 2048 * 2048, .lds = 64 }, pl.quant);
+        // the GEMM's operands: mx.linear's after its quant (codes row stride K = 4,096, scales row stride K / 32)
+        try std.testing.expectEqual(@as(usize, 4096), pl.k);
+        try std.testing.expectEqual(wq, pl.q);
+        try std.testing.expectEqual(ws, pl.s);
+    }
+    // the column ring takes the bf16 part (partnerCat's attempt) at 1,088 rows or fewer: the codes run past it
+    try std.testing.expect(ringTakes(4_456_448, 1088, 2048));
+    try std.testing.expect(!ringTakes(4_456_448, 1089, 2048));
+}
+
+test "wo_b's input from the two pairs' codes is wo_b's own quant of the assembled input: every node, every node order, equal and unequal pair widths" {
+    const n = 5;
+    const at_codes: u64 = 2048;
+    const at_stage: u64 = 3072;
+    const at_q: u64 = 4096;
+    const at_s: u64 = 5120;
+    for ([_][2]usize{ .{ 64, 64 }, .{ 32, 96 } }) |uw| for (orders) |ord| {
         const nc = rankOf(ord);
+        const k = uw[0] + uw[1];
+        var prng = std.Random.DefaultPrng.init(0x4b);
+        const rng = prng.random();
+        // node g's bytes: its part u [n, uw[p]] bf16 at 0, the rest a filler no step may leave behind
+        var mem: [4][6144]u8 align(16) = undefined;
+        for (&mem, 0..) |*m, g| {
+            @memset(m, 0xee);
+            for (std.mem.bytesAsSlice(u16, m[0 .. n * uw[g / 2] * 2])) |*x| x.* = rng.int(u16);
+        }
+        var plans: [4]CatCodes = undefined;
+        for (&plans, 0..) |*pl, g| pl.* = catCodesPlan(@intCast(g), nc, n, uw, 0, at_codes, at_stage, at_q, at_s);
+        // each node's quant of its part (the plan's launch)
+        for (plans, &mem) |pl, *m| {
+            const q = pl.quant;
+            quantModel(@alignCast(std.mem.bytesAsSlice(u16, m[q.x..][0 .. q.m * q.ldx * 2])), q.ldx, q.m, q.kdim, m[q.q..][0 .. q.m * q.ldq], q.ldq, @alignCast(std.mem.bytesAsSlice(f32, m[q.s..][0 .. q.m * q.lds * 4])), q.lds);
+        }
         // one exchange a pair of column partners: each names the other's rank, and what one sends the other takes
+        var after = mem;
+        for (plans, 0..) |pl, g| {
+            const h = nodeOfRank(nc, pl.peer);
+            try std.testing.expectEqual(g ^ 2, h);
+            try std.testing.expectEqual(nc[g], plans[h].peer);
+            try std.testing.expectEqual(pl.send.len, plans[h].recv.len);
+            @memcpy(after[h][plans[h].recv.addr..][0..plans[h].recv.len], mem[g][pl.send.addr..][0..pl.send.len]);
+        }
+        for (plans, 0..) |pl, g| for (pl.copies) |cp| copyRowsHost(&after[g], cp);
+        // wo_b's own quant (mx.linear's) of TP2 rank r's whole input: row i is pair 0's part (node r's) then pair 1's
+        // (node r + 2's)
+        for (0..4) |g| {
+            var full: [n * 128]u16 = undefined;
+            for (0..n) |i| for (0..2) |pg| @memcpy(full[i * k + pg * uw[0] ..][0..uw[pg]], std.mem.bytesAsSlice(u16, mem[g % 2 + 2 * pg][i * uw[pg] * 2 ..][0 .. uw[pg] * 2]));
+            var wq: [n * 128]u8 = undefined;
+            var ws: [n * 4]f32 = undefined;
+            quantModel(full[0 .. n * k], k, n, k, wq[0 .. n * k], k, ws[0 .. n * k / 32], k / 32);
+            try std.testing.expectEqualSlices(u8, wq[0 .. n * k], after[g][at_q..][0 .. n * k]);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(ws[0 .. n * k / 32]), after[g][at_s..][0 .. n * k / 32 * 4]);
+            // nothing past the chunk's rows
+            try std.testing.expect(std.mem.allEqual(u8, after[g][at_q + n * k .. at_q + n * k + 64], 0xee));
+            try std.testing.expect(std.mem.allEqual(u8, after[g][at_s + n * k / 32 * 4 .. at_s + n * k / 32 * 4 + 64], 0xee));
+            // the GEMM reads them as mx.linear's: codes row stride K, scales row stride K / 32
+            try std.testing.expectEqual(k, plans[g].k);
+            try std.testing.expectEqual(at_q, plans[g].q);
+            try std.testing.expectEqual(at_s, plans[g].s);
+        }
+    };
+}
+
 /// copyRows on host bytes `m` (device addresses as offsets into it).
 fn copyRowsHost(m: []u8, cp: RowCopy) void {
     for (0..cp.rows) |i| @memcpy(m[cp.dst + i * cp.dst_stride ..][0..cp.width], m[cp.src + i * cp.src_stride ..][0..cp.width]);
