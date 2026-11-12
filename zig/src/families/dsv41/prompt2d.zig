@@ -266,6 +266,9 @@ pub const Two = struct {
     rest_dec: ?exl3_experts2d.RestScratch = null,
     rest_chunk: ?exl3_experts2d.RestScratch = null,
     peer: u64 = 0,
+    // WP6(b) (docs/prefill-plan.md, indexer row-sharding): agreed at startup (agreeIdxShard), independent of qhc:
+    // the indexer's own scoring kernels, not the quarter-HC path's mix and gather.
+    idx_shard: bool = false,
 
     /// The widths from the split (both pairs'), and the buffers for chunks of up to `cap` rows (and rounds) from `a`.
     pub fn init(c: *const Config, w: *const weights.Weights, a: *prompt.Arena, s: plan.Split, cap: usize) !Two {
@@ -460,16 +463,28 @@ pub const Two = struct {
         return true;
     }
 
-    /// cat_rank (Comm2D.cat_rank): `src` [n, w[p]] -> `dst` [n, w0 + w1]: this node's TP2 rank's whole width, pair 0's
-    /// part then pair 1's (from its column partner, the same rank of the other pair).
-    pub fn catRank(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, w: [2]usize, esize: usize) !void {
-        if (t.rings) |rs| if (try ringed(rs.catRank(e.s, src, dst, n, w, esize))) return;
-        const wmax = try t.allParts(e, src, n, w, esize);
-        const row = (w[0] + w[1]) * esize;
-        for (0..2) |pg| {
-            const g = t.r + 2 * pg;
-            try e.ops.copyRows(e.s, t.parts + g * n * wmax * esize, wmax * esize, dst + pg * w[0] * esize, row, w[pg] * esize, n);
+    /// WP6(b) (docs/prefill-plan.md, indexer row-sharding): agreed at startup like qhc, but independent of
+    /// it -- it only needs a 2D engine with every rank's cap evenly
+    /// divisible into 16-row-aligned quarters (idxShardRange's own check; refused per-rank there, not here, so
+    /// a mismatch across ranks still shows as every rank agreeing on the flag but only some actually sharding).
+    pub fn agreeIdxShard(t: *Two, d: *const cuda.Driver, comm: *const Comm, stream: cuda.Stream) !void {
+        const want = if (std.c.getenv("TF_DS_IDX_SHARD")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        const w = comm.world;
+        var dev = try cuda.DeviceBuffer.alloc(d, (1 + w) * 4);
+        defer dev.free();
+        const mine: u32 = @intFromBool(want);
+        try stream.synchronize();
+        var all: [8]u32 = undefined;
+        if (w > all.len) return error.WorldTooLarge;
+        try dev.download(4, std.mem.sliceAsBytes(all[0..w]));
+        var on: usize = 0;
+        for (all[0..w]) |x| on += x;
+        if (on != 0 and on != w) {
+            std.log.err("TF_DS_IDX_SHARD: set on {d} of {d} ranks (this one: {s}); start every rank with the same value", .{ on, w, if (want) "1" else "unset" });
+            return error.IdxShardMismatch;
         }
+        t.idx_shard = on == w;
+        if (t.idx_shard) std.log.info("TF_DS_IDX_SHARD=1: the indexer's scoring and top-k, for layers before the candidate source on a full chunk, run only each rank's owned quarter, all-gathering the picks", .{});
     }
 
     /// Comm2D.gather (TP2 inside a pair: the DSpark drafter's sublayer partials): `src` [n, width] -> `dst` [2, n, width],

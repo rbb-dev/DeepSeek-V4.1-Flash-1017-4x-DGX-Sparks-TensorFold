@@ -1236,6 +1236,37 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     } else {
         try e.ops.toF32(e.s, ch.x, ch.xf, n * c.hidden);
         try e.blas.xwTRows(ch.xf, lay.idx_proj, ch.wl, n, c.hidden, ih, gemm_rows);
+/// WP6(b) (docs/prefill-plan.md, indexer row-sharding): this layer's owned row range on this node, when
+/// TF_DS_IDX_SHARD applies -- a full-cap 2D chunk, strictly before the candidate-source layer (li <
+/// c.candidate_source). That bound is not coincidental: it is the indexer's own switch point, after which the
+/// per-row "keyed" scoring this shards stops and a cross-layer pool (ch.pool, written once at li ==
+/// candidate_source over every row, read by every later layer) takes over -- excluded here by construction, so
+fn idxShardRange(e: *const Engine, ch: *const Chunk, li: usize) ?QRows {
+    const t = e.two orelse return null;
+    if (!t.idx_shard) return null;
+    if (li >= e.c.candidate_source) return null;
+}
+
+/// The indexer of a layer with index queries (switch "prompt_keys", layers before the candidate source): the
+/// queries (idx_wq_b of q's latent, RoPE, fp4_qd's bytes), the heads' weights (x.float() @ idx_proj.t() through cuBLAS,
+/// to bf16, times idx_dim ** -0.5 * idx_heads ** -0.5), each row's int64 keys of the kv source's index keys and the
+/// top-k selection into cidx.
+/// WP6(b): when idxShardRange applies, the row-block loop below covers only this node's owned quarter (the same
+/// pointer-offset-into-the-full-buffer pattern it already uses for block 2, 3, ... of any multi-block call --
+/// see the loop's own "a row's scores and picks are its own" comment, and the offline proof,
+/// tf-dsv41-wp6b-idx-shard-replay, for a nonzero FIRST block), and ch.cidx is all-gathered back to full width
+/// before this returns, so every caller sees the same fully-populated cidx either way.
+fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize, wqb: weights.Linear, src: usize, n_comp_end: usize, rope: Rope) !void {
+    const lay = e.w.layers[li];
+    const c = e.c;
+    const n = ch.n;
+    const ih = c.index_heads;
+    const id = c.index_head_dim;
+    if (n_comp_end == 0) { // cidx [n, 0]: no compressed entry yet (a one-token prompt), the attention reads none
+        sh.kk = 0;
+        return;
+    }
+    if (n_comp_end > ch.max_comp) return error.ChunkTooLong;
         // Format.native: weights_proj, a bf16 Linear, times the scale (Indexer.forward), at any row count
     } else {
         if (n <= tri.decode_rows) {
@@ -1283,6 +1314,12 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
         // the block's rows: iq[r0:r1] and wts[r0:r1] as views (their offsets the served pointers'), vis[r0:r1] at a
         // 16-byte-aligned address (visBlock), its selection into cidx[r0:r1]
         const m = @min(n, r0 + rb) - r0;
+    var r0: usize = if (idxr) |r| r.start else 0;
+    const r_end: usize = if (idxr) |r| r.start + r.n else n;
+    while (r0 < r_end) : (r0 += rb) {
+        // the block's rows: iq[r0:r1], wts[r0:r1] and vis[r0:r1] as views (their offsets the served pointers'), its
+        // selection into cidx[r0:r1]
+        const m = @min(r_end, r0 + rb) - r0;
         const q = ch.iq4 + r0 * ih * id * 2;
         const wb = ch.iw + r0 * ih * 2;
         const vr = try visBlock(e, ch, r0, m);
@@ -1305,6 +1342,9 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
         }
     }
     if (pooled and li == c.candidate_source) sh.pool = true;
+    // WP6(b): this rank's owned-row slice of cidx, all-gathered to every rank -- a plain world-4 all-gather, in
+    // for ch.x. Bytes, not a typed count: cidx's per-row width (kk int64 keys) is uniform across rows for this
+    // call, so a raw byte gather needs no element-type opinion.
     sh.kk = kk;
 }
 

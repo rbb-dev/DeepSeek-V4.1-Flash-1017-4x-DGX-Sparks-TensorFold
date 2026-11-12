@@ -203,6 +203,12 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     ds_idx_replay.addImport("dsv41", ds_check.import_table.get("dsv41").?);
     ds_idx_replay.addImport("cuda", cuda);
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-idx-replay", .root_module = ds_idx_replay }));
+    // WP6(b): _index_score_rows as one full-chunk call vs four quarter-sized calls at row offsets 0/512/1024/
+    // 1536 into the same buffers (the row-sharded indexer's own pattern), bit compared
+    const ds_wp6b_replay = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/wp6b_idx_shard_replay_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    ds_wp6b_replay.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+    ds_wp6b_replay.addImport("cuda", cuda);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-wp6b-idx-shard-replay", .root_module = ds_wp6b_replay }));
     // the Engram reader's buffered, O_DIRECT and AIO paths on the real tables, every byte compared
     const ds_engram = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/engram_check_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     ds_engram.addImport("dsv41", ds_check.import_table.get("dsv41").?);

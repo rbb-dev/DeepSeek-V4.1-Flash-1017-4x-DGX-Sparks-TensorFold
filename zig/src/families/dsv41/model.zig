@@ -783,6 +783,7 @@ pub fn startSettings(o: Options) prompt2d.Settings {
         errdefer if (m.par) |*x| x.unload();
         m.mxk = if (c.format == .native) try mx.Kernels.load(d, cuda.kernels.dsv41_native) else null;
         errdefer if (m.mxk) |*x| x.unload();
+            try m.two.?.agreeIdxShard(d, &m.comm, m.stream);
         logPdlControls(m.comm.rank);
         if (m.mxk) |*x| m.eng.mx = x;
         m.cand = try m.arena.take(round.max_rows * (sampling.max_candidates * 12 + 4));
