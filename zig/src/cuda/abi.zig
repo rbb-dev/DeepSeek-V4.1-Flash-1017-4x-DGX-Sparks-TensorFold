@@ -199,6 +199,13 @@ const Ptr = ?*anyopaque;
 const CPtr = ?*const anyopaque;
 const Params = ?[*]?*anyopaque;
 
+/// CUctx_flags' scheduling values (cuda.h): how a host thread waits in a synchronize call.
+pub const ctx_sched_auto: c_uint = 0x00;
+pub const ctx_sched_spin: c_uint = 0x01;
+pub const ctx_sched_yield: c_uint = 0x02;
+pub const ctx_sched_blocking_sync: c_uint = 0x04;
+pub const ctx_sched_mask: c_uint = 0x07;
+
 /// CUhostFn: run on a driver thread in a stream's order; it must make no CUDA call.
 pub const HostFn = *const fn (?*anyopaque) callconv(.c) void;
 
@@ -213,6 +220,8 @@ pub const Api = struct {
     cuDeviceTotalMem_v2: *const fn (*usize, Device) callconv(.c) R,
     cuDevicePrimaryCtxRetain: *const fn (*Context, Device) callconv(.c) R,
     cuDevicePrimaryCtxRelease_v2: *const fn (Device) callconv(.c) R,
+    cuDevicePrimaryCtxSetFlags_v2: *const fn (Device, c_uint) callconv(.c) R,
+    cuDevicePrimaryCtxGetState: *const fn (Device, *c_uint, *c_int) callconv(.c) R,
     cuCtxSetCurrent: *const fn (Context) callconv(.c) R,
     cuCtxGetCurrent: *const fn (*Context) callconv(.c) R,
     cuCtxSynchronize: *const fn () callconv(.c) R,

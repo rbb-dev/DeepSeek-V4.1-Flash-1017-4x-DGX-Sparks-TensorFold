@@ -4,6 +4,21 @@ const std = @import("std");
 const abi = @import("abi.zig");
 const Driver = @import("driver.zig").Driver;
 const Error = @import("driver.zig").Error;
+pub fn schedFlags(text: ?[]const u8) Error!?c_uint {
+    if (v.len == 0) return null;
+    const names = [_]struct { []const u8, c_uint }{ .{ "auto", abi.ctx_sched_auto }, .{ "spin", abi.ctx_sched_spin }, .{ "yield", abi.ctx_sched_yield }, .{ "blocking", abi.ctx_sched_blocking_sync } };
+    for (names) |n| if (std.mem.eql(u8, v, n[0])) return n[1];
+    return error.Invalid;
+}
+
+fn schedName(flags: c_uint) []const u8 {
+    return switch (flags & abi.ctx_sched_mask) {
+        abi.ctx_sched_spin => "spin",
+        abi.ctx_sched_yield => "yield",
+        abi.ctx_sched_blocking_sync => "blocking sync",
+    };
+}
+
 
 pub const Context = struct {
     d: *const Driver,
@@ -63,3 +78,13 @@ pub const Context = struct {
         return m;
     }
 };
+
+    try std.testing.expectEqual(@as(?c_uint, null), try schedFlags(null));
+    try std.testing.expectEqual(@as(?c_uint, null), try schedFlags(""));
+    try std.testing.expectEqual(@as(?c_uint, abi.ctx_sched_auto), try schedFlags("auto"));
+    try std.testing.expectEqual(@as(?c_uint, abi.ctx_sched_spin), try schedFlags("spin"));
+    try std.testing.expectEqual(@as(?c_uint, abi.ctx_sched_yield), try schedFlags("yield"));
+    try std.testing.expectEqual(@as(?c_uint, abi.ctx_sched_blocking_sync), try schedFlags("blocking"));
+    try std.testing.expectError(error.Invalid, schedFlags("block"));
+    try std.testing.expectError(error.Invalid, schedFlags("4"));
+}
