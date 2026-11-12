@@ -2,6 +2,7 @@
     also_on: []const []const u8 = &.{},
     .{ .env = "TF_DS_ATTN_EPI_FUSED", .value = "1", .what = "prompt attention epilogue (inverse RoPE, wo_a quant) in the attention kernel (the kernel kit's extra set; needs TF_DS_ATTN_EPILOGUE)", .cost = "prompts slower by the epilogue launch and a pass over the attention output (estimated 10-12 ms a 4,096-row pass; not measured)" },
     .{ .env = "TF_DS_HC_2S", .value = "1", .what = "prompt mHC mix on the two-block sums, four streams in one program (the kernel kit's extra set)", .cost = "the mix reads the previous streams and sums four times from L2 (estimated 4-10 ms a 4,096-row pass; not measured)" },
+    .{ .env = "TF_DS_DRAFT_VOCAB", .value = "1", .what = "drafter proposes from a list of 32,768 token ids (8,192 a node)", .cost = "a token outside the list is never drafted (misses 0.1 to 0.4 % of tokens held out, ESTIMATED offline; a guard returns to the whole head past 2 %); the speed was not measured alone" },
     .{ .env = "TF_DS_QKV_PLAIN", .value = "1", .what = "a decode window's q norm and window KV in one launch (the kernel kit's extra set)", .cost = "one launch more a layer (about 0.1 to 0.15 ms of a 28 ms decode round, estimated; not measured alone)" },
     .{ .env = "TF_DS_DEC_GROUP2", .value = "1", .what = "decode expert grouping by a parallel scan", .cost = "each decode round about 0.1 ms longer (estimated, not measured; the grouping bytes are equal)" },
     .{ .env = "TF_DS_MERGE_D", .value = "3", .what = "decode attention merge in column blocks (the kernel kit's extra set)", .cost = "each decode round about 0.06 to 0.08 ms longer with 128-column blocks (TF_DS_MERGE_D=1) and 0.15 to 0.25 ms longer with the single block (estimated from kernel timings, not measured in a round; the bytes are equal)", .also_on = &.{ "1", "2" } },
@@ -16,15 +17,20 @@
     .{ .env = "TF_DS_ROCI_P2_FIRST", .value = "1", .what = "Rocinante: second part sent first", .cost = "prompts a few percent slower (the Rocinante orderings together x1.054 to x1.069 measured, not one by one)" },
     .{ .env = "TF_DS_ROCI_COMBINE_DOOR", .value = "1", .what = "Rocinante: sum and signal in one launch", .cost = "see TF_DS_ROCI_P2_FIRST" },
     .{ .env = "TF_DS_DRAFT_4WAY", .value = "1", .what = "drafter split four ways (the kernel kit's extra set)", .cost = "decode about 3 to 4 % slower (x1.029 one stream, x1.040 16 streams measured); about 2 GB more a Spark" },
+    .{ .env = "TF_DS_DRAFT_MAIN_4WAY", .value = "1", .what = "drafter main projection four ways", .cost = "one-stream decode slower (part of the x1.013 decode release)" },
     .{ .env = "TF_DS_WOA_W8", .value = "1", .what = "attention output from FP8 rows", .cost = "about 0.67 GB more memory a Spark (speed unchanged)" },
     .{ .env = "TF_DS_ATTN_EPILOGUE", .value = "1", .what = "attention output's inverse RoPE and quant in one launch", .cost = "one launch and one memory pass more per layer (no speed difference measured: net -0.3 ms of a ~600 ms pass)" },
     .{ .env = "TF_DS_RING_WC", .value = "1", .what = "decode rings on write-combined slots", .cost = "the in-place ring cannot run (no speed difference measured: decode x1.000 one stream, x0.994 at 16)" },
     .{ .env = "TF_DS_RING_INPLACE", .value = "1", .what = "decode exchanges write straight into the ring's send slots", .cost = "one staging copy more per decode exchange (no speed difference measured: decode x0.9965 one stream, x0.9985 at 16)" },
     .{ .env = "TF_DS_ROCI_IDLE_PARK_US", .value = "2000", .what = "idle Rocinante proxies sleep in the kernel", .cost = "idle proxies busy-wait on their doorbells (speed and first-request latency unchanged measured; hotter)" },
+/// Whether the operator left `env` unset, so the default gave it its value (a switch whose precondition fails then falls back).
 pub const Verdict = enum { run, fallback, refuse };
 
 pub fn verdict(why: ?[]const u8, is_default: bool) Verdict {
     if (why == null) return .run;
+    return if (is_default) .fallback else .refuse;
+}
+
 /// What the engine loses without `env`'s feature, for the fallback's one line.
     return table[i].cost;
 }
@@ -34,6 +40,7 @@ pub fn verdict(why: ?[]const u8, is_default: bool) Verdict {
         var nb: [64:0]u8 = undefined;
         var vb: [32:0]u8 = undefined;
         if (d.env.len >= nb.len or d.value.len >= vb.len) continue;
+        @memcpy(vb[0..d.value.len], d.value);
     try std.testing.expectEqual(Verdict.run, verdict(null, false));
     try std.testing.expectEqual(Verdict.fallback, verdict("needs the rails' devices", true));
     try std.testing.expectEqual(Verdict.refuse, verdict("needs the rails' devices", false));

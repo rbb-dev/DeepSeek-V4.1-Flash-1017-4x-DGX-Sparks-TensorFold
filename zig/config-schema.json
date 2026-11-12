@@ -362,6 +362,29 @@
    "env_override": true
   },
   {
+   "id": 980,
+   "name": "tf_ds_draft_vocab",
+   "env": "TF_DS_DRAFT_VOCAB",
+   "group": "decode",
+   "tab": "Generation",
+   "kind": "flag",
+   "unit": "",
+   "min": null,
+   "max": null,
+   "default": "1",
+   "default_check": "none",
+   "apply": "R",
+   "who": [
+    "admin"
+   ],
+   "label": "Drafter on a short vocabulary list",
+   "doc": "The drafter proposes from a list of 32,768 token ids (8,192 on each node: the model's special tokens and the ids most frequent in the project's own text) instead of the whole vocabulary, so its output head reads about a sixteenth of the bytes and its Markov steps score a sixteenth of the columns. A draft is only a proposal the model checks, so replies are the model's own whatever the list holds; what the list changes is which tokens get proposed. A guard on rank 0 counts the committed tokens that fall outside the list and returns to the whole head while more than 2% of the last 4,096 do. On by default; set it to 0 to turn it off. Needs the four-node layout, TF_DS_DRAFT_HEAD=fp4 and the kernel kit's Markov kernels; where a rank cannot run it the start says so and every rank drafts from the whole head. Every node must agree.",
+   "values": [],
+   "seed": "name",
+   "first_use": "families/dsv41/model.zig:2240",
+   "secret": false
+  },
+  {
    "id": 981,
    "name": "tf_ds_roci_xlog",
    "env": "TF_DS_ROCI_XLOG",

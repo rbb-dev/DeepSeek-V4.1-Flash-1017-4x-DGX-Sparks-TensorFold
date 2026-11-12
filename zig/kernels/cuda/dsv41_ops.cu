@@ -746,6 +746,18 @@ extern "C" __global__ void tf_ds_assemble_rest_kernel(const uint4* part0, const 
     for (int c = threadIdx.x; c < ir8; c += blockDim.x) o[2 * ig8 + c] = rest[c];
 }
 
+// TF_DS_DRAFT_VOCAB: a Markov step's picks from positions of the pruned list to token ids, in place: out[r * stride] =
+// ids[out[r * stride]] for r < rows. A position past the list (none occurs: the pick is one of the list's columns)
+// maps to the list's last id.
+extern "C" __global__ void tf_ds_list_ids_kernel(long long* out, long long stride, int rows, const long long* ids, int count) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    long long p = out[(size_t)r * stride];
+    if (p < 0) p = 0;
+    if (p >= count) p = count - 1;
+    out[(size_t)r * stride] = ids[p];
+}
+
 // TF_DS_IDX_SPLIT (idx_split.zig): a node's k largest keys of its columns [c0, c0 + n) as keys of the whole row, in
 // place. A key's low word is its inverted column (0xFFFFFFFF - j, j counted from c0); the row's is that word less c0,
 // at least 0xFFFFFFFF - (c0 + n - 1), so the score word above it stays as it was: the key the served scores hold at

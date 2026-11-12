@@ -202,6 +202,24 @@ pub const draft_depths = 16;
 pub const DraftDepth = struct { drafted: u32 = 0, reached: u32 = 0, kept: u32 = 0 };
 
 /// What a finished reply's rounds did, for its runtime fields and /metrics.
+/// A drafter's pruned vocabulary (DeepSeek's TF_DS_DRAFT_VOCAB), as the family counts it: its passes on the list and
+/// on the whole head, the committed tokens its guard counted and how many of them were outside the list, and whether
+/// the passes take the whole head. The family writes them; the server reads them at any time.
+pub const DraftVocabCounters = struct {
+    list_passes: std.atomic.Value(u64) = .init(0),
+    full_passes: std.atomic.Value(u64) = .init(0),
+    tokens: std.atomic.Value(u64) = .init(0),
+    misses: std.atomic.Value(u64) = .init(0),
+    full: std.atomic.Value(bool) = .init(false),
+
+    pub fn read(c: *const DraftVocabCounters) DraftVocab {
+        return .{ .list_passes = c.list_passes.load(.monotonic), .full_passes = c.full_passes.load(.monotonic), .tokens = c.tokens.load(.monotonic), .misses = c.misses.load(.monotonic), .full = c.full.load(.monotonic) };
+    }
+};
+
+/// A read of DraftVocabCounters (Status.draft_vocab).
+pub const DraftVocab = struct { list_passes: u64 = 0, full_passes: u64 = 0, tokens: u64 = 0, misses: u64 = 0, full: bool = false };
+
 pub const Stats = struct {
     rounds: u64 = 0,
     drafted: u64 = 0,
@@ -427,6 +445,9 @@ pub const Status = struct {
     preemptions: ?u64 = null,
     /// CUDA graph captures that failed, their work run eagerly instead; null when the engine does not count them.
     graph_fallbacks: ?u64 = null,
+    /// The drafter on a pruned vocabulary (DeepSeek's TF_DS_DRAFT_VOCAB): its passes and its guard's counts; null when
+    /// the engine does not run one.
+    draft_vocab: ?DraftVocab = null,
     warming: bool = false,
     /// Live streams written to the caller's buffer: tokens each holds.
     streams: usize = 0,

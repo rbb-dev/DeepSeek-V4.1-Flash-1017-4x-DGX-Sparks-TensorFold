@@ -22,6 +22,7 @@ const model = @import("model.zig");
 const where = @import("where.zig");
 const round = @import("round.zig");
 const draft = @import("draft.zig");
+const draft_vocab = @import("draft_vocab.zig");
 const sampling = @import("sampling.zig");
 const link = @import("link.zig");
 const cuda = @import("cuda");
@@ -97,6 +98,38 @@ pub const Reader = struct {
         const n = try r.int(u32);
         try out.resize(gpa, n);
         for (out.items) |*x| x.* = try r.int(i32);
+/// A drafter pass's frame after its header: the streams and steps, each stream's pending token, first position and
+/// slot; with TF_DS_DRAFT_VOCAB's list in effect (`full` not null) one byte more, whether the pass takes the whole head.
+pub const PassFrame = struct {
+    n: usize,
+    steps: usize,
+    tokens: [max_streams]i64 = undefined,
+    q0: [max_streams]i64 = undefined,
+    slots: [max_streams]i64 = undefined,
+    full: ?bool = null,
+
+    pub fn write(p: *const PassFrame, w: *Wire, gpa: std.mem.Allocator) !void {
+        try w.int(gpa, u32, @intCast(p.n));
+        try w.int(gpa, u32, @intCast(p.steps));
+        for (0..p.n) |i| {
+            try w.int(gpa, i64, p.tokens[i]);
+            try w.int(gpa, i64, p.q0[i]);
+            try w.int(gpa, i64, p.slots[i]);
+        }
+        if (p.full) |f| try w.int(gpa, u8, @intFromBool(f));
+    }
+
+    /// The fields as write wrote them; `list`: the pruned list in effect, its byte last.
+    pub fn read(r: *Reader, list: bool) !PassFrame {
+        var p: PassFrame = .{ .n = try r.int(u32), .steps = try r.int(u32) };
+        if (p.n == 0 or p.n > max_streams) return error.BadFrame;
+        for (0..p.n) |i| {
+            p.tokens[i] = try r.int(i64);
+            p.q0[i] = try r.int(i64);
+            p.slots[i] = try r.int(i64);
+        }
+        if (list) p.full = (try r.int(u8)) != 0;
+        return p;
     }
 };
 
@@ -758,6 +791,8 @@ pub const Lanes = struct {
     first_row: []f32 = &.{},
     first_of: ?*const lanes.Stream = null,
     masked: []f32 = &.{},
+    // TF_DS_DRAFT_VOCAB's guard (rank 0's: the pass frame carries its call): the committed tokens outside the list
+    guard: draft_vocab.Guard = .{},
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -1427,6 +1462,18 @@ pub const Lanes = struct {
         if (m.dr == null) return error.NoDraftHead;
         where.set(.draft, @intCast(requests.len), 0);
         defer where.set(.after_backend, 0, 0);
+        const dr = &m.dr.?;
+        const block = dr.n;
+        // TF_DS_DRAFT_VOCAB: the guard counts every request's committed tokens, then calls this pass's head
+        if (dr.vocab) |*v| {
+            for (requests) |r| self.guard.note(&v.bits, r.follow);
+            dr.vocab_full = self.guard.full;
+            const st = &m.vocab_stats;
+            st.tokens.store(self.guard.tokens, .monotonic);
+            st.misses.store(self.guard.misses, .monotonic);
+            st.full.store(self.guard.full, .monotonic);
+        }
+        var pf: PassFrame = .{ .n = 0, .steps = 0 };
         var depths: [max_streams]usize = undefined;
         var asked: [max_streams]*Lane = undefined;
         var n: usize = 0;
@@ -1439,41 +1486,46 @@ pub const Lanes = struct {
             if (n == max_streams) return error.TooManyStreams;
             if (r.position != r.stream.cache_len + 1) return error.PositionMismatch;
             const token: u32 = if (r.rows == null) self.value(r.first orelse return error.NoFirstToken) else (if (r.follow.len > 0) r.follow[r.follow.len - 1] else return error.NoFollowToken);
-            tokens[n] = token;
-            q0[n] = @intCast(r.position - 1);
-            slots[n] = @intCast(l.slot);
+            pf.tokens[n] = token;
+            pf.q0[n] = @intCast(r.position - 1);
+            pf.slots[n] = @intCast(l.slot);
             depths[n] = @min(r.depth, block);
             asked[n] = l;
             steps = @max(steps, depths[n]);
             n += 1;
         }
         if (n == 0) return;
-        // a pass runs block rows a stream through the decode window's linears (prompt.grouped: 128 rows at most), so
-        // more streams than 128 / block (25 at the 5-row block) draft in passes of that many, each its own wire message
-        const per = @max(1, pass_rows / block);
+        try m.checkTransport();
+        pf.n = n;
+        pf.steps = steps;
+        if (dr.vocab != null) pf.full = dr.vocab_full;
         // a pass runs block rows a stream through the decode window's linears (prompt.grouped: 128 rows at most), so more
         // (TensorFold ba03026c; the followers are unchanged)
         var g0: usize = 0;
         while (g0 < n) : (g0 += per) {
             const g1 = @min(n, g0 + per);
+            var sub: PassFrame = .{ .n = g1 - g0, .steps = steps, .full = pf.full };
+            @memcpy(sub.tokens[0..sub.n], pf.tokens[g0..g1]);
+            @memcpy(sub.q0[0..sub.n], pf.q0[g0..g1]);
+            @memcpy(sub.slots[0..sub.n], pf.slots[g0..g1]);
             if (try self.begin(.pass)) {
-                try self.wire.int(gpa, u32, @intCast(g1 - g0));
-                try self.wire.int(gpa, u32, @intCast(steps));
-                for (g0..g1) |i| {
-                    try self.wire.int(gpa, i64, tokens[i]);
-                    try self.wire.int(gpa, i64, q0[i]);
-                    try self.wire.int(gpa, i64, slots[i]);
-                }
+                try sub.write(&self.wire, gpa);
                 try self.flush();
             }
             const t0 = m.now();
             try m.pass(tokens[g0..g1], q0[g0..g1], slots[g0..g1], steps);
+            try m.pass(sub.tokens[0..sub.n], sub.q0[0..sub.n], sub.slots[0..sub.n], steps);
+            try m.checkTransport();
+            if (dr.vocab != null) {
+                const st = &m.vocab_stats;
+                _ = (if (dr.vocab_full) &st.full_passes else &st.list_passes).fetchAdd(1, .monotonic);
+            }
             if (self.prof) |*p| {
                 p.pass += m.now() - t0;
                 p.passes += 1;
                 p.pass_streams += g1 - g0;
             }
-            const d = &m.dr.?;
+            const d = dr;
             for (asked[g0..g1], depths[g0..g1], 0..) |l, k, i| {
                 for (0..k) |j| {
                     l.held[j] = @intCast(d.drafts[i][j]);
@@ -1749,6 +1801,13 @@ fn headProbe() i32 {
                 c.m.headWhole(n) catch |err| try refusedExchange(c.m, err);
             },
             .pass => {
+                const pf = try PassFrame.read(r, if (c.m.dr) |dr| dr.vocab != null else false);
+                if (pf.full) |full| if (c.m.dr) |*dr| {
+                    dr.vocab_full = full;
+                };
+                c.m.pass(pf.tokens[0..pf.n], pf.q0[0..pf.n], pf.slots[0..pf.n], pf.steps) catch |err| try refusedExchange(c.m, err);
+            },
+            else => return error.BadFrame,
         }
         if (self.first_of == s) self.first_of = null;
         const kv = self.streams.fetchRemove(s) orelse return;
@@ -2007,6 +2066,71 @@ test "a frame's fields read back as written" {
     try r.ids(gpa, &got);
     try std.testing.expectEqualSlices(i32, &.{ 1, -2, 129279 }, got.items);
     try std.testing.expectError(error.ShortFrame, r.int(u8));
+}
+
+test "a pass frame: the streams, steps and each stream's token, position and slot; with the pruned list one byte more, its head" {
+    const gpa = std.testing.allocator;
+    var p: PassFrame = .{ .n = 2, .steps = 3 };
+    p.tokens[0] = 11;
+    p.tokens[1] = 129_279;
+    p.q0[0] = 40;
+    p.q0[1] = 7;
+    p.slots[0] = 0;
+    p.slots[1] = 15;
+    // without the list: the baseline bytes (n, steps, then the streams' triples)
+    var w: Wire = .{};
+    defer w.deinit(gpa);
+    try w.begin(gpa, .pass, 9);
+    try p.write(&w, gpa);
+    try std.testing.expectEqual(@as(usize, 1 + 8 + 4 + 4 + 2 * 24), w.buf.items.len);
+    var r: Reader = .{ .b = w.buf.items[9..] };
+    const got = try PassFrame.read(&r, false);
+    try std.testing.expectEqual(@as(usize, 2), got.n);
+    try std.testing.expectEqual(@as(usize, 3), got.steps);
+    try std.testing.expectEqualSlices(i64, p.tokens[0..2], got.tokens[0..2]);
+    try std.testing.expectEqualSlices(i64, p.q0[0..2], got.q0[0..2]);
+    try std.testing.expectEqualSlices(i64, p.slots[0..2], got.slots[0..2]);
+    try std.testing.expectEqual(@as(?bool, null), got.full);
+    try std.testing.expectError(error.ShortFrame, r.int(u8));
+    // with the list: its head last, both ways
+    for ([_]bool{ false, true }) |full| {
+        p.full = full;
+        try w.begin(gpa, .pass, 9);
+        try p.write(&w, gpa);
+        try std.testing.expectEqual(@as(usize, 1 + 8 + 4 + 4 + 2 * 24 + 1), w.buf.items.len);
+        var rl: Reader = .{ .b = w.buf.items[9..] };
+        const gl = try PassFrame.read(&rl, true);
+        try std.testing.expectEqual(@as(?bool, full), gl.full);
+        try std.testing.expectEqualSlices(i64, p.tokens[0..2], gl.tokens[0..2]);
+        try std.testing.expectError(error.ShortFrame, rl.int(u8));
+    }
+    // a frame of no streams or too many is refused
+    var bad: Wire = .{};
+    defer bad.deinit(gpa);
+    try bad.int(gpa, u32, 0);
+    try bad.int(gpa, u32, 1);
+    var rb: Reader = .{ .b = bad.buf.items };
+    try std.testing.expectError(error.BadFrame, PassFrame.read(&rb, false));
+}
+
+test "rank 0's drafter passes: TF_DS_DRAFT_VOCAB's guard counts every request's committed tokens first, then the pass and its frame take its head" {
+    const src = @embedFile("lanes.zig");
+    const at = std.mem.indexOf(u8, src, "    fn draftFn(ptr: *anyopaque") orelse return error.TestUnexpectedResult;
+    const body = src[at .. at + (std.mem.indexOf(u8, src[at..], "\n    }\n") orelse return error.TestUnexpectedResult)];
+    const note = std.mem.indexOf(u8, body, "for (requests) |r| self.guard.note(&v.bits, r.follow);") orelse return error.TestUnexpectedResult;
+    const mode = std.mem.indexOf(u8, body, "dr.vocab_full = self.guard.full;") orelse return error.TestUnexpectedResult;
+    const loop = std.mem.indexOf(u8, body, "for (requests) |r| {") orelse return error.TestUnexpectedResult;
+    const frame = std.mem.indexOf(u8, body, "if (dr.vocab != null) pf.full = dr.vocab_full;") orelse return error.TestUnexpectedResult;
+    const pass = std.mem.indexOf(u8, body, "try m.pass(sub.tokens[0..sub.n], sub.q0[0..sub.n], sub.slots[0..sub.n], steps);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(note < mode and mode < loop and loop < frame and frame < pass);
+    // each pass counted by its head; the guard's counts copied out for /metrics
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "_ = (if (dr.vocab_full) &st.full_passes else &st.list_passes).fetchAdd(1, .monotonic);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "st.misses.store(self.guard.misses, .monotonic);"));
+    // a follower takes its head from the frame
+    const fol = std.mem.indexOf(u8, src, "            .pass => {") orelse return error.TestUnexpectedResult;
+    const fb = src[fol .. fol + (std.mem.indexOf(u8, src[fol..], "\n            },\n") orelse return error.TestUnexpectedResult)];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, fb, "const pf = try PassFrame.read(r, if (c.m.dr) |dr| dr.vocab != null else false);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, fb, "if (pf.full) |full| if (c.m.dr) |*dr| {\n                    dr.vocab_full = full;"));
 }
 
 test "a round's rows: each window at its positions, its ids written over the rejected rows" {
@@ -2298,6 +2422,11 @@ test "a refusal that is this rank's alone fails the transport at once; a refusal
         try std.testing.expect(std.mem.indexOf(u8, code[at..line_end], "refusedExchange(m, err)") != null);
     }
     // the round frames (FollowCtx.roundFrame, run from the main loop and from inside a pass's layers) report the same way
+    for ([_][]const u8{ "c.m.verify(rows, c.built.absorb", "c.m.headWhole(n)", "c.m.pass(pf.tokens[0..pf.n], pf.q0" }) |call| {
+        const at = std.mem.indexOf(u8, code, call) orelse return error.TestUnexpectedResult;
+        const line_end = std.mem.indexOfPos(u8, code, at, "\n") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, code[at..line_end], "refusedExchange(c.m, err)") != null);
+    }
     try std.testing.expect(std.mem.indexOf(u8, code, "m.failExchanges();") != null);
     try std.testing.expect(std.mem.indexOf(u8, @embedFile("model.zig"), "rc.t.fail(why, .own1, gone);") != null);
     try std.testing.expect(std.mem.indexOf(u8, @embedFile("model.zig"), "m.failLanes(.refused, 0);") != null);

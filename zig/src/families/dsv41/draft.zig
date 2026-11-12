@@ -28,6 +28,8 @@ const mx = @import("mx.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const markov_tokens = @import("markov_tokens.zig");
 const draft2d = @import("draft2d.zig");
+const draft_vocab = @import("draft_vocab.zig");
+const land_mod = @import("land.zig");
 const graph_fallback = @import("graph_fallback.zig");
 
 const Engine = prompt.Engine;
@@ -182,6 +184,7 @@ const DumpProbe = struct {
             .attn_gather, .moe_gather => e.world * R * d * 4,
             .stages_h => R * e.c.hc * d * 2,
             .stages_pre => R * e.c.hc * 4,
+            .local => R * p.dr.headWidth(e) * 4,
             .markov => p.N * (p.steps + 1) * 8,
         };
         ddWrite(e, @tagName(what), stage, dev, bytes, false);
@@ -265,6 +268,74 @@ const MarkovGather = struct {
     }
 };
 
+/// TF_DS_DRAFT_VOCAB: a step's picked list positions to their ids (ops.Ops.listIds), on the pass's stream.
+const ListIds = struct {
+    e: *const Engine,
+    ids: u64,
+
+    fn run(ctx: *anyopaque, out: u64, stride: usize, rows: usize) anyerror!void {
+        const l: *ListIds = @ptrCast(@alignCast(ctx));
+        try l.e.ops.listIds(l.e.s, out, stride, rows, l.ids, draft_vocab.count);
+    }
+};
+
+/// The kit's base set as draft_vocab.kitOff's lookups.
+const SetFinds = struct {
+    set: *const cuda.aot.Set,
+
+    pub fn has(f: SetFinds, name: []const u8, args: []const cuda.aot.Arg, consts: []const cuda.aot.Const) bool {
+        return f.set.lookup(name, args, consts) != null;
+    }
+};
+
+/// TF_DS_DRAFT_VOCAB's state on a node: the list's head rows of this node (FP4 [8,192, D], the list's order), the
+/// Markov loop on its positions (its head rows [count, rank] fp16 and cached bias rows of its own), the ids (int64
+/// [count]: the picks' map), the start's exchange plan and the rows it took from other nodes.
+pub const Vocab = struct {
+    head: weights.Linear,
+    mk: tri_markov.Markov,
+    ids: u64,
+    flag: u64, // u32: a gather's row past its table (the start's checks)
+    plan: draft_vocab.Plan,
+    idx: u64, // int64 [nodes, 8,192]: each send's (and the node's own) rows of its quarter
+    quarters: [draft_vocab.nodes][2]usize, // every node's head rows of the vocabulary
+    blob: usize, // the exchange's export in bytes: its rounds' chunks, the staging's first part
+    from_others: usize,
+    bits: draft_vocab.Bits, // the list's ids, a bit an id (rank 0's guard)
+};
+
+/// TF_DS_DRAFT_VOCAB's start: the rows of this node's quarter `q` each node takes (pl.send), as row indices of the
+/// quarter's head, into out int64 [nodes, 8,192] (node j's from j * 8,192; the rest 0).
+pub fn vocabRows(pl: draft_vocab.Plan, q: [2]usize, out: []i64) void {
+    @memset(out, 0);
+    for (pl.send, 0..) |x, j| for (x[0]..x[1], 0..) |p, i| {
+        out[j * draft_vocab.per_node + i] = @as(i64, draft_vocab.id(p)) - @as(i64, @intCast(q[0]));
+    };
+}
+
+/// The rows of this node's quarter node j takes (pl.send[j]), gathered from the FP4 head h8 by the uploaded vocabRows
+/// table `idx` into dst_w (codes, k / 2 bytes a row) and dst_s (scales, k / 32): how many.
+pub fn vocabPack(ops: anytype, s: cuda.Stream, h8: weights.Linear, idx: u64, pl: draft_vocab.Plan, j: usize, dst_w: u64, dst_s: u64, flag: u64) !usize {
+    const x = pl.send[j];
+    const r = x[1] - x[0];
+    if (r == 0) return 0;
+    const at = idx + j * draft_vocab.per_node * 8;
+    try ops.gatherRows(s, h8.w, h8.n, at, dst_w, h8.k / 2, r, flag);
+    try ops.gatherRows(s, h8.s, h8.n, at, dst_s, h8.k / 32, r, flag);
+    return r;
+}
+
+/// Where the rows node j sends node `me` (pl.recv[j] of me's plan) land in me's list head: its codes' and scales'
+/// spans; null when j sends none.
+pub fn vocabLand(pl: draft_vocab.Plan, me: usize, j: usize, head: weights.Linear) ?[2]land_mod.Span {
+    const x = pl.recv[j];
+    if (x[1] == x[0]) return null;
+    const at = x[0] - draft_vocab.nodeRange(me)[0];
+    const cb: usize = head.k / 2;
+    const sb: usize = head.k / 32;
+    return .{ .{ .addr = head.w + at * cb, .len = (x[1] - x[0]) * cb }, .{ .addr = head.s + at * sb, .len = (x[1] - x[0]) * sb } };
+}
+
 /// The drafter pass's CUDA graphs (BatchDraftGraph), one a (streams, steps): every pointer it reads is a fixed
 /// buffer and every per-pass value (ids, positions, slots, the pick lists) is uploaded ahead of the replay.
 pub const PassGraphs = struct {
@@ -272,7 +343,7 @@ pub const PassGraphs = struct {
     map: std.AutoHashMapUnmanaged(Key, cuda.graph.Exec) = .empty,
     lazy: Lazy = .{}, // the passes held eager after a failed capture, the captures attempted (TF_DS_GRAPH_FAIL_TEST=RANK:N:pass)
 
-    pub const Key = struct { streams: u32, steps: u32 };
+    pub const Key = struct { streams: u32, steps: u32, list: bool = false }; // list: on TF_DS_DRAFT_VOCAB's list
     const Lazy = graph_fallback.Lazy(graph_fallback.Cuda, Key);
 
     pub fn init(gpa: std.mem.Allocator) PassGraphs {
@@ -295,22 +366,7 @@ pub const PassGraphs = struct {
     }
 
     fn run(g: *PassGraphs, dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, N: usize, steps: usize) !void {
-        const key: Key = .{ .streams = @intCast(N), .steps = @intCast(steps) };
-        if (g.map.getPtr(key)) |x| return x.launchOn(e.s);
-        try cuda.graph.beginCapture(e.s, .thread_local);
-        dr.body(e, ch, pool, N, steps, null) catch |err| {
-            if (cuda.graph.endCapture(e.s)) |got| {
-                var x = got;
-                x.deinit();
-            } else |_| {}
-            return err;
-        };
-        var graph = try cuda.graph.endCapture(e.s);
-        defer graph.deinit();
-        var exec = try graph.instantiate();
-        errdefer exec.deinit();
-        try g.map.put(g.gpa, key, exec);
-        try exec.launchOn(e.s);
+        const key: Key = .{ .streams = @intCast(N), .steps = @intCast(steps), .list = dr.onList() };
         if (g.map.getPtr(key)) |x| return ring_wait.launchGraph(x.*, e.s);
         // G0.3, as round.Graphs.run: every rank captures and instantiates, then all agree before any launch
         // (graph_fallback: launch and keep, every rank eager, or the pass failed on every rank)
@@ -457,6 +513,11 @@ pub const Drafter = struct {
     passes: u64 = 0,
     // the pass's graphs (BatchDraftGraph: one a streams and steps; null: eager)
     graphs: ?*PassGraphs = null,
+    // TF_DS_DRAFT_VOCAB (vocabPrepare, vocabExchange): the pruned list's head, Markov loop and ids; null: the whole
+    // vocabulary's
+    vocab: ?Vocab = null,
+    // with the list in effect, the next pass on the whole head (the guard's call, every rank alike: the pass frame)
+    vocab_full: bool = false,
     // the last pass on the host: each stream's drafts and confidences (`steps` of them)
     streams: usize = 0,
     steps: usize = 0,
@@ -492,6 +553,8 @@ pub const Drafter = struct {
             }
         }
         dr.passes = 0;
+        dr.vocab = null;
+        dr.vocab_full = false;
         dr.nacts = if (dlog != null and e.mx != null) try a.take(max_stages * 4) else 0;
         dr.ds = ds;
         dr.n = c.dspark_block;
@@ -659,10 +722,133 @@ pub const Drafter = struct {
         dr.confw_host = &.{};
         dr.xc_host = &.{};
         dr.em_host = &.{};
+        dr.dropVocab();
     }
 
     fn row(dr: *const Drafter, i: usize) u64 {
         return dr.rows + i * max_rows * 8;
+    }
+
+    /// TF_DS_DRAFT_VOCAB off (refused, or the drafter closing): its host table freed, every pass the whole vocabulary's
+    /// (its device buffers are the arena's).
+    pub fn dropVocab(dr: *Drafter) void {
+        if (dr.vocab) |*v| v.bits.deinit(std.heap.page_allocator);
+        dr.vocab = null;
+        dr.vocab_full = false;
+    }
+
+    /// The next pass on TF_DS_DRAFT_VOCAB's list (in effect, and the guard not asking for the whole head).
+    pub fn onList(dr: *const Drafter) bool {
+        return dr.vocab != null and !dr.vocab_full;
+    }
+
+    /// The head's columns the next pass computes on this node: the list's 8,192, else the quarter's.
+    pub fn headWidth(dr: *const Drafter, e: *const Engine) usize {
+        return if (dr.onList()) draft_vocab.per_node else (dr.ds.head8 orelse e.w.head).n;
+    }
+
+    /// TF_DS_DRAFT_VOCAB's checks on this rank, before anything is made: why it cannot run (null: it can). The
+    /// four-node split is the 2D one: `two` set and the engine's comm the four nodes' (its `world` is TP2's, 2 inside
+    /// a pair). `quarters`: every node's head rows of the vocabulary (Model.open's all-gather), `me` this node's.
+    pub fn vocabWhy(dr: *const Drafter, e: *const Engine, quarters: [draft_vocab.nodes][2]usize, me: u32) !?[]const u8 {
+        const c = e.c;
+        if (draft_vocab.check(c.vocab)) |why| return why;
+        if (e.two == null or e.comm.world != draft_vocab.nodes or me >= draft_vocab.nodes) return "needs the four-node split";
+        const h8 = dr.ds.head8 orelse return "needs TF_DS_DRAFT_HEAD=fp4";
+        if (h8.fmt != .fp4) return "needs TF_DS_DRAFT_HEAD=fp4";
+        const q = quarters[me];
+        if (q[0] != e.w.vocab_lo or h8.n != q[1] - q[0]) return "its head rows are not its vocabulary quarter";
+        _ = draft_vocab.plan(me, quarters, c.vocab) catch return "the nodes' head rows do not tile the vocabulary";
+        if (e.t.set) |set| if (try draft_vocab.kitOff(std.heap.page_allocator, SetFinds{ .set = set }, c.*)) |why| return why;
+        return null;
+    }
+
+    /// TF_DS_DRAFT_VOCAB, this rank's part before the agreement: why it cannot (vocabWhy; null: it can), else the
+    /// list's buffers made, its Markov head rows and this node's own head rows in them, its cached bias rows filled, and
+    /// the exchange's staging (`staging`, the caller's to free) holding each send's rows of this node's quarter.
+    pub fn vocabPrepare(dr: *Drafter, e: *const Engine, a: *prompt.Arena, quarters: [draft_vocab.nodes][2]usize, me: u32, staging: *?cuda.DeviceBuffer) !?[]const u8 {
+        const c = e.c;
+        dr.vocab = null;
+        if (try dr.vocabWhy(e, quarters, me)) |why| return why;
+        const h8 = dr.ds.head8.?;
+        const q = quarters[me];
+        const pl = try draft_vocab.plan(me, quarters, c.vocab);
+        const n = draft_vocab.per_node;
+        const cb: usize = h8.k / 2; // an FP4 row's codes
+        const sb: usize = h8.k / 32; // its scales
+        const rank = c.markov_rank;
+        var v: Vocab = undefined;
+        v.plan = pl;
+        v.from_others = pl.fromOthers(me);
+        v.flag = try a.take(4);
+        try prompt.fill(e, v.flag, 0, 4);
+        // the list's ids, and its rows of the Markov head
+        v.ids = try a.take(draft_vocab.count * 8);
+        const pa = std.heap.page_allocator;
+        const ids = try pa.alloc(i64, draft_vocab.count);
+        defer pa.free(ids);
+        for (ids, 0..) |*x, i| x.* = draft_vocab.id(i);
+        try prompt.upload(e, v.ids, ids.ptr, draft_vocab.count * 8);
+        const mhead = try a.take(draft_vocab.count * rank * 2);
+        try e.ops.gatherRows(e.s, dr.mk.head, c.vocab, v.ids, mhead, rank * 2, draft_vocab.count, v.flag);
+        // the staging: the export blob (every round's chunk of it, zeros past its end), then each node's rows of this
+        // quarter (int64 [nodes, n])
+        v.quarters = quarters;
+        v.blob = try draft_vocab.rounds(quarters, cb, sb) * draft_vocab.chunk;
+        staging.* = try cuda.DeviceBuffer.alloc(e.d, v.blob + draft_vocab.nodes * n * 8);
+        try prompt.fill(e, staging.*.?.ptr, 0, v.blob);
+        v.idx = staging.*.?.ptr + v.blob;
+        const rows = try pa.alloc(i64, draft_vocab.nodes * n);
+        defer pa.free(rows);
+        vocabRows(pl, q, rows);
+        try prompt.upload(e, v.idx, rows.ptr, rows.len * 8);
+        try e.s.synchronize(); // (the host tables are freed next)
+        // the list's head rows: this node's own now, the others' in the exchange
+        const w = try a.take(n * cb);
+        const sc = try a.take(n * sb);
+        v.head = .{ .words = w, .w = w, .s = sc, .k = h8.k, .n = n, .fmt = .fp4 };
+        if (vocabLand(pl, me, me, v.head)) |own| _ = try vocabPack(e.ops, e.s, h8, v.idx, pl, me, own[0].addr, own[1].addr, v.flag);
+        // the Markov loop on the list, with its own cached bias rows of the 256 tokens (the slot table is the same)
+        v.mk = draft_vocab.markov(c.*, me, mhead, dr.mk.emb, dr.mk.none);
+        const kt = markov_tokens.cached.len;
+        const tok = try a.take(kt * 8);
+        try prompt.upload(e, tok, &markov_tokens.cached, kt * 8);
+        try v.mk.fill(e.t, tok, kt, try a.take(kt * n * 2), dr.mk.slot);
+        try e.s.synchronize();
+        var bad: u32 = 0;
+        try e.d.check(e.d.api.cuMemcpyDtoH_v2(@ptrCast(&bad), v.flag, 4), "cuMemcpyDtoH");
+        if (bad != 0) return "a row of the list is past its table";
+        v.bits = try draft_vocab.Bits.init(pa, c.vocab);
+        dr.vocab = v;
+        return null;
+    }
+
+    /// TF_DS_DRAFT_VOCAB's start exchange, on every rank after the agreement: the rows each other node takes from this
+    /// node's quarter gathered into `staging` (the export blob, draft_vocab.blobPart), then the ranks gather their blobs
+    /// over the host links one chunk a round (comm.gatherHost, in step) and this node copies each sender's part for it
+    /// from the gathered chunk into its list's head (draft_vocab.landings).
+    pub fn vocabExchange(dr: *Drafter, e: *const Engine, me: u32, staging: *const cuda.DeviceBuffer) !void {
+        const v = &dr.vocab.?;
+        const h8 = dr.ds.head8.?;
+        const cb: usize = h8.k / 2;
+        const sb: usize = h8.k / 32;
+        for (0..draft_vocab.nodes) |m| if (m != me) {
+            const part = try draft_vocab.blobPart(v.quarters, me, m, cb, sb);
+            _ = try vocabPack(e.ops, e.s, h8, v.idx, v.plan, m, staging.ptr + part.codes, staging.ptr + part.scales, v.flag);
+        };
+        var recv = try cuda.DeviceBuffer.alloc(e.d, draft_vocab.nodes * draft_vocab.chunk);
+        defer recv.free();
+        for (0..v.blob / draft_vocab.chunk) |round| {
+            try e.comm.gatherHost(e.d, staging.ptr + round * draft_vocab.chunk, recv.ptr, draft_vocab.chunk, e.s);
+            for (0..draft_vocab.nodes) |j| for (try draft_vocab.landings(v.quarters, me, j, round, cb, sb)) |cp| if (cp) |x| {
+                const dst = (if (x.codes) v.head.w else v.head.s) + x.dst;
+                try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(dst, recv.ptr + j * draft_vocab.chunk + x.src, x.len, e.s.handle), "cuMemcpyDtoDAsync");
+            };
+        }
+        try e.s.synchronize();
+        var bad: u32 = 0;
+        try e.d.check(e.d.api.cuMemcpyDtoH_v2(@ptrCast(&bad), v.flag, 4), "cuMemcpyDtoH");
+        if (bad != 0) return error.RowPastTable;
     }
 
     /// Drafter.absorb into slot `slot`'s view: the target's taps rows of positions start .. start + n - 1 (bf16
@@ -911,13 +1097,20 @@ pub const Drafter = struct {
         try tri_basic.rmsnorm(t, dr.xc, d, dr.ds.norm, dr.xn, d, c.eps, R, d);
         dd(e, "xc", 0, dr.xc, R * d * 2);
         dd(e, "xn", 0, dr.xn, R * d * 2);
+        // the list's head rows (TF_DS_DRAFT_VOCAB), else the drafter's FP8 / FP4 copy (weights.DSpark.head8), else the
+        // backbone's
+        const list: ?*const Vocab = if (dr.onList()) &dr.vocab.? else null;
+        const head = if (list) |v| v.head else dr.ds.head8 orelse e.w.head;
         try prompt.groupedDecode(e, ch, R, &.{head}, &.{dr.xn}, &.{d}, &.{dr.local}, &.{head.n}, &.{.f32});
         try Probe.check(probe, .local, S, dr.local);
         pmark(e, .head);
         // the Markov loop: out [N, steps + 1], each stream's last token first
         const ts = steps + 1;
         var g: MarkovGather = .{ .e = e, .dst = dr.mg };
-        try dr.mk.steps(t, dr.local, dr.out, ts, N, n, steps, dr.msc, .{ .ctx = &g, .run = MarkovGather.run });
+        if (list) |v| {
+            var ids: ListIds = .{ .e = e, .ids = v.ids };
+            try draft_vocab.steps(v.mk, t, dr.local, dr.out, ts, N, n, steps, dr.msc, .{ .ctx = &g, .run = MarkovGather.run }, .{ .ctx = &ids, .run = ListIds.run });
+        } else try dr.mk.steps(t, dr.local, dr.out, ts, N, n, steps, dr.msc, .{ .ctx = &g, .run = MarkovGather.run });
         try Probe.check(probe, .markov, S, dr.out);
         pmark(e, .markov);
         // the confidence head: [xc (fp32), the embedding rows the steps read (fp32)] @ conf^T, a stream's first steps rows
@@ -1398,4 +1591,372 @@ test "with main_proj four ways an absorb's rows are each node's quarter, gathere
 fn notPorted(src: std.builtin.SourceLocation) error{NotPortedYet} {
     std.debug.print("{{\"not_ported\": \"{s}:{d}\"}}\n", .{ src.file, src.line });
     return error.NotPortedYet;
+}
+
+test "TF_DS_DRAFT_VOCAB's checks pass on every node of the four-node split as Model.open builds its engine, and refuse TP2's" {
+    const config = @import("config.zig");
+    const prompt2d = @import("prompt2d.zig");
+    var why: config.Why = .{};
+    const c = try config.parse(std.testing.allocator, config.test_config, &why);
+    // Model.open on four nodes: the split prompt2d.split(g, 4) (TP2 inside a pair: world 2), the engine's `world` the
+    // split's, its comm the four nodes' (m.comm), `two` set; each node's head rows the split's head columns
+    // (weights.load: headCols), the four-way drafter's FP4 head those rows (TF_DS_DRAFT_HEAD=fp4)
+    const model = @embedFile("model.zig");
+    const at = std.mem.indexOf(u8, model, "m.eng = .{ .d = d,") orelse return error.TestUnexpectedResult;
+    const eng = model[at .. at + std.mem.indexOfScalar(u8, model[at..], '\n').?];
+    for ([_][]const u8{ ".comm = &m.comm,", ".world = sp.world,", ".two = if (m.two) |*t| t else null };" }) |pin| {
+        if (std.mem.indexOf(u8, eng, pin) == null) {
+            std.debug.print("Model.open's engine lacks: {s}\n", .{pin});
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expect(std.mem.indexOf(u8, model, "dr.vocabPrepare(&m.eng, &m.arena, quarters, m.comm.rank, &staging)") != null);
+    var quarters: [draft_vocab.nodes][2]usize = undefined;
+    for (0..draft_vocab.nodes) |g| quarters[g] = (try prompt2d.split(@intCast(g), 4)).headCols(c);
+    try std.testing.expectEqual([2]usize{ 64_640, 97_024 }, quarters[1]);
+    var two: prompt2d.Two = undefined;
+    for (0..draft_vocab.nodes) |g| {
+        const sp = try prompt2d.split(@intCast(g), 4);
+        try std.testing.expectEqual(@as(u32, 2), sp.world);
+        var comm: comm_mod.Comm = undefined;
+        comm.world = 4;
+        comm.rank = @intCast(g);
+        var w: weights.Weights = undefined;
+        w.vocab_lo = quarters[g][0];
+        w.vocab_hi = quarters[g][1];
+        var e: Engine = undefined;
+        e.c = &c;
+        e.w = &w;
+        e.comm = &comm;
+        e.world = sp.world;
+        e.two = &two;
+        e.t = .{};
+        var dr: Drafter = undefined;
+        dr.ds.head8 = .{ .words = 0, .k = @intCast(c.hidden), .n = @intCast(quarters[g][1] - quarters[g][0]), .fmt = .fp4 };
+        try std.testing.expectEqual(@as(?[]const u8, null), try dr.vocabWhy(&e, quarters, @intCast(g)));
+        // the start line each node then logs: its list's rows from the other nodes' quarters
+        const from = (try draft_vocab.plan(g, quarters, c.vocab)).fromOthers(g);
+        try std.testing.expectEqual(([_]usize{ 0, 8192, 806, 4637 })[g], from);
+        var lb: [512]u8 = undefined;
+        var want: [512]u8 = undefined;
+        var db: [8]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&want, "TF_DS_DRAFT_VOCAB=1: the drafter's head and Markov loop on 8192 ids a node (32768 of 129280, list 82fa3034), on every rank; {d} of this node's head rows from the other nodes; the whole head kept: a pass takes it while more than 2% of the last 4096 committed tokens are outside the list (back under 1%)", .{from}), draft_vocab.line(&lb, 0, null, "", from, c.vocab, draft_vocab.digest(&db)));
+        // the drafter's FP8 head, and a node's head rows other than its quarter
+        dr.ds.head8.?.fmt = .fp8;
+        try std.testing.expectEqualStrings("needs TF_DS_DRAFT_HEAD=fp4", (try dr.vocabWhy(&e, quarters, @intCast(g))).?);
+        dr.ds.head8.?.fmt = .fp4;
+        w.vocab_lo += 128;
+        try std.testing.expectEqualStrings("its head rows are not its vocabulary quarter", (try dr.vocabWhy(&e, quarters, @intCast(g))).?);
+        w.vocab_lo -= 128;
+        // TP2 (two nodes, no 2D split): its engine's comm is the pair's
+        var tp2 = e;
+        tp2.two = null;
+        var pair = comm;
+        pair.world = 2;
+        tp2.comm = &pair;
+        try std.testing.expectEqualStrings("needs the four-node split", (try dr.vocabWhy(&tp2, quarters, @intCast(g))).?);
+        // four ranks without the 2D split, and a rank past the four nodes
+        var plain = e;
+        plain.two = null;
+        try std.testing.expectEqualStrings("needs the four-node split", (try dr.vocabWhy(&plain, quarters, @intCast(g))).?);
+        try std.testing.expectEqualStrings("needs the four-node split", (try dr.vocabWhy(&e, quarters, draft_vocab.nodes)).?);
+    }
+}
+
+test "TF_DS_DRAFT_VOCAB's top ids: the list's head, built by the start's exchange, ranks the kept ids as the whole head does (top 1 and top 5, ties to the lower id), and a misplaced row is caught" {
+    // The head's columns are independent dot products (the decode kernel's K split ignores N: replay section draft_vocab
+    // proves a list column's fp32 logit byte for byte the whole head's), so what is left to prove on the host is the
+    // PLACEMENT: that the bytes the exchange puts at each list position are the row of that position's id. Each node's
+    // list head is built here by the engine's own functions on host memory: the senders' blobs (vocabRows: each
+    // receiver's gather indices into the sender's quarter; draft_vocab.blobPart: where its parts sit), the rounds' chunks
+    // (draft_vocab.landings: what each receiver copies from each sender's chunk, and where), its own rows (vocabLand).
+    // The reference reads the whole table by id, never through the placement.
+    const gpa = std.testing.allocator;
+    const quarters = [draft_vocab.nodes][2]usize{ .{ 0, 32_384 }, .{ 64_640, 97_024 }, .{ 32_384, 64_640 }, .{ 97_024, 129_280 } };
+    const V: usize = 129_280;
+    const K: usize = 32;
+    const cb = K / 2; // an FP4 row's codes
+    const sb = K / 32; // its scales: one
+    const n = draft_vocab.per_node;
+    const codes = try gpa.alloc(u8, V * cb); // the whole head by id (a node holds its quarter's rows of it)
+    defer gpa.free(codes);
+    const scales = try gpa.alloc(u8, V * sb);
+    defer gpa.free(scales);
+    var prng = std.Random.DefaultPrng.init(0xd4af7);
+    const rng = prng.random();
+    rng.bytes(codes);
+    rng.bytes(scales);
+    // equal logits whatever the activation: three ids' rows are copies of a fourth's, on different nodes, in the list
+    const tie_ids = [_]u32{ draft_vocab.id(100), draft_vocab.id(9_000), draft_vocab.id(17_000), draft_vocab.id(30_000) };
+    for (tie_ids[1..]) |v| {
+        @memcpy(codes[v * cb ..][0..cb], codes[tie_ids[0] * cb ..][0..cb]);
+        scales[v] = scales[tie_ids[0]];
+    }
+    const nr = try draft_vocab.rounds(quarters, cb, sb);
+    // each node's export blob, zeros past its end
+    const blobs = try gpa.alloc(u8, draft_vocab.nodes * nr * draft_vocab.chunk);
+    defer gpa.free(blobs);
+    @memset(blobs, 0);
+    const ix = try gpa.alloc(i64, draft_vocab.nodes * n);
+    defer gpa.free(ix);
+    for (0..draft_vocab.nodes) |j| {
+        const pj = try draft_vocab.plan(j, quarters, V);
+        vocabRows(pj, quarters[j], ix);
+        const blob = blobs[j * nr * draft_vocab.chunk ..];
+        for (0..draft_vocab.nodes) |m| if (m != j) {
+            const part = try draft_vocab.blobPart(quarters, j, m, cb, sb);
+            for (0..part.rows) |i| { // vocabPack: the rows of this quarter the receiver takes
+                const row = quarters[j][0] + @as(usize, @intCast(ix[m * n + i]));
+                @memcpy(blob[part.codes + i * cb ..][0..cb], codes[row * cb ..][0..cb]);
+                @memcpy(blob[part.scales + i * sb ..][0..sb], scales[row * sb ..][0..sb]);
+            }
+        };
+    }
+    // each node's list head: its own rows, then every round's landings
+    const hw = try gpa.alloc(u8, draft_vocab.nodes * n * cb);
+    defer gpa.free(hw);
+    const hs = try gpa.alloc(u8, draft_vocab.nodes * n * sb);
+    defer gpa.free(hs);
+    @memset(hw, 0xee);
+    @memset(hs, 0xee);
+    for (0..draft_vocab.nodes) |me| {
+        const pl = try draft_vocab.plan(me, quarters, V);
+        vocabRows(pl, quarters[me], ix);
+        const lin: weights.Linear = .{ .words = 0, .w = 0, .s = 0, .k = K, .n = n, .fmt = .fp4 };
+        if (vocabLand(pl, me, me, lin)) |own| {
+            for (0..pl.send[me][1] - pl.send[me][0]) |i| {
+                const row = quarters[me][0] + @as(usize, @intCast(ix[me * n + i]));
+                @memcpy(hw[me * n * cb + own[0].addr + i * cb ..][0..cb], codes[row * cb ..][0..cb]);
+                @memcpy(hs[me * n * sb + own[1].addr + i * sb ..][0..sb], scales[row * sb ..][0..sb]);
+            }
+        }
+        for (0..nr) |r| for (0..draft_vocab.nodes) |j| for (try draft_vocab.landings(quarters, me, j, r, cb, sb)) |cp| if (cp) |x| {
+            const chunk_j = blobs[(j * nr + r) * draft_vocab.chunk ..][0..draft_vocab.chunk];
+            const dst = if (x.codes) hw[me * n * cb + x.dst ..] else hs[me * n * sb + x.dst ..];
+            @memcpy(dst[0..x.len], chunk_j[x.src..][0..x.len]);
+        };
+    }
+    // the head the nodes built holds, at every list position, the bytes of that position's id
+    for (0..draft_vocab.count) |p| {
+        const v = draft_vocab.id(p);
+        try std.testing.expectEqualSlices(u8, codes[v * cb ..][0..cb], hw[p * cb ..][0..cb]);
+        try std.testing.expectEqualSlices(u8, scales[v * sb ..][0..sb], hs[p * sb ..][0..sb]);
+    }
+
+    // the logits: a row's codes (two FP4-like nibbles a byte) scaled, dotted with an activation: the same function on
+    // the table's row and on the list head's row
+    const Dot = struct {
+        fn of(c: []const u8, s: u8, x: *const [K]f32) f32 {
+            var acc: f32 = 0;
+            for (0..K) |k| {
+                const nib: u8 = if (k % 2 == 0) c[k / 2] & 15 else c[k / 2] >> 4;
+                acc += (@as(f32, @floatFromInt(nib)) - 8) * 0.25 * (1 + @as(f32, @floatFromInt(s)) / 16) * x[k];
+            }
+            return acc;
+        }
+    };
+    const Hit = struct { v: f32, id: u32 };
+    const better = struct {
+        fn f(_: void, a: Hit, b: Hit) bool {
+            return a.v > b.v or (a.v == b.v and a.id < b.id);
+        }
+    }.f;
+    const top = 5;
+    // the control: node 2's own rows landing a row late (row i holds row i - 1's bytes)
+    const bad_w = try gpa.dupe(u8, hw);
+    defer gpa.free(bad_w);
+    const bad_s = try gpa.dupe(u8, hs);
+    defer gpa.free(bad_s);
+    {
+        var i: usize = n - 1;
+        while (i > 0) : (i -= 1) {
+            @memcpy(bad_w[(2 * n + i) * cb ..][0..cb], hw[(2 * n + i - 1) * cb ..][0..cb]);
+            bad_s[(2 * n + i) * sb] = hs[(2 * n + i - 1) * sb];
+        }
+    }
+    var control_caught = false;
+    for (0..40) |trial| {
+        var x: [K]f32 = undefined;
+        for (&x) |*e| e.* = rng.float(f32) * 2 - 1;
+        var ref: [top]Hit = @splat(.{ .v = -std.math.inf(f32), .id = std.math.maxInt(u32) });
+        var got = ref;
+        var bad = ref;
+        for (0..draft_vocab.count) |p| {
+            const v = draft_vocab.id(p);
+            insertTop(&ref, .{ .v = Dot.of(codes[v * cb ..][0..cb], scales[v], &x), .id = v }, better);
+            insertTop(&got, .{ .v = Dot.of(hw[p * cb ..][0..cb], hs[p], &x), .id = v }, better);
+            insertTop(&bad, .{ .v = Dot.of(bad_w[p * cb ..][0..cb], bad_s[p], &x), .id = v }, better);
+        }
+        if (trial % 8 == 0) { // the tied rows rank first: ties to the lower id on both
+            for (&x, 0..) |*e, k| e.* = if (k % 2 == 0) 1 else -1;
+            var r2: [top]Hit = @splat(.{ .v = -std.math.inf(f32), .id = std.math.maxInt(u32) });
+            var g2 = r2;
+            for (0..draft_vocab.count) |p| {
+                const v = draft_vocab.id(p);
+                insertTop(&r2, .{ .v = Dot.of(codes[v * cb ..][0..cb], scales[v], &x), .id = v }, better);
+                insertTop(&g2, .{ .v = Dot.of(hw[p * cb ..][0..cb], hs[p], &x), .id = v }, better);
+            }
+            for (r2, g2) |a, b| try std.testing.expectEqual(a.id, b.id);
+        }
+        for (ref, got) |a, b| {
+            try std.testing.expectEqual(a.id, b.id);
+            try std.testing.expectEqual(a.v, b.v);
+        }
+        for (ref, bad) |a, b| if (a.id != b.id) {
+            control_caught = true;
+        };
+    }
+    // the instrument sees a misplaced row: node 2's rows a row late change some trial's top 5
+    try std.testing.expect(control_caught);
+
+    // an id outside the list that the whole head ranks first is the list's miss: the list's top 1 is then the best kept
+    // id, not the whole head's (the guard counts the miss)
+    const out_id: u32 = 128_000;
+    try std.testing.expect(draft_vocab.find(out_id) == null);
+    @memset(codes[out_id * cb ..][0..cb], 0xff);
+    scales[out_id] = 255;
+    var x: [K]f32 = @splat(1);
+    var best_all: Hit = .{ .v = -std.math.inf(f32), .id = 0 };
+    var best_kept = best_all;
+    for (0..V) |v| {
+        const h: Hit = .{ .v = Dot.of(codes[v * cb ..][0..cb], scales[v], &x), .id = @intCast(v) };
+        if (better({}, h, best_all)) best_all = h;
+        if (draft_vocab.find(@intCast(v)) != null and better({}, h, best_kept)) best_kept = h;
+    }
+    try std.testing.expectEqual(out_id, best_all.id);
+    try std.testing.expect(best_kept.id != out_id);
+}
+
+fn insertTop(list: anytype, h: @typeInfo(@TypeOf(list.*)).array.child, less: anytype) void {
+    var i: usize = list.len;
+    while (i > 0 and less({}, h, list[i - 1])) : (i -= 1) {}
+    if (i >= list.len) return;
+    var j: usize = list.len - 1;
+    while (j > i) : (j -= 1) list[j] = list[j - 1];
+    list[i] = h;
+}
+
+test "TF_DS_DRAFT_VOCAB: a pass takes the list's head and Markov loop unless the guard asks for the whole head, its graphs apart" {
+    var dr: Drafter = undefined;
+    dr.vocab = null;
+    dr.vocab_full = false;
+    try std.testing.expect(!dr.onList());
+    dr.vocab = std.mem.zeroes(Vocab);
+    try std.testing.expect(dr.onList());
+    dr.vocab_full = true;
+    try std.testing.expect(!dr.onList());
+    // the graph of a pass on the list is not the whole head's, nor the baseline key
+    const k: PassGraphs.Key = .{ .streams = 4, .steps = 5 };
+    try std.testing.expect(!std.meta.eql(k, PassGraphs.Key{ .streams = 4, .steps = 5, .list = true }));
+    try std.testing.expect(std.meta.eql(k, PassGraphs.Key{ .streams = 4, .steps = 5, .list = false }));
+    const src = @embedFile("draft.zig");
+    const code = src[0..std.mem.indexOf(u8, src, "\ntest \"").?];
+    // the body: the head and the loop by onList, the list's loop mapping its picks
+    const at = std.mem.indexOf(u8, code, "    fn body(dr: *Drafter").?;
+    const body = code[at .. at + std.mem.indexOf(u8, code[at..], "\n    }\n").?];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "const list: ?*const Vocab = if (dr.onList()) &dr.vocab.? else null;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "const head = if (list) |v| v.head else dr.ds.head8 orelse e.w.head;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "try draft_vocab.steps(v.mk, t, dr.local, dr.out, ts, N, n, steps, dr.msc, .{ .ctx = &g, .run = MarkovGather.run }, .{ .ctx = &ids, .run = ListIds.run });"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "} else try dr.mk.steps(t, dr.local, dr.out, ts, N, n, steps, dr.msc, .{ .ctx = &g, .run = MarkovGather.run });"));
+    // the pass graph's key carries it
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "const key: Key = .{ .streams = @intCast(N), .steps = @intCast(steps), .list = dr.onList() };"));
+}
+
+test "TF_DS_DRAFT_VOCAB's start: this rank's checks in order, its own rows and Markov rows before the agreement, the others' rows a chunk a round over the host links after it" {
+    const src = @embedFile("draft.zig");
+    const code = src[0..std.mem.indexOf(u8, src, "\ntest \"").?];
+    const S = struct {
+        fn body(text: []const u8, head: []const u8) []const u8 {
+            const at = std.mem.indexOf(u8, text, head).?;
+            return text[at .. at + std.mem.indexOf(u8, text[at..], "\n    }\n").?];
+        }
+        fn order(text: []const u8, lines: []const []const u8) !void {
+            var last: usize = 0;
+            for (lines) |l| {
+                const at = std.mem.indexOf(u8, text, l) orelse {
+                    std.debug.print("missing: {s}\n", .{l});
+                    return error.TestUnexpectedResult;
+                };
+                if (at < last) {
+                    std.debug.print("out of order: {s}\n", .{l});
+                    return error.TestUnexpectedResult;
+                }
+                last = at;
+            }
+        }
+    };
+    const checks = S.body(code, "    pub fn vocabWhy(");
+    try S.order(checks, &.{
+        "if (draft_vocab.check(c.vocab)) |why| return why;",
+        "return \"needs the four-node split\";",
+        "const h8 = dr.ds.head8 orelse return \"needs TF_DS_DRAFT_HEAD=fp4\";",
+        "if (h8.fmt != .fp4) return \"needs TF_DS_DRAFT_HEAD=fp4\";",
+        "if (q[0] != e.w.vocab_lo or h8.n != q[1] - q[0]) return \"its head rows are not its vocabulary quarter\";",
+        "_ = draft_vocab.plan(me, quarters, c.vocab) catch return \"the nodes' head rows do not tile the vocabulary\";",
+        "draft_vocab.kitOff(std.heap.page_allocator, SetFinds{ .set = set }, c.*)",
+        "return null;",
+    });
+    const prep = S.body(code, "    pub fn vocabPrepare(");
+    try S.order(prep, &.{
+        "dr.vocab = null;",
+        "\n        if (try dr.vocabWhy(e, quarters, me)) |why| return why;\n",
+        "const pl = try draft_vocab.plan(me, quarters, c.vocab);",
+        "try e.ops.gatherRows(e.s, dr.mk.head, c.vocab, v.ids, mhead, rank * 2, draft_vocab.count, v.flag);",
+        "vocabRows(pl, q, rows);",
+        "if (vocabLand(pl, me, me, v.head)) |own| _ = try vocabPack(e.ops, e.s, h8, v.idx, pl, me, own[0].addr, own[1].addr, v.flag);",
+        "v.mk = draft_vocab.markov(c.*, me, mhead, dr.mk.emb, dr.mk.none);",
+        "try v.mk.fill(e.t, tok, kt, try a.take(kt * n * 2), dr.mk.slot);",
+        "if (bad != 0) return \"a row of the list is past its table\";",
+        "dr.vocab = v;",
+    });
+    const ex = S.body(code, "    pub fn vocabExchange(");
+    try S.order(ex, &.{
+        "const part = try draft_vocab.blobPart(v.quarters, me, m, cb, sb);",
+        "_ = try vocabPack(e.ops, e.s, h8, v.idx, v.plan, m, staging.ptr + part.codes, staging.ptr + part.scales, v.flag);",
+        "for (0..v.blob / draft_vocab.chunk) |round| {",
+        "try e.comm.gatherHost(e.d, staging.ptr + round * draft_vocab.chunk, recv.ptr, draft_vocab.chunk, e.s);",
+        "try draft_vocab.landings(v.quarters, me, j, round, cb, sb)",
+        "cuMemcpyDtoDAsync_v2(dst, recv.ptr + j * draft_vocab.chunk + x.src, x.len, e.s.handle)",
+        "try e.s.synchronize();",
+        "if (bad != 0) return error.RowPastTable;",
+    });
+}
+
+test "TF_DS_DRAFT_VOCAB's row placement: each node's rows of a quarter as its head's rows, and where a sender's rows land" {
+    const quarters = [draft_vocab.nodes][2]usize{ .{ 0, 32_384 }, .{ 64_640, 97_024 }, .{ 32_384, 64_640 }, .{ 97_024, 129_280 } };
+    const gpa = std.testing.allocator;
+    const n = draft_vocab.per_node;
+    const out = try gpa.alloc(i64, draft_vocab.nodes * n);
+    defer gpa.free(out);
+    const head: weights.Linear = .{ .words = 0, .w = 0x1000_0000, .s = 0x2000_0000, .k = 5120, .n = n, .fmt = .fp4 };
+    for (0..draft_vocab.nodes) |me| {
+        const pl = try draft_vocab.plan(me, quarters, 129_280);
+        vocabRows(pl, quarters[me], out);
+        for (pl.send, 0..) |x, j| {
+            for (0..n) |i| {
+                const want: i64 = if (i < x[1] - x[0]) @as(i64, draft_vocab.id(x[0] + i)) - @as(i64, @intCast(quarters[me][0])) else 0;
+                try std.testing.expectEqual(want, out[j * n + i]);
+                if (i < x[1] - x[0]) try std.testing.expect(out[j * n + i] >= 0 and out[j * n + i] < quarters[me][1] - quarters[me][0]);
+            }
+        }
+        // the lands tile me's head, in order, codes 2,560 bytes a row and scales 160
+        var next: usize = 0;
+        var rows: usize = 0;
+        var order: [draft_vocab.nodes]usize = .{ 0, 1, 2, 3 };
+        std.mem.sort(usize, &order, pl, struct {
+            fn lt(p: draft_vocab.Plan, a: usize, b: usize) bool {
+                return p.recv[a][0] < p.recv[b][0];
+            }
+        }.lt);
+        for (order) |j| if (vocabLand(pl, me, j, head)) |l| {
+            try std.testing.expectEqual(head.w + next * 2560, l[0].addr);
+            try std.testing.expectEqual(head.s + next * 160, l[1].addr);
+            const r = pl.recv[j][1] - pl.recv[j][0];
+            try std.testing.expectEqual(r * 2560, l[0].len);
+            try std.testing.expectEqual(r * 160, l[1].len);
+            next += r;
+            rows += r;
+        } else try std.testing.expectEqual(pl.recv[j][0], pl.recv[j][1]);
+        try std.testing.expectEqual(n, rows);
+    }
 }

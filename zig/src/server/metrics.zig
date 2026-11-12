@@ -219,6 +219,7 @@ pub const Metrics = struct {
         try gauge(w, "client_disconnections_total", "counter", "Requests a client left before the reply left the server.", snap.disconnects);
         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
         if (status.graph_fallbacks) |n| try gauge(w, "graph_fallbacks_total", "counter", "CUDA graph captures that failed on a rank; every rank ran that work eagerly instead.", n);
+        if (status.draft_vocab) |v| try draftVocabFamilies(w, v);
     }
 };
 
@@ -229,6 +230,16 @@ fn family(w: *std.Io.Writer, name: []const u8, kind: []const u8, help: []const u
 fn gauge(w: *std.Io.Writer, name: []const u8, kind: []const u8, help: []const u8, value: u64) !void {
     try family(w, name, kind, help);
     try w.print("{s}{s} {d}\n", .{ prefix, name, value });
+}
+
+/// The drafter on a pruned vocabulary (api.DraftVocab): its passes by head, its guard's committed tokens and those
+/// outside the list, and whether the passes take the whole head.
+fn draftVocabFamilies(w: *std.Io.Writer, v: api.DraftVocab) !void {
+    try family(w, "draft_vocab_passes_total", "counter", "Drafter passes on the pruned list (head=\"list\") and, while its guard asked for it, on the whole head (head=\"full\").");
+    try w.print("{s}draft_vocab_passes_total{{head=\"list\"}} {d}\n{s}draft_vocab_passes_total{{head=\"full\"}} {d}\n", .{ prefix, v.list_passes, prefix, v.full_passes });
+    try gauge(w, "draft_vocab_tokens_total", "counter", "Committed tokens the pruned list's guard counted.", v.tokens);
+    try gauge(w, "draft_vocab_misses_total", "counter", "Of the counted committed tokens, those outside the pruned list.", v.misses);
+    try gauge(w, "draft_vocab_full", "gauge", "1 while the guard has the drafter's passes take the whole head (over 2% of the last 4,096 committed tokens outside the list).", @intFromBool(v.full));
 }
 
 /// Depths 1 to the deepest any counted chain drafted (none: no chain counted).
@@ -555,3 +566,34 @@ test "render counts failed graph captures only for an engine that counts them" {
     try std.testing.expect(std.mem.indexOf(u8, some.written(), "# TYPE tensorfold:graph_fallbacks_total counter\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, some.written(), "tensorfold:graph_fallbacks_total 3\n") != null);
 }
+test "render counts the drafter's pruned-list passes, its guard's tokens and misses only for an engine that runs the list" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    var stub: RenderStub = .{};
+    var none: std.Io.Writer.Allocating = .init(gpa);
+    defer none.deinit();
+    try m.render(std.testing.io, &none.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, none.written(), "draft_vocab") == null);
+    stub.status_value.draft_vocab = .{ .list_passes = 120, .full_passes = 7, .tokens = 9000, .misses = 41, .full = true };
+    var some: std.Io.Writer.Allocating = .init(gpa);
+    defer some.deinit();
+    try m.render(std.testing.io, &some.writer, stub.engine(), 4096);
+    const out = some.written();
+    for ([_][]const u8{
+        "# TYPE tensorfold:draft_vocab_passes_total counter\n",
+        "tensorfold:draft_vocab_passes_total{head=\"list\"} 120\n",
+        "tensorfold:draft_vocab_passes_total{head=\"full\"} 7\n",
+        "# TYPE tensorfold:draft_vocab_tokens_total counter\n",
+        "tensorfold:draft_vocab_tokens_total 9000\n",
+        "# TYPE tensorfold:draft_vocab_misses_total counter\n",
+        "tensorfold:draft_vocab_misses_total 41\n",
+        "# TYPE tensorfold:draft_vocab_full gauge\n",
+        "tensorfold:draft_vocab_full 1\n",
+    }) |want| if (std.mem.indexOf(u8, out, want) == null) {
+        std.debug.print("missing: {s}", .{want});
+        return error.TestUnexpectedResult;
+    };
+    // every family has its help
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, out, "# HELP tensorfold:draft_vocab_"));
+}
+

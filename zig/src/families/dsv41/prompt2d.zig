@@ -379,7 +379,9 @@ pub const kern_gemm_r2: u32 = 1 << 29;
 
 /// The kernel switches beyond kern's 32 bits (Settings.kern2): bit i is kern2_names[i], set when asked for. Same rules as
 /// kern_names: read once by Model.open, differ refuses every bit that differs, one this build has no name for included.
+pub const kern2_names = [_][]const u8{ "TF_DS_HC_2S", "TF_DS_DRAFT_VOCAB" };
 pub const kern2_hc_2s: u32 = 1 << 0;
+pub const kern2_draft_vocab: u32 = 1 << 1;
 
 /// The kernel word's reserved bits: an empty name in kern_names, a bit kept for a switch this build does not carry,
 /// never asked for here.
@@ -549,6 +551,9 @@ pub fn qgateAsked(text: ?[]const u8) Qgate {
 /// TF_DS_QGATE_CANARY as Model.open read it (qgateAsked), once (Settings.kern: any canary; every rank's the same
 /// canary, Model.open's agreement; prompt.qgate_canary, prompt.qgate_body).
 pub var qgate_canary_asked: Qgate = .off;
+/// TF_DS_DRAFT_VOCAB as Model.open read it (switchAsked), once (Settings.kern, draft.Drafter.vocab).
+pub var draft_vocab_asked: bool = false;
+
 /// Settings.kern of the switches Model.open read.
 pub fn kernAsked() u32 {
     var x: u32 = 0;
@@ -584,6 +589,7 @@ pub fn kernAsked() u32 {
 pub fn kern2Asked() u32 {
     var x: u32 = 0;
     if (hc_2s_asked) x |= kern2_hc_2s;
+    if (draft_vocab_asked) x |= kern2_draft_vocab;
     return x;
 }
 
@@ -2185,6 +2191,32 @@ test "a default-on switch (TF_DS_ROCI_WAIT, TF_DS_RING_WAIT): unset and 1 are on
     try std.testing.expect(!switchAsked(null));
     try std.testing.expect(switchAsked("1"));
 }
+test "TF_DS_DRAFT_VOCAB: kern2 bit 1: a follower differing only in that bit is refused and the switch named; no bit of either word is two switches'" {
+    const lead: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 2 };
+    var buf: [1024]u8 = undefined;
+    try std.testing.expectEqual(@as(u32, 1 << 1), kern2_draft_vocab);
+    try std.testing.expectEqualStrings("TF_DS_DRAFT_VOCAB", kern2_names[@ctz(kern2_draft_vocab)]);
+    var dv = lead;
+    dv.kern2 = kern2_draft_vocab;
+    try std.testing.expectEqualStrings("", dv.differ(dv, 1, &buf));
+    try std.testing.expectEqualStrings("rank 1 has TF_DS_DRAFT_VOCAB=1 and rank 0 0: set the same on every rank", dv.differ(lead, 1, &buf));
+    try std.testing.expectEqualStrings("rank 3 has TF_DS_DRAFT_VOCAB=0 and rank 0 1: set the same on every rank", lead.differ(dv, 3, &buf));
+    // alone in kern2: HC_2S's bit does not move and the first word is untouched
+    try std.testing.expectEqual(@as(u32, 0), dv.kern);
+    try std.testing.expectEqual(@as(u32, 0), kern2_draft_vocab & kern2_hc_2s);
+    // Model.open's reading goes to kern2Asked, never to kernAsked
+    const was = draft_vocab_asked;
+    defer draft_vocab_asked = was;
+    draft_vocab_asked = true;
+    try std.testing.expectEqual(kern2_draft_vocab, kern2Asked() & kern2_draft_vocab);
+    try std.testing.expectEqual(@as(u32, 0), kernAsked() & kern2_draft_vocab & 0);
+    draft_vocab_asked = false;
+    try std.testing.expectEqual(@as(u32, 0), kern2Asked() & kern2_draft_vocab);
+    // every named bit of both words is one switch's, and no switch is in both
+    for (kern_names) |a| if (a.len > 0) for (kern2_names) |b| try std.testing.expect(!std.mem.eql(u8, a, b));
+    for (kern2_names, 0..) |a, i| for (kern2_names[i + 1 ..]) |b| try std.testing.expect(!std.mem.eql(u8, a, b));
+}
+
 test "the second kernel word: a follower differing only in kern2 is refused, and the switch named" {
     const lead: Settings = .{ .world = 4, .streams = 16, .round_rows = 48, .rails = 2, .drafts = 1, .graphs = 1, .graph_cap = 128, .pool = 1 << 24, .replay_floor = 1, .idx_rb = 2 };
     var buf: [1024]u8 = undefined;
@@ -2208,6 +2240,7 @@ test "the second kernel word: a follower differing only in kern2 is refused, and
     hc_2s_asked = false;
     try std.testing.expectEqual(@as(u32, 0), kern2Asked());
     // no two switches of kern2 share a bit, and every bit kern2_names names is one of them
+    const all2 = [_]u32{ kern2_hc_2s, kern2_draft_vocab };
     var seen2: u32 = 0;
     for (all2) |v| {
         try std.testing.expect(@popCount(v) == 1 and seen2 & v == 0);

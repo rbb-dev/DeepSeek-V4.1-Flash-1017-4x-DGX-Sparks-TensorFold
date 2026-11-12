@@ -76,6 +76,7 @@ pub const Ops = struct {
     assemble_rest: cuda.Function,
     /// tf_ds_add2_bf16_v4_kernel (TF_DS_ADD2_VEC): add2Bf16 four elements a thread; null when the image lacks it.
     add2_v4: ?cuda.Function = null,
+    list_ids: cuda.Function, // tf_ds_list_ids_kernel (TF_DS_DRAFT_VOCAB): a step's picked list positions mapped to ids
     keys_rebase: cuda.Function,
 
     /// Whether add2Bf16 takes the four-wide kernel where it can (TF_DS_ADD2_VEC, on unless 0, read at Model.open; the bytes are the scalar kernel's).
@@ -124,6 +125,7 @@ pub const Ops = struct {
             .remap_picks = try fm.function("tf_ds_remap_picks_kernel"),
             .assemble_rest = try fm.function("tf_ds_assemble_rest_kernel"),
             .add2_v4 = fm.function("tf_ds_add2_bf16_v4_kernel") catch null,
+            .list_ids = try fm.function("tf_ds_list_ids_kernel"),
             .keys_rebase = try fm.function("tf_ds_keys_rebase_kernel"),
         };
     }
@@ -433,6 +435,19 @@ pub const Ops = struct {
         for ([_]u64{ pick, remap, out }) |v| a.add(v);
         a.add(@as(c_int, @intCast(n)));
         try go(o.remap_picks, s, blocks(n, 256), 256, &a);
+    }
+
+    /// TF_DS_DRAFT_VOCAB: a Markov step's picked positions of the pruned list to their ids, in place: out[r * stride]
+    /// (int64) = ids[out[r * stride]] for r < rows, ids int64 [count].
+    pub fn listIds(o: *const Ops, s: cuda.Stream, out: u64, stride: usize, rows: usize, ids: u64, count: usize) !void {
+        if (rows == 0) return;
+        var a: cuda.Args = .{};
+        a.add(out);
+        a.add(@as(i64, @intCast(stride)));
+        a.add(@as(c_int, @intCast(rows)));
+        a.add(ids);
+        a.add(@as(c_int, @intCast(count)));
+        try go(o.list_ids, s, blocks(rows, 128), 128, &a);
     }
 
     /// assemble_rest: out fp16 [P, 2 ig + ir] from the pairs' packs (main rows [P, ig] then rest rows [P, ir] each),

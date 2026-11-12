@@ -446,6 +446,11 @@ pub fn graphFallbacks(ctx: *anyopaque) ?*const std.atomic.Value(u64) {
     return if (st.m.graphs != null) &st.m.graph_fallbacks else null;
 }
 
+/// TF_DS_DRAFT_VOCAB's counters (rank 0's: its guard decides each pass, the followers run it); null unless the list
+/// is in effect.
+pub fn draftVocab(ctx: *anyopaque) ?*const api.DraftVocabCounters {
+    const st: *State = @ptrCast(@alignCast(ctx));
+    return if (st.m.dr) |dr| (if (dr.vocab != null) &st.m.vocab_stats else null) else null;
 }
 
 fn deinitFn(ptr: *anyopaque) void {
@@ -486,6 +491,7 @@ test "every kernel switch the start-up settings carry and a prompt pass computes
     @setEvalBranchQuota(20000);
     // a switch the store's name leaves out lets one setting restore the chunk-end states another wrote; the switches
     // of decode rounds and the drafter's passes alone compute no state a prompt pass stores
+    const decode_only = [_][]const u8{ "TF_DS_DRAFT_4WAY", "TF_DS_HEAD_PACK12", "TF_DS_HC_LATE_FORK", "TF_DS_ATTN_U_DECODE", "TF_DS_DRAFT_MAIN_4WAY", "TF_DS_HEAD_CAND", "TF_DS_HEAD_KEY", "TF_DS_DECODE_KSPLIT", "TF_DS_RING_WC", "TF_DS_RING_INPLACE", "TF_DS_RING_WORD", "TF_DS_RING_WORD_SIGNAL", "TF_DS_DRAFT_VOCAB" };
     inline for (prompt2d.kern_names ++ prompt2d.kern2_names) |name| {
         if (name.len == 0) continue; // a reserved bit: no switch here
         const field = comptime blk: {

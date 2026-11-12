@@ -35,6 +35,7 @@ const prompt2d = @import("prompt2d.zig");
 const round = @import("round.zig");
 const sampling = @import("sampling.zig");
 const draft = @import("draft.zig");
+const draft_vocab = @import("draft_vocab.zig");
 const engram = @import("engram.zig");
 const engram_io = @import("engram_io.zig");
 const engram_aio = @import("engram_aio.zig");
@@ -48,6 +49,7 @@ const ops_mod = @import("ops.zig");
 const exact = @import("exact.zig");
 const cublas = @import("cublas.zig");
 const comm_mod = @import("comm.zig");
+const api = @import("engine_api");
 const link = @import("link.zig");
 const ring2d = @import("ring2d.zig");
 const roci_engine = @import("roci_engine.zig");
@@ -355,6 +357,45 @@ fn draftFourWayOff(gpa: std.mem.Allocator, io: std.Io, c: *const Config, sp: pla
     var man = cuda.aot.Manifest.read(gpa, io, dir) catch return "the kit has no extra set (aot-extra/aot.json)";
     defer man.deinit();
     return try draft.fourWayKitOff(gpa, ManifestFinds{ .m = &man }, c, sp.headSpan(c.*)[1]);
+}
+
+/// Every node's head rows of the vocabulary, [lo, hi) by rank: one world all-gather of each rank's (`lo`, `hi`).
+fn headQuarters(d: *const cuda.Driver, comm: *const comm_mod.Comm, stream: cuda.Stream, lo: usize, hi: usize) ![draft_vocab.nodes][2]usize {
+    var q: [draft_vocab.nodes][2]usize = @splat(.{ 0, 0 });
+    const w: usize = comm.world;
+    var dev = try cuda.DeviceBuffer.alloc(d, (1 + w) * 16);
+    defer dev.free();
+    const mine = [2]u64{ lo, hi };
+    try dev.uploadAsync(0, std.mem.asBytes(&mine), stream.handle);
+    try comm.gatherHost(d, dev.ptr, dev.ptr + 16, 16, stream);
+    try stream.synchronize();
+    var all: [16][2]u64 = undefined;
+    if (w > all.len) return error.WorldTooLarge;
+    try dev.download(16, std.mem.sliceAsBytes(all[0..w]));
+    for (all[0..@min(w, draft_vocab.nodes)], 0..) |x, r| q[r] = .{ @intCast(x[0]), @intCast(x[1]) };
+    return q;
+}
+
+/// TF_DS_DRAFT_VOCAB `asked` in effect: on every rank or none. Every node's head rows first (headQuarters); then this
+/// rank's check and the list's buffers (Drafter.vocabPrepare: the list, the four-node split, the FP4 head, the kit's
+/// variants), one world all-gather of whether every rank can, and on agreement the head rows' exchange on every rank
+/// (Drafter.vocabExchange). Refused, every rank's passes keep the whole vocabulary. One line says which.
+fn useDraftVocab(m: *Model, asked: bool) !void {
+    if (!asked) return;
+    const quarters = try headQuarters(m.eng.d, &m.comm, m.stream, m.w.vocab_lo, m.w.vocab_hi);
+    var staging: ?cuda.DeviceBuffer = null;
+    defer if (staging) |*b| b.free();
+    var why: ?[]const u8 = "needs the drafter";
+    if (m.dr) |*dr| why = dr.vocabPrepare(&m.eng, &m.arena, quarters, m.comm.rank, &staging) catch |e| @errorName(e);
+    const cannot = try prompt2d.ranksThatCannot(m.eng.d, &m.comm, m.stream, why == null);
+    const agreed = prompt2d.agreedOn(asked, cannot);
+    if (!agreed) if (m.dr) |*dr| dr.dropVocab();
+    if (agreed) try m.dr.?.vocabExchange(&m.eng, m.comm.rank, &staging.?);
+    var rb: [64]u8 = undefined;
+    var db: [8]u8 = undefined;
+    var buf: [512]u8 = undefined;
+    const from = if (agreed) m.dr.?.vocab.?.from_others else 0;
+    std.log.info("{s}", .{draft_vocab.line(&buf, cannot, why, prompt2d.rankList(cannot, &rb), from, m.cfg.vocab, draft_vocab.digest(&db))});
 }
 
 /// TF_DS_DRAFT_4WAY after the load (each rank decided before its own, which cannot be undone): every rank's drafter
@@ -1427,6 +1468,14 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
     rope_buf: cuda.DeviceBuffer,
     arena: prompt.Arena,
     graph_fallbacks: std.atomic.Value(u64) = .init(0), // either kind's work run eagerly after a failed capture (/metrics)
+    vocab_stats: api.DraftVocabCounters = .{}, // TF_DS_DRAFT_VOCAB: its passes and guard on rank 0 (/metrics)
+    dpool: ?draft.Pool = null,
+    dr: ?draft.Drafter = null,
+    tables: ?engram_io.Tables = null,
+    epool: ?*engram_io.Pool = null,
+    aio: ?*engram_aio.Aio = null,
+    paio: ?*engram_aio.Aio = null, // the prompt chunks' Engram reads, on a ring of their own
+    eh: ?prompt.EngramHost = null,
     // Track B (TF_DS_SAMPLE_CAND=1): a round's candidates on the device (vals f32, ids i64, flags i32; max_rows rows of
     // sampling.max_candidates) and on the host
     cand: u64 = 0,
@@ -1605,6 +1654,11 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         }
         prompt2d.ring_wait_explicit = ring_wait_text != null;
         prompt2d.qgate_canary_asked = readQgate(); // every rank alike (Settings: any canary; the canary itself, agreeQgateCanary)
+        prompt2d.draft_vocab_asked = prompt2d.switchAsked(if (std.c.getenv("TF_DS_DRAFT_VOCAB")) |v| std.mem.span(v) else null); // every rank alike (Settings)
+        if (std.c.getenv("TF_DS_L2_SKIP")) |v| round.l2_skip = std.fmt.parseInt(u8, std.mem.span(v), 10) catch 0;
+        for ([_][:0]const u8{ "TF_DS_L2_ATTN_MB", "TF_DS_L2_MOE_MB", "TF_DS_L2_NEXT_MB", "TF_DS_L2_STRETCH_END_MB" }, 0..) |name, i| {
+            if (std.c.getenv(name)) |v| round.l2_mb[i] = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_mb[i];
+        }
         if (std.c.getenv("TF_DS_ROCI_XLOG")) |v| rdma.xlog = std.mem.eql(u8, std.mem.span(v), "1");
         if (std.c.getenv("TF_DS_L2_NEXT_EARLY")) |v| round.l2_next_early = !std.mem.eql(u8, std.mem.span(v), "0");
         if (std.c.getenv("TF_DS_L2_DN_MB")) |v| round.l2_dn_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dn_mb;
@@ -1648,6 +1702,8 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         m.paio = null;
         m.eh = null;
         m.graph_fallbacks = .init(0);
+        m.vocab_stats = .{};
+        m.two = null;
         m.pair = false;
         m.pair_open = .init(false);
         m.pair_lanes = 2;
@@ -2025,6 +2081,10 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
                 m.dr.?.graphs = &m.pgraphs.?;
             }
         }
+        try useDraftVocab(m, prompt2d.draft_vocab_asked);
+        try m.stream.synchronize();
+        try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize"); // the setup's legacy-stream copies too
+
         // (unwound in close()'s order: the pins, the packed rows, the rings, the pool, the tables)
         errdefer if (m.tables) |*t| t.close();
         errdefer if (m.epool) |p| p.deinit(gpa);
@@ -4217,12 +4277,24 @@ test "Model.open agrees TF_DS_ATTN_U, TF_DS_IDX_U and TF_DS_ATTN_U_DECODE over t
     try std.testing.expect(skip < gather and gather < off);
 }
 
-    /// The prompt's logits on the host (after a fill's last chunk).
-    pub fn promptLogitsHost(m: *Model) ![]const f32 {
-        const d = m.ctx.d;
-        try m.synchronize();
-        try d.check(d.api.cuMemcpyDtoH_v2(m.logits.ptr, m.ch.head_g, m.vocab * 4), "cuMemcpyDtoH");
-        return m.logits[0..m.vocab];
+test "Model.open reads TF_DS_DRAFT_VOCAB with the kernel switches and puts it in effect after the drafter, its rows' quarters gathered, its check, the agreement, then the exchange" {
+    const src = @embedFile("model.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "prompt2d.draft_vocab_asked = prompt2d.switchAsked(if (std.c.getenv(\"TF_DS_DRAFT_VOCAB\")) |v| std.mem.span(v) else null); // every rank alike (Settings)"));
+    const init = std.mem.indexOf(u8, code, "m.dr = try draft.Drafter.init(&m.eng, &m.arena, sp);") orelse return error.TestUnexpectedResult;
+    const use = std.mem.indexOf(u8, code, "try useDraftVocab(m, prompt2d.draft_vocab_asked);") orelse return error.TestUnexpectedResult;
+    const sync = std.mem.indexOf(u8, code[init..], "try d.check(d.api.cuCtxSynchronize(), \"cuCtxSynchronize\");") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(init < use and use < init + sync);
+    const at = std.mem.indexOf(u8, code, "fn useDraftVocab(") orelse return error.TestUnexpectedResult;
+    const body = code[at .. at + (std.mem.indexOf(u8, code[at..], "\n}\n") orelse return error.TestUnexpectedResult)];
+    const q = std.mem.indexOf(u8, body, "const quarters = try headQuarters(m.eng.d, &m.comm, m.stream, m.w.vocab_lo, m.w.vocab_hi);") orelse return error.TestUnexpectedResult;
+    const prep = std.mem.indexOf(u8, body, "dr.vocabPrepare(&m.eng, &m.arena, quarters, m.comm.rank, &staging)") orelse return error.TestUnexpectedResult;
+    const cannot = std.mem.indexOf(u8, body, "const cannot = try prompt2d.ranksThatCannot(m.eng.d, &m.comm, m.stream, why == null);") orelse return error.TestUnexpectedResult;
+    const ex = std.mem.indexOf(u8, body, "try m.dr.?.vocabExchange(&m.eng, m.comm.rank, &staging.?);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(q < prep and prep < cannot and cannot < ex);
+    // refused: the list's state dropped on every rank, the passes the whole vocabulary's
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "if (!agreed) if (m.dr) |*dr| dr.dropVocab();"));
+}
 
 test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings' (Model.rdma_rings), not only the single ring a TP4 run never has; and by a follower between its frames" {
     const code = @embedFile("model.zig");
@@ -4256,6 +4328,7 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
         const pool = &m.dpool.?;
         for (q0, slots) |q, s| pool.absorbed[@intCast(s)] = @intCast(q);
         try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
+    const src = @embedFile("model.zig");
     // the partner split: the refusal is the operator's branch, the warning and the cleared flag the default's, and no lane is opened before either
     const v = std.mem.indexOf(u8, body, "speed_defaults.verdict(why orelse").?;
     const refuse = std.mem.indexOf(u8, body[v..], ".refuse => {").?;
@@ -4276,6 +4349,7 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
     try std.testing.expect(passRowsFallback(null, true, 64 * gib) == null);
 }
 
+    const src = @embedFile("model.zig");
     const v = std.mem.indexOf(u8, body, "speed_defaults.verdict(why orelse").?;
     const refuse = std.mem.indexOf(u8, body[v..], ".refuse => {").?;
     const refused = std.mem.indexOf(u8, body[v..], "return error.StaggerRefused;").?;
@@ -4287,6 +4361,7 @@ test "TF_DS_ROCI_XLOG's files are written for the rings a run has: the 2D rings'
 }
 
 test "the four-way drafter's mismatch between ranks still refuses, naming the cause and the way out" {
+    const src = @embedFile("model.zig");
     try std.testing.expect(std.mem.indexOf(u8, src, "the ranks' kits differ: give every Spark the same kit, or set TF_DS_DRAFT_4WAY=0") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "set TF_DS_DRAFT_MAIN_4WAY=0 on every Spark") != null);
 }

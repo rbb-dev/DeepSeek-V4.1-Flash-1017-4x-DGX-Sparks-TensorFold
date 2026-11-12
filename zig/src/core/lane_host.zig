@@ -44,6 +44,7 @@ pub const LaneHost = struct {
     decoded_rows: bool = false, // the backend prefills Request.decode_spans with decoded rows' arithmetic, cache or not
     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
     graph_fallbacks: ?*const std.atomic.Value(u64) = null, // the backend's failed graph captures (read at any time)
+    draft_vocab: ?*const api.DraftVocabCounters = null, // the backend's drafter on a pruned vocabulary (read at any time)
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
     learner: ?api.Learner = null, // the family's Sliding Weights learner; null: learn requests are refused
     lessons: std.ArrayList(Lesson) = .empty, // learn requests waiting for an idle engine
@@ -242,6 +243,9 @@ pub const LaneHost = struct {
 
     fn memoryFn(ctx: *anyopaque, reset_peak: bool) ?api.Memory {
             .graph_fallbacks = if (h.graph_fallbacks) |c| c.load(.monotonic) else null,
+            .draft_vocab = if (h.draft_vocab) |c| c.read() else null,
+            .streams = n,
+            .generation_tokens = h.live_generated,
         const source = self(ctx).memory orelse return null;
         return source.read(source.ctx, reset_peak);
     }

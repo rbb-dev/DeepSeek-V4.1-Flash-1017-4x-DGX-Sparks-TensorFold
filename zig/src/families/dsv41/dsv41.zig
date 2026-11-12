@@ -49,6 +49,7 @@ pub const text = @import("text.zig");
 pub const round = @import("round.zig");
 pub const round2d = @import("round2d.zig");
 pub const draft2d = @import("draft2d.zig");
+pub const draft_vocab = @import("draft_vocab.zig");
 pub const markov_tokens = @import("markov_tokens.zig");
 pub const draft = @import("draft.zig");
 pub const sampling = @import("sampling.zig");
@@ -129,6 +130,7 @@ test {
     refAll(@import("graph_fallback.zig"));
     refAll(round2d);
     refAll(draft2d);
+    refAll(draft_vocab);
     refAll(markov_tokens);
     refAll(draft);
     refAll(sampling);

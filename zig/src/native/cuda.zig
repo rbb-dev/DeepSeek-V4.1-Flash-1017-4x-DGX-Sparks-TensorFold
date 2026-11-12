@@ -115,6 +115,7 @@ const Host = struct {
     recording: ?*record.Recording = null, // --record: the recorder in front of the family's backend
     snap_vt: api.prompt_cache.Snapshots.VTable = undefined, // a family's own kept states (Loaded.snaps), `store` copies through it
     graph_fallbacks: ?*const std.atomic.Value(u64) = null, // the family's failed graph captures, when it counts them
+    draft_vocab: ?*const api.DraftVocabCounters = null, // the family's drafter on a pruned vocabulary, when it runs one
 
     fn close(p: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(p));
@@ -165,6 +166,7 @@ const Host = struct {
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true, .logprobs = h.inner.vtable.first_row != null, .structures = h.inner.vtable.first_masked != null, .min_budget = nemotron.native.lone_min_budget, .resumes = true };
         if (h.learn != null) h.host.learner = h.learner();
         h.host.graph_fallbacks = h.graph_fallbacks;
+        h.host.draft_vocab = h.draft_vocab;
         try h.host.start();
     }
 
@@ -451,6 +453,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     });
     errdefer gpa.free(h.startup);
     if (@hasDecl(F, "graphFallbacks")) h.graph_fallbacks = F.graphFallbacks(loaded.ctx);
+    if (@hasDecl(F, "draftVocab")) h.draft_vocab = F.draftVocab(loaded.ctx);
         }
     }
     // a family that keeps prompt states its own way (Loaded.snaps) gets a store over them, as before 1.0.12

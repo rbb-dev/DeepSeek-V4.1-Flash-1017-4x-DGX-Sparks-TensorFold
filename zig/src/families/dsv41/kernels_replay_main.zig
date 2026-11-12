@@ -177,6 +177,14 @@
 //!     negative zeros, a value far above its group): mode 2 in place against act_quant's quant-dequant of the same
 //!     values (mx.fake, bf16, widened) byte-equal, and the values it moved; mode 3 against each value's bits plus one
 //!     (zeros, infinities, NaN and the largest finite values kept) byte-equal.
+//!   - TF_DS_DRAFT_VOCAB (section draft_vocab: the engine's own kernels): node 1's list head assembled as the start's
+//!     exchange places it (each run of its range gathered from the quarter that holds it), its fp32 logits through the
+//!     decode kernels at 5 and 80 rows against each whole quarter's at the list's ids, byte for byte; a step's picked
+//!     positions mapped to ids in place. Section draft_vocab_markov (the kit's Markov kernels): the four nodes' loops of
+//!     the whole vocabulary and of the list on one GPU: the list's bias rows against the whole vocabulary's at its ids;
+//!     16 streams' five steps with each step's best planted: the list's drafts the whole vocabulary's wherever the plant
+//!     is in the list (ties across and within nodes to the lower id), another list id where it is not; a moved plant
+//!     changes a stream's drafts.
 //!   tf-dsv41-kernels-replay AOT_DIR
 const std = @import("std");
 const cuda = @import("cuda");
@@ -4912,6 +4920,396 @@ fn hc2s(r: *Run, rng: std.Random) !void {
         }
     }
     r.note("hc_2s: every launch found the extra set's variant (none kept _hc_mix_pf_2b)", tri_hc.hc_2s_misses.load(.monotonic) == misses0);
+}
+
+/// The sections in their order, each with the lines it prints when it runs whole: one that prints another count fails
+/// the replay, and the counts must sum to replay_lines (a section dropped or added without its count fails the build).
+// -- TF_DS_DRAFT_VOCAB -----------------------------------------------------------------------------------------------
+
+const dv = dsv41.draft_vocab;
+/// The served split's head rows by node (the vocabulary's quarters as draft2d.quarter cuts them: g = 2 p + r).
+const dv_quarters = [4][2]usize{ .{ 0, 32_384 }, .{ 64_640, 97_024 }, .{ 32_384, 64_640 }, .{ 97_024, 129_280 } };
+const DV_V: usize = 129_280;
+
+/// `bytes` into a new device buffer on the replay's stream (stream-ordered: the kernels after it read them).
+fn dvUpload(r: *Run, bytes: []const u8, keep: *std.ArrayList(cuda.DeviceBuffer), ha: std.mem.Allocator) !u64 {
+    const b = try cuda.DeviceBuffer.alloc(r.d, @max(bytes.len, 1));
+    try keep.append(ha, b);
+    try rio.write(b, 0, bytes);
+    return b.ptr;
+}
+
+fn dvAlloc(r: *Run, n: usize, keep: *std.ArrayList(cuda.DeviceBuffer), ha: std.mem.Allocator) !u64 {
+    const b = try cuda.DeviceBuffer.alloc(r.d, @max(n, 1));
+    try keep.append(ha, b);
+    return b.ptr;
+}
+
+/// The owner node of a list id (the quarter that holds it) and its row there.
+fn dvOwner(id: usize) [2]usize {
+    for (dv_quarters, 0..) |q, g| if (id >= q[0] and id < q[1]) return .{ g, id - q[0] };
+    unreachable;
+}
+
+/// TF_DS_DRAFT_VOCAB (section draft_vocab, the engine's own kernels): node 1's list head assembled as the start's
+/// exchange places it (each run of its range gathered from the quarter that holds it), its fp32 logits through the
+/// decode kernels against each whole quarter's at the list's ids; a step's picked positions mapped to ids in place.
+fn draftVocab(r: *Run, rng_in: std.Random) !void {
+    _ = rng_in;
+    var prng = std.Random.DefaultPrng.init(0xd5a1);
+    const rng = prng.random();
+    const ops = r.ops orelse return r.note("draft_vocab: the ops module loads", false);
+    var line: [512]u8 = undefined;
+    var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sarena.deinit();
+    const ha = sarena.allocator();
+    var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer for (keep.items) |*b| b.free();
+    const K: usize = 5120;
+    const cb = K / 2;
+    const sb = K / 32;
+    const me: usize = 1;
+    const pl = try dv.plan(me, dv_quarters, DV_V);
+    const flag = try dvAlloc(r, 4, &keep, ha);
+    try r.d.check(r.d.api.cuMemsetD8Async(flag, 0, 4, r.s.handle), "cuMemsetD8Async");
+    // the quarters node 1's range reads: random FP4 codes, scales 120 .. 130
+    var heads: [4]?weights.Linear = @splat(null);
+    var sources: usize = 0;
+    for (pl.recv, 0..) |x, g| if (x[1] > x[0]) {
+        const n = dv_quarters[g][1] - dv_quarters[g][0];
+        const codes = try ha.alloc(u8, n * cb);
+        rng.bytes(codes);
+        const sc = try ha.alloc(u8, n * sb);
+        for (sc) |*e| e.* = 120 + rng.uintLessThan(u8, 11);
+        const w = try dvUpload(r, codes, &keep, ha);
+        heads[g] = .{ .words = w, .w = w, .s = try dvUpload(r, sc, &keep, ha), .k = K, .n = @intCast(n), .fmt = .fp4 };
+        sources += 1;
+    };
+    // node 1's list head as the start builds it (draft.vocabRows, vocabPack, vocabLand): each sender's rows of its
+    // quarter gathered into a staging by the sender's own plan, then copied where node 1's plan lands them (the bytes
+    // the exchange moves)
+    const lw = try dvAlloc(r, dv.per_node * cb, &keep, ha);
+    const ls = try dvAlloc(r, dv.per_node * sb, &keep, ha);
+    try poison(lw, dv.per_node * cb, r.d, r.s);
+    try poison(ls, dv.per_node * sb, r.d, r.s);
+    const list: weights.Linear = .{ .words = lw, .w = lw, .s = ls, .k = K, .n = dv.per_node, .fmt = .fp4 };
+    const st_w = try dvAlloc(r, dv.per_node * cb, &keep, ha);
+    const st_s = try dvAlloc(r, dv.per_node * sb, &keep, ha);
+    const table = try ha.alloc(i64, dv.nodes * dv.per_node);
+    var landed: usize = 0;
+    for (pl.recv, 0..) |x, g| if (x[1] > x[0]) {
+        const pg = try dv.plan(g, dv_quarters, DV_V);
+        dsv41.draft.vocabRows(pg, dv_quarters[g], table);
+        const idx = try dvUpload(r, std.mem.sliceAsBytes(table), &keep, ha);
+        const rows = try dsv41.draft.vocabPack(ops, r.s, heads[g].?, idx, pg, me, st_w, st_s, flag);
+        const land = dsv41.draft.vocabLand(pl, me, g, list) orelse return r.note("draft_vocab head: a sender's rows have a place", false);
+        if (land[0].len != rows * cb or land[1].len != rows * sb) return r.note("draft_vocab head: a sender's rows fill their place", false);
+        try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(land[0].addr, st_w, land[0].len, r.s.handle), "cuMemcpyDtoDAsync");
+        try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(land[1].addr, st_s, land[1].len, r.s.handle), "cuMemcpyDtoDAsync");
+        landed += rows;
+    };
+    const base = dv.nodeRange(me)[0];
+    // the rows: 80 (16 streams x 5), the logits of the list and of each quarter
+    const max_m: usize = 80;
+    const x = try dvUpload(r, try bf16s(max_m * K, rng, 0.5, ha), &keep, ha);
+    var sbuf: [4]u64 = undefined;
+    for (&sbuf, mx.Scratch.sizes(max_m, K, 1)) |*b, n| b.* = try dvAlloc(r, n, &keep, ha);
+    const scr: mx.Scratch = .{ .q = sbuf[0], .s = sbuf[1], .z = sbuf[2], .fake = sbuf[3], .rows = max_m, .max_k = K };
+    const z: mx.Z = .{ .ptr = sbuf[2], .floats = 1 };
+    var diff: usize = 0;
+    var checked: usize = 0;
+    for ([_]usize{ 5, max_m }) |m| {
+        const yl = try dvAlloc(r, m * dv.per_node * 4, &keep, ha);
+        try poison(yl, m * dv.per_node * 4, r.d, r.s);
+        try mx.linearsDecode(r.k, r.s, scr, &.{list}, &.{x}, &.{K}, m, &.{yl}, &.{dv.per_node}, &.{.f32}, z);
+        var yq: [4]u64 = @splat(0);
+        for (heads, 0..) |h, g| if (h) |hh| {
+            yq[g] = try dvAlloc(r, m * hh.n * 4, &keep, ha);
+            try poison(yq[g], m * hh.n * 4, r.d, r.s);
+            try mx.linearsDecode(r.k, r.s, scr, &.{hh}, &.{x}, &.{K}, m, &.{yq[g]}, &.{hh.n}, &.{.f32}, z);
+        };
+        try r.s.synchronize();
+        const gl = try get(yl, m * dv.per_node * 4, r.d);
+        defer free(gl);
+        for (heads, 0..) |h, g| if (h) |hh| {
+            const gq = try get(yq[g], m * hh.n * 4, r.d);
+            defer free(gq);
+            const run = pl.recv[g];
+            for (0..m) |row| for (run[0]..run[1]) |pos| {
+                const c = pos - base;
+                const col = dv.id(pos) - dv_quarters[g][0];
+                diff += differs(gl[(row * dv.per_node + c) * 4 ..][0..4], gq[(row * hh.n + col) * 4 ..][0..4]);
+                checked += 1;
+            };
+        };
+    }
+    var bad: u32 = 0;
+    try rio.take(r.d, @ptrCast(&bad), flag, 4);
+    r.report(try std.fmt.bufPrint(&line, "draft_vocab head: node 1's 8,192 list rows gathered from {d} quarters as the exchange places them ({d} and {d} rows), fp32 logits at 5 and 80 rows against each whole quarter's at the list's ids ({d} values, gathers in range: {s})", .{ sources, pl.recv[0][1] - pl.recv[0][0], pl.recv[2][1] - pl.recv[2][0], checked, if (bad == 0) "yes" else "NO" }), diff + bad + @intFromBool(checked != (5 + max_m) * dv.per_node or landed != dv.per_node), true);
+    // a step's picks: column 3 of out [16, 6] from list positions to ids, in place; out of range clamped; the others kept
+    const ids = try ha.alloc(i64, dv.count);
+    for (ids, 0..) |*o, i| o.* = dv.id(i);
+    const did = try dvUpload(r, std.mem.sliceAsBytes(ids), &keep, ha);
+    var out: [16 * 6]i64 = undefined;
+    for (&out) |*o| o.* = rng.intRangeLessThan(i64, 0, @intCast(DV_V));
+    for (0..16) |row| out[row * 6 + 3] = rng.intRangeLessThan(i64, 0, dv.count);
+    out[2 * 6 + 3] = -5;
+    out[9 * 6 + 3] = dv.count + 7;
+    const dout = try dvUpload(r, std.mem.sliceAsBytes(&out), &keep, ha);
+    try ops.listIds(r.s, dout + 8 * 3, 6, 16, did, dv.count);
+    try r.s.synchronize();
+    var got: [16 * 6]i64 = undefined;
+    try rio.take(r.d, @ptrCast(&got), dout, @sizeOf(@TypeOf(got)));
+    var ok = true;
+    for (0..16) |row| for (0..6) |c| {
+        const was = out[row * 6 + c];
+        const want: i64 = if (c != 3) was else dv.id(@intCast(std.math.clamp(was, 0, dv.count - 1)));
+        ok = ok and got[row * 6 + c] == want;
+    };
+    r.note("draft_vocab ids: a step's 16 picked list positions to their ids in place (one below the list and one past it clamped), the other columns untouched", ok);
+}
+
+/// The four nodes' Markov loops of one geometry on one GPU (the whole vocabulary's quarters or the list's ranges):
+/// each step every node's best, gathered in node order, then the pick (and, on the list, the picks' ids).
+const DvLoops = struct {
+    mk: [4]dsv41.tri_markov.Markov,
+    lg: [4]u64, // fp32 [80, each node's columns]
+    sc: dsv41.tri_markov.Scratch,
+    g: u64, // fp32 [4, 16, 4]
+    ids: ?u64 = null, // the list's ids (its picks' map)
+
+    fn steps(l: *const DvLoops, r: *Run, out: u64, n: usize, cnt: usize) !void {
+        const blk = 5;
+        for (0..cnt) |i| {
+            for (l.mk, l.lg, 0..) |m, lg, g| {
+                const send = (try m.localBest(r.t, lg, out, cnt + 1, n, blk, i, l.sc)) orelse return error.NotSplit;
+                try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(l.g + g * n * 16, send, n * 16, r.s.handle), "cuMemcpyDtoDAsync");
+            }
+            try l.mk[0].pick(r.t, l.g, 4, out, cnt + 1, n, i);
+            if (l.ids) |ids| try r.ops.?.listIds(r.s, out + 8 * (i + 1), cnt + 1, n, ids, dv.count);
+        }
+    }
+};
+
+/// TF_DS_DRAFT_VOCAB (section draft_vocab_markov, the kit's Markov kernels: an sm_121a GPU): the four nodes' loops of the
+/// whole vocabulary (draft2d's quarters) and of the list (draft_vocab.markov) on one GPU, on the same Markov head,
+/// embedding and cached tokens. The list's bias rows (the 256 cached ones and 16 tokens' staged ones) against the whole
+/// vocabulary's at its ids; 16 streams' five steps with each step's best planted (in the list; two in the list tied
+/// across nodes and within one; outside it at the first step): the list's drafts the whole vocabulary's except where
+/// that one's best is outside it, every one in the list; one planted id moved changes that stream's drafts.
+fn draftVocabMarkov(r: *Run, rng_in: std.Random) !void {
+    _ = rng_in;
+    var prng = std.Random.DefaultPrng.init(0xd5a2);
+    const rng = prng.random();
+    if (r.ops == null) return r.note("draft_vocab_markov: the ops module loads", false);
+    var line: [640]u8 = undefined;
+    var sarena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sarena.deinit();
+    const ha = sarena.allocator();
+    var keep: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer for (keep.items) |*b| b.free();
+    const rank: usize = 256;
+    const N: usize = 16;
+    const blk: usize = 5;
+    const R = N * blk;
+    var c: dsv41.Config = undefined;
+    c.markov_rank = rank;
+    c.vocab = DV_V;
+    c.dspark_block = blk;
+    // the Markov head (fp16) and embedding (bf16) [V, rank], small values; every slot none but the cached tokens'
+    const mh = try ha.alloc(u16, DV_V * rank);
+    for (mh) |*v| v.* = @bitCast(@as(f16, @floatCast((rng.float(f32) - 0.5) * 0.1)));
+    const em = try ha.alloc(u16, DV_V * rank);
+    for (em) |*v| v.* = @truncate(@as(u32, @bitCast((rng.float(f32) - 0.5) * 0.1)) >> 16);
+    const slots = try ha.alloc(i32, DV_V);
+    @memset(slots, -1);
+    const cached = dsv41.markov_tokens.cached;
+    for (cached, 0..) |t, j| slots[@intCast(t)] = @intCast(j);
+    // 16 tokens without cached rows (their bias rows staged each step)
+    var uncached: [N]i64 = undefined;
+    for (&uncached) |*t| {
+        var x = rng.intRangeLessThan(i64, 0, @intCast(DV_V));
+        while (slots[@intCast(x)] >= 0) x = rng.intRangeLessThan(i64, 0, @intCast(DV_V));
+        t.* = x;
+    }
+    // each stream's step best planted: in the list (streams 0 .. 5); two tied across nodes (6: one from node 0's
+    // range, one from node 3's; 7: the lower id in the whole vocabulary's rank-2 quarter, the higher in its rank-1
+    // quarter, so the lower id sits on the higher rank); two tied within node 2's range (8, 9); outside the list at
+    // the first step (10 .. 15)
+    var plants: [N][blk][2]i64 = undefined; // each step's planted ids (a second one: a tie; -1 none)
+    const q2 = dv.run(dv_quarters[2][0], dv_quarters[2][1]);
+    const q1 = dv.run(dv_quarters[1][0], dv_quarters[1][1]);
+    for (0..N) |st| for (0..blk) |i| {
+        plants[st][i] = .{ dv.id(rng.uintLessThan(usize, dv.count)), -1 };
+        if (st == 6) {
+            plants[st][i] = .{ dv.id(rng.uintLessThan(usize, dv.per_node)), dv.id(3 * dv.per_node + rng.uintLessThan(usize, dv.per_node)) };
+        } else if (st == 7) {
+            plants[st][i] = .{ dv.id(q2[0] + rng.uintLessThan(usize, q2[1] - q2[0])), dv.id(q1[0] + rng.uintLessThan(usize, q1[1] - q1[0])) };
+        } else if (st >= 8 and st < 10) {
+            const a = 2 * dv.per_node + rng.uintLessThan(usize, dv.per_node - 1);
+            plants[st][i] = .{ dv.id(a + 1), dv.id(a) };
+        } else if (st >= 10 and i == 0) {
+            // outside the list (a placeholder token)
+            plants[st][i] = .{ 128_000 + @as(i64, @intCast(rng.uintLessThan(usize, 700))), -1 };
+        }
+    };
+    // a tie is exact only if its plants' scores are: each tie's second plant takes the first's Markov head row, so
+    // the bias any token adds to them is the same (the logits planted alike), and the lower id must win (argmax's
+    // total order) on both geometries
+    for (plants) |row| for (row) |pl| if (pl[1] >= 0) {
+        @memcpy(mh[@as(usize, @intCast(pl[1])) * rank ..][0..rank], mh[@as(usize, @intCast(pl[0])) * rank ..][0..rank]);
+    };
+    var rows_tied = true;
+    for (plants) |row| for (row) |pl| if (pl[1] >= 0) {
+        rows_tied = rows_tied and std.mem.eql(u16, mh[@as(usize, @intCast(pl[1])) * rank ..][0..rank], mh[@as(usize, @intCast(pl[0])) * rank ..][0..rank]);
+    };
+    const head = try dvUpload(r, std.mem.sliceAsBytes(mh), &keep, ha);
+    const emb = try dvUpload(r, std.mem.sliceAsBytes(em), &keep, ha);
+    const none = try dvAlloc(r, DV_V * 4, &keep, ha);
+    try r.d.check(r.d.api.cuMemsetD32Async(none, 0xffffffff, DV_V, r.s.handle), "cuMemsetD32Async");
+    const slot = try dvUpload(r, std.mem.sliceAsBytes(slots), &keep, ha);
+    const tok = try dvUpload(r, std.mem.sliceAsBytes(&cached), &keep, ha);
+    // the list's ids and its rows of the Markov head
+    const ids = try ha.alloc(i64, dv.count);
+    for (ids, 0..) |*o, i| o.* = dv.id(i);
+    const did = try dvUpload(r, std.mem.sliceAsBytes(ids), &keep, ha);
+    const lhead = try dvAlloc(r, dv.count * rank * 2, &keep, ha);
+    const flag = try dvAlloc(r, 4, &keep, ha);
+    try r.d.check(r.d.api.cuMemsetD8Async(flag, 0, 4, r.s.handle), "cuMemsetD8Async");
+    try r.ops.?.gatherRows(r.s, head, DV_V, did, lhead, rank * 2, dv.count, flag);
+    // the two geometries' loops, their cached rows filled
+    var whole: DvLoops = undefined;
+    var list: DvLoops = undefined;
+    var widths: [4]usize = undefined;
+    for (0..4) |g| {
+        var tw: dsv41.prompt2d.Two = undefined;
+        tw.hw = .{ 253 * 128, 252 * 128 };
+        tw.r = g % 2;
+        tw.p = g / 2;
+        const q = dsv41.draft2d.quarter(&tw);
+        if (q[0] != dv_quarters[g][0] or q[0] + q[1] != dv_quarters[g][1]) return r.note("draft_vocab_markov: the served split's quarters", false);
+        widths[g] = q[1];
+        whole.mk[g] = try dsv41.draft2d.markov(c, &tw, head, emb, none);
+        try whole.mk[g].fill(r.t, tok, cached.len, try dvAlloc(r, cached.len * whole.mk[g].cols * 2, &keep, ha), slot);
+        list.mk[g] = dv.markov(c, g, lhead, emb, none);
+        try list.mk[g].fill(r.t, tok, cached.len, try dvAlloc(r, cached.len * dv.per_node * 2, &keep, ha), slot);
+    }
+    try r.s.synchronize();
+    // the bias rows: the cached ones, then 16 uncached tokens' staged ones, the list's at each id against its quarter's
+    const utok = try dvUpload(r, std.mem.sliceAsBytes(&uncached), &keep, ha);
+    var stage_w: [4]u64 = undefined;
+    var stage_l: [4]u64 = undefined;
+    for (0..4) |g| {
+        stage_w[g] = try dvAlloc(r, N * widths[g] * 2, &keep, ha);
+        try whole.mk[g].bias(r.t, utok, 1, none, stage_w[g], widths[g], N);
+        stage_l[g] = try dvAlloc(r, N * dv.per_node * 2, &keep, ha);
+        try list.mk[g].bias(r.t, utok, 1, none, stage_l[g], dv.per_node, N);
+    }
+    try r.s.synchronize();
+    var bias_diff: usize = 0;
+    var cw: [4][]u8 = undefined;
+    var sw: [4][]u8 = undefined;
+    for (0..4) |g| {
+        cw[g] = try get(whole.mk[g].cache, cached.len * widths[g] * 2, r.d);
+        sw[g] = try get(stage_w[g], N * widths[g] * 2, r.d);
+    }
+    defer for (0..4) |g| {
+        free(cw[g]);
+        free(sw[g]);
+    };
+    for (0..4) |node| {
+        const cl = try get(list.mk[node].cache, cached.len * dv.per_node * 2, r.d);
+        defer free(cl);
+        const sl = try get(stage_l[node], N * dv.per_node * 2, r.d);
+        defer free(sl);
+        for (dv.nodeRange(node)[0]..dv.nodeRange(node)[1], 0..) |pos, col| {
+            const o = dvOwner(dv.id(pos));
+            for (0..cached.len) |j| bias_diff += differs(cl[(j * dv.per_node + col) * 2 ..][0..2], cw[o[0]][(j * widths[o[0]] + o[1]) * 2 ..][0..2]);
+            for (0..N) |j| bias_diff += differs(sl[(j * dv.per_node + col) * 2 ..][0..2], sw[o[0]][(j * widths[o[0]] + o[1]) * 2 ..][0..2]);
+        }
+    }
+    var bad: u32 = 0;
+    try rio.take(r.d, @ptrCast(&bad), flag, 4);
+    r.report("draft_vocab_markov bias: the list's bias rows (the 256 cached tokens' and 16 others' staged) against the whole vocabulary's at its ids, four nodes", bias_diff + bad, true);
+    // the steps: logits small and random, each stream's step best planted (above)
+    const plant: f32 = 1000;
+    const want = struct {
+        fn of(p: [2]i64) i64 {
+            return if (p[1] >= 0) @min(p[0], p[1]) else p[0];
+        }
+    }.of;
+    var lw: [4][]f32 = undefined;
+    for (0..4) |g| {
+        lw[g] = try ha.alloc(f32, R * widths[g]);
+        for (lw[g]) |*v| v.* = rng.float(f32) - 0.5;
+    }
+    const setPlants = struct {
+        fn run(l: [4][]f32, w: [4]usize, p: [N][blk][2]i64, v: f32) void {
+            for (0..N) |st| for (0..blk) |i| for (p[st][i]) |x| if (x >= 0) {
+                const o = dvOwner(@intCast(x));
+                l[o[0]][(st * blk + i) * w[o[0]] + o[1]] = v;
+            };
+        }
+    }.run;
+    setPlants(lw, widths, plants, plant);
+    const prev = try ha.alloc(i64, N);
+    for (prev, 0..) |*t, st| t.* = if (st % 2 == 0) cached[rng.uintLessThan(usize, cached.len)] else uncached[st];
+    const runBoth = struct {
+        fn go(rr: *Run, wl: *DvLoops, ll: *DvLoops, lwv: [4][]f32, wd: [4]usize, pv: []const i64, kp: *std.ArrayList(cuda.DeviceBuffer), a: std.mem.Allocator) ![2][N * (blk + 1)]i64 {
+            var lgl: [4][]f32 = undefined;
+            for (0..4) |node| {
+                lgl[node] = try a.alloc(f32, N * blk * dv.per_node);
+                for (dv.nodeRange(node)[0]..dv.nodeRange(node)[1], 0..) |pos, col| {
+                    const o = dvOwner(dv.id(pos));
+                    for (0..N * blk) |row| lgl[node][row * dv.per_node + col] = lwv[o[0]][row * wd[o[0]] + o[1]];
+                }
+            }
+            for (0..4) |g| {
+                wl.lg[g] = try dvUpload(rr, std.mem.sliceAsBytes(lwv[g]), kp, a);
+                ll.lg[g] = try dvUpload(rr, std.mem.sliceAsBytes(lgl[g]), kp, a);
+            }
+            var outs: [2][N * (blk + 1)]i64 = undefined;
+            for ([_]*DvLoops{ wl, ll }, 0..) |l, k| {
+                var o0: [N * (blk + 1)]i64 = @splat(0);
+                for (0..N) |st| o0[st * (blk + 1)] = pv[st];
+                const out = try dvUpload(rr, std.mem.sliceAsBytes(&o0), kp, a);
+                try l.steps(rr, out, N, blk);
+                try rr.s.synchronize();
+                try rio.take(rr.d, @ptrCast(&outs[k]), out, @sizeOf(@TypeOf(outs[k])));
+            }
+            return outs;
+        }
+    }.go;
+    for ([_]*DvLoops{ &whole, &list }, [_]usize{ 253, 64 }, [_]usize{ 32_384, dv.per_node }) |l, np_, cols| {
+        l.sc = .{ .pv = try dvAlloc(r, N * np_ * 4, &keep, ha), .pi = try dvAlloc(r, N * np_ * 4, &keep, ha), .send = try dvAlloc(r, N * 16, &keep, ha), .stage = try dvAlloc(r, N * cols * 2, &keep, ha) };
+        try r.d.check(r.d.api.cuMemsetD8Async(l.sc.send, 0, N * 16, r.s.handle), "cuMemsetD8Async");
+        l.g = try dvAlloc(r, 4 * N * 16, &keep, ha);
+    }
+    whole.ids = null;
+    list.ids = did;
+    const got = try runBoth(r, &whole, &list, lw, widths, prev, &keep, ha);
+    var whole_ok = true;
+    var same = true;
+    var in_list = true;
+    var apart = true;
+    for (0..N) |st| for (0..blk) |i| {
+        const w = got[0][st * (blk + 1) + 1 + i];
+        const l = got[1][st * (blk + 1) + 1 + i];
+        whole_ok = whole_ok and w == want(plants[st][i]);
+        in_list = in_list and dv.find(@intCast(l)) != null;
+        if (st >= 10 and i == 0) {
+            apart = apart and l != w;
+        } else same = same and l == w;
+    };
+    r.note(try std.fmt.bufPrint(&line, "draft_vocab_markov steps: 16 streams x 5 steps, each step's best planted (a tie's plants one Markov head row: {s}): the whole vocabulary's drafts the plants, an exact tie to the lower id even where it sits on the higher-ranked node: {s}; the list's the same where the plant is in it, ties across and within nodes included: {s}; outside it another: {s}; every list draft in the list: {s}", .{ if (rows_tied) "yes" else "NO", if (whole_ok) "yes" else "NO", if (same) "yes" else "NO", if (apart) "yes" else "NO", if (in_list) "yes" else "NO" }), rows_tied and whole_ok and same and apart and in_list);
+    // the control: stream 3's step-2 plant moved to another list id
+    setPlants(lw, widths, plants, 0);
+    plants[3][2][0] = dv.id((@as(usize, @intCast(dv.find(@intCast(plants[3][2][0])).?)) + 1) % dv.count);
+    setPlants(lw, widths, plants, plant);
+    const moved = try runBoth(r, &whole, &list, lw, widths, prev, &keep, ha);
+    var n_moved: usize = 0;
+    for (0..blk) |i| n_moved += @intFromBool(moved[1][3 * (blk + 1) + 1 + i] != got[1][3 * (blk + 1) + 1 + i]);
+    r.report("draft_vocab_markov control: stream 3's step-2 best moved to the next list id, its list drafts", n_moved, false);
 }
 
 // -- TF_DS_ROCI's two-block readers ----------------------------------------------------------------------------------
@@ -10105,6 +10503,8 @@ fn qgateBody(r: *Run, rng: std.Random) !void {
     .{ "attn_epi_xe", attnEpiXe, 5 + 1 + 1 },
     .{ "hc_fused_2b", hcFused2b, 2 + 1 + 1 },
     .{ "hc_2s", hc2s, 3 + 1 + 1 },
+    .{ "draft_vocab", draftVocab, 2 },
+    .{ "draft_vocab_markov", draftVocabMarkov, 3 },
 const replay_lines: usize = (3 + 356 + 9 + 3 + 2 + 5 + 23 + 15 + 5 + 13 + 5 + 6 + 3 + 3 + 3 + 24 + 9 + 8 + 2 + 6 + 5 + 24 + 14 + 3 + 6 + 6 + 13 + 2 + 3 + 3 + 6 + 6 + 6 + 8 + 9 + 10 + 18 + 3 + 3 + 2 + 13 + 10 + 53 + 5 + 21 + 9 + 11 + 5 + 2 + 5 + 1 + 14 + 5 + 1 + 1 + 5 + 1 + 1 + 6 + 4 + 6 + 6 + 4 + 6 + 4) - loadonly_lines + (if (instruments) loadonly_lines else 0); // + 4: merge_d's 16-column width; + 6: idx_t (TF_DS_IDX_TPP=4); + 6: split64n (4 byte lines, 2 kernel time lines); + 4: pf_t64 (loaded, bytes, kernel time, control)
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
