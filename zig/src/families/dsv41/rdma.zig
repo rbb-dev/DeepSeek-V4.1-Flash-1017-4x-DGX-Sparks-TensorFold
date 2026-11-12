@@ -137,6 +137,7 @@ const Nic = struct {
     mr_recv: *vabi.Mr,
     gid: [16]u8,
     gid_index: u8,
+    mtu: c_int = mtu_4096, // the port's active MTU (ibv_query_port), capped at 4096: the QPs' path MTU
     used: bool = false, // some route runs on it (the proxy polls its queue)
     qps: [max_ranks]?*vabi.Qp = @splat(null),
     psns: [max_ranks]u32 = @splat(0),
@@ -313,6 +314,11 @@ pub const Ring = struct {
         var nic: Nic = .{ .ctx = ctx, .pd = pd, .cq = cq, .mr_send = mr_send, .mr_recv = mr_recv, .gid = gid.raw };
         const gi = try r.pickGid(ctx, name);
         const gid = try r.v.gid(ctx, port_num, gi);
+        // Path MTU from the port's active MTU, capped at 4096 (enum 5), instead of a fixed 4096: on a fabric whose
+        // Ethernet MTU is 1500 the RoCE active MTU is 1024 and a 4096 path MTU loses every larger packet (the idea of
+        // bertholomus/TensorFold#12, local endpoint only; #12 also exchanges and takes the smaller of both ends).
+        const pa = try r.v.port(ctx, port_num);
+        const mtu: c_int = if (pa.active_mtu >= 1 and pa.active_mtu < mtu_4096) pa.active_mtu else mtu_4096;
         errdefer for (nic.qps) |q| if (q) |qp| {
             _ = api.ibv_destroy_qp(qp);
         };
