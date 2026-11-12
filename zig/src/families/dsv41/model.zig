@@ -893,6 +893,11 @@ pub fn startSettings(o: Options) prompt2d.Settings {
                 if (ahead) |th| {
                     th.join();
                     ahead = null;
+            if (taps) if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| try prompt.tap(e, ch, j, li);
+            try prompt.attnMixes(e, ch, li);
+            if (pt) |t| try t.mark(e.s, .mix_attn);
+            try prompt.attention(e, ch, &m.view, &shared, li, m.ring_view[li], floor, kv_done != null and kv_done.? == li);
+            if (pt) |t| try t.mark(e.s, .attn);
             // The gathers' own output, both sublayers, at every requested layer of the first chunk of at least 64 rows
             // (prompt.dump_layers; dump_done stops it after that chunk, below). The >= 64 guard keeps a smoke test or
             // validate.py's short prompts from spending the one-shot dump on a chunk too short to compare.

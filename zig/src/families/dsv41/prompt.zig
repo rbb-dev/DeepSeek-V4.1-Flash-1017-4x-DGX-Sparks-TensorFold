@@ -267,9 +267,15 @@ pub const Chunk = struct {
     wts: u64, // fp32 [cap, slots]
     pm: u64, // fp32 [cap, D]: the MoE partial
     gm: u64, // fp32 [world, cap, D]: its gather (the pending post)
-    ga_rs: usize, // ga's and gm's rank stride in elements as their last gather left them (prompt.gather)
-    gm_rs: usize,
-    y_neg: bool, // TF_DS_2D_YX: ga's and gm's rank-1 slot at cap * D holds -0.0 (written once)
+    // WP4 (docs/prefill-plan.md, quarter-HC): a repack of ga's or gm's owned-row slice, tightly strided [world, q, D]
+    qhc_g: u64 = 0,
+    // WP4: `part` is pure intermediate scratch for the Sinkhorn/mix iteration (written by _hc_mix_pf, read back by
+    // _hc_finish within the SAME call, never carrying state between calls) whose layout is documented only as a
+    // flat element count, not a dimension order (unlike h/pre/post/comb, which ARE plainly per-row and safe to
+    // pointer-offset -- tf-dsv41-hc-replay's own working test proves it for exactly those). A pointer offset into
+    // the full-cap ch.part assumes a row-major layout that was never established; give it its own buffer, sized
+    // tight for q = cap / world rows, exactly as the real engine would size ch.part for a q-row chunk.
+    qhc_part: u64 = 0,
     xs: exl3_experts.Scratch,
     // Model._moe_scratch's decode scratch: windows under 64 rows (a prompt's small chunk, every decode round), one for
     // every layer of the same slots and experts, its epoch carried from call to call
@@ -363,6 +369,12 @@ pub const Chunk = struct {
         ch.wts_vl = try a.take(cap * sl * 4);
         ch.pm = try a.take(cap * d * 4);
         ch.gm = try a.take(e.world * cap * d * 4);
+        // WP4 quarter-HC scratch: only when a Two exists and cap divides evenly by the physical world (today always
+        // 4): sized for the owned-row-slice repack, world * q * d, q = cap / world.
+        if (e.two != null and e.comm.world != 0 and cap % e.comm.world == 0) {
+            ch.qhc_g = try a.take(e.world * (cap / e.comm.world) * d * 4);
+            ch.qhc_part = try a.take((cap / e.comm.world) * tri_basic.hc_blocks * 32 * 4);
+        }
         // compressed layers: the smallest ratio sets the most compressed entries a row can see
         var min_ratio: usize = 0;
         for (e.w.layers) |lay| {
@@ -828,6 +840,31 @@ fn swapStreams(ch: *Chunk, src: u64) void {
     ch.h = src;
 }
 
+/// A row range: `start`, the count `n`. WP4's qhcRange and WP5's row-sharded gather() both key owned-row
+/// transport off the identical range, so it is named once here rather than as two matching anonymous structs.
+pub const QRows = struct { start: usize, n: usize };
+
+/// WP4 (quarter-HC, docs/prefill-plan.md): this layer's owned row range on this node, when quarter-HC applies --
+/// a full-cap 2D chunk, strictly before the replay-cut boundary layer (c.layers / 2, which needs every row's h /
+/// pre / x globally and is never sharded: replayCut truncates ch.n there for the decoder's own, unchanged path).
+/// node g of `world` owns rows [g * q, (g + 1) * q), q = cap / world. A short chunk, a resumed chunk under cap
+fn qhcRange(e: *const Engine, ch: *const Chunk, li: usize) ?QRows {
+}
+
+/// WP4: `full` (fp32 [e.world, ch.cap, D], i.e. ch.ga or ch.gm) repacked at rows [r.start, r.start + r.n) of every
+/// plane into ch.qhc_g, tightly strided [e.world, r.n, D] -- see ch.qhc_g's own comment for why. A local
+fn qhcRepackG(e: *const Engine, ch: *Chunk, full: u64, r: anytype) !void {
+    const row_bytes = e.c.hidden * 4;
+    for (0..e.world) |w| {
+        try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(
+            ch.qhc_g + w * r.n * row_bytes,
+            full + w * ch.cap * row_bytes + r.start * row_bytes,
+            r.n * row_bytes,
+            e.s.handle,
+        ), "cuMemcpyDtoDAsync");
+    }
+}
+
 /// Layer `li`'s attention mixes: x = RMSNorm of the streams mixed by pre, pre_a / post / comb from their own mixes;
 /// with a pending MoE gather, hc_pre_pf posts it into the streams first.
 pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
@@ -835,6 +872,20 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
     const c = e.c;
     if (ch.pending) {
         const src = try tri_hc.hcPrePf(e.t, ch.h, lay.hc_attn[0], lay.hc_attn[1], lay.hc_attn[2], ch.pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, ch.x, ch.pre_a, ch.post, ch.comb, ch.part, .{ .gathered = ch.gm, .world = e.world, .h_out = ch.h_alt, .rs = ch.gm_rs }, ch.n, c.hidden);
+        const row_h = c.hc * c.hidden * 2;
+        const row_p = c.hc * 4;
+        const row_c = c.hc * c.hc * 4;
+        if (ch.pending) {
+            // swapStreams asserts its argument is exactly ch.h_alt (the whole buffer); the kernel's `h_out` here was
+            // offset to this node's own rows (correct for the write it actually did), so swap the base pointers
+            // directly instead of going through that helper's assert.
+            const old_h = ch.h;
+            ch.h = ch.h_alt;
+            ch.h_alt = old_h;
+            ch.pending = false;
+        }
+    } else if (ch.pending) {
+        const src = try tri_hc.hcPrePf(e.t, ch.h, lay.hc_attn[0], lay.hc_attn[1], lay.hc_attn[2], ch.pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, ch.x, ch.pre_a, ch.post, ch.comb, ch.part, .{ .gathered = ch.gm, .world = e.world, .h_out = ch.h_alt }, ch.n, c.hidden);
         swapStreams(ch, src);
         ch.pending = false;
     } else {
@@ -1279,6 +1330,15 @@ pub fn ffnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
     const lay = e.w.layers[li];
     const c = e.c;
     const src = try tri_hc.hcPrePf(e.t, ch.h, lay.hc_ffn[0], lay.hc_ffn[1], lay.hc_ffn[2], ch.pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, ch.x, ch.pre_f, ch.post, ch.comb, ch.part, .{ .gathered = ch.ga, .world = e.world, .h_out = ch.h_alt, .rs = ch.ga_rs }, ch.n, c.hidden);
+        const row_h = c.hc * c.hidden * 2;
+        const row_p = c.hc * 4;
+        const row_c = c.hc * c.hc * 4;
+        const old_h = ch.h;
+        ch.h = ch.h_alt;
+        ch.h_alt = old_h;
+        return;
+    }
+    const src = try tri_hc.hcPrePf(e.t, ch.h, lay.hc_ffn[0], lay.hc_ffn[1], lay.hc_ffn[2], ch.pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, ch.x, ch.pre_f, ch.post, ch.comb, ch.part, .{ .gathered = ch.ga, .world = e.world, .h_out = ch.h_alt }, ch.n, c.hidden);
     swapStreams(ch, src);
 }
 
@@ -1671,6 +1731,13 @@ pub fn engramWorkerRows(eh: *EngramHost, j: usize, start: usize, chunk: usize) !
     const ci = (start - eh.wk_start) / chunk;
 }
 
+            // WP4: the same row-sharded flush as attnMixes's pending branch (hcPost alone is _hc_mix_pf's "posted"
+            // finisher without the RMSNorm finish; same G-buffer stride gotcha, same repack).
+        } else {
+            try tri_basic.hcPost(e.t, ch.gm, ch.h, ch.post, ch.comb, ch.h, e.world, n, c.hidden);
+        }
+        ch.pending = false;
+    }
     // pos[first:]: a view, first * 8 bytes in (its alignment is the one the served kernels were specialized for). An odd
     // `first` leaves it off a 16-byte boundary, and the kit has no variant for some launches with such a view (a short
     // chunk's split attention: _sparse_attn_part with SPLITS > 1 and no row bases); the same positions copied, in the
@@ -1683,6 +1750,19 @@ pub fn engramWorkerRows(eh: *EngramHost, j: usize, start: usize, chunk: usize) !
 
 /// DSpark tap j (_forward_k at a tap layer): a pending MoE gather posted into the streams first (hc_post, not fused),
 /// then h.to(fp32).mean(1).to(bf16) into tap j's rows.
+pub fn tap(e: *const Engine, ch: *Chunk, j: usize, li: usize) !void {
+    const c = e.c;
+        if (r) |rr| {
+        } else {
+            try tri_basic.hcPost(e.t, ch.gm, ch.h, ch.post, ch.comb, ch.h, e.world, ch.n, c.hidden);
+        }
+        ch.pending = false;
+    }
+    // WP4: hcMean4 is a per-row mean (no cross-row reduction), so it is safe to run over the full ch.n even with
+    // this node's don't-care garbage in the rows it does not own (that garbage produces garbage only in those same
+    // rows' tap output, which the gather below overwrites with every rank's own correct rows next) -- no row-shard
+    // needed for the mean itself, only for what already needed it above (hcPost) and for making ch.taps globally
+    // correct afterward, since DSpark drafting reads every row of it on every node.
 }
 
 /// The head on the chunk's last row (_forward_k without all_logits): the pending MoE post, collapse_norm of the row with
