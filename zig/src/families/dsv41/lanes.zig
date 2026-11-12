@@ -19,6 +19,7 @@
 const std = @import("std");
 const lanes = @import("lanes");
 const model = @import("model.zig");
+const where = @import("where.zig");
 const round = @import("round.zig");
 const draft = @import("draft.zig");
 const sampling = @import("sampling.zig");
@@ -503,6 +504,7 @@ pub const Lanes = struct {
     }
 
     /// Tells rank 1 to stop, then frees the host state (the model is the caller's).
+        self.m.unwatch(); // (the followers end on done: their links close)
     pub fn deinit(self: *Lanes) void {
         for (self.snaps.items) |sn| {
             sn.buf.free();
@@ -671,6 +673,7 @@ pub const Lanes = struct {
             setRdmaIdle(self.m, false);
             self.rdma_idle = false;
         }
+        where.frame('S', @backingInt(kind), self.step);
         try self.wire.begin(self.gpa, kind, self.step);
         self.step += 1;
         return true;
@@ -693,6 +696,8 @@ pub const Lanes = struct {
     pub fn idleRdma(self: *Lanes) !void {
         if (self.rdma_idle or self.streams.count() != 0 or !hasRdma(self.m)) return;
         self.m.joinAhead();
+        const held = where.enter(.idle_ack, 0, 0);
+        defer where.leave(held);
         try self.m.ctx.synchronize();
         try self.send(.rdma_idle);
         var ack: [64]u8 = undefined;
@@ -1067,6 +1072,8 @@ pub const Lanes = struct {
             };
         }
         const t0 = m.now();
+        where.set(.round, @intCast(windows.len), 0);
+        defer where.set(.after_backend, 0, 0); // (the lane core's own work until the next backend call or the gate's next mark)
         defer m.flushDiag(false); // (TF_DS_ROCI_XLOG / TF_DS_NACT_LOG's files, every 256th call: nothing when both are off)
         if (try self.begin(.verify)) {
             try self.wire.int(gpa, u32, @intCast(windows.len));
@@ -1141,10 +1148,8 @@ pub const Lanes = struct {
         const m = self.m;
         const gpa = self.gpa;
         if (m.dr == null) return error.NoDraftHead;
-        const block = m.dr.?.n;
-        var tokens: [max_streams]i64 = undefined;
-        var q0: [max_streams]i64 = undefined;
-        var slots: [max_streams]i64 = undefined;
+        where.set(.draft, @intCast(requests.len), 0);
+        defer where.set(.after_backend, 0, 0);
         var depths: [max_streams]usize = undefined;
         var asked: [max_streams]*Lane = undefined;
         var n: usize = 0;
@@ -1417,6 +1422,53 @@ fn refused(err: anyerror) void {
     std.debug.print("{{\"follow_refused\": \"{s}\"}}\n", .{@errorName(err)});
 }
 
+/// Whether a refusal leaves every rank in step: the errors a primitive raises from its inputs alone, before it has posted or
+/// awaited an exchange, which rank 0 raises at the same step. Any other error (a disk read, an allocation, a device call) is
+/// this rank's alone.
+fn refusalKeepsRanksInStep(err: anyerror) bool {
+    return switch (err) {
+        error.BadChunk, error.BadPair, error.BadSlot, error.BadRound, error.HeadCandOff, error.NoDrafter => true,
+        else => false,
+    };
+}
+
+/// A primitive that carries exchanges (a chunk, a pair, a round, a head, a drafter pass) refused: reported like any refusal,
+/// and when the error is this rank's alone the transport fails at once, since the other ranks wait for outputs this rank
+/// skipped.
+fn refusedExchange(m: anytype, err: anyerror) error{GpuContextFailed}!void {
+    refused(err);
+    if (!refusalKeepsRanksInStep(err)) {
+        m.failExchanges();
+        // A GPU fault (an illegal address, a trap) leaves this rank's context running nothing more, and the lanes' failure
+        // only reaches the ranks through the NIC: a follower whose context failed ends, so its link closes and rank 0's watch
+        // (Model.watchPeers) stops rank 0 with a line that names this rank.
+        if (err == error.CudaFailed and m.contextFailed()) return error.GpuContextFailed;
+    }
+}
+
+/// A follower's verify times with Model.prof (a profile on ranks 1-3: rounds, issue and wall ns summed).
+pub var follow_prof: struct { rounds: u64 = 0, enqueue: u64 = 0, forward: u64 = 0 } = .{};
+
+/// The follower's link, for the failure line's socket head (where.head_probe).
+var probe_peer: ?link.Link = null;
+
+fn headProbe() i32 {
+    const p = probe_peer orelse return -1;
+    return if (p.peekKind() catch null) |k| k else -1;
+}
+                c.m.verify(rows, c.built.absorb[0..nw], head) catch |err| try refusedExchange(c.m, err);
+                if (c.m.prof) {
+                    follow_prof.rounds += 1;
+                    follow_prof.enqueue += c.m.t_enqueue;
+                    follow_prof.forward += c.m.t_forward;
+                }
+            },
+            .head_whole => {
+                // the round's candidates fell back on rank 0 (TF_DS_HEAD_CAND): its whole head, every rank alike
+                const n: usize = try r.int(u32);
+                c.m.headWhole(n) catch |err| try refusedExchange(c.m, err);
+            },
+            .pass => {
         }
         if (self.first_of == s) self.first_of = null;
         const kv = self.streams.fetchRemove(s) orelse return;
@@ -1449,7 +1501,10 @@ pub var follow_prof: struct { rounds: u64 = 0, enqueue: u64 = 0, forward: u64 = 
 /// Rank 1 (each of ranks 1-3 on the four-node split): the primitives rank 0 sends, run in order until it says done.
 pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     const peer = m.peer();
-    const buf = try gpa.alloc(u8, (m.pool_cap + 1) * 4 + (1 << 16));
+    probe_peer = peer;
+    defer probe_peer = null;
+    where.head_probe = headProbe;
+    defer where.head_probe = null;
     defer gpa.free(buf);
     var seqs: [max_streams]std.ArrayList(i32) = @splat(.empty);
     defer for (&seqs) |*q| q.deinit(gpa);
@@ -1469,6 +1524,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     }
     var lf = try land.Follower(cuda.DeviceBuffer).init(gpa, .{ .ctx = m, .alloc = landAlloc, .free = landFree }, m.snapBytes(), lplanes, 0);
     while (true) {
+        where.set(.main_loop, 0, 0);
         // the next primitive, polled for 20 ms before the read blocks (rank 0 sends it a fraction of a millisecond
         // after this rank's GPU goes idle in a decode; a sleeping thread would add its core's wake-up to every frame)
         var r: Reader = .{ .b = try peer.recvSpin(buf, 20 * std.time.ns_per_ms) };
@@ -1492,6 +1548,8 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             rdma_idle = false;
         }
         if (try r.int(u64) != step) return error.OutOfStep;
+        where.frame('T', @backingInt(kind), step);
+        where.set(.frame, @backingInt(kind), @intCast(step));
         step += 1;
         defer m.flushDiag(false); // (TF_DS_ROCI_XLOG / TF_DS_NACT_LOG's files on a follower too: every 256th frame, nothing when both are off)
         // a chunk's read-ahead of the next is done before anything but that chunk (a prompt's ids may change)
@@ -1525,6 +1583,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 if (start + n > seqs[slot].items.len) return error.BadChunk;
                 if (m.fill_seq.len == 0) m.fill_seq = seqs[slot].items; // a piece after a round: the read-ahead again
                 _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| try refused(m, err);
+                _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| try refusedExchange(m, err);
             },
             .fill_pair => {
                 const start: usize = @intCast(try r.int(u64));
@@ -1854,6 +1913,7 @@ test "a window's masks are none or every row's bits" {
 
 test "retained histories preserve their replay and output reservations (PR #10: eight 100K histories)" {
     var m: Model = undefined;
+    m.watch = .{}; // (finish and deinit end the watch)
     m.pool_cap = 1 << 20;
     var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
     defer ln.snaps.deinit(std.testing.allocator);
@@ -1885,6 +1945,7 @@ test "retained histories preserve their replay and output reservations (PR #10: 
 
 test "a prefix two conversations share: the second one resuming it in place would stale the first one's later marks" {
     var m: Model = undefined;
+    m.watch = .{}; // (finish and deinit end the watch)
     m.pool_cap = 1 << 20;
     var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
     defer ln.snaps.deinit(std.testing.allocator);
@@ -1896,11 +1957,59 @@ test "a prefix two conversations share: the second one resuming it in place woul
     try std.testing.expect(ln.keptOver(shared.base + shared.at, shared.base + 55296, &shared)); // the second one moves
     try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
 }
+    m.watch = .{}; // (finish and deinit end the watch)
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 },
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, // 9: the same kinds, the Rocinante-only Settings
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }, // 11: the same kinds, fill_pair carries the third pass's rows
+    m.watch = .{}; // (finish and deinit end the watch)
+    m.watch = .{}; // (finish and deinit end the watch)
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "            c.m.verify(rows, c.built.absorb[0..nw], head) catch |err| try refusedExchange(c.m, err);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "                const n: usize = try r.int(u32);\n                c.m.headWhole(n) catch |err| try refusedExchange(c.m, err);"));
     try std.testing.expect(std.mem.indexOf(u8, src, "if (self.spill) |t| t.bump(lane.base + f.start, lane.base + f.start + n + n2 + n3);\n        self.instr.chunk(m.now() / std.time.ns_per_us, n);") != null);
+
+test "every wait that can hold a host names itself, and each rank journals the frames it sends and takes" {
+    const src = @embedFile("lanes.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"every wait that can hold a host names itself") orelse return error.TestUnexpectedResult];
+    for ([_][]const u8{
+        "where.frame('S', @backingInt(kind), self.step);",
+        "where.frame('T', @backingInt(kind), step);",
+        "where.set(.round, @intCast(windows.len), 0);\n        defer where.set(.after_backend, 0, 0);",
+        "where.set(.draft, @intCast(requests.len), 0);\n        defer where.set(.after_backend, 0, 0);",
+        "where.set(.frame, @backingInt(kind), @intCast(step));",
+        "where.head_probe = headProbe;",
+        "p.peekKind() catch null",
+    }) |needle| try std.testing.expect(std.mem.indexOf(u8, code, needle) != null);
+    const prompt_src = @embedFile("prompt.zig");
+    const pcode = prompt_src[0 .. std.mem.indexOf(u8, prompt_src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    for ([_][]const u8{ "where.enter(.capture_vote, @backingInt(stage), recorded)", "where.enter(.engram_rows, @intCast(j), @intCast(ci))", "where.enter(.engram_flush, 0, 0)" }) |needle| try std.testing.expect(std.mem.indexOf(u8, pcode, needle) != null);
+    try std.testing.expect(std.mem.indexOf(u8, @embedFile("rdma.zig"), "where.report(&pb)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, @embedFile("model.zig"), "return where.report(buf);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, @embedFile("rocinante.zig"), "var pb: [640]u8 = undefined;") != null);
+}
+
+test "a refusal that is this rank's alone fails the transport at once; a refusal every rank raises from the inputs does not" {
+    // the errors rank 0 raises at the same step leave the ranks in step
+    for ([_]anyerror{ error.BadChunk, error.BadPair, error.BadSlot, error.BadRound, error.HeadCandOff, error.NoDrafter }) |e| try std.testing.expect(refusalKeepsRanksInStep(e));
+    // a disk read, an allocation, a device call: this rank skipped outputs the others wait for
+    for ([_]anyerror{ error.OutOfMemory, error.InputOutput, error.CudaError, error.EngramRead }) |e| try std.testing.expect(!refusalKeepsRanksInStep(e));
+    const src = @embedFile("lanes.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"a refusal that is this rank's alone") orelse return error.TestUnexpectedResult];
+    // every primitive that carries exchanges reports through refusedExchange; the rest stay plain refusals
     for ([_][]const u8{ "m.fillChunk(seqs[slot]", "m.fillGroup(seqs[slot]" }) |call| {
+        const at = std.mem.indexOfPos(u8, code, std.mem.indexOf(u8, code, "pub fn follow(") orelse return error.TestUnexpectedResult, call) orelse return error.TestUnexpectedResult;
+        const line_end = std.mem.indexOfPos(u8, code, at, "\n") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, code[at..line_end], "refusedExchange(m, err)") != null);
+    }
+    // the round frames (FollowCtx.roundFrame, run from the main loop and from inside a pass's layers) report the same way
+    try std.testing.expect(std.mem.indexOf(u8, code, "m.failExchanges();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, @embedFile("model.zig"), "rc.t.fail(why, .own1, gone);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, @embedFile("model.zig"), "m.failLanes(.refused, 0);") != null);
+}
+
+test "TF_DS_ROCI_STAGGER: a pair forms only where no stream decodes, or where the host owes the streams a count of rounds (TF_DS_ROUNDS_BESIDE)" {
+    // a prompt alone: the pair forms
+    try std.testing.expect(pairMayForm(true, false, 0));
+    // decoders running: no pair without a count of rounds
 
 // The pair rules (R1-R7 of the frame-order panel, tip 7ce258cdb), one host test each. The rules are why a pair beside
 // generating users is safe: frames cannot differ between ranks, and nothing waits on a frame that is not yet there.
@@ -1975,6 +2084,51 @@ test "R4: the Engram worker is joined, or on its own reader, before a round foll
     const issued = std.mem.indexOfPos(u8, code, step, "} else try m.fillChunk(").?;
     const join = std.mem.indexOfPos(u8, code, step, "if (yieldOn() and !m.keep_ahead) if (s.between)").?;
     try std.testing.expect(issued < join);
+}
+
+test "a CUDA failure that left the follower's context failed ends the follower, every other refusal does not" {
+    const CtxProbe = struct {
+        failed: bool,
+        asked: usize = 0,
+        failed_lanes: usize = 0,
+        pub fn contextFailed(p: *@This()) bool {
+            p.asked += 1;
+            return p.failed;
+        }
+        pub fn failExchanges(p: *@This()) void {
+            p.failed_lanes += 1;
+        }
+    };
+    var gone: CtxProbe = .{ .failed = true };
+    try std.testing.expectEqual(@as(usize, 1), gone.failed_lanes); // (the lanes fail first: the other ranks are told by the abort)
+    var alive: CtxProbe = .{ .failed = false }; // a failed call the context survived: the lanes fail, the follower goes on
+    try std.testing.expectEqual(@as(usize, 1), alive.asked);
+    try std.testing.expectEqual(@as(usize, 1), alive.failed_lanes);
+    var other: CtxProbe = .{ .failed = true }; // an error this rank alone raises, but no GPU fault: the context is not asked
+    try std.testing.expectEqual(@as(usize, 0), other.asked);
+    try std.testing.expectEqual(@as(usize, 1), other.failed_lanes);
+    var step: CtxProbe = .{ .failed = true }; // rank 0 refuses these at the same step: nothing fails, nobody is asked
+    try std.testing.expectEqual(@as(usize, 0), step.asked);
+    try std.testing.expectEqual(@as(usize, 0), step.failed_lanes);
+}
+
+test "a peer that stops stops this rank: the watch starts before the follow loop and in the server, done and close end it" {
+    const lanes_main = @embedFile("lanes_main.zig");
+    const watch = std.mem.indexOf(u8, lanes_main, "m.watchPeers() catch").?;
+    try std.testing.expect(watch < std.mem.indexOf(u8, lanes_main, "dsv41.lanes.follow(gpa, m, mirror) catch").?);
+    try std.testing.expect(std.mem.indexOf(u8, lanes_main, "if (err == error.GpuContextFailed or m.contextFailed()) std.process.exit(1);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, @embedFile("native.zig"), "st.m.watchPeers() catch") != null);
+    const code = @embedFile("lanes.zig");
+    const src = code[0 .. std.mem.indexOf(u8, code, "\ntest \"a CUDA failure that left the follower") orelse return error.TestUnexpectedResult];
+    // the follower ends the watch on done, rank 0 before it sends done
+    try std.testing.expect(std.mem.indexOf(u8, src, ".done => {\n                m.unwatch();") != null);
+    const fin = src[std.mem.indexOf(u8, src, "pub fn finish(self: *Lanes) void {").?..];
+    try std.testing.expect(std.mem.indexOf(u8, fin, "self.m.unwatch();").? < std.mem.indexOf(u8, fin, "self.begin(.done)").?);
+    // the model's close ends it before the links go, and the watch's hook fails the lanes with the peer's reason
+    const model_src = @embedFile("model.zig");
+    try std.testing.expect(std.mem.indexOf(u8, model_src, "m.watch.stop(); // (still watching up to here").? < std.mem.indexOf(u8, model_src, "        m.fan.close();\n        m.w.deinit();").?);
+    try std.testing.expect(std.mem.indexOf(u8, model_src, "m.failLanes(.peer, @intCast(rank));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, model_src, "m.failLanes(.peer, @intCast(rank));\n        m.abortRings(") != null);
 }
 
 test "draft chances are the prefix survivals chooseK sums" {

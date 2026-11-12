@@ -1,6 +1,7 @@
 //! Rank 0 to rank 1 over TCP (the fabric addresses): length-prefixed frames for each round's step and the start-up settings, as
 //! multi.py's Link sends them. One connection, TCP_NODELAY, SO_BUSY_POLL, blocking reads (recvSpin polls first).
 const std = @import("std");
+const where = @import("where.zig");
 const c = std.c;
 
 pub const Link = struct {
@@ -90,10 +91,8 @@ pub const Link = struct {
 
     /// One frame: its length (u32, little-endian), then its bytes.
     pub fn send(l: Link, bytes: []const u8) !void {
-        var len: [4]u8 = undefined;
-        std.mem.writeInt(u32, &len, @intCast(bytes.len), .little);
-        try l.writeAll(&len);
-        try l.writeAll(bytes);
+        const held = where.enter(.link_send, 0, 0);
+        defer where.leave(held);
     }
 
     /// recv, polling the socket without blocking for up to `spin_ns` first: a frame that comes within it is read
@@ -133,8 +132,21 @@ pub const Link = struct {
         return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
     }
 
+    /// The kind byte of the next frame (the first byte of its payload) when its length and that byte have arrived, without
+    /// reading anything; null when they have not. A frame's other bytes may still be on their way.
+    pub fn peekKind(l: Link) !?u8 {
+        var head: [5]u8 = undefined;
+        const n = c.recv(l.fd, &head, head.len, c.MSG.PEEK | c.MSG.DONTWAIT);
+        if (n == 0) return error.PeerDown;
+        if (n < 0) switch (c.errno(n)) {
+            else => return error.PeerDown,
+        };
+    }
+
     /// The next frame into `buf` (a frame longer than `buf` is refused); its bytes.
     pub fn recv(l: Link, buf: []u8) ![]u8 {
+        const held = where.enter(.link_recv, 0, 0);
+        defer where.leave(held);
         var len: [4]u8 = undefined;
         try l.readAll(&len);
         const n = std.mem.readInt(u32, &len, .little);
@@ -180,11 +192,13 @@ pub const Ports = struct {
 /// Linux poll's POLLRDHUP (std's POLL leaves it out): the peer shut its end. Frames waiting to be read do not set it.
 const POLLRDHUP: i16 = 0x2000;
 
-/// A thread that ends this process when a peer rank goes. The ranks run every step together, so a rank that stops (an
-/// error, a crash, a kill) leaves the others waiting inside their next exchange for good, their GPUs spinning on it.
-/// When a watched link's peer shuts its end and nothing stops the watch within `grace_ms` (a follower's own end after
-/// rank 0's done comes first), the watch says which rank went and exits 1. Stop it before this process ends its
-/// links itself.
+/// A thread that ends this process when a peer rank goes. The ranks run every step together, so a rank that stops (an error,
+/// a crash, a kill) leaves the others waiting inside their next exchange for good, their GPUs spinning on a word it will
+/// never write; nothing else looks at the dead rank's link while a wait on the GPU is all the engine thread does. When a
+/// watched link's peer shuts its end and nothing stops the watch within `grace_ms` (a clean end of the peer comes with this
+/// process's own end of the watch first), the watch says which rank went, runs `stop_hook` (the engine fails its transports
+/// there: the abort reaches the ranks still up and releases every queued wait) and exits 1. The watch only sleeps in poll:
+/// it touches no state of the engine thread's. Stop it before this process ends its links itself.
 pub const Watch = struct {
     fds: [max_links]c.fd_t = undefined,
     ranks: [max_links]u32 = undefined,
@@ -193,10 +207,16 @@ pub const Watch = struct {
     grace_ms: u32 = 5000,
     stopped: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
-    /// A test's stand-in for the exit: told the rank that went.
+    /// What runs once a peer has been gone for the grace, after the line naming it and before the exit: told `ctx` and the rank
+    /// that went. It runs on the watch's thread.
+    stop_hook: ?*const fn (ctx: ?*anyopaque, rank: u32) void = null,
+    ctx: ?*anyopaque = null,
+    /// A test's stand-in for the line and the exit: told the rank that went.
     on_gone: ?*const fn (w: *Watch, rank: u32) void = null,
 
     pub const max_links = 4;
+    /// How long a look at the links waits before the stop flag is read again (the longest a stop takes).
+    const look_ms = 100;
 
     /// Watches `l`, the link to rank `peer_rank`.
     pub fn add(w: *Watch, l: Link, peer_rank: u32) !void {
@@ -223,10 +243,10 @@ pub const Watch = struct {
         var p: [max_links]c.pollfd = undefined;
         for (p[0..w.n], w.fds[0..w.n]) |*q, fd| q.* = .{ .fd = fd, .events = POLLRDHUP, .revents = 0 };
         while (!w.stopped.load(.acquire)) {
-            const r = c.poll(&p, @intCast(w.n), 200);
+            const r = c.poll(&p, @intCast(w.n), look_ms);
             if (r == 0) continue;
             if (r < 0) { // (interrupted: look again; else wait a while rather than spin on the error)
-                _ = c.poll(&p, 0, 200);
+                _ = c.poll(&p, 0, look_ms);
                 continue;
             }
             const went = for (p[0..w.n], 0..) |q, i| {
@@ -234,13 +254,15 @@ pub const Watch = struct {
                 if (q.revents & (POLLRDHUP | c.POLL.HUP | c.POLL.ERR) != 0) break i;
             } else continue;
             var waited: u32 = 0;
-            while (waited < w.grace_ms) : (waited += 100) {
+            while (waited < w.grace_ms) : (waited += look_ms) {
                 if (w.stopped.load(.acquire)) return;
-                _ = c.poll(&p, 0, 100);
+                _ = c.poll(&p, 0, look_ms); // (no descriptors: a sleep)
             }
             if (w.stopped.load(.acquire)) return;
-            if (w.on_gone) |f| return f(w, w.ranks[went]);
-            std.debug.print("dsv41: rank {d} stopped (its link to rank {d} closed), so rank {d} stops too: the ranks run every step together, and it would wait for rank {d} for good (rank {d}'s own output says why it stopped)\n", .{ w.ranks[went], w.rank, w.rank, w.ranks[went], w.ranks[went] });
+            const gone = w.ranks[went];
+            if (w.on_gone == null) std.debug.print("dsv41: rank {d} stopped (its link to rank {d} closed), so rank {d} stops too: the ranks run every step together, and it would wait for rank {d} for good (rank {d}'s own output says why it stopped)\n", .{ gone, w.rank, w.rank, gone, gone });
+            if (w.stop_hook) |f| f(w.ctx, gone);
+            if (w.on_gone) |f| return f(w, gone);
             c._exit(1);
         }
     }
@@ -284,11 +306,49 @@ test "frames cross a loopback link in order" {
     t.join();
 }
 
-/// What a test's watch saw: the rank that went (0: none yet; the tests' peers are ranks 1 and up).
+test "peekKind sees the next frame's kind without reading it, and nothing before the length and the kind byte have come" {
+    var fds: [2]c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds));
+    const a: Link = .{ .fd = fds[0] };
+    const b: Link = .{ .fd = fds[1] };
+    defer {
+        _ = c.close(fds[0]);
+        _ = c.close(fds[1]);
+    }
+    try std.testing.expectEqual(@as(?u8, null), try b.peekKind());
+    try std.testing.expect(!b.wait(1000));
+    try std.testing.expectEqual(@as(?u8, null), try b.peekKind());
+    try std.testing.expectEqual(Link.Head.partial, try b.peekHead());
+    try std.testing.expectEqual(@as(?u8, 3), try b.peekKind());
+    try std.testing.expectEqual(@as(?u8, 3), try b.peekKind()); // (nothing was read)
+    var buf: [64]u8 = undefined;
+    const f = try b.recv(&buf);
+    try std.testing.expectEqual(@as(usize, 7), f.len);
+    try std.testing.expectEqual(@as(u8, 3), f[0]);
+    try std.testing.expectEqual(@as(?u8, null), try b.peekKind());
+}
+/// What a test's watch saw: the rank that went (0: none yet; the tests' peers are ranks 1 and up), the order of its two steps
+/// (the hook, then the stand-in for the exit) and when the stand-in ran.
 var seen_gone: std.atomic.Value(u32) = .init(0);
+var hook_seen: std.atomic.Value(u32) = .init(0);
+var hook_before_gone: std.atomic.Value(bool) = .init(false);
+var gone_at_ns: std.atomic.Value(u64) = .init(0);
+
+fn sawHook(_: ?*anyopaque, rank: u32) void {
+    hook_seen.store(rank, .release);
+}
 
 fn sawGone(_: *Watch, rank: u32) void {
+    hook_before_gone.store(hook_seen.load(.acquire) == rank, .release);
+    gone_at_ns.store(Link.monotonicNs(), .release);
     seen_gone.store(rank, .release);
+}
+
+fn resetSeen() void {
+    seen_gone.store(0, .release);
+    hook_seen.store(0, .release);
+    hook_before_gone.store(false, .release);
+    gone_at_ns.store(0, .release);
 }
 
 /// Waits up to `ms` for a test's watch to see a rank go.
@@ -303,9 +363,118 @@ fn awaitGone(ms: u32) u32 {
     return seen_gone.load(.acquire);
 }
 
+/// A loopback pair: the listening side's link and the peer thread's, which `Peer` runs.
+fn pair(comptime Peer: type) !struct { l: Link, t: std.Thread } {
+    var ports = try Ports.open(&.{.{ 127, 0, 0, 1 }}, 0);
+    defer ports.close();
+    const port = try ports.portOf(1);
+    const t = try std.Thread.spawn(.{}, Peer.run, .{port});
+    return .{ .l = try ports.accept(1), .t = t };
+}
+
+test "a killed peer's link is named within the grace: the line's rank, the stop hook first, frames on the link are no close" {
+    const Peer = struct {
+        fn run(p: u16) void {
+            var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;
+            l.send("a frame") catch {};
+            var buf: [8]u8 = undefined;
+            _ = l.recv(&buf) catch {}; // the test's go: then this rank is gone
+            l.close();
+        }
+    };
+    resetSeen();
+    var pr = try pair(Peer);
+    defer pr.l.close();
+    var w: Watch = .{ .rank = 0, .grace_ms = 300, .stop_hook = sawHook, .on_gone = sawGone };
+    try w.add(pr.l, 3);
+    try w.start();
+    defer w.stop();
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("a frame", try pr.l.recv(&buf));
+    try std.testing.expectEqual(@as(u32, 0), awaitGone(500)); // a frame, read or not, is no close
+    try pr.l.send("go");
+    pr.t.join(); // the peer's link is closed from here
+    const closed = Link.monotonicNs();
+    try std.testing.expectEqual(@as(u32, 3), awaitGone(5000));
+    try std.testing.expectEqual(@as(u32, 3), hook_seen.load(.acquire));
+    try std.testing.expect(hook_before_gone.load(.acquire)); // (the engine's transports fail before the process ends)
+    // nothing before the grace, and the grace plus a look after it at the most
+    const took_ms = (gone_at_ns.load(.acquire) -| closed) / std.time.ns_per_ms;
+    try std.testing.expect(took_ms >= 250);
+    try std.testing.expect(took_ms <= 300 + 2 * Watch.look_ms + 400);
+}
+
+test "the watch names the link that closed, of several" {
+    const Peer = struct {
+        fn run(p: u16) void {
+            var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;
+            var buf: [8]u8 = undefined;
+            _ = l.recv(&buf) catch {};
+            l.close();
+        }
+    };
+    resetSeen();
+    var a = try pair(Peer);
+    defer a.l.close();
+    var b = try pair(Peer);
+    defer b.l.close();
+    var w: Watch = .{ .rank = 0, .grace_ms = 100, .on_gone = sawGone };
+    try w.add(a.l, 1);
+    try w.add(b.l, 2);
+    try w.start();
+    defer w.stop();
+    try b.l.send("go"); // rank 2 goes; rank 1 stays
+    b.t.join();
+    try std.testing.expectEqual(@as(u32, 2), awaitGone(5000));
+    try a.l.send("go");
+    a.t.join();
+}
+
+test "a stopped watch lets its links close quietly" {
+    const Peer = struct {
+        fn run(p: u16) void {
+            var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;
+            var buf: [8]u8 = undefined;
+            _ = l.recv(&buf) catch {};
+            l.close();
+        }
+    };
+    resetSeen();
+    var pr = try pair(Peer);
+    defer pr.l.close();
+    var w: Watch = .{ .rank = 1, .grace_ms = 100, .stop_hook = sawHook, .on_gone = sawGone };
+    try w.add(pr.l, 2);
+    try w.start();
+    w.stop(); // (rank 0's done, or a follower reading it)
+    try pr.l.send("go");
+    pr.t.join();
+    try std.testing.expectEqual(@as(u32, 0), awaitGone(400));
+    try std.testing.expectEqual(@as(u32, 0), hook_seen.load(.acquire));
+}
+
+test "a watch's grace lets this process end first" {
+    const Peer = struct {
+        fn run(p: u16) void {
+            var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;
+            l.close();
+        }
+    };
+    resetSeen();
+    var pr = try pair(Peer);
+    defer pr.l.close();
+    var w: Watch = .{ .rank = 2, .grace_ms = 3000, .stop_hook = sawHook, .on_gone = sawGone };
+    try w.add(pr.l, 1);
+    try w.start();
+    pr.t.join();
+    try std.testing.expectEqual(@as(u32, 0), awaitGone(300)); // closed, but within the grace
+    w.stop(); // this process ends its links itself in time
+    try std.testing.expectEqual(@as(u32, 0), awaitGone(100));
+    try std.testing.expectEqual(@as(u32, 0), hook_seen.load(.acquire));
+}
+
 test "a watch names the rank whose link closed, and frames on the link are no close" {
     const io = std.testing.io;
-    const port: u16 = 29500 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 400)));
+    const port: u16 = 30000 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 400)));
     const Peer = struct {
         fn run(p: u16) void {
             var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;
@@ -329,50 +498,4 @@ test "a watch names the rank whose link closed, and frames on the link are no cl
     try l.send("go");
     t.join();
     try std.testing.expectEqual(@as(u32, 3), awaitGone(5000));
-}
-
-test "a stopped watch lets its links close quietly" {
-    const io = std.testing.io;
-    const port: u16 = 29900 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 90)));
-    const Peer = struct {
-        fn run(p: u16) void {
-            var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;
-            var buf: [8]u8 = undefined;
-            _ = l.recv(&buf) catch {};
-            l.close();
-        }
-    };
-    seen_gone.store(0, .release);
-    const t = try std.Thread.spawn(.{}, Peer.run, .{port});
-    var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
-    defer l.close();
-    var w: Watch = .{ .rank = 1, .grace_ms = 100, .on_gone = sawGone };
-    try w.add(l, 2);
-    try w.start();
-    w.stop(); // (rank 0's done, or a follower reading it)
-    try l.send("go");
-    t.join();
-    try std.testing.expectEqual(@as(u32, 0), awaitGone(400));
-}
-
-test "a watch's grace lets this process end first" {
-    const io = std.testing.io;
-    const port: u16 = 30000 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 400)));
-    const Peer = struct {
-        fn run(p: u16) void {
-            var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;
-            l.close();
-        }
-    };
-    seen_gone.store(0, .release);
-    const t = try std.Thread.spawn(.{}, Peer.run, .{port});
-    var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
-    defer l.close();
-    var w: Watch = .{ .rank = 2, .grace_ms = 3000, .on_gone = sawGone };
-    try w.add(l, 1);
-    try w.start();
-    t.join();
-    try std.testing.expectEqual(@as(u32, 0), awaitGone(300)); // closed, but within the grace
-    w.stop(); // this process ends its links itself in time
-    try std.testing.expectEqual(@as(u32, 0), awaitGone(100));
 }

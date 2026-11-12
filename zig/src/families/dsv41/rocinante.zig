@@ -615,6 +615,13 @@ pub const Settings = struct {
     /// start line says so and the proxies' lines come once a pass of that many events.
     codes: bool = false,
     gathers: bool = false,
+    /// After a failure stores the abort value into the words, the words are looked at again after this long (the fence is the NIC's word that
+    /// the card is out of the control block; this looks at the result): a word that changed is stored again, and the look repeats until one
+    /// whole settle passes with every word as stored, at most `abort_rounds` times (0: no look). The longest a failure waits: rounds x settle.
+    abort_settle_us: u32 = 1_000,
+    abort_rounds: u32 = 50,
+    /// The longest a failure waits for the proxies to be out of their posts before the NIC takes the queue pairs away.
+    proxy_out_ms: u32 = 100,
     /// The queue pairs wait in the card (TF_DS_ROCI_WAIT, rocinante_cd.zig): the engine thread writes every chain into its send queue behind a
     /// WAIT for the GPU's doorbell write when it reserves the send, so no proxy thread runs; one janitor thread, which sleeps in the kernel
     /// between 100 ms looks, watches the peers and reaps the completions. The proxy-only settings above are not read.
@@ -623,6 +630,19 @@ pub const Settings = struct {
     janitor_ms: u32 = 100,
 };
 
+pub const FailReason = enum(u8) { none = 0, post, stamp, qp, watchdog, peer, host_wait, refused };
+
+/// A spin lock over the sibling ring's links (one for the process: lanes close and fail rarely, and `check` holds it for two loads).
+const RingLock = struct {
+    held: std.atomic.Value(bool) = .init(false),
+    fn lock(l: *RingLock) void {
+        while (l.held.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+    fn unlock(l: *RingLock) void {
+        l.held.store(false, .release);
+    }
+};
+var ring_lock: RingLock = .{};
 
 pub const Transport = struct {
     gpa: std.mem.Allocator,
@@ -653,6 +673,15 @@ pub const Transport = struct {
     /// The other lane's transport when two passes of a prompt are in flight (each its own arena, control block, queue pairs and
     /// proxies): a failure on either stops both, and the host's check reads both.
     sibling: ?*Transport = null,
+    /// Words the failure's look found changed after the abort value was stored (and stored again).
+    abort_restored: u64 = 0,
+    /// 1 while a failure's reaction is running on this transport (its look at the words takes milliseconds, on a proxy's thread or a
+    /// sibling's): deinit waits for it, so the control block is not released under it.
+    failing: std.atomic.Value(u32) = .init(0),
+    /// A rail's proxy thread, once it runs, and set when it has left its loop (no post in progress, none to come): a failure raised by
+    /// another thread waits for it before the NIC takes the queue pairs away (the proxy is the only poster on its rail).
+    proxy_tid: [rails]std.atomic.Value(u32) = @splat(.init(0)),
+    proxy_out: [rails]std.atomic.Value(u32) = @splat(.init(0)),
     /// Settings.wait_qp: the janitor, the words the engine thread has written into the send queues (the generation of each (rail, class)),
     /// whether it is inside a reservation (a failure waits for it to be out before the NIC takes the queues away) and which thread it is, and
     /// how far the janitor has walked the scheduling ring.
@@ -687,11 +716,16 @@ pub const Transport = struct {
         t.stop.store(true, .release);
         t.unlink();
         for (&t.threads) |*th| if (th.*) |x| {
+            where.joinThread(x);
             th.* = null;
         };
         if (t.janitor) |x| {
             where.joinThread(x);
             t.janitor = null;
+        }
+        while (t.failing.load(.acquire) != 0) {
+            const ts: std.c.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_us };
+            _ = std.c.nanosleep(&ts, null);
         }
         t.gpa.destroy(t);
     }
@@ -894,11 +928,16 @@ pub const Transport = struct {
     /// Whether the transport has failed (the host reads it at every enqueue and at its own synchronisation points).
     pub fn check(t: *Transport) !void {
         if (t.failed.load(.acquire) != 0 or @atomicLoad(u64, &t.ctl.abort.v, .acquire) != 0) return error.RociFailed;
+        // (the ring links change while lanes close: read the sibling under the lock, so it is not freed under the read)
+        ring_lock.lock();
+        defer ring_lock.unlock();
         if (t.sibling) |s| if (s.failed.load(.acquire) != 0 or @atomicLoad(u64, &s.ctl.abort.v, .acquire) != 0) return error.RociFailed;
     }
 
     /// Makes `a` and `b` the two lanes of one prompt: each fails the other.
     pub fn pair(a: *Transport, b: *Transport) void {
+        ring_lock.lock();
+        defer ring_lock.unlock();
         a.sibling = b;
         b.sibling = a;
     }
@@ -906,6 +945,8 @@ pub const Transport = struct {
     /// Makes `a`, `b` and `c` the three lanes of one prompt (TF_DS_ROCI_STAGGER_LANES=3): a ring a -> b -> c -> a, so a failure on any
     /// one reaches the other two through `fail`'s sibling call (each returns at its first line once it has failed).
     pub fn ring3(a: *Transport, b: *Transport, c: *Transport) void {
+        ring_lock.lock();
+        defer ring_lock.unlock();
         a.sibling = b;
         b.sibling = c;
         c.sibling = a;
@@ -914,6 +955,8 @@ pub const Transport = struct {
     /// Takes this transport out of its sibling ring before it goes: the one that points at it points past it (null when none is left), so no
     /// lane keeps a pointer to a closed one.
     pub fn unlink(t: *Transport) void {
+        ring_lock.lock();
+        defer ring_lock.unlock();
         const next = t.sibling orelse return;
         var p = next;
         var hops: usize = 0;
@@ -937,17 +980,52 @@ pub const Transport = struct {
     /// engine exits and restarts.
     pub fn fail(t: *Transport, reason: FailReason, class: Class, peer: u8) void {
         if (t.failed.cmpxchgStrong(0, @backingInt(reason), .acq_rel, .acquire) != null) return;
+        _ = t.failing.fetchAdd(1, .acq_rel);
+        defer _ = t.failing.fetchSub(1, .acq_rel);
+            var pb: [640]u8 = undefined;
         t.fail_class.store(@backingInt(class), .monotonic);
         t.fail_peer.store(peer, .monotonic);
         @atomicStore(u64, &t.ctl.abort.v, 1, .release);
+        t.wakeAll(); // (a parked proxy leaves its sleep and, seeing the failure, its loop)
+        t.awaitProxiesOut();
         if (t.set.wait_qp) t.awaitPostingOut();
         if (builtin.is_test and abort_doorbell_first) @atomicStore(u64, &t.ctl.doorbell.v, t.go(abort_value), .release);
         t.nic.fail_fn(t.nic.ctx);
+        t.storeAbort();
         @atomicStore(u64, &t.ctl.doorbell.v, abort_value, .release);
         // (the card-waiting mode stores it big-endian; the queue pairs are gone by now, so the native word just above releases nothing)
         if (t.set.wait_qp) @atomicStore(u64, &t.ctl.doorbell.v, t.go(abort_value), .release);
         // the other lane's streams may wait on words its peers will not send once this rank stops: stop it too (it fails
         // once; its own sibling call returns at the first line)
+        // The sibling is taken under the ring lock and held by its `failing` count from there, so its deinit (which unlinks, then waits
+        // for the count) cannot free it while this call runs; a lane already unlinked is not in the ring any more and is not reached.
+        ring_lock.lock();
+        const sib = t.sibling;
+        if (sib) |s| _ = s.failing.fetchAdd(1, .acq_rel);
+        ring_lock.unlock();
+        if (sib) |s| {
+            defer _ = s.failing.fetchSub(1, .acq_rel);
+            s.fail(.peer, class, peer);
+        }
+    }
+
+    /// Waits (short sleeps, at most `proxy_out_ms`) for each rail's proxy to have left its loop, so no post is running when the NIC takes
+    /// its queue pairs away. A proxy that raised the failure itself is out of its post already and is not waited for; a proxy that
+    /// is still in its post after the bound is named in the log and the failure goes on.
+    fn awaitProxiesOut(t: *Transport) void {
+        const me: u32 = @intCast(std.Thread.getCurrentId());
+        const t0 = nowNs();
+        for (0..rails) |r| {
+            if (t.threads[r] == null) continue;
+            while (t.proxy_out[r].load(.acquire) == 0 and t.proxy_tid[r].load(.acquire) != me) {
+                if (nowNs() - t0 > t.set.proxy_out_ms * std.time.ns_per_ms) {
+                    std.log.err("ROCI failed on node {d}: rail {c}'s proxy was still posting after {d} ms; the failure goes on", .{ t.g, @as(u8, 'A') + @as(u8, @intCast(r)), t.set.proxy_out_ms });
+                    break;
+                }
+                const ts: std.c.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_us };
+                _ = std.c.nanosleep(&ts, null);
+            }
+        }
     }
 
     /// awaitProxiesOut for the card-waiting mode: waits (short sleeps, at most `proxy_out_ms`) for the engine thread to be out of its
@@ -964,6 +1042,29 @@ pub const Transport = struct {
             const ts: std.c.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_us };
             _ = std.c.nanosleep(&ts, null);
         }
+    }
+
+    /// Stores the abort value into every awaited word, then checks that it held: after each settle every word is read, a word that is not
+    /// the abort value (a card's atomic that was in flight and landed after the store: old + 1) is stored again, until a whole settle passes
+    /// with every word as stored. A word that never holds is named in the log.
+    fn storeAbort(t: *Transport) void {
+        for (&t.ctl.recv) |*c| for (c) |*s| for (s) |*w| @atomicStore(u64, &w.v, abort_value, .release);
+        if (t.set.abort_rounds == 0) return;
+        var round: u32 = 0;
+        while (round < t.set.abort_rounds) : (round += 1) {
+            const ts: std.c.timespec = .{ .sec = 0, .nsec = @as(isize, t.set.abort_settle_us) * std.time.ns_per_us };
+            _ = std.c.nanosleep(&ts, null);
+            var changed: u32 = 0;
+            for (&t.ctl.recv) |*c| for (c) |*s| for (s) |*w| {
+                if (@atomicLoad(u64, &w.v, .acquire) != abort_value) {
+                    @atomicStore(u64, &w.v, abort_value, .release);
+                    changed += 1;
+                }
+            };
+            if (changed == 0) return;
+            t.abort_restored += changed;
+        }
+        std.log.err("ROCI failed on node {d}: the awaited words did not hold the abort value through a {d} us settle in {d} rounds", .{ t.g, t.set.abort_settle_us, t.set.abort_rounds });
     }
 
     /// The per-peer progress watchdog of one rail: for any class where this rail has posted more than a peer's words
@@ -1056,6 +1157,10 @@ fn nowNs() u64 {
 
 /// One rail's proxy: waits on the doorbell (a nap on its line, a backstop for a write the nap missed), posts the
 /// chains of every send the doorbell has passed, reaps its completions and watches its peers.
+    t.proxy_tid[rail].store(@intCast(std.Thread.getCurrentId()), .release);
+    defer t.proxy_out[rail].store(1, .release);
+}
+
     if (cpu) |c| pinCpu(c);
     const ctr = &t.rail_counters[rail];
     var done: u64 = 0;

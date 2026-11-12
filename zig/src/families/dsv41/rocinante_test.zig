@@ -226,6 +226,8 @@ const Mode = struct {
     /// The atomic's read-modify-write is torn open: the card reads the word, takes this long, then writes the old value + 1 back (an
     /// atomic of the card that a CPU store in between does not see: atomic_cap 1), if the card still has the control block.
     torn_ns: u64 = 0,
+    /// The torn atomic writes back only after the word has been stored the abort value (the failure's store came first), `torn_ns` later.
+    torn_after_abort: bool = false,
     /// Control: a card that is never fenced off the control block (fail_fn returns with its atomics still landing).
     no_fence: bool = false,
     /// The fence takes this long (the queue pairs to error, the registration gone): atomics that land meanwhile still land, before fail_fn returns.
@@ -241,6 +243,7 @@ const Node = struct {
     t: *roci.Transport = undefined,
     net: *Net = undefined,
     me: u8 = 0,
+    gone: bool = false, // the test closed this node's transport itself
 };
 
 const Net = struct {
@@ -252,9 +255,14 @@ const Net = struct {
     /// Atomics whose returned old value was not the signal's count minus one (a signal sent twice or lost), and atomics posted.
     atomic_off: std.atomic.Value(u32) = .init(0),
     atomics: std.atomic.Value(u32) = .init(0),
+    /// Posts in progress on each node (a proxy inside its NIC call), and whether one was when that node's fail_fn ran.
+    in_post: [roci.world]std.atomic.Value(u32) = @splat(.init(0)),
+    post_at_fail: [roci.world]std.atomic.Value(u32) = @splat(.init(0)),
     gate: std.atomic.Value(u32) = .init(0), // 1: the held posts have been released
     gate_lock: std.atomic.Value(u32) = .init(0),
     held: std.ArrayList(Held) = .empty,
+    /// The card's unfinished read-modify-writes (Mode.torn_ns), joined before the arenas go.
+    torn: std.ArrayList(std.Thread) = .empty,
 
     fn lockGate(n: *Net) void {
         while (n.gate_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
@@ -298,6 +306,9 @@ const Net = struct {
     /// data behind its word).
     fn close(n: *Net) void {
         n.openGate();
+        for (&n.nodes) |*nd| if (!nd.gone) nd.t.deinit();
+        for (n.torn.items) |th| th.join();
+        n.torn.deinit(gpa);
         n.held.deinit(gpa);
         for (&n.nodes) |*nd| {
             std.posix.munmap(nd.arena);
@@ -315,17 +326,34 @@ const Net = struct {
             return;
         }
         if (m.torn_ns == 0) {
+            _ = me.net.atomics.fetchAdd(1, .monotonic);
             const old = @atomicRmw(u64, w, .Add, 1, .acq_rel);
             if (old != word - 1) _ = me.net.atomic_off.fetchAdd(1, .monotonic);
             return;
         }
+        // the card reads the word now and writes it back later, on its own, after the post call has returned (as a card does)
         const old = @atomicLoad(u64, w, .acquire);
+        _ = me.net.atomics.fetchAdd(1, .monotonic); // (counted once the card has read: a failure that waits for it stores after the read)
+        const th = std.Thread.spawn(.{}, tornWrite, .{ dst, w, old, m.torn_ns, m.torn_after_abort }) catch @panic("torn atomic");
+        me.net.lockGate();
+        defer me.net.unlockGate();
+        me.net.torn.append(gpa, th) catch @panic("torn atomic");
+    }
+
+    fn tornWrite(dst: *Node, w: *u64, old: u64, ns: u64, after_abort: bool) void {
+        if (after_abort) {
+            var spins: u32 = 0;
+            while (@atomicLoad(u64, w, .acquire) != roci.abort_value and spins < 1_000_000) : (spins += 1) sleep(10_000);
+        }
+        sleep(ns);
         if (dst.net.card_open[dst.me].load(.acquire) != 0) @atomicStore(u64, w, old +% 1, .release);
     }
 
     fn post(ctx: *anyopaque, rail: u8, peer: u8, class: C, chain: *const roci.Chain, word: u64) roci.PostError!void {
         const me: *Node = @ptrCast(@alignCast(ctx));
         const m = me.net.mode;
+        _ = me.net.in_post[me.me].fetchAdd(1, .acq_rel);
+        defer _ = me.net.in_post[me.me].fetchSub(1, .acq_rel);
         if (me.net.failed_nic[me.me].load(.acquire) != 0) return error.QpError;
         if (m.broken == me.me) return error.PostFailed;
         if (m.silent == me.me) return;
@@ -361,6 +389,7 @@ const Net = struct {
     fn failNic(ctx: *anyopaque) void {
         const me: *Node = @ptrCast(@alignCast(ctx));
         me.net.failed_nic[me.me].store(1, .release);
+        _ = me.net.post_at_fail[me.me].fetchAdd(me.net.in_post[me.me].load(.acquire), .acq_rel);
         // the contract: fail_fn returns when the card can no longer write the control block
         if (me.net.mode.no_fence) return;
         sleep(me.net.mode.fence_ns);
@@ -1004,6 +1033,41 @@ test "a peer that never answers: the watchdog names it, every queued wait is rel
     try std.testing.expect(@as(i64, @bitCast(roci.abort_value -% 1_000_000)) >= 0);
 }
 
+test "a rank whose link closed: the watch fails the lane it waits on, the queued wait is released and the failure names the peer (the watchdog is off)" {
+    const link = @import("link.zig");
+    // the watchdog's limit is far off: only the watch can end the wait inside the test's bound
+    const net = try Net.open(.{ .silent = 1 }, .{ .nap = false, .dead_ms = 100_000 }, roci.identity);
+    defer net.close();
+    try net.start();
+    const nd = &net.nodes[0];
+    var fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds));
+    defer _ = std.c.close(fds[0]);
+    const Hook = struct {
+        fn gone(ctx: ?*anyopaque, rank: u32) void {
+            const t: *roci.Transport = @ptrCast(@alignCast(ctx.?));
+            t.fail(.peer, .own1, @intCast(rank));
+        }
+        fn exit(_: *link.Watch, _: u32) void {} // (the test's stand-in for the process's end)
+    };
+    var w: link.Watch = .{ .rank = 0, .grace_ms = 100, .stop_hook = Hook.gone, .ctx = nd.t, .on_gone = Hook.exit };
+    try w.add(.{ .fd = fds[0] }, 1);
+    try w.start();
+    defer w.stop();
+    const s: FakeStream = .{ .timeout_ns = 8 * std.time.ns_per_s };
+    try nd.t.send(s, .own1, 0);
+    const t0 = std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds;
+    _ = std.c.close(fds[1]); // rank 1 is gone: the link closes
+    try nd.t.wait(s, .own1); // returns: the stop's abort released it (rank 1's words never come)
+    const took_ms = @divTrunc(std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds - t0, std.time.ns_per_ms);
+    try std.testing.expect(took_ms < 4000);
+    const f = nd.t.failure().?;
+    try std.testing.expectEqual(roci.FailReason.peer, f.reason);
+    try std.testing.expectEqual(@as(u8, 1), f.peer);
+    try std.testing.expectError(error.RociFailed, nd.t.check());
+    for (&nd.ctl.recv) |*c| for (c) |*sw| for (sw) |*x| try std.testing.expectEqual(roci.abort_value, x.v);
+}
+
 // -- the atomic arrival signal --------------------------------------------------------------------------------------
 
 test "TF_DS_ROCI_SIGNAL's text: unset, empty and atomic are the fetch-and-add (the guaranteed arrival signal), write the second WRITE, anything else is refused" {
@@ -1078,6 +1142,8 @@ test "control: an atomic the card does before the data lets a consumer read stal
 /// Node 0 sends class own1 to its partner while the partner's card has the atomic open (read, `torn_ns`, write back old + 1);
 /// once both cards have read their word, the partner fails (its fence takes `fence_ns`: the atomic lands inside it). Returns the partner's words of that class after the card has finished.
 fn failDuringAtomic(mode: Mode, cap_ns: u64) ![roci.rails]u64 {
+    // (no look at the words after the store: these two tests are about the fence alone)
+    const net = try Net.open(mode, .{ .nap = false, .dead_ms = 100_000, .abort_rounds = 0 }, roci.identity);
     defer net.close();
     try net.start();
     const e = roci.buildEvent(.own1, 4096, 0, roci.identity);
@@ -1102,6 +1168,64 @@ test "a failure with atomics in flight: the card is fenced off before the abort 
 test "control: a card that is never fenced finishes its atomic over the abort value, and the wait of the failed rank is not released" {
     const got = try failDuringAtomic(.{ .signal = .atomic, .torn_ns = 100 * std.time.ns_per_ms, .fence_ns = 100 * std.time.ns_per_ms, .no_fence = true }, 300 * std.time.ns_per_ms);
     for (got) |v| try std.testing.expectEqual(@as(u64, 1), v); // the atomic's old + 1 over the abort value: a count of one, below the generations a later wait names
+}
+
+/// Node 0 sends own1 to its partner whose card is NOT fenced and finishes an atomic it had begun (read, `torn_ns`, write back old + 1) just after
+/// the partner's failure has stored the abort values. Returns the partner's words and how many the failure's look put back.
+fn failBehindAtomic(set: roci.Settings) !struct { words: [roci.rails]u64, restored: u64 } {
+    const net = try Net.open(.{ .signal = .atomic, .torn_ns = 200 * std.time.ns_per_us, .torn_after_abort = true, .no_fence = true }, set, roci.identity);
+    defer net.close();
+    try net.start();
+    const e = roci.buildEvent(.own1, 4096, 0, roci.identity);
+    const p = e.peerSlice()[0];
+    try net.nodes[0].t.send(FakeStream{}, .own1, 0);
+    var spins: u32 = 0;
+    while (net.atomics.load(.acquire) < roci.rails and spins < 5_000_000) : (spins += 1) std.atomic.spinLoopHint(); // both rails' cards have read their word
+    net.nodes[p].t.fail(.refused, .own1, 0);
+    sleep(30 * std.time.ns_per_ms); // the card has finished
+    var out: [roci.rails]u64 = undefined;
+    for (&out, 0..) |*o, r| o.* = @atomicLoad(u64, &net.nodes[p].ctl.recv[@backingInt(C.own1)][0][r].v, .acquire);
+    return .{ .words = out, .restored = net.nodes[p].t.abort_restored };
+}
+
+test "an atomic the card finishes after the abort store is put right: the failure looks at the words again and stores the abort value back, so the wait is released" {
+    const got = try failBehindAtomic(.{ .nap = false, .dead_ms = 100_000, .abort_settle_us = 5_000 });
+    for (got.words) |v| try std.testing.expectEqual(roci.abort_value, v);
+    try std.testing.expect(got.restored >= 1);
+}
+
+test "control: without the failure's second look the same atomic leaves a count of one over the abort value" {
+    const got = try failBehindAtomic(.{ .nap = false, .dead_ms = 100_000, .abort_rounds = 0 });
+    for (got.words) |v| try std.testing.expectEqual(@as(u64, 1), v);
+}
+
+test "a failure raised by another thread waits for the proxies to be out of their posts before the NIC takes the queue pairs away" {
+    // node 0's rail A proxy is inside a slow post (50 ms in the NIC) when node 0's host fails the transport
+    const net = try Net.open(.{ .late_rail = 0, .late_ns = 50 * std.time.ns_per_ms }, .{ .nap = false, .dead_ms = 100_000 }, roci.identity);
+    defer net.close();
+    try net.start();
+    try net.nodes[0].t.send(FakeStream{}, .own1, 0);
+    var spins: u32 = 0;
+    while (net.in_post[0].load(.acquire) == 0 and spins < 5_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    try std.testing.expect(net.in_post[0].load(.acquire) != 0);
+    net.nodes[0].t.fail(.refused, .own1, 0);
+    try std.testing.expectEqual(@as(u32, 0), net.post_at_fail[0].load(.acquire)); // no post was in the NIC when the queue pairs went
+    try std.testing.expect(net.failed_nic[0].load(.acquire) != 0);
+}
+
+test "a failure the proxy raises itself does not wait for itself" {
+    const net = try Net.open(.{ .broken = 0 }, .{ .nap = false, .dead_ms = 100_000 }, roci.identity);
+    defer net.close();
+    try net.start();
+    const t0 = std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds;
+    try net.nodes[0].t.send(FakeStream{}, .wob, 0);
+    var tries: u32 = 0;
+    while (net.nodes[0].t.failure() == null and tries < 2000) : (tries += 1) sleep(100_000);
+    try std.testing.expectEqual(roci.FailReason.post, net.nodes[0].t.failure().?.reason);
+    // the failure's reaction (its look at the words included) is over well inside the 100 ms a wait for a proxy would cost
+    while (net.nodes[0].t.failing.load(.acquire) != 0) sleep(100_000);
+    const took: u64 = @intCast(std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds - t0);
+    try std.testing.expect(took < 90 * std.time.ns_per_ms);
 }
 
 test "a post that fails stops the transport naming the class and the peer" {
@@ -1439,6 +1563,8 @@ test "a failure on lane 0 stops lane 1 of the same rank: abort values in its wor
     try std.testing.expectEqual(roci.FailReason.post, f0.reason);
     const f1 = nets[1].nodes[0].t.failure().?;
     try std.testing.expectEqual(roci.FailReason.peer, f1.reason);
+    // (the failure's flag is set first; the abort values are in the words when its reaction has finished)
+    while (nets[1].nodes[0].t.failing.load(.acquire) != 0) sleep(100_000);
     try std.testing.expectError(error.RociFailed, nets[1].nodes[0].t.check());
     try std.testing.expectError(error.RociFailed, nets[1].nodes[0].t.send(s, .own1, 0));
     try std.testing.expectError(error.RociFailed, nets[1].nodes[0].t.wait(s, .own1));
@@ -1540,6 +1666,42 @@ test "control: a ring of two links (pair) leaves a third lane serving after a fa
     try std.testing.expect(b.nodes[0].t.failure() != null);
     sleep(20_000_000);
     try std.testing.expectEqual(@as(?@TypeOf(c.nodes[0].t.failure().?), null), c.nodes[0].t.failure());
+}
+
+const RaceJob = struct { t: *roci.Transport, closes: bool, go: *std.atomic.Value(bool) };
+
+fn raceMain(j: *RaceJob) void {
+    while (!j.go.load(.acquire)) std.atomic.spinLoopHint();
+    if (j.closes) j.t.deinit() else j.t.fail(.peer, .wob, 0);
+}
+
+test "a failure on one lane while the other two close: the ring's links are read under the lock and a lane being failed is held by its count, so deinit never frees it under fail() and no closed lane is touched (many rounds)" {
+    for (0..40) |round| {
+        const nets = try openLanes3(.{ .{}, .{}, .{} }, .{ .nap = false }, roci.identity);
+        defer nets[0].close();
+        defer nets[1].close();
+        defer nets[2].close();
+        for (nets) |n| try n.start();
+        var go = std.atomic.Value(bool).init(false);
+        // lane 0 fails (reaching its siblings through the ring) while lane 1 and lane 2 close, in both orders
+        var jobs = [3]RaceJob{
+            .{ .t = nets[0].nodes[0].t, .closes = false, .go = &go },
+            .{ .t = nets[1].nodes[0].t, .closes = true, .go = &go },
+            .{ .t = nets[2].nodes[0].t, .closes = true, .go = &go },
+        };
+        if (round % 2 == 1) std.mem.swap(RaceJob, &jobs[1], &jobs[2]);
+        nets[1].nodes[0].gone = true;
+        nets[2].nodes[0].gone = true;
+        var th: [3]std.Thread = undefined;
+        for (&th, &jobs) |*t, *j| t.* = try std.Thread.spawn(.{}, raceMain, .{j});
+        go.store(true, .release);
+        for (th) |t| t.join();
+        // lane 0 failed and nothing else was touched after its close: the survivors of the ring are lane 0 alone
+        try std.testing.expect(nets[0].nodes[0].t.failure() != null);
+        try std.testing.expectEqual(@as(?*roci.Transport, null), nets[0].nodes[0].t.sibling);
+        // (check() reads the ring under the same lock)
+        try std.testing.expectError(error.RociFailed, nets[0].nodes[0].t.check());
+    }
 }
 
 test "a lane leaves the ring before it closes: the lane that pointed at it points past it, nothing keeps a pointer to a closed lane" {
@@ -1988,6 +2150,18 @@ test "four nodes: a decoder window's taps and head row land every byte at window
         for (run.bad) |b| try std.testing.expectEqual(@as(u64, 0), b);
         for (&net.nodes) |*nd| try std.testing.expectEqual(@as(?@TypeOf(nd.t.failure().?), null), nd.t.failure());
     }
+}
+
+test "a rank that refuses a primitive fails its lanes at once: the refused reason is named, the host place is logged, and the failed lane's check ends every wait with an error" {
+    const net = try Net.open(.{ .host = true }, .{ .nap = false, .dead_ms = 100_000 }, roci.identity);
+    defer net.close();
+    try net.start();
+    const nd = &net.nodes[0];
+    try std.testing.expect(nd.t.failure() == null);
+    nd.t.fail(.refused, .own1, 0);
+    try std.testing.expectEqual(roci.FailReason.refused, nd.t.failure().?.reason);
+    try std.testing.expectError(error.RociFailed, nd.t.check());
+    try std.testing.expectError(error.RociFailed, nd.t.waitHost(.rec, 1, 0));
 }
 
 test "the arena and the plans follow the booted pass rows: 4,096 unless more (setCap), the plans of the whole pass and the resume unit" {

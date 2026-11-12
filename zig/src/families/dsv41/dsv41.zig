@@ -52,6 +52,10 @@ pub const draft = @import("draft.zig");
 pub const sampling = @import("sampling.zig");
 pub const model = @import("model.zig");
 pub const lanes = @import("lanes.zig");
+/// A decode ring's progress watchdog.
+pub const ring_watch = @import("ring_watch.zig");
+/// Where this rank's host is, for a failure that names it.
+pub const where = @import("where.zig");
 pub const any_check = @import("any_check.zig");
 pub const replay_runner = @import("replay_runner.zig");
 /// Rocinante: the zero-copy two-rail transport.
@@ -123,6 +127,8 @@ test {
     refAll(sampling);
     refAll(model);
     refAll(lanes);
+    refAll(ring_watch);
+    refAll(where);
     refAll(rocinante);
     refAll(rocinante_verbs);
     refAll(mlx5_devx);

@@ -5,6 +5,7 @@
 //! on every rank (its link closes), never a hang for good.
 const std = @import("std");
 const Link = @import("link.zig").Link;
+const where = @import("where.zig");
 
 /// A part is at most this many bytes a rank (a frame of the table is `world` parts).
 pub const max_part = 16 * 1024;
@@ -35,6 +36,8 @@ pub const Star = struct {
         if (mine.len > max_part or table.len != s.world * mine.len) return error.BadPart;
         try s.enter();
         defer s.leave();
+        const held = where.enter(.settle_gather, 0, 0);
+        defer where.leave(held);
         const n = mine.len;
         if (s.world == 1) {
             @memcpy(table[0..n], mine);

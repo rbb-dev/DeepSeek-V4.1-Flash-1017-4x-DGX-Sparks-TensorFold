@@ -1228,6 +1228,48 @@ test "wait mode, ATOMIC signal: the same failure order: no armed chain (no ATOMI
     try failureOrder(.atomic);
 }
 
+test "wait mode: a rank whose link closed fails the lanes through the watch: the same failure as a peer's abort, armed chains taken from the card first, the peers told" {
+    const link = @import("link.zig");
+    const f = try Fab.open(.{});
+    defer f.close();
+    fx.err_delay_ns = 2 * std.time.ns_per_ms;
+    try armed(f);
+    const a = &f.nd[0];
+    var fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds));
+    defer _ = std.c.close(fds[0]);
+    const Hook = struct {
+        fn gone(ctx: ?*anyopaque, rank: u32) void {
+            const t: *roci.Transport = @ptrCast(@alignCast(ctx.?));
+            t.fail(.peer, .own1, @intCast(rank));
+        }
+        fn exit(_: *link.Watch, _: u32) void {}
+    };
+    var w: link.Watch = .{ .rank = 0, .grace_ms = 100, .stop_hook = Hook.gone, .ctx = a.t, .on_gone = Hook.exit };
+    try w.add(.{ .fd = fds[0] }, 1);
+    try w.start();
+    defer w.stop();
+    _ = std.c.close(fds[1]); // rank 1 is gone
+    var waited: u32 = 0;
+    while (a.t.failure() == null and waited < 4000) : (waited += 10) {
+        const ts: std.c.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+        _ = std.c.nanosleep(&ts, null);
+    }
+    const fl = a.t.failure() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(roci.FailReason.peer, fl.reason);
+    try std.testing.expectEqual(@as(u8, 1), fl.peer);
+    w.stop(); // (the hook has returned once the watch's thread ends)
+    fx.lockIt();
+    const writes = fx.writes;
+    const released = fx.waits_released;
+    fx.unlockIt();
+    try std.testing.expectEqual(@as(u64, 0), writes);
+    try std.testing.expectEqual(@as(u64, 0), released);
+    try std.testing.expectEqual(a.t.go(roci.abort_value), @atomicLoad(u64, &a.ctl.doorbell.v, .acquire));
+    for (f.nd[1..]) |*nd| try std.testing.expectEqual(@as(u64, 1), @atomicLoad(u64, &nd.ctl.abort.v, .acquire));
+    try std.testing.expectEqual(@as(u32, 0), fx.violations);
+}
+
 test "control: with the abort value stored into the doorbell first, the armed chains are released and unproduced data and arrival words land in the peers (the ordering test can fail)" {
     const f = try Fab.open(.{});
     defer f.close();

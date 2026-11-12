@@ -27,6 +27,7 @@ const ops = @import("ops.zig");
 const cublas = @import("cublas.zig");
 const comm = @import("comm.zig");
 const graph_fallback = @import("graph_fallback.zig");
+const where = @import("where.zig");
 const engram = @import("engram.zig");
 const engram_io = @import("engram_io.zig");
 const engram_aio = @import("engram_aio.zig");
@@ -212,6 +213,8 @@ pub const Engine = struct {
     /// recorded) made the ranks' byte-wise largest over the host links in the agreement buffer, read after a synchronize, so every
     /// rank decides the same. Called in the same order on every rank, as agreeAll. World 1: this rank's own ballot.
     pub fn agreeCapture(e: *const Engine, stage: graph_fallback.Stage, recorded: u32) !graph_fallback.Outcome {
+        const prev = where.enter(.capture_vote, @backingInt(stage), recorded);
+        defer where.leave(prev);
         const mine = graph_fallback.ballot(stage, recorded);
         if (e.comm.world <= 1) return graph_fallback.decide(mine);
         if (e.agree_flag == 0) return error.NoAgreeFlag;
@@ -2281,13 +2284,20 @@ pub fn engramWorker(eh: *EngramHost, c: *const Config, seq: []const i32, start: 
 pub fn engramWorkerStop(eh: *EngramHost) void {
     const th = eh.wk_thread orelse return;
     eh.wk_stop.store(true, .release);
+    where.joinThread(th);
     eh.wk_thread = null;
     eh.wk_seq = &.{};
 }
 
+    const held = where.enter(.engram_release, @intCast(j), 0);
+    defer where.leave(held);
+    const prev = where.enter(.engram_flush, 0, 0);
+    defer where.leave(prev);
 /// The worker's rows of Engram layer j for the chunk at `start` (waiting for them), for engramApply.
 pub fn engramWorkerRows(eh: *EngramHost, j: usize, start: usize, chunk: usize) ![]u16 {
     const ci = (start - eh.wk_start) / chunk;
+    const prev_place = where.enter(.engram_rows, @intCast(j), @intCast(ci));
+    defer where.leave(prev_place);
     const t_in = nowNs();
     return eh.wk_rows[ci % eh.wk_slots][j];
 }

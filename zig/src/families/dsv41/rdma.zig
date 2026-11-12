@@ -19,6 +19,8 @@ const std = @import("std");
 const cuda = @import("cuda");
 const fabric = @import("fabric");
 const seqs = @import("rdma_seq.zig");
+const ring_watch = @import("ring_watch.zig");
+const where = @import("where.zig");
 const wait = @import("ring_wait.zig");
 const mx = @import("mlx5_devx.zig");
 
@@ -554,6 +556,18 @@ fn linked(a: Info, b: Info, prefix: u8) bool {
     return n > 0;
 }
 
+/// The decode ring's progress watch: a posted sequence whose peers' parts do not all come within this many milliseconds
+/// fails the ring by name (TF_DS_RING_DEAD_MS).
+pub const default_dead_ms: u64 = 10_000;
+
+/// TF_DS_RING_DEAD_MS's value: the default when unset, a whole number of milliseconds from 1 when set, else null (the
+/// start refuses by name: a typo must never become the default unseen).
+pub fn deadMsFrom(text: ?[]const u8) ?u64 {
+    const t = text orelse return default_dead_ms;
+    const v = std.fmt.parseInt(u64, t, 10) catch return null;
+    return if (v == 0) null else v;
+}
+
 /// The UDP source port of RoCE v2's flow entropy for a queue pair: from its number, the device and the peer, in the dynamic port range.
 fn udpSport(qpn: u32, nic: usize, peer: usize) u16 {
     const h = (qpn *% 2654435761) ^ @as(u32, @intCast(nic * 7 + peer));
@@ -657,6 +671,7 @@ pub const Ring = struct {
     send: Pinned,
     recv: Pinned,
     meta: Pinned,
+    dead_ms: u64 = default_dead_ms, // TF_DS_RING_DEAD_MS: the progress watch's limit, read once at create
     gen: ?Pinned = null, // TF_DS_RING_WORD: the generation words [peer][lane] and the proxy's local word
     lanes_dev: ?cuda.DeviceBuffer = null, // the lanes toward each peer, the waiting kernel's [world] u32
     fault: ?cuda.DeviceBuffer = null, // the first expired generation-word wait: magic, seq, rank, peer/lane, seen, waited, when, why
@@ -793,6 +808,10 @@ pub const Ring = struct {
             std.log.err("TF_DS_RING_WAIT=1: needs TF_DS_RING_WORD=1 and the wait kernels in the fatbin", .{});
             return error.BadInfo;
         }
+        const dead_ms = deadMsFrom(if (std.c.getenv("TF_DS_RING_DEAD_MS")) |v| std.mem.span(v) else null) orelse {
+            std.log.err("TF_DS_RING_DEAD_MS must be a whole number of milliseconds from 1 (the decode ring's progress watch; unset: {d})", .{default_dead_ms});
+            return error.BadInfo;
+        };
         const r = try gpa.create(Ring);
         errdefer gpa.destroy(r);
         var verbs = try Verbs.open(null);
@@ -1545,12 +1564,24 @@ pub const Ring = struct {
         // the bytes of each peer's sequence in (by slot), for the halves a relay sends on
         var got_bytes: [max_ranks][seqs.max_slots]u64 = @splat(@splat(0));
         var posted: u64 = 0;
+        // the progress watchdog: a sequence posted whose peers' parts do not all come within TF_DS_RING_DEAD_MS (default 10 s) fails
+        // the ring by name
+        const dead_ms: u64 = r.dead_ms;
+        var watch: ring_watch.Watch = .{ .dead = dead_ms * 1000 * tpu };
         var wc: [64]vabi.Wc = undefined;
         while (r.running.load(.monotonic)) {
                 r.fail("RDMA idle futex wait failed");
                 return;
             };
             if (!r.running.load(.acquire)) break;
+            if (watch.open > 0 and watch.expired(instr.ticks())) {
+                var pb: [640]u8 = undefined;
+                var mb: [900]u8 = undefined;
+                const msg = std.fmt.bufPrint(&mb, "{s}: a sequence posted by this rank has had no peer part for {d} ms (posted {d}, {d} open); this rank's host was {s}", .{ r.s.name, dead_ms, posted, watch.open, where.report(&pb) }) catch "a posted sequence got no peer part";
+                std.log.err("{s}", .{msg});
+                r.fail(msg);
+                watch.open = 0;
+            }
             const ring = @atomicLoad(u64, r.doorbell(), .acquire);
             // TF_DS_RING_WORD: the doorbell is a counter whose every sequence must be posted; the GPU cannot ring
             // more than the ring's slots ahead (the staging kernel waits on `sent`), so more pending than slots is a
@@ -1668,6 +1699,7 @@ pub const Ring = struct {
                                 bytes.* = 0;
                             } else if (im.relayed_from == null) got_bytes[p][@intCast(q % r.s.slots)] = 0;
                             @atomicStore(u64, r.flagAt(q, p), q, .release);
+                                watch.completed(sl, instr.ticks(), posted >= q);
                         }
                         postRecv(nic.ctx, nic.qps[from].?) catch {
                             r.fail("ibv_post_recv failed");
@@ -2096,6 +2128,35 @@ test "every declaration compiles (the GPU and verbs paths run only on the nodes)
     }
 
         if (t.gen_mem) |g| gpa.free(g);
+test "a watch's hook aborts a ring: its waits give up and the failure says why" {
+    const link = @import("link.zig");
+    var t = try TestRing.init(false, 0);
+    defer t.deinit();
+    try std.testing.expect(t.r.failure() == null);
+    var fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds));
+    defer _ = std.c.close(fds[0]);
+    const Hook = struct {
+        fn gone(ctx: ?*anyopaque, _: u32) void {
+            const r: *Ring = @ptrCast(@alignCast(ctx.?));
+            r.abort("a peer rank's link closed: the rank stopped");
+        }
+        fn exit(_: *link.Watch, _: u32) void {}
+    };
+    var w: link.Watch = .{ .rank = 0, .grace_ms = 100, .stop_hook = Hook.gone, .ctx = t.r, .on_gone = Hook.exit };
+    try w.add(.{ .fd = fds[0] }, 1);
+    try w.start();
+    defer w.stop();
+    _ = std.c.close(fds[1]);
+    var waited: u32 = 0;
+    while (t.r.failure() == null and waited < 4000) : (waited += 10) {
+        const ts: std.c.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+        _ = std.c.nanosleep(&ts, null);
+    }
+    try std.testing.expectEqualStrings("a peer rank's link closed: the rank stopped", t.r.failure() orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(@as(u64, 1), @atomicLoad(u64, t.r.abortWord(), .acquire));
+}
+
 test "TF_DS_RING_WORD's signals: the word is the sequence, the atomic counts, and a wait ends at or past it" {
     try std.testing.expect(!Roci.off.on());
     try std.testing.expect(Roci.word.on() and Roci.atomic.on());
@@ -2316,6 +2377,13 @@ test "TF_DS_RING_WC is off by default; a ring's switch word carries it, and the 
     // the switch changes pages, not the ring's fields: a Pinned made by alloc (not allocHost) frees by unregister
     const p: Pinned = .{ .mem = t.r.send.mem, .dev = 0 };
     try std.testing.expect(!p.host and p.d == null);
+}
+
+test "TF_DS_RING_DEAD_MS: unset is the default; a whole number from 1 is taken; anything else refuses (null), never the default" {
+    try std.testing.expectEqual(@as(?u64, default_dead_ms), deadMsFrom(null));
+    try std.testing.expectEqual(@as(?u64, 2500), deadMsFrom("2500"));
+    try std.testing.expectEqual(@as(?u64, 1), deadMsFrom("1"));
+    for ([_][]const u8{ "", "0", "-5", "10s", "1e4", " 100", "x" }) |t| try std.testing.expectEqual(@as(?u64, null), deadMsFrom(t));
 }
 
 test "TF_DS_RING_WAIT: the Settings struct's own default is the proxy path (the engine's default is Model.open's, the card's WAIT); a ring's switch word carries it only when set, its info carries no MAC then, the proxy path's kernels and arguments are the ones they were" {

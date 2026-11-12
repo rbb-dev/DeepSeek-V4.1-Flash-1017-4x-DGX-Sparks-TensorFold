@@ -935,6 +935,7 @@ fn openPair(m: *Model, gpa: std.mem.Allocator, d: *const cuda.Driver, o: Options
     std.log.info("TF_DS_ROCI_STAGGER=1: rank {d}: {d} whole passes of {d} rows in flight (TF_DS_ROCI_STAGGER_LANES), the later's layer L after the earlier's layer L caches, issue gap {d} layers (TF_DS_ROCI_STAGGER_GAP), stream priorities A {d} and B {d} (TF_DS_ROCI_STAGGER_PRIO={d}; a lower number is more urgent), the Engram worker's order {s} (TF_DS_ROCI_WORKER_PAIR_MAJOR); the second pass's chunk and node take {d} bytes of the device arena, its transport's arena {d} bytes and control block {d} bytes; {d} bytes free before, {d} after; the Engram worker's ring holds {d} chunk slots of {d} rows, a pass takes {d}; the KV pool holds {d} positions ({d:.2} GiB on this Spark, POOL) and the floor kept free is {d:.1} GiB", .{ m.comm.rank, m.pair_lanes, m.pass_rows, m.pair_gap, m.stream.priority() catch -99, m.stream_b.?.priority() catch -99, @backingInt(m.pair_prio), if (m.pair_major) "pair-major (both passes' layer 0, then both layer 1)" else "pass-major (each pass's layers in turn)", m.pair_bytes, lay.total, @sizeOf(@import("rocinante.zig").Control), free, after.free, m.workerSlots(), chunk_rows, m.pass_rows / chunk_rows, m.pool_cap, @as(f64, @floatFromInt(poolView(m, c).bytes(m.pool_cap))) / (1 << 30), @as(f64, @floatFromInt(pair_guard_bytes)) / (1 << 30) });
 }
 
+    return where.report(buf);
 /// One line of TF_DS_ROCI_PAIR_LOG: to the log, and appended to the file the variable names when its value is a path.
 fn pairLog(comptime fmt: []const u8, args: anytype) void {
     std.log.info(fmt, args);
@@ -948,6 +949,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
 }
 
     vfan: prompt2d.Fan, // the host collectives' links (prompt2d.hostLinksAsked), else none
+    watch: link.Watch, // watchPeers: a peer rank that stops stops this one too
     star_busy: std.atomic.Value(bool), // star.Star's guard against two threads in one collective
     comm: comm_mod.Comm,
     rdma_mod: ?cuda.Module = null, // the RDMA kernels (TP2's ring or world 4's rings)
@@ -1130,6 +1132,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         m.pair_bytes = 0;
         m.rdma_rings = null;
         m.vfan = .{};
+        m.watch = .{};
         m.star_busy = .init(false);
         const d = ctx.d;
         m.cfg = try Config.read(a, io, o.model_dir);
@@ -1394,6 +1397,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         m.set.deinit();
         if (m.two) |*t| if (t.rc) |rc| rc.close();
         m.comm.deinit();
+        m.watch.stop(); // (still watching up to here: a wait above on a rank that went ends this process)
         m.vfan.close();
         m.fan.close();
         m.w.deinit();
@@ -1542,6 +1546,62 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         return m.fan.links[0 .. m.world - 1];
     }
 
+    /// From here on a peer rank that stops stops this one too, with a line that names it (link.Watch): rank 0 watches its
+    /// followers' links, a follower rank 0's. The server's rank 0 (native.open) and the lane followers (lanes_main) watch; rank
+    /// 0's done (Lanes.finish), a follower reading it (follow) and close end the watch. A peer's link that has been closed for
+    /// the grace fails the Rocinante lanes first (`peerGone`), so the ranks still up have it by the abort and not by their
+    /// watchdogs, then ends the process.
+    pub fn watchPeers(m: *Model) !void {
+        if (m.world < 2 or m.watch.thread != null) return;
+        m.watch = .{ .rank = m.rank, .stop_hook = peerGone, .ctx = m };
+        if (m.rank == 0) {
+            for (m.followers(), 1..) |l, r| if (l) |x| try m.watch.add(x, @intCast(r));
+        } else try m.watch.add(m.peer(), 0);
+        try m.watch.start();
+    }
+
+    /// The watch's hook, run on its thread once a peer has been gone for the grace: the Rocinante lanes fail with the rank that went
+    /// (a lane that waits in the card as well as one with proxies: Transport.fail), and so do the decode rings.
+    fn peerGone(ctx: ?*anyopaque, rank: u32) void {
+        const m: *Model = @ptrCast(@alignCast(ctx.?));
+        m.failLanes(.peer, @intCast(rank));
+        m.abortRings("a peer rank's link closed: the rank stopped");
+    }
+
+    /// Every decode ring gives up its waits from here on (Ring.abort: a ring that waits in the card has its queue pairs taken
+    /// from the card first, then the abort word set, which releases the kernels' waits).
+    fn abortRings(m: *Model, why: []const u8) void {
+        if (m.ring) |r| r.abort(why);
+        if (m.rdma_rings) |rs| for ([_]?*rdma.Ring{ rs.all4, rs.col, rs.pair }) |y| if (y) |r| r.abort(why);
+    }
+
+    /// Ends watchPeers' watch: this process ends its links itself now.
+    pub fn unwatch(m: *Model) void {
+        m.watch.stop();
+    }
+
+    /// Whether this rank's GPU context has failed for good: after a fault in a kernel (an illegal address, a trap) every
+    /// later call returns that fault, the stream's query too; a context that survived a failed call answers done or busy.
+    pub fn contextFailed(m: *Model) bool {
+        _ = m.stream.done() catch return true;
+        return false;
+    }
+
+    pub fn drafting(m: *const Model) bool {
+        return m.dr != null;
+    }
+
+    // -- the primitives (both ranks, in the same order) ----------------------------------------------------------
+
+    /// Every decode ring's exchange waits since the last call (instr.WaitHist), summed into `acc`.
+    pub fn ringWaits(m: *Model, acc: *instr_mod.WaitHist.Acc) void {
+        if (m.ring) |r| r.waits.drain(acc);
+        if (m.rdma_rings) |rs| for ([_]?*rdma.Ring{ rs.all4, rs.col, rs.pair }) |y| if (y) |r| r.waits.drain(acc);
+    }
+
+    pub fn joinAhead(m: *Model) void {
+        if (m.ahead) |th| where.joinThread(th);
+        m.ahead = null;
         if (m.eh) |*eh| prompt.engramWorkerStop(eh);
     }
 
@@ -1665,6 +1725,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
             eh.inst_apply_ns += m.now() - t_apply;
         } else {
             if (ahead.*) |th| {
+                where.joinThread(th);
                 ahead.* = null;
             }
             if (eh.ahead_err) |err| return err;
@@ -1710,15 +1771,26 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         const use_wk = m.eh != null and wk_on and m.fill_seq.len >= start + n and m.fill_seq.ptr == seq.ptr;
         var ahead: ?std.Thread = m.ahead;
         m.ahead = null;
-        defer if (ahead) |th| th.join();
+        defer if (ahead) |th| where.joinThread(th);
         if (m.eh) |*eh| {
             if (use_wk) {
+                if (ahead) |th| where.joinThread(th);
                 ahead = null;
                 const same = eh.wk_thread != null and eh.wk_seq.ptr == m.fill_seq.ptr and eh.wk_seq.len == m.fill_seq.len and
                     start >= eh.wk_start and (start - eh.wk_start) % chunk_rows == 0 and
             } else {
                 prompt.engramWorkerStop(eh);
                 if (ahead != null and (eh.ahead_start != start or eh.ahead_n != n)) {
+                    where.joinThread(ahead.?);
+                    ahead = null;
+                }
+                if (ahead == null) {
+                    eh.ahead_start = start;
+                    eh.ahead_n = n;
+                    eh.ahead_ready = .{ false, false };
+                    eh.ahead_err = null;
+                    ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, @as(usize, 0) }) catch null;
+                }
             }
         }
         var engram_pre: ?usize = null;
@@ -2005,6 +2077,7 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         // every finished pair's GPU span (its first queued work to its second pass's last), in order
         if (m.pair_log) m.sweepSpans();
         if (m.ahead) |th| {
+            where.joinThread(th);
             m.ahead = null;
         }
         defer {
@@ -2107,7 +2180,29 @@ fn pairLog(comptime fmt: []const u8, args: anytype) void {
         if (pt) |t| {
             try m.synchronize();
             try t.finish();
+    /// A primitive that carries exchanges failed on this rank alone: its peers wait for parts this rank will never send. Fails every
+    /// Rocinante lane at once (the abort reaches the peers' queue pairs and releases their waits), so each rank says so within
+    /// a second instead of at the watchdog's limit.
+    pub fn failExchanges(m: *Model) void {
+        m.failLanes(.refused, 0);
+    }
+
+    /// failExchanges for any reason: every Rocinante lane fails at once, whoever's fault it is.
+    fn failLanes(m: *Model, why: rocinante_mod.FailReason, gone: u8) void {
+        if (m.two) |*t| if (t.rc) |rc| rc.t.fail(why, .own1, gone);
+        if (m.two_b) |*t| if (t.rc) |rc| rc.t.fail(why, .own1, gone);
         if (m.two_c) |*t| if (t.rc) |rc| rc.t.fail(why, .own1, gone);
+        if (m.partner_rc) |rc| rc.t.fail(why, .own1, gone);
+    }
+
+    /// The monotonic clock (ns).
+    pub fn now(m: *const Model) u64 {
+        return @intCast(std.Io.Timestamp.now(m.io, .awake).nanoseconds);
+    }
+
+    /// The round's logits, R rows of the vocabulary, on the host (after verify).
+    /// The round's greedy tokens, R rows (the device's argmax of the round's logits, as sampling.argmax), on the host.
+    pub fn roundArgmax(m: *Model, R: usize) ![]const u32 {
     /// Track B: the round's first `count` candidates a row (sampling.topCandidates' set and order) on the host, from the
     /// device's logits: vals and ids [R, count], flags [R] (non-zero: that row must be read whole, roundLogits).
     }

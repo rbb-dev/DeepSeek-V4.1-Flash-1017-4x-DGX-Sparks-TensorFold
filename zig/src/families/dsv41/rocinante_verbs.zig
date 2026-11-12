@@ -37,6 +37,9 @@ pub const Info = extern struct {
     layout_hash: u64 = 0,
     /// The node's arrival signal (a roci.Signal): the nodes compare it at connect.
     signal: u64 = 0,
+    /// The ATOMICs in flight each rail's queue pairs were set up for (max_dest_rd_atomic and max_rd_atomic: one number): a requester may
+    /// not have more in flight than its peer's responder grants, so the nodes compare them at connect.
+    rd_atomic: [roci.rails]u32 = @splat(0),
     /// Whether the node's queue pairs wait in the card (TF_DS_ROCI_WAIT, rocinante_cd.zig): 1, else 0 (this file's queue pairs). The nodes compare it at connect.
     wait: u64 = 0,
     /// The card-waiting backend's connection data, zero here: each rail's port MAC (RoCE v2's destination MAC for a queue pair made
@@ -44,6 +47,9 @@ pub const Info = extern struct {
     mac: [roci.rails][8]u8 = @splat(@splat(0)),
     abort_qpn: [roci.rails][roci.world]u32 = @splat(@splat(0)),
 };
+
+/// Whether open prints why it refused (the host tests that provoke a refusal turn it off: a logged error fails a test).
+pub var log_refusals: bool = true;
 
 pub const Error = error{ VerbsFailed, PortDown, LayoutMismatch, SignalMismatch, DepthMismatch, NoGid, AtomicUnsupported, Misaligned, WaitMismatch };
 
@@ -53,6 +59,7 @@ pub fn checkPeers(all: *const [roci.world]Info, mine: Info) Error!void {
     for (all) |a| if (a.layout_hash != mine.layout_hash) return error.LayoutMismatch;
     for (all) |a| if (a.signal != mine.signal) return error.SignalMismatch;
     for (all) |a| if (a.wait != mine.wait) return error.WaitMismatch;
+    for (all) |a| if (!std.mem.eql(u32, &a.rd_atomic, &mine.rd_atomic)) return error.DepthMismatch;
 }
 
 /// What a rail's registrations and queue pairs grant a peer's NIC: WRITE always, and with the atomic signal ATOMIC on the control block
@@ -92,6 +99,8 @@ const Rail = struct {
     mtu: c_int,
     /// The ATOMICs in flight a queue pair is set up for (0: the WRITE signal).
     rd_atomic: u8 = 0,
+    /// Set by the fence: a post waiting for send-queue room (a stalled peer) gives up instead of waiting on a queue pair taken away.
+    fenced: bool = false,
     qps: [roci.world]?*vabi.Qp = @splat(null),
     /// WRs posted a queue pair, and those a signaled completion has retired.
     posted: [roci.world]u64 = @splat(0),
@@ -134,6 +143,7 @@ pub const VerbsNic = struct {
             const dev = try v.device(ctx);
             var why: [256]u8 = undefined;
             if (signalRefusal(&why, set.signal, set.devices[r], dev.atomic_cap, dev.max_qp_rd_atom, dev.max_qp_init_rd_atom)) |text| {
+                if (log_refusals) std.log.err("{s}", .{text});
                 return error.AtomicUnsupported;
             }
             // the arena takes WRITEs only; the control block's words are what the signal writes or adds to
@@ -155,6 +165,7 @@ pub const VerbsNic = struct {
 
     pub fn info(n: *VerbsNic) !Info {
         var i: Info = .{ .arena_base = @intFromPtr(n.arena.ptr), .ctl_base = @intFromPtr(n.ctl.ptr), .layout_hash = n.layout_hash, .signal = @backingInt(n.set.signal) };
+        for (0..roci.rails) |r| i.rd_atomic[r] = n.rail[r].rd_atomic;
         for (0..roci.rails) |r| {
             const g = try n.v.gid(n.rail[r].ctx, 1, n.set.gid_index);
             i.gid[r] = g.raw;
@@ -257,9 +268,12 @@ pub const VerbsNic = struct {
     fn postFn(ctx: *anyopaque, rail: u8, peer: u8, class: roci.Class, chain: *const roci.Chain, word: u64) roci.PostError!void {
         const n: *VerbsNic = @ptrCast(@alignCast(ctx));
         const rl = &n.rail[rail];
+        const qp = rl.qps[peer] orelse return error.PostFailed;
         const wrs = chain.n + 1;
+        // the send queue holds `sq_depth` WRs: wait for a signaled completion to free the room (a rail that has been fenced gives up)
         var spins: u64 = 0;
         while (rl.posted[peer] - rl.retired[peer] + wrs + n.set.signal_every * 8 >= n.set.sq_depth) : (spins += 1) {
+            if (@atomicLoad(bool, &rl.fenced, .acquire)) return error.PostFailed;
             try n.poll(rail);
             if (spins > n.set.sq_wait_ms * 100_000) return error.PostFailed;
         }
@@ -297,9 +311,23 @@ pub const VerbsNic = struct {
         n.fence();
     }
 
+    /// Takes the control block away from the card, and does not assume the card is done with what it had begun: the queue pairs are in
+    /// error, then destroyed (a destroyed queue pair has no responder), then the registration is released (no access at all after it). The
+    /// card's atomics are only atomic against its own: a CPU store beside one in flight may be lost, so the transport also looks at its words
+    /// after storing them (Transport.storeAbort). A deregistration that is refused leaves the card a settle time. The rail's proxy is the only
+    /// poster: Transport.fail waits for the proxies to be out of their posts before it calls this.
     fn fence(n: *VerbsNic) void {
         var held = false;
+        for (&n.rail) |*rl| {
+            @atomicStore(bool, &rl.fenced, true, .release);
+            for (&rl.qps) |*q| if (q.*) |qp| {
+                _ = n.v.api.ibv_destroy_qp(qp);
+                q.* = null;
             };
+            if (rl.mr_ctl) |m| {
+                if (n.v.api.ibv_dereg_mr(m) == 0) rl.mr_ctl = null else held = true;
+            }
+        }
         if (held) {
             std.log.err("ROCI: the control block's registration could not be released at a failure: the card is given 100 ms to finish what it has begun", .{});
             const ts: std.c.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
@@ -476,4 +504,305 @@ test "a chain's work requests: the data WRITEs, then the signal on the same queu
     const n = fakeNic(.atomic, &arena, &sink, &mr_a, &mr_s);
     _ = n.buildWrs(0, 1, class, &chain, &word, false, 1, &sges, &list);
     try std.testing.expectEqual(@as(c_uint, 0), list[2].send_flags);
+}
+
+test "nodes that set their queue pairs up for different ATOMIC depths refuse to connect, by name" {
+    var all: [roci.world]Info = @splat(.{ .layout_hash = 7, .signal = 1, .rd_atomic = .{ 16, 16 } });
+    const mine = all[0];
+    try checkPeers(&all, mine);
+    all[1].rd_atomic = .{ 16, 4 };
+    try std.testing.expectError(error.DepthMismatch, checkPeers(&all, mine));
+    all[1].rd_atomic = .{ 8, 16 };
+    try std.testing.expectError(error.DepthMismatch, checkPeers(&all, mine));
+}
+
+/// A provider with no card behind it: two devices (mlx5_0, mlx5_2), every registration, queue-pair attribute and destroy recorded in order,
+/// so the tests read what open, connect and the failure path really ask of the verbs.
+const FakeVerbs = struct {
+    const Mod = struct { qp_num: u32, state: c_int, mask: c_int, access: c_uint, max_dest: u8, max_rd: u8 };
+    var devs: [2]vabi.Device = undefined;
+    var list: [2:null]?*vabi.Device = .{ null, null };
+    var ctxs: [2]vabi.Context = undefined;
+    var pd: vabi.Pd = undefined;
+    var cq: vabi.Cq = undefined;
+    var mrs: [16]vabi.Mr = undefined;
+    var n_mr: usize = 0;
+    var mr_access: [16]c_int = undefined;
+    var qps: [16]vabi.Qp = undefined;
+    var n_qp: usize = 0;
+    var mods: [64]Mod = undefined;
+    var n_mod: usize = 0;
+    /// What happened, in order: 'm' a queue pair to error, 'q' a queue pair destroyed, 'd' a registration released, 'p' a post.
+    var events: [128]u8 = undefined;
+    var n_ev: usize = 0;
+    var dereg_idx: [16]usize = undefined;
+    var n_dereg: usize = 0;
+    var n_destroy: usize = 0;
+    var n_post: usize = 0;
+    var n_poll: usize = 0;
+    var atomic_cap: c_int = vabi.atomic_hca;
+
+    fn reset(cap: c_int) void {
+        n_mr = 0;
+        n_qp = 0;
+        n_mod = 0;
+        n_ev = 0;
+        n_dereg = 0;
+        n_destroy = 0;
+        n_post = 0;
+        n_poll = 0;
+        atomic_cap = cap;
+        list = .{ &devs[0], &devs[1] };
+        for (&ctxs) |*c| {
+            c.ops.post_send = postSend;
+            c.ops.poll_cq = pollCq;
+        }
+    }
+    fn ev(c: u8) void {
+        events[n_ev] = c;
+        n_ev += 1;
+    }
+    fn getList(num: *c_int) callconv(.c) ?[*:null]?*vabi.Device {
+        num.* = 2;
+        return &list;
+    }
+    fn freeList(_: [*:null]?*vabi.Device) callconv(.c) void {}
+    fn devName(d: *vabi.Device) callconv(.c) ?[*:0]const u8 {
+        return if (d == &devs[0]) "mlx5_0" else "mlx5_2";
+    }
+    fn openDev(d: *vabi.Device) callconv(.c) ?*vabi.Context {
+        return if (d == &devs[0]) &ctxs[0] else &ctxs[1];
+    }
+    fn closeDev(_: *vabi.Context) callconv(.c) c_int {
+        return 0;
+    }
+    fn queryDevice(_: *vabi.Context, a: *vabi.DeviceAttr) callconv(.c) c_int {
+        a.atomic_cap = atomic_cap;
+        a.max_qp_rd_atom = 16;
+        a.max_qp_init_rd_atom = 16;
+        return 0;
+    }
+    fn queryPort(_: *vabi.Context, _: u8, a: *vabi.PortAttr) callconv(.c) c_int {
+        a.state = vabi.port_active;
+        a.active_mtu = 5;
+        a.gid_tbl_len = 4;
+        return 0;
+    }
+    fn queryGid(_: *vabi.Context, _: u8, _: c_int, g: *vabi.Gid) callconv(.c) c_int {
+        g.raw = @splat(0);
+        g.raw[15] = 1;
+        return 0;
+    }
+    fn allocPd(_: *vabi.Context) callconv(.c) ?*vabi.Pd {
+        return &pd;
+    }
+    fn deallocPd(_: *vabi.Pd) callconv(.c) c_int {
+        return 0;
+    }
+    fn regMr(_: *vabi.Pd, addr: ?*anyopaque, len: usize, access: c_int) callconv(.c) ?*vabi.Mr {
+        const m = &mrs[n_mr];
+        m.addr = addr;
+        m.length = len;
+        m.lkey = @intCast(100 + n_mr);
+        m.rkey = @intCast(200 + n_mr);
+        mr_access[n_mr] = access;
+        n_mr += 1;
+        return m;
+    }
+    fn deregMr(m: *vabi.Mr) callconv(.c) c_int {
+        dereg_idx[n_dereg] = (@intFromPtr(m) - @intFromPtr(&mrs[0])) / @sizeOf(vabi.Mr);
+        n_dereg += 1;
+        ev('d');
+        return 0;
+    }
+    fn createCq(_: *vabi.Context, _: c_int, _: ?*anyopaque, _: ?*anyopaque, _: c_int) callconv(.c) ?*vabi.Cq {
+        return &cq;
+    }
+    fn destroyCq(_: *vabi.Cq) callconv(.c) c_int {
+        return 0;
+    }
+    fn createQp(_: *vabi.Pd, _: *vabi.QpInitAttr) callconv(.c) ?*vabi.Qp {
+        const q = &qps[n_qp];
+        q.qp_num = @intCast(1000 + n_qp);
+        n_qp += 1;
+        return q;
+    }
+    fn modifyQp(q: *vabi.Qp, a: *vabi.QpAttr, mask: c_int) callconv(.c) c_int {
+        mods[n_mod] = .{ .qp_num = q.qp_num, .state = a.qp_state, .mask = mask, .access = a.qp_access_flags, .max_dest = a.max_dest_rd_atomic, .max_rd = a.max_rd_atomic };
+        n_mod += 1;
+        if (a.qp_state == vabi.qps_err) ev('m');
+        return 0;
+    }
+    fn destroyQp(_: *vabi.Qp) callconv(.c) c_int {
+        n_destroy += 1;
+        ev('q');
+        return 0;
+    }
+    fn postSend(_: *vabi.Qp, _: *vabi.SendWr, _: *?*vabi.SendWr) callconv(.c) c_int {
+        ev('p');
+        n_post += 1;
+        return 0;
+    }
+    fn pollCq(_: *vabi.Cq, _: c_int, _: [*]vabi.Wc) callconv(.c) c_int {
+        n_poll += 1;
+        return 0;
+    }
+
+    fn verbs() Verbs {
+        var v: Verbs = undefined;
+        v.api.ibv_get_device_list = getList;
+        v.api.ibv_free_device_list = freeList;
+        v.api.ibv_get_device_name = devName;
+        v.api.ibv_open_device = openDev;
+        v.api.ibv_close_device = closeDev;
+        v.api.ibv_query_device = queryDevice;
+        v.api.ibv_query_port = queryPort;
+        v.api.ibv_query_gid = queryGid;
+        v.api.ibv_alloc_pd = allocPd;
+        v.api.ibv_dealloc_pd = deallocPd;
+        v.api.ibv_reg_mr = regMr;
+        v.api.ibv_dereg_mr = deregMr;
+        v.api.ibv_create_cq = createCq;
+        v.api.ibv_destroy_cq = destroyCq;
+        v.api.ibv_create_qp = createQp;
+        v.api.ibv_modify_qp = modifyQp;
+        v.api.ibv_destroy_qp = destroyQp;
+        return v;
+    }
+};
+
+var fake_arena: [4096]u8 align(64) = undefined;
+var fake_ctl: [@sizeOf(roci.Control)]u8 align(64) = undefined;
+
+/// A VerbsNic opened and connected on the fake provider (node 1, every node alike).
+fn fakeConnected(v: *const Verbs, signal: roci.Signal) !*VerbsNic {
+    const n = try VerbsNic.open(std.testing.allocator, v, .{ .signal = signal }, 1, &fake_arena, &fake_ctl, 77);
+    errdefer n.close();
+    const mine = try n.info();
+    var all: [roci.world]Info = @splat(mine);
+    try n.connect(&all);
+    return n;
+}
+
+test "open and connect ask the verbs for what the signal needs: the control block's registration and the queue pairs' access flags carry remote ATOMIC with the atomic signal and not without, and the depths are set at RTR and RTS" {
+    for ([_]roci.Signal{ .write, .atomic }) |signal| {
+        FakeVerbs.reset(vabi.atomic_hca);
+        const v = FakeVerbs.verbs();
+        const n = try fakeConnected(&v, signal);
+        defer n.close();
+        const want_depth: u8 = if (signal == .atomic) 16 else 0;
+        // registrations: per rail the arena (WRITE only), the control block (remoteAccess), and with the atomic signal the sink (local write)
+        var arenas: usize = 0;
+        var ctls: usize = 0;
+        var sinks: usize = 0;
+        for (0..FakeVerbs.n_mr) |i| {
+            const m = FakeVerbs.mrs[i];
+            const access = FakeVerbs.mr_access[i];
+            if (m.addr == @as(?*anyopaque, &fake_arena)) {
+                arenas += 1;
+                try std.testing.expectEqual(@as(c_int, vabi.access_local_write | vabi.access_remote_write), access);
+            } else if (m.addr == @as(?*anyopaque, &fake_ctl)) {
+                ctls += 1;
+                try std.testing.expectEqual(remoteAccess(signal), access);
+                try std.testing.expectEqual(signal == .atomic, access & vabi.access_remote_atomic != 0);
+            } else {
+                sinks += 1;
+                try std.testing.expectEqual(@as(c_int, vabi.access_local_write), access);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, roci.rails), arenas);
+        try std.testing.expectEqual(@as(usize, roci.rails), ctls);
+        try std.testing.expectEqual(@as(usize, if (signal == .atomic) roci.rails else 0), sinks);
+        // queue pairs: INIT with the access flags, RTR with max_dest_rd_atomic, RTS with max_rd_atomic; one each for 3 peers on 2 rails
+        var init: usize = 0;
+        var rtr: usize = 0;
+        var rts: usize = 0;
+        for (FakeVerbs.mods[0..FakeVerbs.n_mod]) |m| switch (m.state) {
+            vabi.qps_init => {
+                init += 1;
+                try std.testing.expect(m.mask & vabi.mask.access_flags != 0);
+                try std.testing.expectEqual(@as(c_uint, @intCast(remoteAccess(signal))), m.access);
+            },
+            vabi.qps_rtr => {
+                rtr += 1;
+                try std.testing.expect(m.mask & vabi.mask.max_dest_rd_atomic != 0);
+                try std.testing.expectEqual(want_depth, m.max_dest);
+            },
+            vabi.qps_rts => {
+                rts += 1;
+                try std.testing.expect(m.mask & vabi.mask.max_qp_rd_atomic != 0);
+                try std.testing.expectEqual(want_depth, m.max_rd);
+            },
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(@as(usize, 6), init);
+        try std.testing.expectEqual(@as(usize, 6), rtr);
+        try std.testing.expectEqual(@as(usize, 6), rts);
+        // the depths a node sends its peers
+        const info = try n.info();
+        try std.testing.expectEqual([roci.rails]u32{ want_depth, want_depth }, info.rd_atomic);
+        try std.testing.expectEqual(@as(u64, @backingInt(signal)), info.signal);
+    }
+}
+
+test "open refuses the atomic signal on a card without ATOMICs, by name, before anything is registered; the write signal opens on it" {
+    FakeVerbs.reset(vabi.atomic_none);
+    const v = FakeVerbs.verbs();
+    log_refusals = false;
+    defer log_refusals = true;
+    try std.testing.expectError(error.AtomicUnsupported, VerbsNic.open(std.testing.allocator, &v, .{ .signal = .atomic }, 1, &fake_arena, &fake_ctl, 77));
+    try std.testing.expectEqual(@as(usize, 0), FakeVerbs.n_mr);
+    const n = try VerbsNic.open(std.testing.allocator, &v, .{ .signal = .write }, 1, &fake_arena, &fake_ctl, 77);
+    n.close();
+}
+
+test "a failure through the transport takes the control block from the card: every queue pair to error, then destroyed, then the control block's registrations released (not the arena's), before the abort values are stored; later posts fail and close releases nothing twice" {
+    FakeVerbs.reset(vabi.atomic_hca);
+    const v = FakeVerbs.verbs();
+    const n = try fakeConnected(&v, .atomic);
+    const gpa = std.testing.allocator;
+    const ctl = try gpa.create(roci.Control);
+    defer gpa.destroy(ctl);
+    ctl.* = .{};
+    const t = try roci.Transport.init(gpa, 1, roci.identity, ctl, @intFromPtr(ctl), n.nic(), .{ .nap = false, .abort_rounds = 1, .abort_settle_us = 100 });
+    t.fail(.refused, .own1, 0);
+    // the abort WRITEs to the peers (6), then the queue pairs to error (6), then destroyed (6), then each rail's control-block registration after that rail's queue pairs
+    const ev = FakeVerbs.events[0..FakeVerbs.n_ev];
+    try std.testing.expectEqualStrings("pppppp" ++ "mmmmmm" ++ "qqqd" ++ "qqqd", ev);
+    try std.testing.expectEqual(@as(usize, 2), FakeVerbs.n_dereg);
+    for (FakeVerbs.dereg_idx[0..2]) |i| try std.testing.expect(FakeVerbs.mrs[i].addr == @as(?*anyopaque, &fake_ctl));
+    // the abort values are in every awaited word, stored after the card was taken away
+    for (&ctl.recv) |*c| for (c) |*s| for (s) |*w| try std.testing.expectEqual(roci.abort_value, w.v);
+    // a post on the fenced rails fails, naming nothing but the error the proxy turns into a failure
+    var chain: roci.Chain = .{};
+    try std.testing.expectError(error.PostFailed, n.nic().post_fn(n.nic().ctx, 0, 2, .own1, &chain, 1));
+    t.deinit();
+    n.close();
+    // close releases what is left: the arena's and the sink's registrations, and no queue pair or control block twice
+    try std.testing.expectEqual(@as(usize, 6), FakeVerbs.n_destroy);
+    var ctl_dereg: usize = 0;
+    for (FakeVerbs.dereg_idx[0..FakeVerbs.n_dereg]) |i| ctl_dereg += @intFromBool(FakeVerbs.mrs[i].addr == @as(?*anyopaque, &fake_ctl));
+    try std.testing.expectEqual(@as(usize, 2), ctl_dereg);
+}
+
+test "the post path takes no lock and no atomic read-modify-write: its source has none, and a chain in either mode is one post_send and, three chains in four, no poll" {
+    const src = @embedFile("rocinante_verbs.zig");
+    const at = std.mem.indexOf(u8, src, "    fn postFn(") orelse return error.TestUnexpectedResult;
+    const body = src[at .. at + (std.mem.indexOf(u8, src[at..], "\n    }\n") orelse return error.TestUnexpectedResult)];
+    for ([_][]const u8{ "lock", "cmpxchg", "fetchAdd", "fetchSub", "@atomicStore", "@atomicRmw", "spinLoopHint" }) |banned|
+        try std.testing.expect(std.mem.indexOf(u8, body, banned) == null);
+    for ([_]roci.Signal{ .write, .atomic }) |signal| {
+        FakeVerbs.reset(vabi.atomic_hca);
+        const v = FakeVerbs.verbs();
+        const n = try fakeConnected(&v, signal);
+        defer n.close();
+        FakeVerbs.n_post = 0;
+        FakeVerbs.n_poll = 0;
+        var chain: roci.Chain = .{};
+        chain.pieces[0] = .{ .src = 0, .dst = 0, .len = 64 };
+        chain.n = 1;
+        for (0..4) |_| try n.nic().post_fn(n.nic().ctx, 0, 2, .own1, &chain, 1);
+        try std.testing.expectEqual(@as(usize, 4), FakeVerbs.n_post); // one post_send a chain (data + signal linked)
+        try std.testing.expectEqual(@as(usize, 1), FakeVerbs.n_poll); // the one reap in four that 0dfd994fd made
+    }
 }
