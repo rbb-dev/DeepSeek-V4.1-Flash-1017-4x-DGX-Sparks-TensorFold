@@ -18,6 +18,7 @@
 //! tokens (held) to walk them through the grammar; rank 1 runs the same rounds, the masks are rank 0's alone.
 const std = @import("std");
 const lanes = @import("lanes");
+const instr = @import("instr.zig");
 const model = @import("model.zig");
 const where = @import("where.zig");
 const round = @import("round.zig");
@@ -239,8 +240,9 @@ pub const Wire = struct {
 
     pub fn ids(w: *Wire, gpa: std.mem.Allocator, v: []const i32) !void {
         try w.int(gpa, u32, @intCast(v.len));
-        try w.buf.ensureUnusedCapacity(gpa, v.len * 4);
-        for (v) |x| try w.int(gpa, i32, x);
+        // the room made once, the ids written straight into it (a frame carries up to a million of them at a restore, a round's a few dozen)
+        const dst = try w.buf.addManyAsSlice(gpa, v.len * 4);
+        for (v, 0..) |x, i| std.mem.writeInt(i32, dst[i * 4 ..][0..4], x, .little);
     }
 
     pub fn deinit(w: *Wire, gpa: std.mem.Allocator) void {
@@ -271,8 +273,14 @@ pub const Reader = struct {
     /// A list of ids written by Wire.ids, into `out` (replacing it).
     pub fn ids(r: *Reader, gpa: std.mem.Allocator, out: *std.ArrayList(i32)) !void {
         const n = try r.int(u32);
+        if (n > (r.b.len - r.at) / 4) return error.ShortFrame; // (the whole list is there, or the frame is short: one check)
         try out.resize(gpa, n);
-        for (out.items) |*x| x.* = try r.int(i32);
+        const src = r.b[r.at..][0 .. n * 4];
+        for (out.items, 0..) |*x, i| x.* = std.mem.readInt(i32, src[i * 4 ..][0..4], .little);
+        r.at += n * 4;
+    }
+};
+
 /// A drafter pass's frame after its header: the streams and steps, each stream's pending token, first position and
 /// slot; with TF_DS_DRAFT_VOCAB's list in effect (`full` not null) one byte more, whether the pass takes the whole head.
 pub const PassFrame = struct {
@@ -934,6 +942,7 @@ pub const Lanes = struct {
     peer: ?link.Link, // rank 1 (null: one rank); every follower gets each frame (Model.followers)
     vision: ?*@import("vision.zig").Vision = null, // rank 0's tower (a vision checkpoint served with its kit's vision/)
     step: u64 = 0,
+    instr: instr.Instr = .{}, // rank 0's one line per 64 rounds
     rdma_idle: bool = false,
     wire: Wire = .{},
     streams: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
@@ -1036,6 +1045,7 @@ pub const Lanes = struct {
         .queue = queueFn,
         .read = readFn,
         .verify = verifyFn,
+        .overlap = overlapFn,
         .keep = keepFn,
         .draft = draftFn,
         .probabilities = probabilitiesFn,
@@ -1444,6 +1454,7 @@ pub const Lanes = struct {
             try self.flush();
         }
         if (self.spill) |t| t.bump(lane.base + f.start, lane.base + f.start + n + n2 + n3);
+        self.instr.chunk(m.now() / std.time.ns_per_us, n);
         const head = if (n2 != 0) blk: {
             try m.fillGroup(seq.items[0 .. f.start + n + n2 + n3], f.start, if (n3 != 0) &.{ n, n2, n3 } else &.{ n, n2 }, f.replay);
             break :blk false;
@@ -1589,10 +1600,14 @@ pub const Lanes = struct {
         where.set(.round, @intCast(windows.len), 0);
         defer where.set(.after_backend, 0, 0); // (the lane core's own work until the next backend call or the gate's next mark)
         defer m.flushDiag(false); // (TF_DS_ROCI_XLOG / TF_DS_NACT_LOG's files, every 256th call: nothing when both are off)
+        // rank 0's line every 64 rounds (instr.zig): this call's wall
+        defer if (m.rank == 0) {
+            var lb: [512]u8 = undefined;
             if (self.instr.note(&lb, (m.now() - t0) / std.time.ns_per_us, m)) |line| {
                 std.log.info("{s}", .{line});
                 if (m.hw_head.on) std.log.info("hybrid wait (since the start): head: {d} polled ({d} already done), {d} fell back, {d} blocking, expects {d:.0} us; pass: {d} polled ({d} already done), {d} fell back, {d} blocking, expects {d:.0} us", .{ m.hw_head.polled, m.hw_head.early, m.hw_head.fell_back, m.hw_head.blocked, m.hw_head.ema_ns / 1000, m.hw_pass.polled, m.hw_pass.early, m.hw_pass.fell_back, m.hw_pass.blocked, m.hw_pass.ema_ns / 1000 });
             }
+        };
         if (try self.begin(.verify)) {
             try self.wire.int(gpa, u32, @intCast(windows.len));
             if (m.head_cand or m.head_key) try self.wire.int(gpa, u8, head);
@@ -1606,13 +1621,14 @@ pub const Lanes = struct {
             }
             try self.flush();
         }
-        const t1 = m.now();
+        const t1 = if (self.prof != null) m.now() else 0; // (the clock only for a profile)
         if (self.spill) |t| for (wins[0..windows.len]) |w| t.bump(w.base + w.start, w.base + w.start + w.ids.len);
         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
         // TF_DS_CAND_FIRST: the round's reads before the drafter's absorb (Model.verifyHead), read back after.
         // TF_DS_HEAD_CAND: with both on, the early reads are the device's merge, read back by headCandidatesMerged.
         if (m.cand_first) try m.verifyHead(rows, self.built.absorb[0..windows.len], if (greedy) .argmax else if (cand_count > 0) .{ .candidates = cand_count } else .none) else try m.verify(rows, self.built.absorb[0..windows.len], head);
         try m.checkTransport(); // (a round that ended on released waits delivers nothing)
+        const t2 = if (self.prof != null) m.now() else 0;
         const keyed = head == head_cand.key;
         const tokens: []const u32 = if (!greedy) &.{} else if (keyed) try m.headTokens(rows.ids.len) else if (m.cand_first) try m.headArgmax(rows.ids.len) else try m.roundArgmax(rows.ids.len);
         var merged = false;
@@ -1622,6 +1638,7 @@ pub const Lanes = struct {
             whole = whole or fl != 0;
         };
         _ = self.head_rounds[@backingInt(headPath(greedy, keyed, cand != null, merged, whole))].fetchAdd(1, .monotonic);
+        const t3 = if (self.prof != null) m.now() else 0;
         defer if (self.prof) |*p| {
             p.send += t1 - t0;
             p.enqueue += m.t_enqueue;
@@ -1662,6 +1679,13 @@ pub const Lanes = struct {
             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
             l.nheld = 0;
         }
+    }
+
+    /// The host's work for the forward wait of every round of this rank (rank 0's host; the followers have none).
+    fn overlapFn(ptr: *anyopaque, work: ?be.Backend.Overlap) void {
+        const self = of(ptr);
+        self.m.overlap_ctx = if (work) |w| w.ctx else null;
+        self.m.overlap_run = if (work) |w| w.run else null;
     }
 
     /// The caches are positional: the next window starts at the stream's new length and writes over the rows past it.
@@ -1733,8 +1757,7 @@ pub const Lanes = struct {
                 try sub.write(&self.wire, gpa);
                 try self.flush();
             }
-            const t0 = m.now();
-            try m.pass(tokens[g0..g1], q0[g0..g1], slots[g0..g1], steps);
+            const t0 = if (self.prof != null) m.now() else 0; // (the clock only for a profile)
             try m.pass(sub.tokens[0..sub.n], sub.q0[0..sub.n], sub.slots[0..sub.n], steps);
             try m.checkTransport();
             if (dr.vocab != null) {
@@ -3408,8 +3431,18 @@ test "a prompt step the host bills to decoders ends on the device before prefill
     // (a pair's second pass runs on its own stream: pairJoin makes the model's stream wait for its end before the host waits on the stream,
     // or the second pass's tail would land in the next round's time)
 }
+
+test "the rounds' instrument: rank 0 times each verify call and each chunk issue, drains the rings' waits when the span is full, and reads no device" {
+    const src = @embedFile("lanes.zig");
+    const vf = std.mem.indexOf(u8, src, "    fn verifyFn(").?;
+    const vb = src[vf .. vf + std.mem.indexOf(u8, src[vf..], "\n    }\n").?];
     try std.testing.expect(std.mem.indexOf(u8, vb, "defer if (m.rank == 0) {\n            var lb: [512]u8 = undefined;\n            if (self.instr.note(&lb, (m.now() - t0) / std.time.ns_per_us, m)) |line| {\n                std.log.info(\"{s}\", .{line});") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "if (self.spill) |t| t.bump(lane.base + f.start, lane.base + f.start + n + n2 + n3);\n        self.instr.chunk(m.now() / std.time.ns_per_us, n);") != null);
+    // the proxy stamps with the instrument's clock, not the nap's counted one
+    const r = @embedFile("rdma.zig");
+    try std.testing.expect(std.mem.indexOf(u8, r, "post_t[slot] = instr.ticks();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "r.waits.record(if (posted >= q) (instr.ticks() -% post_t[sl]) / tpu else 0);") != null);
+}
 
 test "every wait that can hold a host names itself, and each rank journals the frames it sends and takes" {
     const src = @embedFile("lanes.zig");
@@ -3659,6 +3692,45 @@ test "a cfg frame is kind 16 behind the frame header, reads back whole, and its 
     // a cfg frame is no round's: no RDMA wake is asked for it
     try std.testing.expect(!usesRdma(.cfg));
     try std.testing.expect(leavesAhead(.cfg, false) and leavesAhead(.cfg, true));
+}
+
+test "Wire.ids and Reader.ids: the frame's bytes and the list read back are those of the field-by-field writer and reader, and a short frame is refused" {
+    const gpa = std.testing.allocator;
+    var rng = std.Random.DefaultPrng.init(77);
+    const r = rng.random();
+    for (0..300) |n| {
+        const len = if (n == 0) 0 else r.intRangeAtMost(usize, 0, 200);
+        const v = try gpa.alloc(i32, len);
+        defer gpa.free(v);
+        for (v) |*x| x.* = r.int(i32);
+        var w: Wire = .{};
+        defer w.deinit(gpa);
+        try w.int(gpa, u8, 9);
+        try w.ids(gpa, v);
+        var want: std.ArrayList(u8) = .empty;
+        defer want.deinit(gpa);
+        try want.append(gpa, 9);
+        var four: [4]u8 = undefined;
+        std.mem.writeInt(u32, &four, @intCast(len), .little);
+        try want.appendSlice(gpa, &four);
+        for (v) |x| {
+            std.mem.writeInt(i32, &four, x, .little);
+            try want.appendSlice(gpa, &four);
+        }
+        try std.testing.expectEqualSlices(u8, want.items, w.buf.items);
+        var rd: Reader = .{ .b = w.buf.items };
+        try std.testing.expectEqual(@as(u8, 9), try rd.int(u8));
+        var got: std.ArrayList(i32) = .empty;
+        defer got.deinit(gpa);
+        try rd.ids(gpa, &got);
+        try std.testing.expectEqualSlices(i32, v, got.items);
+        try std.testing.expectEqual(w.buf.items.len, rd.at);
+        if (len > 0) { // one byte short: refused, as the field reader refused
+            var cut: Reader = .{ .b = w.buf.items[0 .. w.buf.items.len - 1] };
+            _ = try cut.int(u8);
+            try std.testing.expectError(error.ShortFrame, cut.ids(gpa, &got));
+        }
+    }
 }
 
 test "a run that reads whole rows on the host (--logits-log, --logits-sha 2) is refused while the head is sharded: rd.logits would be unwritten" {

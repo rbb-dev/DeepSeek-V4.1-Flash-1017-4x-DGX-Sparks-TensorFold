@@ -16,6 +16,7 @@
 //! running sum lands within one unit of the need. sampling_cases.zig holds the Python line's draws for both
 //! (tools/dsv41-zig/rec/zrec_sampling_cases.py).
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// exact_sampling.Sampling (the served lane's defaults: temperature 1.0, top_k 20, top_p 0.95, min_p 0).
 pub const Sampling = struct {
@@ -35,6 +36,9 @@ pub const mass_one: f64 = 0x1p40;
 /// cuda.sampling.NUCLEUS: the candidates a top_k-off row orders first; a nucleus that runs past them orders every
 /// token with a share.
 pub const nucleus_candidates = 1024;
+
+/// Test builds count the noise draws a call makes.
+var noise_draws: usize = 0;
 
 extern "c" fn exp(x: f64) f64;
 extern "c" fn log(x: f64) f64;
@@ -161,12 +165,9 @@ fn chooseRow(values: []const f32, ids: []const i64, position: u64, s: Sampling, 
     const k = @max(1, @min(s.top_k, values.len));
     const t = @max(s.temperature, 1e-6);
     const scaled = work[0..k];
-    const score = work[k..][0..k];
-    for (0..k) |j| {
-        scaled[j] = @as(f64, values[j]) / t;
-        const u = uniform(s.seed, position, @bitCast(ids[j]));
-        score[j] = scaled[j] - log(-log(u));
-    }
+    for (0..k) |j| scaled[j] = @as(f64, values[j]) / t;
+    // the candidates top_p and min_p leave out; their Gumbel noise (two libm logs each) is never read, so it is not drawn
+    var keep = k;
     if (0.0 < s.top_p and s.top_p < 1.0) {
         var mx = scaled[0];
         for (scaled[1..k]) |v| mx = @max(mx, v);
@@ -180,18 +181,20 @@ fn chooseRow(values: []const f32, ids: []const i64, position: u64, s: Sampling, 
             acc += probs[j];
             if (acc < s.top_p) below += 1;
         }
-        const keep = below + 1;
-        for (keep..k) |j| score[j] = -std.math.inf(f64);
+        keep = @min(below + 1, k);
     }
-    if (s.min_p > 0.0) {
-        const floor = scaled[0] + log(s.min_p);
-        for (0..k) |j| {
-            if (scaled[j] < floor) score[j] = -std.math.inf(f64);
-        }
-    }
+    const floor = if (s.min_p > 0.0) scaled[0] + log(s.min_p) else -std.math.inf(f64);
     var best: usize = 0;
-    for (0..k) |j| {
-        if (score[j] > score[best]) best = j;
+    var best_score: f64 = -std.math.inf(f64); // (the score of `best`; the first candidate's own, drawn below)
+    for (0..keep) |j| {
+        if (s.min_p > 0.0 and scaled[j] < floor) continue;
+        if (builtin.is_test) noise_draws += 1;
+        const u = uniform(s.seed, position, @bitCast(ids[j]));
+        const score = scaled[j] - log(-log(u));
+        if (j == 0 or score > best_score) {
+            best = j;
+            best_score = score;
+        }
     }
     return ids[best];
 }
@@ -395,6 +398,91 @@ test "top candidates by value, then id" {
     try std.testing.expectEqual(@as(usize, 4), topCandidates(&row, 4, &v, &ids));
     try std.testing.expectEqualSlices(i64, &.{ 1, 3, 5, 2 }, &ids);
     try std.testing.expectEqualSlices(f32, &.{ 5, 5, 5, 3 }, &v);
+}
+
+/// sampleCandidates as it was before the noise was drawn only for the candidates kept: every candidate's score, then top_p and min_p set the
+/// others' to -inf. The reference the equivalence test compares with.
+fn sampleCandidatesAll(values: []const f32, ids: []const i64, position: u64, s: Sampling) !i64 {
+    const width = values.len;
+    const k = @max(1, @min(s.top_k, width));
+    const t = @max(s.temperature, 1e-6);
+    var scaled: [max_candidates]f64 = undefined;
+    var score: [max_candidates]f64 = undefined;
+    for (0..k) |j| {
+        scaled[j] = @as(f64, values[j]) / t;
+        const u = uniform(s.seed, position, @bitCast(ids[j]));
+        score[j] = scaled[j] - log(-log(u));
+    }
+    if (0.0 < s.top_p and s.top_p < 1.0) {
+        var mx = scaled[0];
+        for (scaled[1..k]) |v| mx = @max(mx, v);
+        var probs: [max_candidates]f64 = undefined;
+        for (0..k) |j| probs[j] = exp(scaled[j] - mx);
+        const sum = pairwiseSum(probs[0..k]);
+        for (0..k) |j| probs[j] /= sum;
+        var acc: f64 = 0.0;
+        var below: usize = 0;
+        for (0..k) |j| {
+            acc += probs[j];
+            if (acc < s.top_p) below += 1;
+        }
+        const keep = below + 1;
+        for (keep..k) |j| score[j] = -std.math.inf(f64);
+    }
+    if (s.min_p > 0.0) {
+        const floor = scaled[0] + log(s.min_p);
+        for (0..k) |j| {
+            if (scaled[j] < floor) score[j] = -std.math.inf(f64);
+        }
+    }
+    var best: usize = 0;
+    for (0..k) |j| {
+        if (score[j] > score[best]) best = j;
+    }
+    return ids[best];
+}
+
+test "the noise is drawn only for the candidates kept, and the token drawn is the one every candidate's noise gave, bit for bit" {
+    var rng = std.Random.DefaultPrng.init(0x5eed);
+    const r = rng.random();
+    var drawn_new: usize = 0;
+    var drawn_all: usize = 0;
+    for (0..20000) |n| {
+        const width = r.intRangeAtMost(usize, 1, max_candidates);
+        var vals: [max_candidates]f32 = undefined;
+        var ids: [max_candidates]i64 = undefined;
+        // descending logits, with ties now and then (lexsort order: the larger value, then the lower id)
+        var v: f32 = r.float(f32) * 20 - 5;
+        for (0..width) |j| {
+            vals[j] = v;
+            ids[j] = @intCast(r.intRangeAtMost(u32, 0, 129279) | 0);
+            if (r.intRangeAtMost(u8, 0, 4) != 0) v -= r.float(f32) * 3;
+        }
+        const s: Sampling = .{
+            .seed = r.int(u64) >> 1,
+            .temperature = if (n % 7 == 0) 0.0001 else 0.2 + r.float(f64) * 1.5,
+            .top_k = r.intRangeAtMost(usize, 1, 56),
+            .top_p = switch (n % 5) {
+                0 => 1.0,
+                1 => 0.0,
+                else => 0.3 + r.float(f64) * 0.69,
+            },
+            .min_p = switch (n % 4) {
+                0 => 0.0,
+                1 => 0.02 + r.float(f64) * 0.3,
+                else => 0.0,
+            },
+        };
+        const pos = r.int(u32);
+        noise_draws = 0;
+        const got = try sampleCandidates(vals[0..width], ids[0..width], pos, s);
+        drawn_new += noise_draws;
+        const want = try sampleCandidatesAll(vals[0..width], ids[0..width], pos, s);
+        drawn_all += @max(1, @min(s.top_k, width));
+        try std.testing.expectEqual(want, got);
+    }
+    // top_p 0.95-ish rows keep a handful of 20-28: well under the whole
+    try std.testing.expect(drawn_new * 10 < drawn_all * 9);
 }
 
 /// sampling_cases.zig's row `sh`, bit for bit as zrec_sampling_cases.py builds it.

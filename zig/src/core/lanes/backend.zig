@@ -68,6 +68,9 @@ pub const Backend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    /// Host work a backend runs inside a round's forward wait (VTable.overlap).
+    pub const Overlap = struct { ctx: ?*anyopaque, run: *const fn (ctx: ?*anyopaque) void };
+
     pub const VTable = struct {
         /// Prefill the stream's prompt into its caches (and its draft head's).
         prefill: *const fn (ptr: *anyopaque, s: *Stream) anyerror!void,
@@ -76,6 +79,10 @@ pub const Backend = struct {
         /// Settings of class A changed live (CfgItem): send them to every rank and apply them on this one, between two
         /// frames. Asked on the engine thread at a loop top, only on a change; a `cfg_unset` value is the start's. null: none.
         live_cfg: ?*const fn (ptr: *anyopaque, version: u64, items: []const CfgItem) anyerror!void = null,
+        /// The host's work to run inside a decode round while the GPU runs its forward (rank 0's thread waits there for the head's reads,
+        /// 25-128 ms): `work` set, or null to clear it. A backend that has such a wait runs it once a round; null: the host does the work
+        /// where it was (after the round).
+        overlap: ?*const fn (ptr: *anyopaque, work: ?Overlap) void = null,
         /// Draw the first token from the prompt's last row at `position`; a handle to it.
         first: *const fn (ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64,
         /// Feed one token and queue the draw of the next at `position` (a one-token round); a handle to it.

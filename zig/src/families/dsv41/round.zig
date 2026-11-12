@@ -101,6 +101,8 @@ pub const Window = struct { row: usize, n: usize, seq: []const i32 };
 /// The index tensors rounds.py's _ix makes from a round's inputs, by row (int64 [R] each, gi [R, 2]).
 const Glue = enum(u8) { wslot, wbase, cbase1, ctarget1, gpos1, vis1, cbase2, ctarget2, gpos2, vis2, rslot, gi };
 const glue_n = @as(usize, @backingInt(Glue.gi)) + 2; // gi (the last) takes two
+/// Where a round's inputs start in the block it shares with the glue (the glue's bytes up to the 256-byte alignment each had alone): both go up in one copy.
+const inputs_at = std.mem.alignForward(usize, glue_n * max_rows * 8, 256);
 
 /// A round's buffers for up to max_rows rows (Python allocates them a round; their contents never carry over).
 pub const Round = struct {
@@ -243,8 +245,8 @@ pub const Round = struct {
         rd.bucket = 0;
         rd.has_cand = false;
         rd.kk = 0;
-        rd.glue = try a.take(glue_n * max_rows * 8); // glue rows at max_rows apart
-        rd.inputs = try a.take(5 * R * 8);
+        rd.glue = try a.take(inputs_at + 5 * R * 8); // glue rows at max_rows apart, then the inputs: one block, one upload (setGlue)
+        rd.inputs = rd.glue + inputs_at;
         rd.ids = rd.inputs;
         rd.pos = rd.inputs;
         rd.zero = try a.take(8);
@@ -587,9 +589,10 @@ fn setGlue(e: *const Engine, rd: *Round, rows: Rows) !void {
         hg[gi0 + 2 * i] = slot * raw + @mod(groups * 2, raw);
         hg[gi0 + 2 * i + 1] = slot * raw + @mod(groups * 2 + 1, raw);
     }
-    try prompt.upload(e, rd.glue, &hg, hg.len * 8);
-    // RoundDecoder.set: [ids, pos, slots, base, end] in one [5, R] copy
-    var in: [5 * max_rows]i64 = @splat(0);
+    // RoundDecoder.set: [ids, pos, slots, base, end] in one [5, R] copy, behind the glue in the same upload
+    var up: [inputs_at / 8 + 5 * max_rows]i64 = @splat(0);
+    @memcpy(up[0..hg.len], &hg);
+    const in = up[inputs_at / 8 ..];
     for (0..R) |i| {
         in[i] = rows.ids[i];
         in[R + i] = rows.pos[i];
@@ -597,7 +600,7 @@ fn setGlue(e: *const Engine, rd: *Round, rows: Rows) !void {
         in[3 * R + i] = rows.baseOf(i);
         in[4 * R + i] = rows.endOf(i);
     }
-    try prompt.upload(e, rd.inputs, &in, 5 * R * 8);
+    try prompt.upload(e, rd.glue, &up, inputs_at + 5 * R * 8);
     rd.ids = rd.inputs;
     rd.pos = rd.inputs + R * 8;
 }
@@ -1633,6 +1636,17 @@ test "TF_DS_HEAD_CAND: the last stretch's head by the round's head_k, its graph 
     try std.testing.expect(!std.meta.eql(k0, Graphs.Key{ .rows = 2, .bucket = 4096, .stretch = 2, .head = 32 }));
 }
 
+test "a round's glue and inputs are one device block and one upload" {
+    const src = @embedFile("round.zig");
+    const code = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse return error.TestUnexpectedResult];
+    const at = std.mem.indexOf(u8, code, "fn setGlue(") orelse return error.TestUnexpectedResult;
+    const body = code[at .. at + (std.mem.indexOf(u8, code[at..], "\n}\n") orelse return error.TestUnexpectedResult)];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "prompt.upload("));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "rd.glue = try a.take(inputs_at + 5 * R * 8);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "rd.inputs = rd.glue + inputs_at;"));
+    // the inputs keep the 256-byte alignment their own allocation had
+    try std.testing.expect(inputs_at % 256 == 0 and inputs_at >= glue_n * max_rows * 8);
+}
 
 test "the whole head's quarters exchange goes round in ring-sized row blocks: a full round's rows of the vocabulary's quarters (48 x 129,536 bytes) are wider than a 4,456,448-byte slot, and TF_DS_HEAD_KEY=0 TF_DS_HEAD_CAND=0 failed the first round with RingRefused" {
     const prompt2d = @import("prompt2d.zig");

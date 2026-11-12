@@ -23,6 +23,7 @@ const seqs = @import("rdma_seq.zig");
 const idle_gate = @import("idle_gate.zig");
 const IdleGate = idle_gate.Gate;
 pub const nap = @import("rdma_nap.zig");
+const instr = @import("instr.zig");
 const ring_watch = @import("ring_watch.zig");
 const where = @import("where.zig");
 const wait = @import("ring_wait.zig");
@@ -815,6 +816,7 @@ pub const Ring = struct {
     late_window: nap.LateWindow = .{}, // the last 64 naps' late share; the proxy spins when more than a quarter is late
     nap_ticks: u64 = 0, // a nap's longest length in the count's ticks
     nap_stats: nap.Stats = .{},
+    waits: instr.WaitHist = .{}, // each exchange's wait in us, from this rank's post to the last peer's part (the proxy writes, the report drains)
     nap_since: std.atomic.Value(u64) = .init(0), // when the proxy last woke at the gate (nap.now(); napping only)
     nap_cpu_since: std.atomic.Value(u64) = .init(0), // the proxy's CPU time then (nap.cpuNow())
     nap_cpu_now: std.atomic.Value(u64) = .init(0), // its CPU time after its last nap (read by the ring check)
@@ -1791,6 +1793,10 @@ pub const Ring = struct {
         // the bytes of each peer's sequence in (by slot), for the halves a relay sends on
         var got_bytes: [max_ranks][seqs.max_slots]u64 = @splat(@splat(0));
         var posted: u64 = 0;
+        // the exchange's wait: when each sequence was posted, and how many peers' parts of it are published
+        var post_t: [seqs.max_slots]u64 = @splat(0);
+        var pub_n: [seqs.max_slots]u32 = @splat(0);
+        const tpu = nap.ticksPerUs();
         // the progress watchdog: a sequence posted whose peers' parts do not all come within TF_DS_RING_DEAD_MS (default 10 s) fails
         // the ring by name
         const dead_ms: u64 = r.dead_ms;
@@ -1906,6 +1912,7 @@ pub const Ring = struct {
                         };
                     }
                 }
+                post_t[slot] = instr.ticks();
                 // (under TF_DS_RING_WORD no arrival reaches this proxy to close the sequence: the collecting kernel's deadline is the bound)
                 if (ring_watch.armed(!r.roci_live)) watch.posted(slot, post_t[slot]);
                 posted = q;
@@ -1978,7 +1985,14 @@ pub const Ring = struct {
                                 bytes.* = 0;
                             } else if (im.relayed_from == null) got_bytes[p][@intCast(q % r.s.slots)] = 0;
                             @atomicStore(u64, r.flagAt(q, p), q, .release);
+                            const sl: usize = @intCast(q % r.s.slots);
+                            pub_n[sl] += 1;
+                            if (pub_n[sl] >= r.world - 1) {
+                                pub_n[sl] = 0;
+                                // (peers ahead of this rank's post waited for nothing: zero)
+                                r.waits.record(if (posted >= q) (instr.ticks() -% post_t[sl]) / tpu else 0);
                                 watch.completed(sl, instr.ticks(), posted >= q);
+                            }
                         }
                         postRecv(nic.ctx, nic.qps[from].?) catch {
                             r.fail("ibv_post_recv failed");

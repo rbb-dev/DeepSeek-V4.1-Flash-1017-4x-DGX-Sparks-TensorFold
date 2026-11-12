@@ -130,6 +130,9 @@ const Walk = struct {
     }
 };
 
+/// Bytes of stack a decode's scratch takes before it asks the overflow allocator for more.
+const decode_stack = 16 << 10;
+
 pub const Tokenizer = struct {
     allocator: Allocator,
     arena: ?*std.heap.ArenaAllocator = null,
@@ -295,7 +298,15 @@ pub const Tokenizer = struct {
 
     /// Text for `ids` through the decoder chain; unknown ids are skipped. Caller frees with `a`.
     pub fn decode(t: *const Tokenizer, a: Allocator, ids: []const u32, skip_special_tokens: bool) Error![]u8 {
-        var arena = std.heap.ArenaAllocator.init(a);
+        return t.decodeWith(a, ids, skip_special_tokens, std.heap.page_allocator);
+    }
+
+    /// decode with the scratch's overflow allocator named: the scratch is a stack buffer first (a stop check's few tokens, a streamed
+    /// token's context: no mmap and munmap, no fresh pages to fault in), and `overflow` (the page allocator) past it.
+    pub fn decodeWith(t: *const Tokenizer, a: Allocator, ids: []const u32, skip_special_tokens: bool, overflow: Allocator) Error![]u8 {
+        var buffer: [decode_stack]u8 align(16) = undefined;
+        var first = std.heap.BufferFirstAllocator.init(&buffer, overflow);
+        var arena = std.heap.ArenaAllocator.init(first.allocator()); // (scratch never kept in `a`: see encode)
         defer arena.deinit();
         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
         var tokens = try std.ArrayList([]const u8).initCapacity(ctx.a, ids.len);
@@ -1022,6 +1033,26 @@ test {
     _ = @import("memo.zig");
 }
 
-test {
-    _ = @import("identity.zig");
+test "a short decode keeps its scratch on the stack; a long one overflows to the allocator named, and both give the same text" {
+    const gpa = std.testing.allocator;
+    var t = try deepseekLike(gpa, &test_words);
+    defer t.deinit();
+    const text = try longText(gpa, &test_words, 64 << 10);
+    defer gpa.free(text);
+    const ids = try t.encode(gpa, text);
+    defer gpa.free(ids);
+    const short = ids[0..@min(ids.len, 24)];
+    var small: Counting = .{ .child = gpa };
+    const a = try t.decodeWith(gpa, short, false, small.allocator());
+    defer gpa.free(a);
+    try std.testing.expectEqual(@as(usize, 0), small.peak);
+    const b = try t.decode(gpa, short, false);
+    defer gpa.free(b);
+    try std.testing.expectEqualStrings(b, a);
+    var big: Counting = .{ .child = gpa };
+    const c = try t.decodeWith(gpa, ids, false, big.allocator());
+    defer gpa.free(c);
+    try std.testing.expect(big.peak > 0);
+    try std.testing.expectEqual(@as(usize, 0), big.live);
+    if (std.unicode.utf8ValidateSlice(text)) try std.testing.expectEqualStrings(text, c);
 }

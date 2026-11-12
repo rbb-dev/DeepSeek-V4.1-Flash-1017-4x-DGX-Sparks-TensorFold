@@ -65,10 +65,10 @@ pub const Link = struct {
         l.* = undefined;
     }
 
-    fn writeAll(l: Link, bytes: []const u8) !void {
+    fn writeAll(l: Link, bytes: []const u8, flags: u32) !void {
         var done: usize = 0;
         while (done < bytes.len) {
-            const n = c.send(l.fd, bytes.ptr + done, bytes.len - done, 0);
+            const n = c.send(l.fd, bytes.ptr + done, bytes.len - done, flags);
             if (n <= 0) {
                 if (n < 0 and c.errno(n) == .INTR) continue;
                 return error.PeerDown;
@@ -97,9 +97,25 @@ pub const Link = struct {
         return c.poll(&p, 1, ms) != 0;
     }
 
+    /// Frames up to this many bytes go out in one send() call, length and payload together.
+    const one_call = 2048;
+
+    /// One frame: its length (u32, little-endian), then its bytes. A small frame leaves in one send() call, so its first bytes
+    /// (the length) never reach a follower alone: a follower that peeks at the socket (peekHead) sees the length and the kind
+    /// byte together, and rank 0's engine thread makes one syscall a follower a frame. A larger one sends its length with
+    /// MSG_MORE, which holds it for the payload.
     pub fn send(l: Link, bytes: []const u8) !void {
         const held = where.enter(.link_send, 0, 0);
         defer where.leave(held);
+        var one: [4 + one_call]u8 = undefined;
+        const len = one[0..4];
+        std.mem.writeInt(u32, len, @intCast(bytes.len), .little);
+        if (bytes.len <= one_call) {
+            @memcpy(one[4..][0..bytes.len], bytes);
+            return l.writeAll(one[0 .. 4 + bytes.len], 0);
+        }
+        try l.writeAll(len, c.MSG.MORE);
+        try l.writeAll(bytes, 0);
     }
 
     /// recv, polling the socket without blocking for up to `spin_ns` first: a frame that comes within it is read
@@ -171,12 +187,29 @@ pub const Link = struct {
     /// The kind byte of the next frame (the first byte of its payload) when its length and that byte have arrived, without
     /// reading anything; null when they have not. A frame's other bytes may still be on their way.
     pub fn peekKind(l: Link) !?u8 {
+        return switch (try l.peekHead()) {
+            .kind => |k| k,
+            .empty, .partial => null,
+        };
+    }
+
+    /// What the socket holds of the next frame's first five bytes (its length and its kind byte), without reading anything.
+    pub const Head = union(enum) {
+        empty, // nothing there
+        partial, // some of the five bytes: the sender wrote the length and its payload has not yet come
+        kind: u8,
+    };
+
+    pub fn peekHead(l: Link) !Head {
         var head: [5]u8 = undefined;
         const n = c.recv(l.fd, &head, head.len, c.MSG.PEEK | c.MSG.DONTWAIT);
         if (n == 0) return error.PeerDown;
         if (n < 0) switch (c.errno(n)) {
+            .AGAIN => return .empty,
+            .INTR => return .empty,
             else => return error.PeerDown,
         };
+        return if (n >= head.len) .{ .kind = head[4] } else .partial;
     }
 
     /// The next frame into `buf` (a frame longer than `buf` is refused); its bytes.
@@ -366,8 +399,11 @@ test "peekKind sees the next frame's kind without reading it, and nothing before
     }
     try std.testing.expectEqual(@as(?u8, null), try b.peekKind());
     try std.testing.expect(!b.wait(1000));
+    try a.writeAll(&[_]u8{ 7, 0, 0, 0 }, 0); // a length of 7 and no payload yet
+    try std.testing.expect(b.wait(50000));
     try std.testing.expectEqual(@as(?u8, null), try b.peekKind());
     try std.testing.expectEqual(Link.Head.partial, try b.peekHead());
+    try a.writeAll(&[_]u8{ 3, 1, 2, 3, 4, 5, 6 }, 0); // kind 3 (verify), its step and more
     try std.testing.expectEqual(@as(?u8, 3), try b.peekKind());
     try std.testing.expectEqual(@as(?u8, 3), try b.peekKind()); // (nothing was read)
     var buf: [64]u8 = undefined;
@@ -376,6 +412,82 @@ test "peekKind sees the next frame's kind without reading it, and nothing before
     try std.testing.expectEqual(@as(u8, 3), f[0]);
     try std.testing.expectEqual(@as(?u8, null), try b.peekKind());
 }
+
+test "a frame's length and payload reach the receiver together: the first bytes are never seen alone" {
+    var fds: [2]c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds));
+    defer {
+        _ = c.close(fds[0]);
+        _ = c.close(fds[1]);
+    }
+    const frames = 200_000;
+    const Sender = struct {
+        fn run(l: Link) void {
+            const body = [_]u8{ 3, 0, 0, 0, 0, 0, 0, 0, 0 };
+            for (0..frames) |_| l.send(&body) catch return;
+        }
+    };
+    const rx: Link = .{ .fd = fds[1] };
+    const t = try std.Thread.spawn(.{}, Sender.run, .{Link{ .fd = fds[0] }});
+    var partial: u32 = 0;
+    var buf: [64]u8 = undefined;
+    for (0..frames) |_| {
+        // as a follower's gate does: the head is peeked as soon as the socket holds anything
+        var h = try rx.peekHead();
+        while (h == .empty) h = try rx.peekHead();
+        if (h == .partial) partial += 1;
+        _ = try rx.recv(&buf);
+    }
+    t.join();
+    std.debug.print("\nframes seen with only part of their first five bytes: {d} of {d}\n", .{ partial, frames });
+    try std.testing.expectEqual(@as(u32, 0), partial);
+}
+
+test "a frame above the one-call size crosses intact, length first" {
+    var fds: [2]c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds));
+    defer {
+        _ = c.close(fds[0]);
+        _ = c.close(fds[1]);
+    }
+    var big: [3 * Link.one_call + 5]u8 = undefined;
+    for (&big, 0..) |*b, i| b.* = @truncate(i *% 7 +% 3);
+    const Tx = struct {
+        fn run(l: Link, b: []const u8) void {
+            l.send(b) catch {};
+            l.send(&.{9}) catch {};
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Tx.run, .{ Link{ .fd = fds[0] }, @as([]const u8, &big) });
+    var buf: [4 * Link.one_call]u8 = undefined;
+    const rx: Link = .{ .fd = fds[1] };
+    try std.testing.expectEqualSlices(u8, &big, try rx.recv(&buf));
+    try std.testing.expectEqualSlices(u8, &.{9}, try rx.recv(&buf));
+    t.join();
+}
+
+test "a frame of exactly the one-call size and one byte more both cross intact" {
+    var fds: [2]c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds));
+    defer {
+        _ = c.close(fds[0]);
+        _ = c.close(fds[1]);
+    }
+    var a: [Link.one_call]u8 = undefined;
+    var b: [Link.one_call + 1]u8 = undefined;
+    for (&a, 0..) |*x, i| x.* = @truncate(i *% 5 +% 1);
+    for (&b, 0..) |*x, i| x.* = @truncate(i *% 11 +% 2);
+    const tx: Link = .{ .fd = fds[0] };
+    const rx: Link = .{ .fd = fds[1] };
+    try tx.send(&a);
+    try tx.send(&b);
+    try tx.send(&.{});
+    var buf: [4 * Link.one_call]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &a, try rx.recv(&buf));
+    try std.testing.expectEqualSlices(u8, &b, try rx.recv(&buf));
+    try std.testing.expectEqual(@as(usize, 0), (try rx.recv(&buf)).len);
+}
+
 /// What a test's watch saw: the rank that went (0: none yet; the tests' peers are ranks 1 and up), the order of its two steps
 /// (the hook, then the stand-in for the exit) and when the stand-in ran.
 var seen_gone: std.atomic.Value(u32) = .init(0);

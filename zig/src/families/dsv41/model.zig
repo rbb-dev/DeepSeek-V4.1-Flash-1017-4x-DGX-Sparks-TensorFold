@@ -54,6 +54,7 @@ const mx5 = @import("mlx5_devx.zig");
 const ops_mod = @import("ops.zig");
 const exact = @import("exact.zig");
 const cublas = @import("cublas.zig");
+const instr_mod = @import("instr.zig");
 const hybrid_wait = @import("hybrid_wait.zig");
 const rocinante = @import("rocinante.zig");
 const comm_mod = @import("comm.zig");
@@ -1983,6 +1984,9 @@ pub const Model = struct {
     img_buf: ?cuda.DeviceBuffer = null,
     // profiling (lanes' --profile): the last round's forward and absorb, synchronized apart (ns)
     prof: bool = false,
+    /// The host's work for a round's wait (Backend.overlap; rank 0 only): called once a round, after the round's launches and before the wait.
+    overlap_ctx: ?*anyopaque = null,
+    overlap_run: ?*const fn (ctx: ?*anyopaque) void = null,
     cand_first: bool = false, // TF_DS_CAND_FIRST: the leader's verifyHead (a round's head reads before the absorb)
     head_ready: ?cuda.Event = null, // verifyHead's event after the head reads
     /// TF_DS_HYBRID_WAIT (on unless 0): the waits for a round's head reads and for the drafter pass's reads sleep until shortly before they are due and poll
@@ -4510,6 +4514,7 @@ pub const Model = struct {
         if (hb == 0) try m.launchHead(head, R); // (hb != 0: round.forward's last stretch ran it)
         try m.head_ready.?.record(m.stream);
         try m.absorbRows(rows, absorb);
+        if (m.overlap_run) |run| run(m.overlap_ctx);
         try m.hw_head.wait(hybrid_wait.SystemClock{}, m.head_ready.?);
         if (m.erows) |r| try r.roundCheck(); // the forward's stream host steps came before the event
     }
@@ -4564,7 +4569,10 @@ pub const Model = struct {
         if (head != 0 and !(if (head == head_cand.key) m.head_key else m.head_cand)) return error.HeadCandOff;
         m.rd.head_k = head;
         try m.forwardRows(rows);
+        const t1 = if (m.prof) m.now() else 0; // (the clock only for a profile)
         try m.absorbRows(rows, absorb);
+        if (m.overlap_run) |run| run(m.overlap_ctx);
+        try m.stream.synchronize();
         if (m.erows) |r| try r.roundCheck(); // a stream host step's failed read fails the round
         if (m.prof) m.t_absorb = m.now() - t1;
     }
@@ -4573,6 +4581,7 @@ pub const Model = struct {
     fn forwardRows(m: *Model, rows: round.Rows) !void {
         const e = &m.eng;
         if (m.prof) try m.stream.synchronize(); // (the GPU idle, so the issue time shows whether the host keeps it fed)
+        const t0 = if (m.prof) m.now() else 0; // (the clock only for a profile)
         try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.ctx_cap, null, if (m.graphs) |*g| g else null);
         if (m.prof) {
             m.t_enqueue = m.now() - t0;
@@ -4633,6 +4642,12 @@ pub const Model = struct {
         pt.* = try round.PhaseTimer.init(m.gpa, m.ctx.d);
         m.ptimer = pt;
         m.rd.timer = t;
+    }
+
+    /// Every decode ring's exchange waits since the last call (instr.WaitHist), summed into `acc`.
+    pub fn drain(m: *Model, acc: *instr_mod.WaitHist.Acc) void {
+        if (m.ring) |r| r.waits.drain(acc);
+        if (m.rdma_rings) |rs| for ([_]?*rdma.Ring{ rs.all4, rs.col, rs.pair }) |y| if (y) |r| r.waits.drain(acc);
     }
 
     /// A primitive that carries exchanges failed on this rank alone: its peers wait for parts this rank will never send. Fails every

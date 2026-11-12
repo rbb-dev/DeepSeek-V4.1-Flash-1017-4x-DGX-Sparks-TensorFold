@@ -12,7 +12,7 @@ const shape = @import("shape.zig");
 const plan_lanes = @import("plan_lanes.zig");
 const fill = @import("fill.zig");
 const trail = @import("trail.zig");
-const open = @import("open.zig");
+const proposer_mod = @import("proposer.zig");
 const Stream = sm.Stream;
 const Feed = be.Feed;
 const LogRow = @import("logprob.zig").Row;
@@ -89,6 +89,13 @@ pub const Engine = struct {
     /// Whether this backend can return to admission between prompt chunks.
     pub fn fills(e: *const Engine) bool {
         return e.backend.vtable.prefill_step != null;
+    }
+
+    /// Host work for the backend to run inside each decode round's forward wait (Backend.VTable.overlap): false when it has no such wait.
+    pub fn setOverlap(e: *Engine, work: ?be.Backend.Overlap) bool {
+        const set = e.backend.vtable.overlap orelse return false;
+        set(e.backend.ptr, work);
+        return true;
     }
 
     /// A change of class A (Backend.live_cfg): false when the backend has none.
@@ -186,6 +193,10 @@ pub const Engine = struct {
         const a = e.arena.allocator();
         try trail.event(e, &.{ f("ev", str("step")), f("index", int(e.steps)) });
         e.steps += 1;
+        if (e.steps % 512 == 0) { // (the copy proposer's span: what it cost this thread, with every GPU idle)
+            var line: [768]u8 = undefined;
+            if (proposer_mod.meter.line(&line)) |text| std.log.info("{s}", .{text});
+        }
         var live: std.ArrayList(*Stream) = .empty;
         for (e.live.items) |s| {
             if (!s.finished and !s.paused) try live.append(a, s);

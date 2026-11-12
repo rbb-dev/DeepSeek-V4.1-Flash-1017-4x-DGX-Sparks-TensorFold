@@ -663,172 +663,225 @@ test "the seconds rule: a background prompt takes a step once it waited its maxi
     try std.testing.expectEqual(@as(usize, 1), steps[2].prompt_len); // the background prompt, due
     try std.testing.expectEqual(@as(usize, 4), steps[3].prompt_len);
 }
+
+const Warm = struct {
+    indexed: [16]usize = @splat(0),
+    chunks: usize = 0,
+    done: std.atomic.Value(u32) = .init(0),
+
+    fn hook(ctx: *anyopaque, s: *lanes.Stream, _: usize) void {
+        const w: *Warm = @ptrCast(@alignCast(ctx));
+        const p: *lanes.SuffixLookup = @ptrCast(@alignCast(s.proposer.?.ptr));
+        if (w.chunks < w.indexed.len) w.indexed[w.chunks] = p.indexed;
+        w.chunks += 1;
+    }
+
+    fn event(ctx: *anyopaque, _: api.Id, e: *const api.Event) void {
+        const w: *Warm = @ptrCast(@alignCast(ctx));
+        if (e.* == .finished) _ = w.done.fetchAdd(1, .release);
+    }
+};
+
+test "a prompt's copy index is built a step at a time while the prompt fills, not by the first round after it" {
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
     defer cfg.deinit(gpa);
-    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 4 };
+    var prompt: [40]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(1 + i % 5);
+    var warm: Warm = .{};
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 8, .prefill_hook = Warm.hook, .prefill_hook_ctx = &warm };
     defer target.deinit();
     var clock: lanes.fake.FixedClock = .{};
-    var core = lanes.Engine.init(gpa, &cfg, target.stepped(), clock.clock());
+    var core = lanes.Engine.init(gpa, &cfg, target.chunkedBackend(), clock.clock());
     defer core.deinit();
-    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 1 });
+    var host = api.LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 1 });
     try host.start();
     defer host.stop();
-    const Seen = struct {
-        engine: Engine = undefined,
-        lefts: std.ArrayList(u32) = .empty,
-        done: std.atomic.Value(bool) = .init(false),
-
-        fn hook(ctx: *anyopaque, _: *lanes.Stream, _: usize) void {
-            const seen: *@This() = @ptrCast(@alignCast(ctx));
-            var status: api.Status = .{};
-            seen.engine.status(&status, &.{}); // the pass runs without the host's lock: this can read
-            if (status.fill_tokens_left) |left| seen.lefts.append(gpa, left) catch {};
-        }
-        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
-            const seen: *@This() = @ptrCast(@alignCast(ctx));
-            if (e.* == .finished) seen.done.store(true, .release);
-        }
-    };
-    var seen: Seen = .{};
-    seen.engine = host.engine();
-    target.prefill_hook = Seen.hook;
-    target.prefill_hook_ctx = &seen;
-    const prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
-    const request: Request = .{ .prompt = &prompt, .max_tokens = 4 };
-    try seen.engine.submit(1, &request, .{ .ctx = &seen, .event = Seen.event });
-    while (!seen.done.load(.acquire)) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
-    defer seen.lefts.deinit(gpa);
-    try std.testing.expect(seen.lefts.items.len >= 2); // each chunk of the pass sampled the status
-    for (seen.lefts.items) |left| try std.testing.expect(left > 0 and left <= prompt.len);
-    try std.testing.expect(seen.lefts.items[0] > seen.lefts.items[seen.lefts.items.len - 1]); // it counted down
-    var status: api.Status = .{};
-    seen.engine.status(&status, &.{});
-    try std.testing.expect(status.fill_prompt_tokens == null and status.fill_tokens_left == null); // the pass is over
+    const request: api.Request = .{ .prompt = &prompt, .max_tokens = 4 };
+    try host.engine().submit(1, &request, .{ .ctx = &warm, .event = Warm.event });
+    for (0..2000) |_| {
+        if (warm.done.load(.acquire) == 1) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(u32, 1), warm.done.load(.acquire));
+    try std.testing.expect(warm.chunks >= 3);
+    // nothing indexed in the first chunk (the first step came before any warm); after each step the prompt's tokens are in
+    try std.testing.expectEqual(@as(usize, 0), warm.indexed[0]);
+    try std.testing.expectEqual(prompt.len, warm.indexed[warm.chunks - 1]);
 }
 
-const Passes = struct {
+const Overlapped = struct {
+    tokens: std.atomic.Value(u32) = .init(0),
+    before: u32 = 0,
+    gained: u32 = 0, // tokens the host delivered inside the verify's forward wait, over every round
+    rounds: u32 = 0,
+    done: std.atomic.Value(u32) = .init(0),
+    all: std.ArrayList(u32) = .empty,
     mutex: std.Io.Mutex = .init,
-    prefilled: [2]Id = .{ 0, 0 },
-    count: usize = 0,
-    done: usize = 0,
-    fn event(ctx: *anyopaque, id: Id, e: *const Event) void {
-        const o: *@This() = @ptrCast(@alignCast(ctx));
-        o.mutex.lockUncancelable(std.testing.io);
-        defer o.mutex.unlock(std.testing.io);
-        switch (e.*) {
-            .prefilled => {
-                o.prefilled[o.count] = id;
-                o.count += 1;
-            },
-            .finished => o.done += 1,
-            else => {},
-        }
+
+    fn probe(ctx: *anyopaque, after_work: bool) void {
+        const o: *Overlapped = @ptrCast(@alignCast(ctx));
+        const n = o.tokens.load(.acquire);
+        if (!after_work) {
+            o.before = n;
+            o.rounds += 1;
+        } else o.gained += n - o.before;
     }
-    fn wait(o: *@This(), n: usize) void {
-        while (true) {
-            o.mutex.lockUncancelable(std.testing.io);
-            const d = o.done;
-            o.mutex.unlock(std.testing.io);
-            if (d == n) return;
-            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+
+    fn event(ctx: *anyopaque, _: api.Id, e: *const api.Event) void {
+        const o: *Overlapped = @ptrCast(@alignCast(ctx));
+        switch (e.*) {
+            .tokens => |t| {
+                _ = o.tokens.fetchAdd(@intCast(t.len), .release);
+                o.mutex.lockUncancelable(std.testing.io);
+                defer o.mutex.unlock(std.testing.io);
+                o.all.appendSlice(gpa, t) catch unreachable;
+            },
+            .finished => _ = o.done.fetchAdd(1, .release),
+            else => {},
         }
     }
 };
 
-test "a backend that holds one prompt pass at a time runs the pass it began to its end before the next comes in" {
-    const gpa = std.testing.allocator;
-    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+test "a decode round's tokens are delivered inside the next round's forward wait; a stream's last round at once, and every token arrives in order" {
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = false, .hidden_rows = true }, 8, 7);
     defer cfg.deinit(gpa);
-    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 4 };
+    const prompt = [_]u32{ 1, 2, 3 };
+    var o: Overlapped = .{};
+    defer o.all.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .verify_probe = Overlapped.probe, .verify_probe_ctx = &o };
     defer target.deinit();
     var clock: lanes.fake.FixedClock = .{};
-    var core = lanes.Engine.init(gpa, &cfg, target.steppedOne(), clock.clock());
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
     defer core.deinit();
-    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
-    var order: Passes = .{};
-    const long = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3 };
-    const short = [_]u32{ 2, 7, 1, 8 };
-    const background: Request = .{ .prompt = &long, .max_tokens = 4, .background = true };
-    const foreground: Request = .{ .prompt = &short, .max_tokens = 4 };
-    const e = host.engine();
-    // the long background prompt's first chunk sends a short foreground request, which a stepping backend of
-    // several passes fills first (above): here it comes in once the long pass ends, and no two passes fill at once
-    const Arrive = struct {
-        engine: api.Engine,
-        request: *const Request,
-        order: *Passes,
-        target: *lanes.fake.Fake,
-        sent: bool = false,
-        most: usize = 0,
-        fn call(ctx: *anyopaque, _: *lanes.Stream, _: usize) void {
-            const a: *@This() = @ptrCast(@alignCast(ctx));
-            var n: usize = 0;
-            var it = a.target.lanes.valueIterator();
-            while (it.next()) |l| n += @intFromBool(l.filling);
-            a.most = @max(a.most, n);
-            if (a.sent) return;
-            a.sent = true;
-            a.engine.submit(2, a.request, .{ .ctx = a.order, .event = Passes.event }) catch {};
-        }
-    };
-    var arrive: Arrive = .{ .engine = e, .request = &foreground, .order = &order, .target = &target };
-    target.prefill_hook = Arrive.call;
-    target.prefill_hook_ctx = &arrive;
-    try e.submit(1, &background, .{ .ctx = &order, .event = Passes.event });
+    var host = api.LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
     try host.start();
     defer host.stop();
-    order.wait(2);
-    try std.testing.expectEqualSlices(Id, &.{ 1, 2 }, &order.prefilled);
-    try std.testing.expectEqual(@as(usize, 1), arrive.most);
+    const request: api.Request = .{ .prompt = &prompt, .max_tokens = 12, .drafts = false };
+    try host.engine().submit(1, &request, .{ .ctx = &o, .event = Overlapped.event });
+    for (0..2000) |_| {
+        if (o.done.load(.acquire) == 1) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(u32, 1), o.done.load(.acquire));
+    try std.testing.expect(o.rounds >= 3);
+    try std.testing.expect(o.gained > 0); // the previous rounds' tokens came in the wait, not before it
+    const want = try reference(&cfg, &prompt);
+    defer gpa.free(want);
+    try std.testing.expectEqualSlices(u32, want[0..@min(want.len, 12)], o.all.items[0..@min(want.len, 12)]);
+    try std.testing.expectEqual(@as(usize, 12), o.all.items.len);
 }
 
-test "a pass that began waits out fill_rounds of the live streams' rounds between two of its steps" {
-    const gpa = std.testing.allocator;
-    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+test "a prompt filling beside a decoding stream: the stream's tokens already landed are with its request when the prompt's next step runs" {
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = false, .hidden_rows = true }, 8, 7);
     defer cfg.deinit(gpa);
-    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 4 };
-    defer target.deinit();
-    var clock: lanes.fake.FixedClock = .{};
-    var core = lanes.Engine.init(gpa, &cfg, target.steppedOne(), clock.clock());
-    defer core.deinit();
-    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2, .fill_rounds = 3 });
-    var order: Passes = .{};
-    const first_prompt = [_]u32{ 2, 7, 1, 8 };
-    const second_prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
-    const first: Request = .{ .prompt = &first_prompt, .max_tokens = 2000 };
-    const second: Request = .{ .prompt = &second_prompt, .max_tokens = 4 };
-    const e = host.engine();
-    // the first pass's last chunk sends the second request: the first stream decodes while the second fills
-    const Seen = struct {
-        engine: api.Engine,
-        request: *const Request,
-        order: *Passes,
-        target: *lanes.fake.Fake,
-        core: *lanes.Engine,
-        sent: bool = false,
-        at: [4]u64 = @splat(0), // the core's rounds run before each step of the second pass (a lone stream's
-        // pipelined round makes no verify call, so the fake's own count of rounds would miss them)
-        steps: usize = 0,
-        fn call(ctx: *anyopaque, s: *lanes.Stream, chunk: usize) void {
-            const a: *@This() = @ptrCast(@alignCast(ctx));
-            if (s.prompt_len == second_prompt.len) {
-                if (a.steps < a.at.len) a.at[a.steps] = a.core.steps;
-                a.steps += 1;
-                return;
-            }
-            if (chunk + 1 < a.target.prefill_chunks or a.sent) return;
-            a.sent = true;
-            a.engine.submit(2, a.request, .{ .ctx = a.order, .event = Passes.event }) catch {};
+    const first = [_]u32{ 1, 2, 3 };
+    var long: [32]u32 = undefined;
+    for (&long, 0..) |*t, i| t.* = @intCast(3 + i % 4);
+    var o: Overlapped = .{};
+    defer o.all.deinit(gpa);
+    const Late = struct {
+        o: *Overlapped,
+        engine: api.Engine = undefined,
+        short: *const api.Request,
+        submitted: bool = false,
+        at_step: ?u32 = null,
+        steps: u32 = 0,
+        fn hook(ctx: *anyopaque, s: *lanes.Stream, _: usize) void {
+            const x: *@This() = @ptrCast(@alignCast(ctx));
+            if (s.prompt_len != 32) return;
+            if (x.steps == 1) x.at_step = x.o.tokens.load(.acquire); // the second step of the long prompt: what the first stream's request has by now
+            x.steps += 1;
         }
     };
-    var seen: Seen = .{ .engine = e, .request = &second, .order = &order, .target = &target, .core = &core };
-    target.prefill_hook = Seen.call;
-    target.prefill_hook_ctx = &seen;
-    try e.submit(1, &first, .{ .ctx = &order, .event = Passes.event });
+    var late: Late = .{ .o = &o, .short = &.{ .prompt = &long, .max_tokens = 2, .drafts = false } };
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 8, .prefill_hook = Late.hook, .prefill_hook_ctx = &late };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.chunkedBackend(), clock.clock());
+    defer core.deinit();
+    var host = api.LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+    late.engine = host.engine();
     try host.start();
     defer host.stop();
-    order.wait(2);
-    try std.testing.expectEqual(@as(usize, 4), seen.steps);
-    for (seen.at[0..3], seen.at[1..4]) |a, b| try std.testing.expect(b - a >= 3); // the first stream's rounds between
-    try std.testing.expectEqualSlices(Id, &.{ 1, 2 }, &order.prefilled);
+    const a: api.Request = .{ .prompt = &first, .max_tokens = 100000, .drafts = false };
+    try late.engine.submit(1, &a, .{ .ctx = &o, .event = Overlapped.event });
+    while (o.tokens.load(.acquire) < 6) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    const before = o.tokens.load(.acquire);
+    try late.engine.submit(2, late.short, .{ .ctx = &o, .event = Overlapped.event });
+    for (0..2000) |_| {
+        if (late.at_step != null) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    late.engine.cancel(1);
+    try std.testing.expect(late.at_step != null);
+    try std.testing.expect(late.at_step.? >= before);
+}
+
+test "the decode rate takes one mark a round, however many streams landed tokens in it, and the marks add up to the tokens delivered" {
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = false, .hidden_rows = true, .streams_exact = true, .max_streams = 4 }, 8, 7);
+    defer cfg.deinit(gpa);
+    const p1 = [_]u32{ 1, 2, 3 };
+    const p2 = [_]u32{ 4, 5, 6 };
+    var o: Overlapped = .{};
+    defer o.all.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = api.LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+    try host.start();
+    defer host.stop();
+    const r1: api.Request = .{ .prompt = &p1, .max_tokens = 40, .drafts = false };
+    const r2: api.Request = .{ .prompt = &p2, .max_tokens = 40, .drafts = false };
+    try host.engine().submit(1, &r1, .{ .ctx = &o, .event = Overlapped.event });
+    try host.engine().submit(2, &r2, .{ .ctx = &o, .event = Overlapped.event });
+    for (0..4000) |_| {
+        if (o.done.load(.acquire) == 2) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(u32, 2), o.done.load(.acquire));
+    // a round's tokens reach the requests before the host stores that round's mark: wait for the marks to catch up
+    var total: usize = 0;
+    for (0..2000) |_| {
+        host.mutex.lockUncancelable(std.testing.io);
+        total = 0;
+        for (host.decoded.items) |m| total += m.tokens;
+        host.mutex.unlock(std.testing.io);
+        if (total >= 80) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    host.mutex.lockUncancelable(std.testing.io);
+    defer host.mutex.unlock(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 80), total);
+    try std.testing.expect(host.decoded.items.len <= target.rounds + 2);
+}
+
+test "the engine thread builds the status counters when status asks, not every turn: a request's turns build none, and each status gets a fresh answer" {
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = false, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    const prompt = [_]u32{ 1, 2, 3 };
+    var o: Overlapped = .{};
+    defer o.all.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = api.LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+    try host.start();
+    defer host.stop();
+    const request: api.Request = .{ .prompt = &prompt, .max_tokens = 30, .drafts = false };
+    try host.engine().submit(1, &request, .{ .ctx = &o, .event = Overlapped.event });
+    for (0..4000) |_| {
+        if (o.done.load(.acquire) == 1) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(u32, 1), o.done.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), host.tele_builds); // (30 rounds and the turns around them, none asked)
+    var out: api.Status = undefined;
+    var toks: [4]u32 = undefined;
+    for (0..5) |_| host.engine().status(&out, &toks);
+    try std.testing.expectEqual(@as(u64, 5), host.tele_builds);
+    try std.testing.expectEqual(@as(u32, 0), out.running); // (the answer is the engine's now: the request ended)
 }

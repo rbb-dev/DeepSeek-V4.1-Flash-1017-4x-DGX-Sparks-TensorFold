@@ -69,6 +69,11 @@ pub const Fake = struct {
     pass_rule: ?PassRule = null,
     steps: std.ArrayList(StepSeen) = .empty,
     decodes: u64 = 0, // verify and queue calls (a round's work, pipelined or verified)
+    /// The host's forward-wait work (Backend.VTable.overlap), run at the start of every verify as the real backend runs it inside the
+    /// wait; `verify_probe` is called just before and just after it (a test reads what the host had delivered at each).
+    overlap: ?be.Backend.Overlap = null,
+    verify_probe: ?*const fn (ctx: *anyopaque, after_work: bool) void = null,
+    verify_probe_ctx: ?*anyopaque = null,
 
     ranked: bool = false, // the head gives its held chain back (alternatives)
     memory_lanes: ?usize = null, // prefill past this many live lanes fails with error.LaneMemory (no room yet)
@@ -105,9 +110,12 @@ pub const Fake = struct {
     }
 
     pub fn backend(x: *Fake) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .alternatives = alternatives, .held = heldDrafts, .reports_fill = true } };
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .cancel_prefill = cancelPrefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .overlap = setOverlap, .keep = keep, .draft = draft, .held = heldDrafts, .release = release } };
+    }
+
     /// The same target, advancing four prompt tokens per host visit.
     pub fn chunkedBackend(x: *Fake) be.Backend {
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .cancel_prefill = cancelPrefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .overlap = setOverlap, .keep = keep, .draft = draft, .held = heldDrafts, .release = release } };
     }
 
     fn prefillStep(ptr: *anyopaque, s: *Stream) anyerror!bool {
@@ -322,6 +330,10 @@ pub const Fake = struct {
         return self(ptr).drawn.items[handle];
     }
 
+    fn setOverlap(ptr: *anyopaque, work: ?be.Backend.Overlap) void {
+        self(ptr).overlap = work;
+    }
+
     fn verify(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const x = self(ptr);
         x.rounds += 1;
@@ -329,6 +341,9 @@ pub const Fake = struct {
         x.last_rows = 0;
         x.last_sampled = false;
         x.decodes += 1;
+        if (x.verify_probe) |probe| probe(x.verify_probe_ctx.?, false);
+        if (x.overlap) |o| o.run(o.ctx);
+        if (x.verify_probe) |probe| probe(x.verify_probe_ctx.?, true);
         for (windows, out) |w, o| {
             x.last_rows += w.rows();
             x.last_sampled = x.last_sampled or w.stream.sampling != null;

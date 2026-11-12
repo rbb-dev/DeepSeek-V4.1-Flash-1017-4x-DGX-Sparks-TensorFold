@@ -38,7 +38,17 @@ pub const LaneHost = struct {
     cancels: std.ArrayList(Id) = .empty,
     closing: bool = false,
     thread: ?std.Thread = null,
-    decoded: std.ArrayList(status.Mark) = .empty, // tokens a round landed, for the 2 s decode rate
+    engine_tid: std.atomic.Value(u64) = .init(0), // the engine thread's id once it runs (status asked from it must not wait for itself)
+    /// A reader (status) wants the live counters, cache statistics and spill state brought up to date: the engine thread builds them (about
+    /// a microsecond or two, and the cache statistics' ~80 counters copied twice) at its next turn only when asked, not every turn.
+    tele_want: std.atomic.Value(bool) = .init(false),
+    tele_done: std.Io.Condition = .init,
+    tele_gen: u64 = 0, // refreshes made (under the lock)
+    tele_builds: u64 = 0, // times the engine thread built the counters (a test reads it)
+    decoded: std.ArrayList(Mark) = .empty, // tokens a round landed, for the 2 s decode rate
+    decoded_pending: usize = 0, // tokens sent since the last mark (engine thread)
+    overlap_ran: bool = false, // the backend ran `overlapWork` in the round that just ended
+    overlap: bool = false, // the backend runs `overlapWork` inside each round's forward wait (Backend.overlap): the round's tokens go out there
     prefill_rate: f64 = 0,
     prefill_at: i96 = 0,
     live_tokens: std.ArrayList(u32) = .empty,
@@ -121,6 +131,11 @@ pub const LaneHost = struct {
     const long_pass_ns: i96 = std.time.ns_per_s;
     const finish_ns: i96 = 5 * std.time.ns_per_s;
     const finish_left: i64 = 256;
+    const window_ns: i96 = 2 * std.time.ns_per_s;
+    /// Prompt tokens a prompt step indexes for the copy proposer (SuffixLookup.warm): ~1 ms of this thread against a step of 100+ ms on the GPU.
+    const warm_tokens: usize = 8192;
+    /// The longest a status waits for the engine thread's refresh (ms): a long round, never the request path.
+    const tele_wait_max_ms: u32 = 300;
 
     /// The restores one service polls at most (a fixed buffer; the tier holds TF_DS_SPILL_RESTORES in flight, at most
     /// 16 by the parser's range).
@@ -440,6 +455,23 @@ pub const LaneHost = struct {
     }
 
     fn memoryFn(ctx: *anyopaque, reset_peak: bool) ?api.Memory {
+        // the engine thread refreshes what the lock guards only for a reader: ask, and wait (a round or a turn at most) for the answer
+        if (h.thread != null and !h.closing and h.engine_tid.load(.acquire) != 0 and h.engine_tid.load(.acquire) != std.Thread.getCurrentId()) {
+            const gen = h.tele_gen;
+            h.tele_want.store(true, .release);
+            h.wake.signal(h.io);
+            var waited: u32 = 0;
+            while (h.tele_gen == gen and !h.closing and waited < tele_wait_max_ms) : (waited += 1) {
+                h.tele_done.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } }) catch {};
+            }
+        }
+        const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        var tokens: u64 = 0;
+        for (h.decoded.items) |m| {
+            if (m.at >= now - window_ns) tokens += m.tokens;
+        }
+        const n = @min(stream_tokens.len, h.live_tokens.items.len);
+        @memcpy(stream_tokens[0..n], h.live_tokens.items[0..n]);
             .waiting = @intCast(h.queued.items.len + h.waitingCount()),
             .decode_tokens_per_second = @as(f64, @floatFromInt(tokens)) / 2.0,
             .graph_fallbacks = if (h.graph_fallbacks) |c| c.load(.monotonic) else null,
@@ -479,6 +511,7 @@ pub const LaneHost = struct {
                 continue;
             }
         }
+        h.commitDecoded();
     }
 
     /// Whether a round between an admitting job's chunks would run (another stream is live): the backend asks first,
@@ -620,8 +653,8 @@ pub const LaneHost = struct {
         return true;
     }
 
-    pub fn finish(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) void {
-        h.memory_lanes = null; // a lane may have freed: the next admission asks the backend for memory again
+    fn finish(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) void {
+        if (job.started and job.prefilled != null) h.send(job); // (tokens the forward wait did not get to)
         job.reported();
         h.gpa.free(job.marks);
         h.gpa.free(job.lineage);
@@ -636,7 +669,26 @@ pub const LaneHost = struct {
         h.gpa.destroy(job);
     }
 
-    pub fn lock(h: *LaneHost) void {
+    /// Counts tokens landed (engine thread, no lock); `commitDecoded` makes one mark of what a round's streams landed together.
+    fn noteDecoded(h: *LaneHost, n: usize) void {
+        h.decoded_pending += n;
+    }
+
+    /// The mark of the tokens landed since the last one: one clock read, one lock, and the marks older than the window dropped from the
+    /// front (they are in time order), once a round however many streams landed tokens in it.
+    fn commitDecoded(h: *LaneHost) void {
+        if (h.decoded_pending == 0) return;
+        const n = h.decoded_pending;
+        h.decoded_pending = 0;
+        const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        h.mutex.lockUncancelable(h.io);
+        defer h.mutex.unlock(h.io);
+        var old: usize = 0;
+        while (old < h.decoded.items.len and h.decoded.items[old].at < now - window_ns) old += 1;
+        if (old > 0) h.decoded.replaceRangeAssumeCapacity(0, old, &.{});
+        h.decoded.append(h.gpa, .{ .at = now, .tokens = n }) catch {};
+    }
+
     /// takeCancels for every job but `keep` (an admitting job in its prompt pass): under the one lock that takes the
     /// other ids, `keep`'s stay named (for its pass's own check and the loop after it), so a cancel of it arriving
     /// meanwhile can never free it here.
@@ -905,6 +957,8 @@ pub const LaneHost = struct {
         if (billed) h.share.stepped(@intCast(@max(0, h.shareNow() - t0)), true);
         if (long) h.share.stepRounds(true, job.stream.step_pair);
         job.reported(); // the first step restored it; no dangling cache entry across another prompt's keep
+        // the copy index of the prompt, a slice a step (the GPU runs the step just issued): the first round after the prompt finds it built
+        if (!done and job.stream.drafts and job.stream.proposer != null) job.proposer.warm(job.stream.context.items, job.stream.prompt_len, warm_tokens) catch {};
         if (done) {
             h.prefilled(job, job.began);
         }
@@ -1163,6 +1217,8 @@ pub const LaneHost = struct {
         };
     }
 
+        if (!h.tele_want.swap(false, .acq_rel)) return; // (nobody asked since the last refresh)
+        h.tele_builds += 1;
         const tele = h.telemetry();
         const spill = if (h.spill_asked) h.spillNow() else null;
         h.lock();
@@ -1175,6 +1231,10 @@ pub const LaneHost = struct {
         };
         if (tele) |t| h.tele = t;
         if (h.spill_asked) h.spill = spill;
+        h.tele_gen +%= 1;
+        h.tele_done.broadcast(h.io);
+    }
+
     /// What the start gave, kept for `unset` to return to. Called by `start`, after the tier was configured.
     pub fn captureBoot(h: *LaneHost) void {
         h.boot = .{ .tier = h.tier, .share_p = h.share.p, .beside_rows = h.info_.beside_rows, .fill = h.info_.fill };
@@ -1290,10 +1350,18 @@ pub const LaneHost = struct {
     }
 
     fn run(h: *LaneHost) void {
+        h.engine_tid.store(std.Thread.getCurrentId(), .release);
+        defer h.engine_tid.store(0, .release);
+        h.overlap = h.core.setOverlap(.{ .ctx = h, .run = overlapWork });
+        defer {
+            if (h.overlap) _ = h.core.setOverlap(null);
+            h.overlap = false;
+        }
         while (true) {
-            ends.takeCancels(h);
-            rows_host.answer(h);
-            learn.refuse(h);
+            // tokens left for the next round's forward wait go out first when this turn does other work before its round (a prompt's
+            // step, a restore's service, an admission, a cancel): they would wait that work's time otherwise
+            if (h.overlap and h.turnWorks()) h.flushDeferred();
+            h.commitDecoded(); // (a first token or a finish delivered outside a round)
             h.liveTurn();
             h.takeCancels();
             while (h.admitOne()) {}
@@ -1326,9 +1394,53 @@ pub const LaneHost = struct {
                 continue;
             };
             var i: usize = 0;
+            const deferred = h.overlap and h.overlap_ran;
+            h.overlap_ran = false;
             while (i < h.admitted.items.len) {
                 const job = h.admitted.items[i];
-                if (h.deliver(job)) continue; // it left the list: the next job slid into slot i
+                // a stream that goes on has its tokens sent in the next round's forward wait (overlapWork, which this round's backend
+                // ran); one that finished, or a round that had no such wait, now
+                if (deferred and !job.stream.finished and job.started) {
+                    i += 1;
+                    continue;
+                }
+            h.commitDecoded();
+        }
+    }
+
+    /// The host's work inside a decode round's forward wait (Backend.overlap; the engine thread, between the round's launch and the wait for
+    /// its head reads, every stream's context as the last round left it): the tokens the streams that go on landed in the round before, to
+    /// their requests. Nothing here feeds the round or the next frame; only the streams that finished are left to the loop's tail.
+    fn overlapWork(ctx: ?*anyopaque) void {
+        const h: *LaneHost = @ptrCast(@alignCast(ctx.?));
+        h.overlap_ran = true;
+        h.flushDeferred();
+    }
+
+    /// The tokens the streams that go on landed, to their requests.
+    fn flushDeferred(h: *LaneHost) void {
+        for (h.admitted.items) |job| {
+            if (!job.started or job.prefilled == null or job.stream.finished) continue;
+            h.send(job);
+        }
+        h.commitDecoded();
+    }
+
+    /// Whether this turn does work of its own before its round: a prompt's step, parked work's service, an admission or a cancel.
+    fn turnWorks(h: *LaneHost) bool {
+        if (h.filling() or (h.servicing() and h.pending())) return true;
+        h.lock();
+        defer h.unlock();
+        return h.queued.items.len > 0 or h.ready.items.len > 0 or h.cancels.items.len > 0 or h.closing;
+    }
+
+    /// A failed round ends every stream it held, with the backend's error.
+    fn failAll(h: *LaneHost, message: []const u8) void {
+        h.lock();
+        const jobs = h.gpa.dupe(*Job, h.admitted.items) catch &.{};
+        h.admitted.clearRetainingCapacity();
+        h.unlock();
+        for (jobs) |job| {
             if (job.started and !job.stream.finished) h.core.discard(&job.stream);
             h.finish(job, .failed, message);
         }

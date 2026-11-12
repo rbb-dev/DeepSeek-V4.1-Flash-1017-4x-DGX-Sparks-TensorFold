@@ -36,12 +36,97 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
+/// The place's time stamp: aarch64's virtual counter (one register read, 2-5 ns; clock_gettime is ~25 ns through the vDSO, and a place
+/// changes ~14 times a round), else the monotonic clock in ns. Turned into the reader's nanoseconds in `get`.
+fn stamp() u64 {
+    if (@import("builtin").cpu.arch == .aarch64) return asm volatile ("mrs %[v], cntvct_el0"
+        : [v] "=r" (-> u64),
+    );
+    return nowNs();
+}
+
+fn stampHz() u64 {
+    if (@import("builtin").cpu.arch == .aarch64) return asm volatile ("mrs %[v], cntfrq_el0"
+        : [v] "=r" (-> u64),
+    );
+    return std.time.ns_per_s;
+}
+
+/// The stamp clock against the monotonic clock, read together: a stamp is a fixed number of nanoseconds on the monotonic clock
+/// (the same place read twice gives the same time). The monotonic clock is slewed and the counter is not, so a pairing drifts from
+/// the day it was made: a reader that finds the pairing more than a second old pairs the clocks again. The pair sits behind a
+/// generation (odd while it is rewritten; 0 before the first pairing), so a reader takes the stamp and the nanoseconds of one pairing.
+var pair_gen: std.atomic.Value(u32) = .init(0);
+var pair_ns: std.atomic.Value(u64) = .init(0);
+var pair_stamp: std.atomic.Value(u64) = .init(0);
+var pair_busy: std.atomic.Value(bool) = .init(false); // one reader pairs at a time
+
+const Pair = struct { stamp: u64, ns: u64 };
+
+/// The two clocks read as one instant: a stamp on each side of the clock read, kept only when the two stamps lie within 20 us
+/// (a thread preempted between the reads would shift every place's time late by the preemption); the clock read is paired
+/// with the stamps' midpoint.
+fn measure() Pair {
+    const tight = @max(1, stampHz() / 50_000); // 20 us in stamp ticks
+    var tries: u32 = 0;
+    while (true) : (tries += 1) {
+        const s0 = stamp();
+        const n = nowNs();
+        const s1 = stamp();
+        if (s1 -% s0 <= tight or tries >= 100) return .{ .stamp = s0 +% (s1 -% s0) / 2, .ns = n };
+    }
+}
+
+/// Publishes a pairing (the caller holds `pair_busy`).
+fn publish(p: Pair) void {
+    const g = pair_gen.load(.monotonic);
+    _ = pair_gen.swap(g | 1, .acq_rel); // odd: being rewritten
+    // release: neither half of the pair becomes visible before the odd generation (a later plain store may, on aarch64), so a
+    // reader that sees a new half also sees the generation move and reads again
+    pair_stamp.store(p.stamp, .release);
+    pair_ns.store(p.ns, .release);
+    pair_gen.store((g | 1) +% 1, .release);
+}
+
+/// The current pairing, made on first use and made again once it is more than a second old.
+fn pairing() Pair {
+    while (true) {
+        const g1 = pair_gen.load(.acquire);
+        if (g1 == 0 or g1 & 1 == 1) {
+            if (g1 == 0 and !pair_busy.swap(true, .acq_rel)) {
+                publish(measure());
+                pair_busy.store(false, .release);
+            } else std.atomic.spinLoopHint();
+            continue;
+        }
+        const p: Pair = .{ .stamp = pair_stamp.load(.acquire), .ns = pair_ns.load(.acquire) };
+        if (pair_gen.load(.acquire) != g1) continue;
+        const age: i64 = @bitCast(stamp() -% p.stamp);
+        if (age <= @as(i64, @intCast(stampHz())) or pair_busy.swap(true, .acq_rel)) return p;
+        const fresh = measure();
+        publish(fresh);
+        pair_busy.store(false, .release);
+        return fresh;
+    }
+}
+
+/// A stamp as nanoseconds on the monotonic clock.
+fn stampNs(st: u64) u64 {
+    if (st == 0) return 0;
+    const p = pairing();
+    const d: i64 = @bitCast(st -% p.stamp);
+    const ns: i128 = @divTrunc(@as(i128, d) * std.time.ns_per_s, @as(i128, stampHz()));
+    return @intCast(@max(0, @as(i128, p.ns) + ns));
+}
+
 pub fn set(p: Place, a: u32, b: u32) void {
     a_v.store(a, .monotonic);
     b_v.store(b, .monotonic);
+    if (place_v.swap(@backingInt(p), .acq_rel) != @backingInt(p)) since_v.store(stamp(), .release);
 }
 
 pub fn get() Mark {
+    return .{ .place = @fromBackingInt(@intCast(place_v.load(.acquire))), .a = a_v.load(.monotonic), .b = b_v.load(.monotonic), .since_ns = stampNs(since_v.load(.acquire)) };
 }
 
 /// The one thread whose waits are the host's place (0: none claimed, any thread writes). A failure's line names where THE ENGINE
@@ -269,4 +354,47 @@ test "every thread join, blocking link call and unbounded wait on the engine thr
         try std.testing.expect(std.mem.indexOf(u8, body[e..], "defer where.leave(") != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, @embedFile("prompt.zig"), "where.joinThread(th);") != null);
+}
+
+test "a pairing made long ago is made again: a place set after the clocks drifted reads on the monotonic clock" {
+    _ = stampNs(stamp()); // (a pairing exists)
+    // a pairing from two seconds ago whose nanoseconds are 5 ms off, as if the monotonic clock had been slewed since
+    const old = stamp() -% 2 * stampHz();
+    const g = pair_gen.load(.acquire);
+    pair_gen.store(g | 1, .release);
+    pair_stamp.store(old, .release);
+    pair_ns.store(nowNs() -| 2 * std.time.ns_per_s -| 5 * std.time.ns_per_ms, .release);
+    pair_gen.store((g | 1) +% 1, .release);
+    set(.settle_gather, 0, 0);
+    const before = nowNs();
+    set(.round, 9, 0);
+    const after = nowNs();
+    const m = get();
+    try std.testing.expectEqual(Place.round, m.place);
+    try std.testing.expect(m.since_ns + 1 * std.time.ns_per_ms >= before);
+    try std.testing.expect(m.since_ns <= after + 1 * std.time.ns_per_ms);
+}
+
+test "a place's age reads as the time since it was set, on the reader's clock, whatever clock stamped it" {
+    const t_before = nowNs();
+    set(.round, 3, 0);
+    const t_set = nowNs();
+    var ts: std.c.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+    _ = std.c.nanosleep(&ts, null);
+    const m = get();
+    try std.testing.expectEqual(Place.round, m.place);
+    const at = nowNs();
+    try std.testing.expect(m.since_ns != 0);
+    // stamped inside [t_before, t_set] (the anchor pairs the clocks within 20 us), whatever the scheduler did around the set
+    try std.testing.expect(m.since_ns <= t_set + 1 * std.time.ns_per_ms);
+    try std.testing.expect(m.since_ns + 1 * std.time.ns_per_ms >= t_before);
+    var buf: [128]u8 = undefined;
+    const text = describe(&buf, m, at);
+    try std.testing.expect(std.mem.indexOf(u8, text, "for 2") != null or std.mem.indexOf(u8, text, "for 1") != null); // 20 ms +- jitter
+    // the same place set again keeps its time; another place restarts it
+    set(.round, 4, 0);
+    try std.testing.expectEqual(m.since_ns, get().since_ns);
+    set(.draft, 1, 1);
+    try std.testing.expect(get().since_ns > m.since_ns + 10 * std.time.ns_per_ms);
+    set(.main_loop, 0, 0);
 }
