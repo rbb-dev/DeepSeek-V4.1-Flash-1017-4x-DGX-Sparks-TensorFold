@@ -64,7 +64,9 @@ pub const flags = [_]Flag{
     .{ .name = "--min-p", .native = true },
     .{ .name = "--thinking", .kind = .store_true, .native = true },
     .{ .name = "--no-thinking", .kind = .store_true, .native = true },
-    .{ .name = "--reasoning-effort", .choices = &.{ "low", "medium", "high", "xhigh" }, .native = true },
+    // max: the effort a template names past xhigh (DeepSeek-V4.1's "low" / "high" / "max"); fields.coerceEffort maps
+    // each name to the nearest one the served template knows, as it does a request's
+    .{ .name = "--reasoning-effort", .choices = &.{ "low", "medium", "high", "xhigh", "max" }, .native = true },
     .{ .name = "--thinking-budget", .native = true },
     .{ .name = "--loop-guard", .kind = .store_true, .native = true },
     .{ .name = "--no-drafts", .kind = .store_true, .native = true },
