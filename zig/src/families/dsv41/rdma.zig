@@ -16,9 +16,13 @@
 //! reading (the owner writes q + 1 into that slot only after collecting this rank's q). The
 //! GPU half and the bytes are the same either way.
 const std = @import("std");
+const builtin = @import("builtin");
 const cuda = @import("cuda");
 const fabric = @import("fabric");
 const seqs = @import("rdma_seq.zig");
+const idle_gate = @import("idle_gate.zig");
+const IdleGate = idle_gate.Gate;
+pub const nap = @import("rdma_nap.zig");
 const ring_watch = @import("ring_watch.zig");
 const where = @import("where.zig");
 const wait = @import("ring_wait.zig");
@@ -123,17 +127,28 @@ pub const Settings = struct {
     unroll: bool = true,
     fence: bool = true,
     probing: bool = false,
+    wfe: ?bool = null, // null: TF_DS_RDMA_WFE decides; true: nap; false: spin (a settings field wins over the environment)
+    nap_us: u32 = nap.default_us, // a nap's longest length
     wc: bool = false, // TF_DS_RING_WC: the send and landing data slots from cudaHostAlloc(Mapped | WriteCombined)
     inplace: bool = false, // TF_DS_RING_INPLACE (needs wc): a producer writes a fixed send slot; no staging copy
     roci: Roci = .off, // TF_DS_RING_WORD: each lane's plain data write then the generation word it waits on in-kernel
     roci_deadline_ns: u64 = 120 * std.time.ns_per_s, // a lane's word not reaching its sequence: fail stop after this
     wait_explicit: bool = true, // TF_DS_RING_WAIT was set (to 1), not the default: only names the switch in a refusal (Model.open has already fallen back where the default cannot run)
     wait: bool = false, // TF_DS_RING_WAIT (needs roci == .word): Core Direct queue pairs wait in the card on the doorbell; no proxy thread
+    name: []const u8 = "the RDMA ring", // the ring in the proxy's lines
     cpu: ?u16 = null, // the proxy thread's CPU (TF_DS_RDMA_CPUS), else wherever the scheduler puts it
     collect_peers: bool = false, // TF_DS_RDMA_COLLECT_PEERS: gather_into's copy-out by dsv41_rdma_collect_peers
+    nap_cpu: ?nap.Cpu = null, // tests: the capability start() sees (null: this CPU's, nap.cpu())
+    nap_clock: ?nap.Clock = null, // tests: the counter rate start() sees (null: this CPU's, nap.clock())
+    nap_us_env: bool = true, // false: the tests' rings take nap_us as given, never TF_DS_RDMA_NAP_US
+    log: ?*const fn (ctx: ?*anyopaque, line: []const u8) void = null, // tests: where the lines go (null: std.log.info)
+    log_ctx: ?*anyopaque = null,
 };
 
 /// What the other side's queue pairs toward this rank need (a device each), and where this rank's receive ring is.
+/// Host tests only: make start()'s spawn fail with ThreadQuotaExceeded, to exercise the rollback. False in production.
+pub var spawn_fail: bool = false;
+
 pub const Info = extern struct {
     devices: u32,
     flags: u32, // the rings' switches (switchBits): every rank must run the same ones, or the ring's slots lay out another way
@@ -650,6 +665,12 @@ fn linked(a: Info, b: Info, prefix: u8) bool {
     return n > 0;
 }
 
+/// Whether a CPU index fits the affinity mask's storage. An index outside it is ignored: the scheduler decides,
+/// rather than a write past the mask's stack array.
+fn affinityIndexOk(c: u16) bool {
+    return c < @bitSizeOf(std.os.linux.cpu_set_t);
+}
+
 /// The decode ring's progress watch: a posted sequence whose peers' parts do not all come within this many milliseconds
 /// fails the ring by name (TF_DS_RING_DEAD_MS).
 pub const default_dead_ms: u64 = 10_000;
@@ -789,6 +810,14 @@ pub const Ring = struct {
     running: std.atomic.Value(bool) = .init(false),
     failed: std.atomic.Value(bool) = .init(false),
     why: [128]u8 = @splat(0),
+    napping: bool = false, // the proxy naps (start: TF_DS_RDMA_WFE, routes without relays, a CPU with WFET)
+    nap_how: ?nap.Start = null, // the Start decision start() made when the switch asked; null when it did not
+    late_window: nap.LateWindow = .{}, // the last 64 naps' late share; the proxy spins when more than a quarter is late
+    nap_ticks: u64 = 0, // a nap's longest length in the count's ticks
+    nap_stats: nap.Stats = .{},
+    nap_since: std.atomic.Value(u64) = .init(0), // when the proxy last woke at the gate (nap.now(); napping only)
+    nap_cpu_since: std.atomic.Value(u64) = .init(0), // the proxy's CPU time then (nap.cpuNow())
+    nap_cpu_now: std.atomic.Value(u64) = .init(0), // its CPU time after its last nap (read by the ring check)
     streams: [max_users]?cuda.abi.Stream = @splat(null), // the streams an in-place send slot was given to
     n_users: u32 = 0,
 
@@ -894,6 +923,7 @@ pub const Ring = struct {
     pub fn create(gpa: std.mem.Allocator, d: *const cuda.Driver, k: Kernels, devices: []const []const u8, rank: u32, world: u32, s: Settings) Error!*Ring {
         if (world < 2 or world > max_ranks or rank >= world or devices.len == 0 or devices.len > max_devices) return error.BadInfo;
         if (s.slots < 2 or s.slots > seqs.max_slots or s.max_bytes == 0 or s.max_bytes % 64 != 0) return error.BadInfo;
+        if (s.nap_us == 0) return error.BadInfo; // a zero-length nap is a busy loop
         if (inplaceOff(s.wc, s.inplace) != null) return error.BadInfo; // the send slot must be write-combined
         if (s.roci.on() and s.roci_deadline_ns == 0) return error.BadInfo; // a lost word must end, never wait forever
         if (s.wait and (!s.roci.on() or !k.hasWait())) {
@@ -1479,6 +1509,10 @@ pub const Ring = struct {
         return .{ .lanes = out, .relays = r.n_jobs };
     }
 
+    /// Starts the proxy thread; `spawn_fail` (host tests) makes the spawn fail, to exercise start()'s rollback.
+    fn spawnProxy(r: *Ring) std.Thread.SpawnError!std.Thread {
+        if (spawn_fail) return error.ThreadQuotaExceeded;
+        return std.Thread.spawn(.{}, proxyLoop, .{r});
     }
 
     pub fn start(r: *Ring) Error!void {
@@ -1508,11 +1542,55 @@ pub const Ring = struct {
             };
             return;
         }
+        // TF_DS_RDMA_WFE (or the settings): the proxy naps between exchanges where its routes and the CPU let it.
+        // With the switch off nothing of the nap is read or set: the proxy runs the loop it ran before the nap.
+        r.napping = false;
+        r.nap_how = null;
+        r.late_window = .{};
+        r.nap_ticks = 0;
+        r.nap_stats = .{}; // a start's counts begin here, not where the previous run stopped
+        const want = r.s.wfe orelse nap.wanted();
+        if (want) {
+            const how = nap.startOf(!r.napRoutes(), r.s.nap_cpu orelse nap.cpu(), r.s.nap_clock orelse nap.clock());
+            r.nap_how = how;
+            // TF_DS_RDMA_NAP_US or the settings' length, capped so a stop's join waits at most the teardown budget;
+            // the tests' rings take their length as given so a long nap can exercise the control store
+            const us = if (r.s.nap_us_env) @min(nap.napUs(r.s.nap_us), nap.teardown_us) else r.s.nap_us;
+            // a 0 us nap arms deadline == t0: WFET returns at once and the proxy re-naps and polls in a busy loop.
+            // Refuse the length before spawning, and leave the ring startable: create() rejects it for its callers.
+            if (how == .naps and us == 0) {
+                r.running.store(false, .release);
+                return error.BadInfo;
+            }
+            r.napping = how == .naps;
+            // a ring that relays writes cannot nap: quiet() cannot see a relay's write, so the invariant is asserted
+            // where the decision is made rather than left to napRoutes' duplicate derivation
+            std.debug.assert(!r.napping or r.n_jobs == 0);
+            if (r.napping) {
+                r.nap_ticks = @as(u64, us) * nap.ticksPerUs();
+                // the interval the ring check reads starts here, not at the proxy's first pass (the proxy refreshes it)
+                const now = nap.now();
+                const cpu = nap.cpuNow();
+                r.nap_since.store(now, .release);
+                r.nap_cpu_since.store(cpu, .release);
+                r.nap_cpu_now.store(cpu, .release);
+            }
+            var buf: [256]u8 = undefined;
+            r.logLine(nap.startLine(&buf, r.s.name, how, us));
+        }
+        r.proxy = spawnProxy(r) catch |e| {
+            // no thread means no proxy: roll the switch and the nap decision back so a retry starts one
+            r.running.store(false, .release);
+            r.napping = false;
+            r.nap_how = null;
+            r.nap_ticks = 0;
+            return e;
+        };
     }
 
-    pub fn stop(r: *Ring) void {
-        if (r.running.swap(false, .acq_rel)) if (r.proxy) |t| t.join();
-        r.proxy = null;
+    /// A line for the ring's start or park: std.log.info, or the tests' sink (Settings.log).
+    fn logLine(r: *Ring, line: []const u8) void {
+        if (r.s.log) |f| f(r.s.log_ctx, line) else std.log.info("{s}", .{line});
     }
 
     /// Why the generation-word switch cannot run on this ring, kept for its start line.
@@ -1591,6 +1669,17 @@ pub const Ring = struct {
         return true;
     }
 
+    /// Stops the proxy. A parked proxy wakes at once; a napping one ends within one short nap: a store of the value the
+    /// doorbell already holds clears its monitor without ringing the sequence (a proxy past the running check posts
+    /// nothing stale), and the deadline is capped at the teardown budget. The store can race the monitor's arming load,
+    /// so the join's bound is the capped nap, not zero.
+    ///
+    /// The store is a load then a store, not an atomic: call stop() only when the GPU side is quiescent (the callers
+    /// synchronize the stream first: model.zig's close, the ring check's final synchronize; its error path's close
+    /// after a queued gather is already a failed run). A staging kernel's write to the doorbell between the load and
+    /// the store is reverted, and a proxy past the running check then reads the old sequence and does not post the
+    /// write. The cap bounds the join either way: the store buys a prompt wake, not the stop's correctness.
+    pub fn stop(r: *Ring) void {
         const was_running = r.running.swap(false, .acq_rel);
         if (was_running and r.cd != null) {
             r.cd.?.stopJanitor(); // no proxy: the queue pairs stay armed until the ring is destroyed or fails
@@ -1598,9 +1687,51 @@ pub const Ring = struct {
                 r.logLine(wait.statsLine(&sb));
         } else if (was_running) {
             r.idle_gate.wake(); // a parked proxy must wake before join
+            // the doorbell's 64-byte granule is the nap's monitor: a same-value store clears it and ends the nap. It
+            // does not change the sequence, so a proxy that already passed the running check posts nothing extra.
+            const d = r.doorbell();
+            @atomicStore(u64, d, @atomicLoad(u64, d, .acquire), .release);
             if (r.proxy) |t| t.join();
         }
         r.proxy = null;
+        // a stopped ring has no nap state to report: the next start() decides it again and begins fresh counts
+        r.napping = false;
+        r.nap_how = null;
+        r.nap_ticks = 0;
+        r.late_window = .{};
+    }
+
+    /// Whether this ring's proxy can nap on its routes: every peer on lanes of its own and no relays (a part this rank
+    /// relays on is waited for by a peer, not after this rank's own doorbell).
+    fn napRoutes(r: *const Ring) bool {
+        const rts = r.routes();
+        if (rts.relays != 0) return false;
+        for (0..r.world) |p| if (p != r.rank and rts.lanes[p] == 0) return false;
+        return true;
+    }
+
+    /// The Start decision start() made when TF_DS_RDMA_WFE asked this ring to nap: `.naps`, or why it spins; null
+    /// when the switch did not ask. The ring check judges only a ring whose decision was `.naps`.
+    pub fn napStart(r: *const Ring) ?nap.Start {
+        return r.nap_how;
+    }
+
+    /// The proxy's naps since the ring started; null when it does not nap.
+    pub fn napCounts(r: *const Ring) ?nap.Counts {
+        return if (r.napping) r.nap_stats.counts() else null;
+    }
+
+    /// A napping proxy's interval since its last gate wake (or its start): the count's ticks and the proxy's CPU
+    /// nanoseconds at its last nap (both read from the proxy's own stores: the caller's clock is not the proxy's).
+    /// Null when it does not nap.
+    pub fn napSince(r: *const Ring) ?struct { ticks: u64, cpu: u64 } {
+        if (!r.napping) return null;
+        return .{
+            .ticks = nap.now() -% r.nap_since.load(.acquire),
+            .cpu = r.nap_cpu_now.load(.acquire) -% r.nap_cpu_since.load(.acquire),
+        };
+    }
+
     /// Only the CPU control protocol calls these at globally quiescent boundaries.
     pub fn park(r: *Ring) void {
         r.idle_gate.park();
@@ -1641,11 +1772,13 @@ pub const Ring = struct {
 
     fn proxyLoop(r: *Ring) void {
         if (r.s.cpu) |c| {
+            if (affinityIndexOk(c)) {
                 var set: std.os.linux.cpu_set_t = @splat(0);
                 const bits = @bitSizeOf(usize);
                 set[c / bits] |= @as(usize, 1) << @intCast(c % bits);
                 std.os.linux.sched_setaffinity(0, &set) catch {};
             }
+        }
         var need: u32 = 0;
         var arrivals: seqs.Arrivals = .{};
         for (0..r.world) |p| {
@@ -1663,10 +1796,48 @@ pub const Ring = struct {
         const dead_ms: u64 = r.dead_ms;
         var watch: ring_watch.Watch = .{ .dead = dead_ms * 1000 * tpu };
         var wc: [64]vabi.Wc = undefined;
+        // the writes posted and not yet completed, and (napping) the naps since the ring last woke, for its park line
+        var inflight: u64 = 0;
+        var since: u64 = 0;
+        var cpu_since: u64 = 0;
+        var base: nap.Counts = .{};
+        var naps_since_cpu: u32 = 0; // nap_cpu_now is refreshed every 256 naps: a thread-CPU read is a syscall
+        if (r.napping) {
+            since = nap.now();
+            cpu_since = nap.cpuNow();
+            r.nap_since.store(since, .release);
+            r.nap_cpu_since.store(cpu_since, .release);
+            r.nap_cpu_now.store(cpu_since, .release);
+            base = r.nap_stats.counts();
+        }
         while (r.running.load(.monotonic)) {
+            const parking = r.napping and r.idle_gate.parked.load(.acquire) != 0;
+            // the clock samples belong to the nap: with the switch off the proxy runs its old loop without a clock read.
+            // The pass samples only the count (a register read); the thread's CPU time is read at a report alone: that
+            // read is a syscall, and on Arm every exception return sets the event register, so one a pass would end
+            // the next WFET at once (measured on a GB10: ~2.6 M a second, 99.998 % of the naps ended by another wake). A thread
+            // asleep in the gate spends no CPU time, so a read after the wait gives the pre-wait figure.
+            var end: u64 = 0;
+            if (r.napping) end = nap.now();
+            // the sample already saw the park: report before sleeping, as the operator's line arrives on the park
+            if (parking) r.napReport(since, cpu_since, base, end, nap.cpuNow());
+            const blocked = r.idle_gate.wait() catch {
                 r.fail("RDMA idle futex wait failed");
                 return;
             };
+            // a park that landed between the sample above and the gate's own load still slept: report it too, with the
+            // interval ending at the pre-wait sample so the parked time is neither awake nor napped
+            if (r.napping and blocked and !parking) r.napReport(since, cpu_since, base, end, nap.cpuNow());
+            // every emitted report starts a new interval: a wake that raced the gate load (parking true, blocked
+            // false) emitted the first report, so its interval must not be covered again by the next park's report
+            if (r.napping and (parking or blocked)) {
+                since = nap.now();
+                cpu_since = nap.cpuNow();
+                r.nap_since.store(since, .release);
+                r.nap_cpu_since.store(cpu_since, .release);
+                r.nap_cpu_now.store(cpu_since, .release);
+                base = r.nap_stats.counts();
+            }
             if (!r.running.load(.acquire)) break;
             if (watch.open > 0 and watch.expired(instr.ticks())) {
                 var pb: [640]u8 = undefined;
@@ -1738,11 +1909,25 @@ pub const Ring = struct {
                 // (under TF_DS_RING_WORD no arrival reaches this proxy to close the sequence: the collecting kernel's deadline is the bound)
                 if (ring_watch.armed(!r.roci_live)) watch.posted(slot, post_t[slot]);
                 posted = q;
+                if (r.napping) inflight += need;
             }
-            for (r.nics[0..nd], 0..) |nic, d| {
+            // quiet before the queues are swept: every sequence the doorbell rang is posted, every write has completed
+            // and every peer's part of every posted sequence is published, so the completion queues can hold only a
+            // later sequence's parts, which this rank waits for only after its next doorbell (that doorbell wakes the
+            // nap, posts, sees inflight > 0 and falls through to the poll below). An idle wake that changed nothing
+            // naps again without a poll_cq a device. The check after the poll stays: it is the pass that reaps the last
+            // completion and finds the ring quiet.
+            if (r.napping) {
+                // the posting loop drains the doorbell when the ring naps, so quiet()'s posted < rung clause is dead
+                // here; the invariant is asserted rather than left implicit
+                std.debug.assert(posted == ring);
                 // with the generation word the receive side is passive: a sequence is quiet once its own word writes
                 // have completed (earlier data writes on the same queue pairs complete before them)
                 if (if (r.roci_live) inflight == 0 else nap.quiet(posted, ring, inflight, arrivals.published[0..r.world], r.rank)) {
+                    r.napOn(posted, &naps_since_cpu);
+                    continue;
+                }
+            }
             for (r.nics[0..r.nd], 0..) |nic, d| {
                 if (!nic.used) continue;
                 const k = nic.ctx.ops.poll_cq(nic.cq, wc.len, &wc);
@@ -1801,6 +1986,8 @@ pub const Ring = struct {
                         };
                     } else if (w.wr_id & relay_wr != 0) {
                         relays.complete(w.wr_id & ~relay_wr);
+                    } else {
+                        if (r.napping) inflight -|= 1;
                         if (sends.complete(w.wr_id)) |q| {
                             const qslot: usize = @intCast(q % r.s.slots);
                             // read the slot's name before publishing `sent`: a producer of q + slots may overwrite the
@@ -1814,12 +2001,64 @@ pub const Ring = struct {
                     }
                 }
             }
+            // nothing in flight: nap until this rank's next doorbell (a peer's part of it waits in the queues)
+            if (r.napping) {
+                std.debug.assert(posted == ring); // the posting loop above drains the doorbell when the ring naps
                 if (if (r.roci_live) inflight == 0 else nap.quiet(posted, ring, inflight, arrivals.published[0..r.world], r.rank)) r.napOn(posted, &naps_since_cpu);
             }
         }
     }
 
+    /// One nap on the doorbell while it holds `seen` (the last sequence posted), counted in the nap stats.
+    fn napOn(r: *Ring, seen: u64, naps_since_cpu: *u32) void {
+        const t0 = nap.now();
+        const deadline = t0 + r.nap_ticks;
+        // the word beside the doorbell the staging kernel writes for the next sequence (fence mode 1, block 0): the
+        // doorbell's monitor granule holds it too, so its write can end the nap; a wake with the doorbell unmoved but
+        // this word moved is the GPU's sizes[] write, not an event. A write of the same byte count as the
+        // slot's previous use changes nothing and stays 'other': the neighbour count is a lower bound unless a run's
+        // cases change size (they do: rows x case widths).
+        const beside = &r.sizes()[@intCast((seen + 1) % r.s.slots)];
+        const beside_before = @atomicLoad(u64, beside, .acquire);
+        r.nap_stats.begin();
+        if (!nap.napOnce(r.doorbell(), seen, deadline)) {
+            // a skip is a successful doorbell wake, not evidence the monitor clears: it counts in the window as a
+            // non-late nap, so a broken monitor's late share is not diluted by the skips its own writes cause
+            if (r.late_window.add(false) and r.napping) r.backOff();
+            return r.nap_stats.end(.skipped, 0);
         }
+        const t1 = nap.now();
+        const moved = @atomicLoad(u64, r.doorbell(), .acquire) != seen;
+        const neighbour = !moved and @atomicLoad(u64, beside, .acquire) != beside_before;
+        const end = nap.end_for_test orelse nap.classifyWith(moved, t1, deadline, neighbour);
+        r.nap_stats.end(end, t1 -% t0);
+        // the chip's GPU stores occasionally do not clear a WFE's monitor; a window of naps more than a quarter late
+        // means this ring's do not. Naps buy nothing then: spin from here on and say so once. The check refuses it.
+        if (r.late_window.add(end == .late) and r.napping) r.backOff();
+        // the ring check's cpu_ms: the proxy's CPU time, sampled on the first nap (a short run would otherwise report
+        // 0) and every 256 naps after (each read is a syscall)
+        naps_since_cpu.* +%= 1;
+        if (naps_since_cpu.* == 1 or naps_since_cpu.* % 256 == 0) r.nap_cpu_now.store(nap.cpuNow(), .release);
+    }
+
+    /// The proxy stops napping: its window shows the GPU's stores are not clearing the monitor. It spins from here
+    /// on and says so once; the ring check refuses it.
+    fn backOff(r: *Ring) void {
+        r.napping = false;
+        r.nap_how = .backoff;
+        r.late_window = .{};
+        var buf: [256]u8 = undefined;
+        r.logLine(nap.startLine(&buf, r.s.name, .backoff, 0));
+    }
+
+    /// The proxy's line when its ring parks: its naps since the ring last woke at `since` (the thread's CPU time then:
+    /// `cpu_since`; the counts then: `base`), ending at `end`/`cpu_end` sampled before the gate wait, so the parked
+    /// interval itself is not reported as awake or napped.
+    fn napReport(r: *Ring, since: u64, cpu_since: u64, base: nap.Counts, end: u64, cpu_end: u64) void {
+        var buf: [512]u8 = undefined;
+        r.logLine(nap.line(&buf, r.s.name, r.nap_stats.counts().since(base), end -% since, nap.ticksPerUs(), cpu_end -% cpu_since));
+    }
+
     /// Rank `src`'s sequence q (`n` bytes, all in this rank's receive slot) on to the ranks this one relays it to.
     fn relay(r: *Ring, src: usize, q: u64, n: u64) Error!void {
         const slot: usize = @intCast(q % r.s.slots);
@@ -2186,10 +2425,100 @@ test "every declaration compiles (the GPU and verbs paths run only on the nodes)
     std.testing.refAllDecls(Kernels);
 }
 
+/// A fake provider for the proxy's tests: a device's completion queue the test fills and the proxy drains, each write
+/// the proxy posts counted and completed at once (or held back until `release`).
+const FakeDev = struct {
+    ctx: vabi.Context = undefined,
+    cq: vabi.Cq = undefined,
+    qps: [max_ranks]vabi.Qp = undefined, // toward each peer (this rank's own slot is unused)
+    mr: vabi.Mr = undefined,
+    mutex: std.atomic.Mutex = .unlocked,
+    queue: [64]vabi.Wc = undefined,
+    n: usize = 0,
+    posts: std.atomic.Value(u32) = .init(0),
+    polls: std.atomic.Value(u32) = .init(0),
+    hold: bool = false,
+    held: [64]u64 = undefined,
+    n_held: usize = 0,
     words: [64]u64 = undefined, // an inline 8-byte write's value, in post order
     n_words: usize = 0,
     adds: [64]u64 = undefined, // an ATOMIC fetch-and-add's addend, in post order
     n_adds: usize = 0,
+
+    fn init(d: *FakeDev, base_qpn: u32) void {
+        d.* = .{};
+        d.ctx = .{ .device = undefined, .ops = .{ ._before_poll = @splat(null), .poll_cq = fakePoll, ._before_post = @splat(null), .post_send = fakeSend, .post_recv = fakeRecv, ._after = @splat(null) }, .cmd_fd = -1, .async_fd = -1, .num_comp_vectors = 0, .mutex = undefined, .abi_compat = null };
+        d.cq = .{ .context = &d.ctx, .channel = null, .cq_context = d, .handle = 0, .cqe = 64, .mutex = undefined, .cond = undefined, .comp_events_completed = 0, .async_events_completed = 0 };
+        for (0..max_ranks) |p| d.qps[p] = .{ .context = &d.ctx, .qp_context = d, .pd = undefined, .send_cq = &d.cq, .recv_cq = &d.cq, .srq = null, .handle = 0, .qp_num = base_qpn + @as(u32, @intCast(p)), .state = 0, .qp_type = vabi.qpt_rc, .mutex = undefined, .cond = undefined, .events_completed = 0 };
+        d.mr = .{ .context = &d.ctx, .pd = undefined, .addr = null, .length = 0, .handle = 0, .lkey = 1, .rkey = 2 };
+    }
+
+    fn lock(d: *FakeDev) void {
+        while (!d.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn wc(wr_id: u64, opcode: c_int, qpn: u32, imm: u32) vabi.Wc {
+        return .{ .wr_id = wr_id, .status = vabi.wc_success, .opcode = opcode, .vendor_err = 0, .byte_len = 32, .imm_data = imm, .qp_num = qpn, .src_qp = 0, .wc_flags = 0, .pkey_index = 0, .slid = 0, .sl = 0, .dlid_path_bits = 0 };
+    }
+
+    /// Peer `p`'s part of sequence q lands on this device.
+    fn land(d: *FakeDev, p: usize, q: u64) void {
+        d.lock();
+        defer d.mutex.unlock();
+        d.queue[d.n] = wc(0, wc_recv_rdma_with_imm, d.qps[p].qp_num, seqs.immediate(q, null));
+        d.n += 1;
+    }
+
+    fn release(d: *FakeDev) void {
+        d.lock();
+        defer d.mutex.unlock();
+        for (d.held[0..d.n_held]) |id| {
+            d.queue[d.n] = wc(id, 1, d.qps[1].qp_num, 0);
+            d.n += 1;
+        }
+        d.n_held = 0;
+        d.hold = false;
+    }
+
+    /// Completes the oldest held write (the send completions a sequence's parts finish in any order).
+    fn completeOne(d: *FakeDev) void {
+        d.lock();
+        defer d.mutex.unlock();
+        if (d.n_held == 0) return;
+        d.queue[d.n] = wc(d.held[0], 1, d.qps[1].qp_num, 0);
+        d.n += 1;
+        std.mem.copyForwards(u64, d.held[0 .. d.n_held - 1], d.held[1..d.n_held]);
+        d.n_held -= 1;
+    }
+
+    /// Completes every held write.
+    fn completeAll(d: *FakeDev) void {
+        d.lock();
+        defer d.mutex.unlock();
+        for (d.held[0..d.n_held]) |id| {
+            d.queue[d.n] = wc(id, 1, d.qps[1].qp_num, 0);
+            d.n += 1;
+        }
+        d.n_held = 0;
+    }
+
+    fn fakePoll(cq: *vabi.Cq, n: c_int, out: [*]vabi.Wc) callconv(.c) c_int {
+        const d: *FakeDev = @ptrCast(@alignCast(cq.cq_context.?));
+        d.lock();
+        defer d.mutex.unlock();
+        _ = d.polls.fetchAdd(1, .acq_rel);
+        const k = @min(d.n, @as(usize, @intCast(n)));
+        @memcpy(out[0..k], d.queue[0..k]);
+        std.mem.copyForwards(vabi.Wc, d.queue[0 .. d.n - k], d.queue[k..d.n]);
+        d.n -= k;
+        return @intCast(k);
+    }
+
+    fn fakeSend(qp: *vabi.Qp, wr: *vabi.SendWr, bad: *?*vabi.SendWr) callconv(.c) c_int {
+        _ = bad;
+        const d: *FakeDev = @ptrCast(@alignCast(qp.qp_context.?));
+        d.lock();
+        defer d.mutex.unlock();
         _ = d.posts.fetchAdd(1, .acq_rel);
         if (wr.opcode == vabi.wr_atomic_fetch_add) {
             const aw: *const AtomicWr = @ptrCast(@alignCast(wr));
@@ -2202,8 +2531,173 @@ test "every declaration compiles (the GPU and verbs paths run only on the nodes)
         }
         // an unsignalled work request completes without a completion queue entry (a plain data write)
         if (wr.send_flags & vabi.send_signaled == 0) return 0;
+        if (d.hold) {
+            d.held[d.n_held] = wr.wr_id;
+            d.n_held += 1;
+        } else {
+            d.queue[d.n] = wc(wr.wr_id, 1, qp.qp_num, 0);
+            d.n += 1;
+        }
+        return 0;
+    }
+
+    fn fakeRecv(qp: *vabi.Qp, wr: *vabi.RecvWr, bad: *?*vabi.RecvWr) callconv(.c) c_int {
+        _ = qp;
+        _ = wr;
+        _ = bad;
+        return 0;
+    }
+};
+
+/// A log sink the proxy thread and the test share: Settings.log routes the ring's lines here, appended under a spin
+/// lock (the proxy may log while the test reads).
+const Sink = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    buf: [8192]u8 = undefined,
+    len: usize = 0,
+
+    fn push(ctx: ?*anyopaque, line: []const u8) void {
+        const s: *Sink = @ptrCast(@alignCast(ctx.?));
+        while (!s.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer s.mutex.unlock();
+        const n = @min(line.len, s.buf.len - s.len);
+        @memcpy(s.buf[s.len..][0..n], line[0..n]);
+        s.len += n;
+        if (s.len < s.buf.len) {
+            s.buf[s.len] = '\n';
+            s.len += 1;
+        }
+    }
+
+    fn reset(s: *Sink) void {
+        while (!s.mutex.tryLock()) std.atomic.spinLoopHint();
+        s.len = 0;
+        s.mutex.unlock();
+    }
+
+    /// The lines so far, copied out (the sink may append after).
+    fn text(s: *Sink, out: []u8) []const u8 {
+        while (!s.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer s.mutex.unlock();
+        const n = @min(s.len, out.len);
+        @memcpy(out[0..n], s.buf[0..n]);
+        return out[0..n];
+    }
+
+    fn has(s: *Sink, needle: []const u8) bool {
+        var out: [8192]u8 = undefined;
+        return std.mem.indexOf(u8, s.text(&out), needle) != null;
+    }
+
+    fn countOf(s: *Sink, needle: []const u8) usize {
+        var out: [8192]u8 = undefined;
+        return std.mem.count(u8, s.text(&out), needle);
+    }
+};
+
+/// Waits (2 s at most) until the sink holds `needle` at least `times` times.
+fn untilSinkCount(s: *Sink, needle: []const u8, times: usize) !void {
+    var i: usize = 0;
+    while (s.countOf(needle) < times) : (i += 1) {
+        if (i == 2000) return error.Timeout;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+}
+
+/// The seconds a park line reports ("over the 1.234 s since its wake"), and where the line starts.
+const ParkSecs = struct { at: usize, secs: f64 };
+fn parkSecs(text: []const u8, from: usize) ?ParkSecs {
+    const i = std.mem.indexOfPos(u8, text, from, "over the ") orelse return null;
+    const rest = text[i + "over the ".len ..];
+    const j = std.mem.indexOf(u8, rest, " s ") orelse return null;
+    return .{ .at = i, .secs = std.fmt.parseFloat(f64, rest[0..j]) catch return null };
+}
+
+/// TF_DS_RDMA_WFE's environment, saved and restored around a test that sets, clears or reads it (the tests' runs are
+/// independent of an ambient switch).
+const EnvGuard = struct {
+    name: [:0]const u8,
+    had: bool = false,
+    val: [128]u8 = undefined,
+    vlen: usize = 0,
+
+    extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+    extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+    fn save(name: [:0]const u8) EnvGuard {
+        var g: EnvGuard = .{ .name = name };
+        if (std.c.getenv(name.ptr)) |v| {
+            const s = std.mem.span(v);
+            g.vlen = @min(s.len, g.val.len);
+            @memcpy(g.val[0..g.vlen], s[0..g.vlen]);
+            g.had = true;
+        }
+        return g;
+    }
+
+    fn restore(g: *const EnvGuard) void {
+        if (g.had) {
+            var z: [129]u8 = undefined;
+            @memcpy(z[0..g.vlen], g.val[0..g.vlen]);
+            z[g.vlen] = 0;
+            _ = setenv(g.name.ptr, @ptrCast(&z), 1);
+        } else _ = unsetenv(g.name.ptr);
+    }
+
+    fn clear(g: *const EnvGuard) void {
+        _ = unsetenv(g.name.ptr);
+    }
+
+    fn set(g: *const EnvGuard, v: [:0]const u8) void {
+        _ = setenv(g.name.ptr, v.ptr, 1);
+    }
+};
+
+/// Whether this host can run the nap integration tests: the stand-in on x86_64, the real WFET on aarch64, judged by
+/// /proc/cpuinfo's wfxt (an authority apart from the auxv cpu() reads, so a broken detection cannot skip them); null
+/// (qemu-user reads the x86 host's cpuinfo) falls back to cpu().
+fn napTestable() bool {
+    if (builtin.cpu.arch != .aarch64) return true;
+    return nap.cpuinfoWfxt(std.testing.io, std.testing.allocator) orelse nap.available();
+}
+
+/// Rank 0 of two over two fake devices (two lanes to rank 1), its proxy run as the engine runs it.
+const TestRing = struct {
+    devs: [2]*FakeDev,
+    r: *Ring,
     gen_mem: ?[]align(std.heap.page_size_min) u8 = null,
+
+    fn init(wfe: ?bool, nap_us: u32) !TestRing {
+        return initWith(wfe, nap_us, null, null);
+    }
+
+    fn initWith(wfe: ?bool, nap_us: u32, log: ?*const fn (?*anyopaque, []const u8) void, log_ctx: ?*anyopaque) !TestRing {
+        const gpa = std.testing.allocator;
+        var t: TestRing = undefined;
         t.gen_mem = null;
+        for (&t.devs, 0..) |*d, i| {
+            d.* = try gpa.create(FakeDev);
+            d.*.init(@intCast(100 + i * 16));
+        }
+        const page = comptime std.mem.Alignment.fromByteUnits(std.heap.page_size_min);
+        // the nap tests give start() the capability their hardware has (start's seam): a broken auxv detection cannot
+        // make them skip; napTestable() keeps them off a CPU without WFET, where the asm would be UNDEFINED
+        const s: Settings = .{ .slots = 4, .max_bytes = 64, .wfe = wfe, .nap_us = nap_us, .name = "the test ring", .nap_cpu = if (wfe orelse true) .wfet else null, .nap_clock = if (wfe orelse true) .fine else null, .nap_us_env = false, .log = log, .log_ctx = log_ctx };
+        const meta = try gpa.alignedAlloc(u8, page, std.heap.page_size_min);
+        @memset(meta, 0);
+        const send = try gpa.alignedAlloc(u8, page, s.slots * s.max_bytes);
+        const recv = try gpa.alignedAlloc(u8, page, s.slots * max_ranks * s.max_bytes);
+        t.r = try gpa.create(Ring);
+        t.r.* = .{ .d = undefined, .verbs = undefined, .k = undefined, .s = s, .rank = 0, .world = 2, .hr = undefined, .send = .{ .mem = send, .dev = 0 }, .recv = .{ .mem = recv, .dev = 0 }, .meta = .{ .mem = meta, .dev = 0 }, .scalars = undefined };
+        t.r.nd = 2;
+        for (t.devs, 0..) |d, i| {
+            t.r.nics[i] = .{ .ctx = &d.ctx, .pd = undefined, .cq = &d.cq, .mr_send = &d.mr, .mr_recv = &d.mr, .gid = @splat(0), .gid_index = 0, .used = true };
+            t.r.nics[i].qps[1] = &d.qps[1];
+        }
+        t.r.peers[1] = .{ .lanes = 2, .nic = .{ 0, 1, 0, 0 }, .rkey = .{ 2, 2, 0, 0 }, .recv = 0x10000 };
+        return t;
+    }
+
     /// A ring with TF_DS_RING_WORD set and runnable: a generation-word region (the fakery writes and reads it as
     /// the peers' NICs would) and every device's fake registration of it.
     fn initRoci(wfe: ?bool, nap_us: u32, sig: Roci) !TestRing {
@@ -2220,7 +2714,91 @@ test "every declaration compiles (the GPU and verbs paths run only on the nodes)
         return t;
     }
 
+    /// Rank 0 of four over the same two devices: peers 1 (2 lanes), 2 (1 lane, device 0) and 3 (1 lane, device 1);
+    /// `need` is 4, which a sum over one peer's lanes cannot produce.
+    fn initWorld4(wfe: bool, nap_us: u32) !TestRing {
+        var t = try TestRing.init(wfe, nap_us);
+        t.r.world = 4;
+        t.r.rank = 0;
+        for (t.devs, 0..) |d, i| {
+            t.r.nics[i].qps[2] = &d.qps[2];
+            t.r.nics[i].qps[3] = &d.qps[3];
+        }
+        t.r.peers[2] = .{ .lanes = 1, .nic = .{ 0, 0, 0, 0 }, .rkey = .{ 2, 0, 0, 0 }, .recv = 0x20000 };
+        t.r.peers[3] = .{ .lanes = 1, .nic = .{ 1, 1, 0, 0 }, .rkey = .{ 2, 0, 0, 0 }, .recv = 0x30000 };
+        return t;
+    }
+
+    fn deinit(t: *TestRing) void {
+        const gpa = std.testing.allocator;
         if (t.gen_mem) |g| gpa.free(g);
+        gpa.free(t.r.meta.mem);
+        gpa.free(t.r.send.mem);
+        gpa.free(t.r.recv.mem);
+        gpa.destroy(t.r);
+        for (t.devs) |d| gpa.destroy(d);
+    }
+
+    /// This rank's staging kernel rings sequence q (its slot's size first, as the kernel writes it).
+    fn ring(t: *TestRing, q: u64) void {
+        @atomicStore(u64, &t.r.sizes()[@intCast(q % t.r.s.slots)], 64, .release);
+        @atomicStore(u64, t.r.doorbell(), q, .release);
+    }
+
+    /// Peer `p`'s part of sequence q lands on every lane of its route.
+    fn landPeer(t: *TestRing, p: usize, q: u64) void {
+        const peer = &t.r.peers[p];
+        for (0..peer.lanes) |lane| t.devs[peer.nic[lane]].land(p, q);
+    }
+
+    fn land(t: *TestRing, q: u64) void {
+        t.landPeer(1, q);
+    }
+
+    fn flagAt(t: *TestRing, q: u64, p: usize) u64 {
+        return @atomicLoad(u64, t.r.flagAt(q, p), .acquire);
+    }
+
+    fn flag(t: *TestRing, q: u64) u64 {
+        return @atomicLoad(u64, t.r.flagAt(q, 1), .acquire);
+    }
+
+    fn sent(t: *TestRing, q: u64) u64 {
+        return @atomicLoad(u64, &t.r.sent()[@intCast(q % t.r.s.slots)], .acquire);
+    }
+
+    fn posts(t: *TestRing) u32 {
+        return t.devs[0].posts.load(.acquire) + t.devs[1].posts.load(.acquire);
+    }
+
+    fn polls(t: *TestRing) u32 {
+        return t.devs[0].polls.load(.acquire) + t.devs[1].polls.load(.acquire);
+    }
+
+    /// Whether a nap is on now.
+    fn napping(t: *TestRing) bool {
+        const c = t.r.nap_stats.counts();
+        return c.naps > c.ended();
+    }
+
+    /// Waits (2 s at most) until `cond(t)`.
+    fn until(t: *TestRing, comptime cond: fn (*TestRing) bool) !void {
+        var i: usize = 0;
+        while (!cond(t)) : (i += 1) {
+            if (i == 2000) return error.Timeout;
+            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+        }
+    }
+
+    /// Stops the proxy wherever it is: a nap ends at the doorbell's next write.
+    fn stopProxy(t: *TestRing) void {
+        t.r.running.store(false, .release);
+        t.ring(@atomicLoad(u64, t.r.doorbell(), .acquire) + 1);
+        if (t.r.proxy) |th| th.join();
+        t.r.proxy = null;
+    }
+};
+
 test "a watch's hook aborts a ring: its waits give up and the failure says why" {
     const link = @import("link.zig");
     var t = try TestRing.init(false, 0);
@@ -2248,6 +2826,741 @@ test "a watch's hook aborts a ring: its waits give up and the failure says why" 
     }
     try std.testing.expectEqualStrings("a peer rank's link closed: the rank stopped", t.r.failure() orelse return error.TestUnexpectedResult);
     try std.testing.expectEqual(@as(u64, 1), @atomicLoad(u64, t.r.abortWord(), .acquire));
+}
+
+test "TF_DS_RDMA_WFE: a peer's part that lands before this rank's doorbell is published once the doorbell rings" {
+    if (!napTestable()) return error.SkipZigTest;
+    // on the target another wake (an event or an interrupt, ~10 kHz) may end a nap early and let the
+    // proxy poll. Injecting the same rate here makes the target's normal case deterministic on the stand-in.
+    nap.stand_in_wake_after = 100 * nap.ticksPerUs();
+    defer nap.stand_in_wake_after = 0;
+    var t = try TestRing.init(true, 2_000_000); // 2 s: the doorbell (or another wake) ends a nap, never the deadline
+    defer t.deinit();
+    try t.r.start();
+    defer t.stopProxy();
+    try std.testing.expect(t.r.napping);
+    try t.until(TestRing.napping); // nothing rung yet: it naps at once
+    t.ring(1);
+    t.land(1);
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return x.flag(1) == 1 and x.sent(1) == 1 and x.napping();
+        }
+    }.f);
+    // rank 1 runs a sequence ahead: its part of 2 lands while this proxy naps, and waits in the completion queues
+    t.land(2);
+    std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+    try std.testing.expectEqual(@as(u64, 0), t.flag(2));
+    try t.until(TestRing.napping); // the proxy is between naps for a moment after each event-ended one
+    try std.testing.expectEqual(@as(u32, 2), t.posts());
+    // this rank's staging kernel rings 2 before its collecting kernel waits on rank 1's flag of 2
+    t.ring(2);
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return x.flag(2) == 2 and x.posts() == 4 and x.sent(2) == 2 and x.napping();
+        }
+    }.f);
+    const c = t.r.napCounts().?;
+    // the naps ended by the doorbells, an event, a skip in the quiet-to-arm window or a sizes[] write: the exact
+    // split is not a property (the stand-in's event stream and the doorbell's timing decide it). The deadline is 2 s,
+    // so no nap ended at it.
+    try std.testing.expect(c.naps >= 2);
+    try std.testing.expectEqual(@as(u64, 0), c.deadline);
+}
+
+test "TF_DS_RDMA_WFE: no nap while a posted write is to complete or a peer's part is missing, whatever ends the others" {
+    // Counts are properties, not exact totals: on the target another wake (an event or interrupt, 39 % there) may end
+    // any nap, so an exact cumulative count is only green on a host with no event stream. Deltas around a stimulus are
+    // the assertion: while a sequence is in flight no nap may begin, however many wakes the machine makes.
+    if (!napTestable()) return error.SkipZigTest;
+    var t = try TestRing.init(true, 2_000_000);
+    defer t.deinit();
+    nap.stand_in_wake_after = 100 * nap.ticksPerUs(); // ~10 kHz, the target's measured other-wake rate
+    defer nap.stand_in_wake_after = 0;
+    for (t.devs) |d| d.hold = true;
+    try t.r.start();
+    defer t.stopProxy();
+    try t.until(TestRing.napping);
+    t.ring(1); // ends the first nap; its two writes complete only at the release
+    t.land(1);
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return x.flag(1) == 1 and x.posts() == 2;
+        }
+    }.f);
+    const a = t.r.nap_stats.counts();
+    std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+    try std.testing.expectEqual(@as(u64, 0), t.r.nap_stats.counts().since(a).naps);
+    try std.testing.expect(!t.napping());
+    try std.testing.expectEqual(@as(u64, 0), t.sent(1));
+    for (t.devs) |d| d.release();
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return x.sent(1) == 1 and x.napping();
+        }
+    }.f);
+    t.ring(2); // rank 1's part of 2 not in yet: the proxy keeps polling
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return x.sent(2) == 2 and !x.napping();
+        }
+    }.f);
+    const b = t.r.nap_stats.counts();
+    std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+    try std.testing.expectEqual(@as(u64, 0), t.r.nap_stats.counts().since(b).naps);
+    try std.testing.expectEqual(@as(u64, 0), t.flag(2));
+    t.land(2);
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return x.flag(2) == 2 and x.napping();
+        }
+    }.f);
+    try std.testing.expect(t.r.nap_stats.counts().since(b).naps > 0);
+}
+
+test "TF_DS_RDMA_WFE: a four-node ring sums every peer's lanes and naps only after every completion and every part" {
+    // the world-2 fake cannot tell "every peer's lanes" from "rank 1's lanes", nor a completion gap inside one
+    // sequence from a whole sequence: here three peers have 2+1+1 lanes (need 4), their parts arrive together, and
+    // the sequence's four write completions finish one at a time before the peer's missing part
+    if (!napTestable()) return error.SkipZigTest;
+    var t = try TestRing.initWorld4(true, 2_000_000);
+    defer t.deinit();
+    for (t.devs) |d| d.hold = true;
+    try t.r.start();
+    defer t.stopProxy();
+    try t.until(TestRing.napping);
+    // sequence 1: every peer's part published while our four writes are in flight, then the completions one by one
+    t.ring(1);
+    t.landPeer(1, 1);
+    t.landPeer(2, 1);
+    t.landPeer(3, 1);
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return x.posts() == 4 and x.flagAt(1, 1) == 1 and x.flagAt(1, 2) == 1 and x.flagAt(1, 3) == 1;
+        }
+    }.f);
+    const a = t.r.nap_stats.counts();
+    t.devs[0].completeOne();
+    std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+    try std.testing.expectEqual(@as(u64, 0), t.r.nap_stats.counts().since(a).naps);
+    t.devs[1].completeOne();
+    t.devs[1].completeOne();
+    std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+    try std.testing.expectEqual(@as(u64, 0), t.r.nap_stats.counts().since(a).naps);
+    t.devs[0].completeOne(); // the fourth and last of the sequence
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return x.sent(1) == 1 and x.napping();
+        }
+    }.f);
+    // sequence 2: every write completes, peer 3's part is missing: no nap until it lands
+    t.ring(2);
+    t.landPeer(1, 2);
+    t.landPeer(2, 2);
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return x.posts() == 8;
+        }
+    }.f);
+    for (t.devs) |d| d.completeAll();
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return x.sent(2) == 2 and !x.napping();
+        }
+    }.f);
+    const b = t.r.nap_stats.counts();
+    std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+    try std.testing.expectEqual(@as(u64, 0), t.r.nap_stats.counts().since(b).naps);
+    try std.testing.expectEqual(@as(u64, 0), t.flagAt(2, 3));
+    t.landPeer(3, 2);
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return x.flagAt(2, 3) == 2 and x.napping();
+        }
+    }.f);
+}
+
+test "the ring check reads the proxy's CPU interval, not the reader's own clock" {
+    // napSince() must subtract the proxy's two stores: reading CLOCK_THREAD_CPUTIME_ID in the checking thread would
+    // give that thread's time, not the proxy's (a huge first value, then an underflow), and no nap test would see it
+    var r: Ring = undefined;
+    r.napping = true;
+    const now = nap.now();
+    r.nap_since = .init(now);
+    r.nap_cpu_since = .init(1_000);
+    r.nap_cpu_now = .init(5_000);
+    const e = r.napSince().?;
+    try std.testing.expectEqual(@as(u64, 4_000), e.cpu);
+    try std.testing.expect(e.ticks < 1_000 * nap.ticksPerUs());
+    r.napping = false;
+    try std.testing.expect(r.napSince() == null);
+}
+
+test "TF_DS_RDMA_WFE: a nap a sizes[] write beside the doorbell ends is counted beside it" {
+    // sizes[] shares the doorbell's 64-byte line (and, slots 4, sizes[0] its 16-byte block); fence mode 1
+    // writes sizes[slot] at the stage's start, before the copy and the doorbell, so it can end a nap first. The count
+    // must not call that an event or the doorbell (a measured run's 39 % 'other' then splits).
+    if (!napTestable()) return error.SkipZigTest;
+    var t = try TestRing.init(true, 1000);
+    defer t.deinit();
+    t.r.nap_ticks = 1_000_000 * nap.ticksPerUs(); // 1 s: the write below ends the nap first
+    t.ring(3); // the proxy posted 3; sequence 4's stage writes sizes[0], the doorbell's 16-byte block
+    const beside = &t.r.sizes()[0];
+    nap.stand_in_beside = &.{beside}; // the stand-in's monitor; on a target the CPU store clears the real one
+    defer nap.stand_in_beside = &.{};
+    const Writer = struct {
+        fn run(w: *u64) void {
+            std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+            @atomicStore(u64, w, 64, .release);
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Writer.run, .{beside});
+    defer th.join();
+    var naps_since_cpu: u32 = 0;
+    // A real WFET nap also ends at the event stream (~10 kHz, 39 % of naps measured on a GB10 node: nap.napOnce's doc), long
+    // before the writer's 20 ms: those naps end 'other', and the proxy naps again. So nap until the write has been made; the
+    // stand-in (x86_64) has no such wake and ends on the first nap. The nap the write ends is the one counted beside it.
+    // (A write landing in the few ns between this check and the nap's own read of the word would leave one 1 s nap: ~1e-4.)
+    while (@atomicLoad(u64, beside, .acquire) != 64) t.r.napOn(3, &naps_since_cpu);
+    const c = t.r.nap_stats.counts();
+    try std.testing.expect(c.naps >= 1);
+    try std.testing.expectEqual(@as(u64, 1), c.neighbour);
+    try std.testing.expectEqual(@as(u64, 0), c.doorbell + c.late + c.deadline);
+    try std.testing.expectEqual(c.naps - 1, c.other); // every nap before the last ended at an event, none at the doorbell
+}
+
+test "TF_DS_RDMA_WFE: an idle wake sweeps no completion queue before napping again" {
+    // quiet already proves every used CQ holds nothing this rank needs before its next doorbell, so polling on
+    // a deadline/event wake is pure awake time; a doorbell wake posts, sees inflight > 0, and polls below
+    if (!napTestable()) return error.SkipZigTest;
+    var t = try TestRing.init(true, 1000);
+    defer t.deinit();
+    nap.stand_in_wake_after = 100 * nap.ticksPerUs(); // on the target the event stream ends these naps
+    defer nap.stand_in_wake_after = 0;
+    try t.r.start();
+    defer t.stopProxy();
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return x.r.nap_stats.counts().other >= 3;
+        }
+    }.f);
+    try std.testing.expectEqual(@as(u32, 0), t.polls());
+}
+
+test "TF_DS_RDMA_NAP_US sets the nap's length, with the baseline 50 us as the default" {
+    // the 50 us deadline is the largest wake source (57 % of naps), and Settings.nap_us is read from no
+    // environment, so a measurement cannot try a longer one without a rebuild. The knob keeps the baseline default.
+    if (comptime !builtin.link_libc) return error.SkipZigTest;
+    if (!napTestable()) return error.SkipZigTest; // the proxy runs the WFET asm on aarch64
+    var g = EnvGuard.save("TF_DS_RDMA_NAP_US");
+    defer g.restore();
+    var sink: Sink = .{};
+    g.set("1234");
+    {
+        var t = try TestRing.initWith(true, 50, Sink.push, &sink);
+        defer t.deinit();
+        t.r.s.nap_us_env = true; // the knob under test (TestRing's rings ignore the environment by default)
+        try t.r.start();
+        defer t.stopProxy();
+        try std.testing.expectEqual(@as(u64, 1234) * nap.ticksPerUs(), t.r.nap_ticks);
+        try std.testing.expect(sink.has("at most 1234 us a nap"));
+    }
+    g.clear();
+    {
+        var t = try TestRing.initWith(true, 50, Sink.push, &sink);
+        defer t.deinit();
+        t.r.s.nap_us_env = true;
+        try t.r.start();
+        defer t.stopProxy();
+        try std.testing.expectEqual(@as(u64, 50) * nap.ticksPerUs(), t.r.nap_ticks); // the default
+    }
+}
+
+test "an explicit wfe=false spins even when the environment asks for naps" {
+    if (comptime !builtin.link_libc) return error.SkipZigTest;
+    var g = EnvGuard.save("TF_DS_RDMA_WFE");
+    defer g.restore();
+    g.set("1");
+    var t = try TestRing.init(false, 2_000_000); // explicit false: spin, whatever the environment says
+    defer t.deinit();
+    try t.r.start();
+    defer t.stopProxy();
+    try std.testing.expect(!t.r.napping);
+}
+
+test "TF_DS_RDMA_WFE in the environment turns a start()'s proxy to napping, and only a wanted start logs" {
+    if (comptime !builtin.link_libc) return error.SkipZigTest;
+    if (!napTestable()) return error.SkipZigTest; // the proxy runs the WFET asm on aarch64
+    var g = EnvGuard.save("TF_DS_RDMA_WFE");
+    defer g.restore();
+    var sink: Sink = .{};
+    // set and not 0 (Settings.wfe null): the environment turns the proxy to napping and it says so
+    g.set("1");
+    {
+        var t = try TestRing.initWith(null, 2_000_000, Sink.push, &sink);
+        defer t.deinit();
+        try t.r.start();
+        defer t.stopProxy();
+        try std.testing.expect(t.r.napping);
+        try std.testing.expect(sink.has("TF_DS_RDMA_WFE: the test ring's RDMA proxy naps on its doorbell"));
+    }
+    // 0, and unset: the proxy spins, and no start line is logged
+    var zero: usize = 0;
+    while (zero < 2) : (zero += 1) {
+        if (zero == 0) g.set("0") else g.clear();
+        sink.reset();
+        var t = try TestRing.initWith(null, 2_000_000, Sink.push, &sink);
+        defer t.deinit();
+        try t.r.start();
+        defer t.stopProxy();
+        try std.testing.expect(!t.r.napping);
+        try std.testing.expectEqual(@as(usize, 0), sink.countOf("TF_DS_RDMA_WFE:"));
+    }
+    // wanted(): set and not 0, an empty value on
+    g.clear();
+    try std.testing.expect(!nap.wanted());
+    g.set("0");
+    try std.testing.expect(!nap.wanted());
+    g.set("");
+    try std.testing.expect(nap.wanted());
+    g.set("1");
+    try std.testing.expect(nap.wanted());
+}
+
+test "a nap length of 0 is refused, not a nap that ends as soon as it begins" {
+    if (!napTestable()) return error.SkipZigTest;
+    var t = try TestRing.init(true, 0);
+    defer t.deinit();
+    // a 0 us nap arms deadline == t0: WFET returns at once, the proxy re-naps and polls millions of times a second
+    try std.testing.expectError(error.BadInfo, t.r.start());
+    try std.testing.expect(!t.r.running.load(.acquire)); // the refusal leaves the ring startable
+    try std.testing.expect(!t.r.napping);
+    // the same ring with a positive length starts and naps: the refusal rejected the length, not the ring
+    t.r.s.nap_us = nap.default_us;
+    try t.r.start();
+    defer t.r.stop();
+    try std.testing.expect(t.r.napping);
+}
+
+test "a nap longer than the teardown budget is capped" {
+    if (!napTestable()) return error.SkipZigTest;
+    if (comptime !builtin.link_libc) return error.SkipZigTest;
+    // the environment's knob allows a second; a stop would then wait up to that long per ring. start() caps the
+    // effective length at the teardown budget, so the join waits at most one short nap. The test reads the knob, so
+    // it clears an ambient value first (the suite is also run with TF_DS_RDMA_NAP_US set).
+    var g = EnvGuard.save("TF_DS_RDMA_NAP_US");
+    defer g.restore();
+    g.clear();
+    var t = try TestRing.init(true, 1_000_000);
+    defer t.deinit();
+    t.r.s.nap_us_env = true; // production-like: the length goes through the environment path and its cap
+    try t.r.start();
+    defer t.r.stop();
+    try std.testing.expect(t.r.napping);
+    try std.testing.expectEqual(@as(u64, nap.teardown_us) * nap.ticksPerUs(), t.r.nap_ticks);
+}
+
+test "stop() ends a nap promptly without ringing the doorbell" {
+    if (!napTestable()) return error.SkipZigTest;
+    if (comptime !builtin.link_libc) return error.SkipZigTest;
+    var g = EnvGuard.save("TF_DS_RDMA_NAP_US");
+    defer g.restore();
+    g.clear();
+    var t = try TestRing.init(true, 500_000); // 0.5 s requested: start() caps it to the teardown budget
+    defer t.deinit();
+    t.r.s.nap_us_env = true; // production-like: the requested length goes through the cap
+    try t.r.start();
+    defer t.r.stop();
+    try t.until(TestRing.napping); // a nap is on
+    const before = @atomicLoad(u64, t.r.doorbell(), .acquire);
+    const t0 = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
+    t.r.stop();
+    const ns = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - t0;
+    try std.testing.expectEqual(before, @atomicLoad(u64, t.r.doorbell(), .acquire)); // the sequence was not rung
+    try std.testing.expect(ns < 100 * std.time.ns_per_ms); // the capped nap, not the length requested
+}
+
+test "a failed spawn leaves no running ring behind; a retry starts the proxy" {
+    if (!napTestable()) return error.SkipZigTest; // the retry's proxy runs the WFET asm on aarch64
+    var t = try TestRing.init(true, 1000);
+    defer t.deinit();
+    defer spawn_fail = false;
+    spawn_fail = true;
+    try std.testing.expectError(error.ThreadQuotaExceeded, t.r.start());
+    try std.testing.expect(!t.r.running.load(.acquire)); // the failed start must roll back
+    spawn_fail = false;
+    try t.r.start();
+    defer t.r.stop();
+    try std.testing.expect(t.r.running.load(.acquire));
+    try std.testing.expect(t.r.proxy != null);
+}
+
+test "start()'s clock seam: an unreadable counter spins with its reason; a readable one naps" {
+    if (!napTestable()) return error.SkipZigTest;
+    var sink: Sink = .{};
+    var t = try TestRing.initWith(true, 1000, Sink.push, &sink);
+    defer t.deinit();
+    t.r.s.nap_cpu = .wfet;
+    t.r.s.nap_clock = .unread;
+    try t.r.start();
+    defer t.r.stop();
+    try std.testing.expect(!t.r.napping);
+    try std.testing.expectEqual(@as(?nap.Start, .no_clock), t.r.napStart());
+    try std.testing.expect(sink.has("counter rate reads 0"));
+    // the same seam with a readable counter: the ring naps (the mutant that hardcodes .fine would nap here and in the
+    // case above, where the start line says it cannot read the rate)
+    var t2 = try TestRing.initWith(true, 1000, Sink.push, &sink);
+    defer t2.deinit();
+    t2.r.s.nap_cpu = .wfet;
+    t2.r.s.nap_clock = .fine;
+    try t2.r.start();
+    defer t2.r.stop();
+    try std.testing.expect(t2.r.napping);
+}
+
+test "the proxy publishes its CPU time on its first nap, not only after 256" {
+    if (!napTestable()) return error.SkipZigTest;
+    var t = try TestRing.init(true, 1000);
+    defer t.deinit();
+    t.r.nap_ticks = 1000 * nap.ticksPerUs();
+    const since = nap.cpuNow();
+    t.r.nap_cpu_since.store(since, .release);
+    t.r.nap_cpu_now.store(0, .release);
+    var n: u32 = 0;
+    t.r.napOn(0, &n);
+    try std.testing.expect(t.r.nap_cpu_now.load(.acquire) > since);
+}
+
+test "a CPU index outside the affinity mask is ignored, not written past it" {
+    try std.testing.expect(affinityIndexOk(0));
+    try std.testing.expect(affinityIndexOk(@intCast(@bitSizeOf(std.os.linux.cpu_set_t) - 1)));
+    try std.testing.expect(!affinityIndexOk(@intCast(@bitSizeOf(std.os.linux.cpu_set_t))));
+    try std.testing.expect(!affinityIndexOk(65_535)); // Settings.cpu is u16; the old index wrote past the mask
+}
+
+test "an out-of-range CPU in the settings is ignored by the proxy, not written past the mask" {
+    // the guard's production call site: proxyLoop indexes the affinity mask with Settings.cpu. An index outside the
+    // mask (Settings.cpu is u16; the mask is 16 words) must be ignored, not written past the array. Removing the
+    // guard makes this test panic in Debug (the index is out of bounds) or corrupt the stack in ReleaseFast.
+    var t = try TestRing.init(false, 1000); // spin: the proxy runs its loop without a nap
+    defer t.deinit();
+    t.r.s.cpu = 65_535;
+    try t.r.start();
+    defer t.stopProxy();
+    t.ring(1);
+    t.land(1);
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return x.flag(1) == 1 and x.sent(1) == 1;
+        }
+    }.f);
+}
+
+test "stop clears the nap state and start resets the counts" {
+    if (!napTestable()) return error.SkipZigTest;
+    var t = try TestRing.init(true, 1000); // 1 ms naps: several begin in the 10 ms below
+    defer t.deinit();
+    try t.r.start();
+    defer t.r.stop();
+    try t.until(TestRing.napping);
+    std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    const before = t.r.nap_stats.counts().naps;
+    try std.testing.expect(before >= 2);
+    t.r.stop();
+    try std.testing.expect(!t.r.napping);
+    try std.testing.expectEqual(@as(?nap.Counts, null), t.r.napCounts());
+    try std.testing.expect(t.r.napSince() == null);
+    try std.testing.expectEqual(@as(?nap.Start, null), t.r.napStart());
+    // a restart begins its own counts instead of adding to the stopped run's
+    try t.r.start();
+    const after = t.r.nap_stats.counts().naps;
+    try std.testing.expect(after < before);
+}
+
+test "without TF_DS_RDMA_WFE the proxy spins as before: a peer's part is published as it lands" {
+    // the switch-off run must not depend on an ambient TF_DS_RDMA_WFE (this suite is also run with it set)
+    if (comptime !builtin.link_libc) return error.SkipZigTest;
+    var g = EnvGuard.save("TF_DS_RDMA_WFE");
+    defer g.restore();
+    g.clear();
+    var t = try TestRing.init(false, 2_000_000);
+    defer t.deinit();
+    const now0 = nap.now_calls.load(.acquire);
+    const cpu0 = nap.cpu_now_calls.load(.acquire);
+    try t.r.start();
+    defer t.r.stop();
+    try std.testing.expect(!t.r.napping);
+    t.ring(1);
+    t.land(1);
+    t.land(2); // ahead of this rank's doorbell
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return x.flag(1) == 1 and x.flag(2) == 2 and x.sent(1) == 1;
+        }
+    }.f);
+    try std.testing.expectEqual(@as(?nap.Counts, null), t.r.napCounts());
+    try std.testing.expectEqual(@as(u64, 0), t.r.nap_stats.counts().naps);
+    // the clock reads belong to the nap: the switch-off proxy runs its pre-nap loop without reading either clock
+    try std.testing.expectEqual(now0, nap.now_calls.load(.acquire));
+    try std.testing.expectEqual(cpu0, nap.cpu_now_calls.load(.acquire));
+}
+
+test "TF_DS_RDMA_WFE: a napping proxy reads the thread-CPU clock (a syscall) at its reports, never on every pass" {
+    // a syscall returns through an exception, and on Arm every exception return sets the event register, so a read on
+    // every pass ends the next WFET at once (measured on a GB10: ~2.6 M clock_gettime(THREAD_CPUTIME_ID) a second, 99.998 %
+    // of the naps ended by another wake, 7 % of the time napping)
+    if (!napTestable()) return error.SkipZigTest;
+    var t = try TestRing.init(true, 5);
+    defer t.deinit();
+    const cpu0 = nap.cpu_now_calls.load(.acquire);
+    try t.r.start();
+    defer t.r.stop();
+    try std.testing.expect(t.r.napping);
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return x.r.nap_stats.counts().naps >= 2048;
+        }
+    }.f);
+    const naps = t.r.nap_stats.counts().naps;
+    const reads = nap.cpu_now_calls.load(.acquire) - cpu0;
+    // the interval's start, the first nap's sample and one each 256 naps for the ring check's cpu_ms (a park's report
+    // would add one): never one a pass
+    try std.testing.expect(reads <= 3 + naps / 256);
+}
+
+test "TF_DS_RDMA_WFE: a relaying ring's proxy spins; another wake costs one pass, and a napping proxy goes on" {
+    if (!napTestable()) return error.SkipZigTest;
+    {
+        var t = try TestRing.init(true, 1000);
+        defer t.deinit();
+        t.r.n_jobs = 1; // it would relay (nothing is rung here, so nothing is relayed)
+        try t.r.start();
+        defer t.r.stop();
+        try std.testing.expect(!t.r.napping);
+        try std.testing.expectEqual(@as(?nap.Counts, null), t.r.napCounts());
+    }
+    // a nap another wake ends first (an event or an interrupt, ~10 kHz on the target, more often than a 1 ms deadline)
+    // costs one pass: the proxy naps again, and no end is claimed as the doorbell's or as skipped
+    var t = try TestRing.init(true, 1000);
+    defer t.deinit();
+    nap.stand_in_wake_after = 100 * nap.ticksPerUs();
+    defer nap.stand_in_wake_after = 0;
+    try t.r.start();
+    defer t.stopProxy();
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return x.r.nap_stats.counts().other >= 3;
+        }
+    }.f);
+    const c = t.r.napCounts().?;
+    try std.testing.expectEqual(@as(u64, 0), c.doorbell + c.late + c.skipped);
+    try std.testing.expect(c.naps >= c.other and c.ticks > 0);
+}
+
+test "a proxy whose naps keep ending late stops napping and says so once" {
+    if (!napTestable()) return error.SkipZigTest;
+    var sink: Sink = .{};
+    var t = try TestRing.initWith(true, 1000, Sink.push, &sink);
+    defer t.deinit();
+    defer nap.end_for_test = null;
+    nap.end_for_test = .late; // drive every nap's end to the late class
+    try t.r.start();
+    defer t.r.stop();
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return !x.r.napping;
+        }
+    }.f);
+    // backOff stores `napping = false`, then `nap_how = .backoff`, then logs. `napping` can be seen false before the
+    // nap_how store is visible (plain fields, a weakly ordered CPU), so read both only after the line: the sink's
+    // mutex gives the reader the proxy's stores before the log.
+    try untilSinkCount(&sink, "stopped napping", 1);
+    try std.testing.expectEqual(@as(?nap.Start, .backoff), t.r.napStart());
+    try std.testing.expectEqual(@as(?nap.Counts, null), t.r.napCounts());
+    try std.testing.expect(sink.has("stopped napping"));
+    try std.testing.expectEqual(@as(usize, 1), sink.countOf("stopped napping")); // logged once
+}
+
+test "a proxy that failed after the last gather fails the ring check" {
+    var t = try TestRing.init(true, 1000);
+    defer t.deinit();
+    // the nap half is healthy: one nap begun, slept, and not late, so napOk alone would pass the ring
+    t.r.napping = true;
+    t.r.nap_how = .naps;
+    t.r.nap_stats.begin();
+    t.r.nap_stats.end(.doorbell, 10);
+    const c = t.r.napCounts().?;
+    try std.testing.expect(nap.napOk(true, t.r.napStart(), c));
+    // then its proxy fails after the last gather: the abort word and the reason are set
+    t.r.fail("ibv_poll_cq failed");
+    try std.testing.expect(t.r.failure() != null);
+    const rings = [_]nap.RingNap{.{ .how = t.r.napStart(), .c = c, .failed = t.r.failure() }};
+    try std.testing.expect(!nap.ringsOk(true, &rings));
+    try std.testing.expectEqual(@as(u8, 1), nap.runCheck(true, true, &rings));
+}
+
+test "TF_DS_RDMA_WFE: a nap nothing else ends returns at its deadline and the proxy naps again" {
+    // the host's stand-in: on real WFET the event stream ends a 1 ms nap first (the property test above, and
+    // rdma_nap.zig's cumulative-deadline loop, which tolerates them)
+    if (builtin.cpu.arch == .aarch64) return error.SkipZigTest;
+    var t = try TestRing.init(true, 1000);
+    defer t.deinit();
+    try t.r.start();
+    defer t.stopProxy();
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return x.r.nap_stats.counts().deadline >= 3;
+        }
+    }.f);
+    const c = t.r.napCounts().?;
+    try std.testing.expectEqual(@as(u64, 0), c.doorbell + c.late + c.skipped + c.other);
+    try std.testing.expect(c.ticks >= 3 * 1000 * nap.ticksPerUs());
+}
+
+test "TF_DS_RDMA_WFE: a nap whose doorbell moved before it began is counted skipped; one nothing writes, at its end" {
+    if (!napTestable()) return error.SkipZigTest;
+    var t = try TestRing.init(true, 1000);
+    defer t.deinit();
+    t.r.nap_ticks = 1000 * nap.ticksPerUs();
+    t.ring(5);
+    var naps_since_cpu: u32 = 0;
+    t.r.napOn(4, &naps_since_cpu); // the doorbell rang 5 after the proxy posted 4
+    try std.testing.expectEqual(nap.Counts{ .naps = 1, .skipped = 1 }, t.r.nap_stats.counts());
+    const t0 = nap.now();
+    t.r.napOn(5, &naps_since_cpu);
+    const c = t.r.nap_stats.counts();
+    try std.testing.expectEqual(@as(u64, 2), c.naps);
+    try std.testing.expectEqual(@as(u64, 1), c.skipped);
+    // the deadline on a host with no event stream; on the target another wake may end the nap first (its kind is
+    // asserted by the property test above, and classify()'s unit test pins the boundary)
+    try std.testing.expect(c.deadline + c.other == 1);
+    try std.testing.expect(c.ticks >= 1 and nap.now() - t0 >= c.ticks);
+}
+
+test "a ring's proxy naps only with every peer on lanes of its own and no relays" {
+    var r: Ring = undefined;
+    r.world = 4;
+    r.rank = 1;
+    r.n_jobs = 0;
+    r.peers = @splat(.{});
+    for ([_]usize{ 0, 2, 3 }) |p| r.peers[p].lanes = 2;
+    try std.testing.expect(r.napRoutes());
+    r.n_jobs = 2; // it relays (a ring without a switch)
+    try std.testing.expect(!r.napRoutes());
+    r.n_jobs = 0;
+    r.peers[3].lanes = 0; // a peer reached through relays
+    r.peers[3].n_relayers = 2;
+    try std.testing.expect(!r.napRoutes());
+}
+
+test "TF_DS_RDMA_WFE: start() naps from the capability it is given, and says why it spins otherwise" {
+    // the seam start() takes, swept on every host: the four nap tests do not depend on the auxv detection, and a
+    // wrong HWCAP2 key, bit or argument order is caught here on the gate as well as by the /proc/cpuinfo authority
+    if (!napTestable()) return error.SkipZigTest; // .wfet runs the nap asm on aarch64
+    var sink: Sink = .{};
+    for ([_]nap.Cpu{ .wfet, .no_wfet, .unread }) |c| {
+        sink.reset();
+        var t = try TestRing.initWith(true, 1000, Sink.push, &sink);
+        defer t.deinit();
+        t.r.s.nap_cpu = c;
+        try t.r.start();
+        defer t.stopProxy();
+        try std.testing.expectEqual(c == .wfet, t.r.napping);
+        if (c == .wfet) {
+            try std.testing.expect(sink.has("naps on its doorbell"));
+        } else {
+            try std.testing.expect(sink.has(if (c == .no_wfet) "this CPU has no WFET" else "reads no auxiliary vector"));
+            try std.testing.expectEqual(@as(?nap.Counts, null), t.r.napCounts());
+        }
+    }
+}
+
+test "TF_DS_RDMA_WFE: start() logs one line, and the nap length is the settings'" {
+    // the start decision is behavioural: a wanted start logs exactly one line with the settings' nap length, and
+    // sets the deadline start() computed from it (the switch-off and relay cases log their own lines in their tests)
+    if (!napTestable()) return error.SkipZigTest;
+    var sink: Sink = .{};
+    var t = try TestRing.initWith(true, 1234, Sink.push, &sink);
+    defer t.deinit();
+    try t.r.start();
+    defer t.stopProxy();
+    try std.testing.expect(t.r.napping);
+    try std.testing.expectEqual(@as(u64, 1234) * nap.ticksPerUs(), t.r.nap_ticks);
+    try std.testing.expect(sink.has("at most 1234 us a nap"));
+    try std.testing.expectEqual(@as(usize, 1), sink.countOf("TF_DS_RDMA_WFE:"));
+}
+
+test "TF_DS_RDMA_WFE: a napping proxy parks at the gate, reports once, and resets the interval on the wake" {
+    if (!napTestable()) return error.SkipZigTest;
+    var sink: Sink = .{};
+    var t = try TestRing.initWith(true, 1000, Sink.push, &sink); // 1 ms naps: the gate is reached within a deadline
+    defer t.deinit();
+    try t.r.start();
+    defer t.r.stop();
+    try t.until(TestRing.napping);
+    std.Io.sleep(std.testing.io, .fromMilliseconds(40), .awake) catch {};
+    try std.testing.expect(t.r.nap_stats.counts().naps > 0);
+    t.r.park();
+    try untilSinkCount(&sink, "over the ", 1);
+    try std.testing.expectEqual(@as(u32, 1), t.r.idle_gate.parked.load(.acquire));
+    // parked: the gate sleeps on a futex, which a GPU doorbell cannot wake, so the proxy services nothing and naps not
+    const parked = t.r.nap_stats.counts();
+    t.ring(1);
+    t.land(1);
+    std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+    try std.testing.expectEqual(@as(u64, 0), t.flag(1));
+    try std.testing.expectEqual(@as(u64, 0), t.r.nap_stats.counts().since(parked).naps);
+    try std.testing.expectEqual(@as(u32, 1), t.r.idle_gate.parked.load(.acquire));
+    // the wake resumes it; the doorbell rung while it was parked is posted whole
+    t.r.wake();
+    try t.until(struct {
+        fn f(x: *TestRing) bool {
+            return x.flag(1) == 1 and x.sent(1) == 1;
+        }
+    }.f);
+    // park again at once: the second line covers the interval since the wake, not since the proxy started
+    t.r.park();
+    try untilSinkCount(&sink, "over the ", 2);
+    var buf: [8192]u8 = undefined;
+    const text = sink.text(&buf);
+    const first = parkSecs(text, 0) orelse return error.TestUnexpectedResult;
+    const second = parkSecs(text, first.at + 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(first.secs >= 0.02); // the 40 ms before the first park
+    try std.testing.expect(second.secs < first.secs); // since the wake: the reset of since/base
+    try std.testing.expect(std.mem.indexOf(u8, text, "s on CPU") != null);
+}
+
+test "TF_DS_RDMA_WFE: a park that lands between the sample and the gate's load is reported once" {
+    if (!napTestable()) return error.SkipZigTest;
+    var sink: Sink = .{};
+    var t = try TestRing.initWith(true, 1000, Sink.push, &sink); // 1 ms naps: the loop reaches the gate quickly
+    defer t.deinit();
+    const Hook = struct {
+        var gate: *IdleGate = undefined;
+        var armed = std.atomic.Value(bool).init(true);
+        fn run() void {
+            if (armed.swap(false, .acq_rel)) gate.park();
+        }
+    };
+    Hook.gate = &t.r.idle_gate;
+    idle_gate.wait_before = Hook.run;
+    defer idle_gate.wait_before = null;
+    try t.r.start();
+    defer t.r.stop();
+    // the proxy's own sample reads 0, then the hook parks in the gap and the gate's load blocks
+    var i: usize = 0;
+    while (t.r.idle_gate.parked.load(.acquire) == 0) : (i += 1) {
+        if (i == 2000) return error.Timeout;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    // the parked interval the next report must not count as awake or napped
+    std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+    t.r.wake();
+    try untilSinkCount(&sink, "over the ", 1);
+    var buf: [8192]u8 = undefined;
+    const text = sink.text(&buf);
+    const first = parkSecs(text, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(first.secs < 0.020); // 20 ms parked, excluded from the interval
 }
 
 test "TF_DS_RING_WORD's signals: the word is the sequence, the atomic counts, and a wait ends at or past it" {

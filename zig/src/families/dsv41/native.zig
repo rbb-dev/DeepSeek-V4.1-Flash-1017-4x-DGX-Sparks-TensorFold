@@ -41,6 +41,16 @@
 //!                                               bounded by TF_DS_RING_WORD_DEADLINE_MS (default 120,000) and the abort word,
 //!                                               and a ring no sequence reaches is poisoned; the same bytes, one line at
 //!                                               the start; every rank alike
+//!   TF_DS_RDMA_WFE=1                            each RDMA proxy with nothing in flight naps on its doorbell (Arm WFET,
+//!                                               at most 50 us a nap) instead of reading it in a loop, on a ring with
+//!                                               no relays and a CPU with WFET (one line at the start says which); a
+//!                                               proxy logs its naps when its ring parks; the replies' bits as without
+//!   TF_DS_RDMA_NAP_US=N                         (with TF_DS_RDMA_WFE) a nap's longest length in us, default 50 (a
+//!                                               positive value, at most 1,000,000; start() caps the effective length
+//!                                               at 2,500 us, the teardown budget, so the usable range is 1..2,500):
+//!                                               the deadline that ends a nap nothing else ends; longer means fewer
+//!                                               deadline wakes and a longer tail if the GPU's write is lost (the
+//!                                               knob for a measured comparison, not a default)
 //!   TF_DS_GRAPHS=1                              the rounds' stretches as CUDA graphs
 //!   TF_DS_GRAPH_CAP=N                           (with TF_DS_GRAPHS) the captured stretches kept at most, the least
 //!                                               recently replayed destroyed first (0 or unset: all); rank 1's

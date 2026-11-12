@@ -2,7 +2,8 @@
 //! split's decode-size exchanges over the RDMA rings (ring2d.zig) on the four nodes, each checked word for word against
 //! the layout Comm2D gives and timed: quarters of the attention / MoE partials (fp32, 2,560 + 2,560), cat_rank of the
 //! wo_a output (bf16, 2,048 + 2,048) and of the experts' intermediate (fp16, 640 + 512 over rows x 7 slots), the pair
-//! gather (fp32, 5,120) and Engram's quarters (fp32, 12,800 + 12,800). One JSON line a rank, case and row count.
+//! gather (fp32, 5,120) and Engram's quarters (fp32, 12,800 + 12,800). One JSON line a rank, case and row count; then
+//! one a ring with its proxy's naps (TF_DS_RDMA_WFE: rdma_nap.zig's counts; "rdma_wfe": false where it does not nap).
 const std = @import("std");
 const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
@@ -112,6 +113,7 @@ pub fn main(init: std.process.Init) !u8 {
         run(&rings, stream, c, src.ptr, dst.ptr, n) catch |e| {
             try w_out.print("{{\"rank\": {d}, \"case\": \"{s}\", \"rows\": {d}, \"error\": \"{s}\"}}\n", .{ g, c.name, rows, @errorName(e) });
             try w_out.flush();
+            all_ok = rdma.nap.gatherOk(all_ok, null); // a case that did not run fails the check as a wrong gather does
             continue;
         };
         for (0..20) |_| try run(&rings, stream, c, src.ptr, dst.ptr, n);
@@ -158,11 +160,34 @@ pub fn main(init: std.process.Init) !u8 {
                 }
             },
         }
-        all_ok = all_ok and bad == 0;
+        all_ok = rdma.nap.gatherOk(all_ok, bad);
         try w_out.print("{{\"rank\": {d}, \"case\": \"{s}\", \"rows\": {d}, \"bytes\": {d}, \"us\": {d:.2}, \"bad\": {d}}}\n", .{ g, c.name, rows, dst_bytes, us, bad });
         try w_out.flush();
     };
+    // each ring's naps (rdma_nap.jsonLine: one field a count, tested by name) and whether the switch's request is met: a
+    // ring that should nap but did not (or began no nap) fails the check as a wrong gather does, not just the reader
+    const asked = rdma.nap.wanted();
+    var naps: [3]rdma.nap.RingNap = undefined;
+    var n_naps: usize = 0;
+    for ([_]?*rdma.Ring{ rings.all4, rings.col, rings.pair }) |y| if (y) |x| {
+        var buf: [512]u8 = undefined;
+        // a proxy that failed after the last gather (its abort word set, its reason recorded) fails the check as a
+        // wrong gather does, and says why beside its nap line
+        const why = x.failure();
+        if (why) |m| {
+            try w_out.print("{s}\n", .{rdma.nap.failureLine(&buf, g, x.s.name, m)});
+            try w_out.flush();
+        }
+        const c = x.napCounts();
+        const e = x.napSince();
+        const how = x.napStart();
+        try w_out.print("{s}\n", .{rdma.nap.jsonLine(&buf, g, x.s.name, how, c, if (e) |v| v.ticks else 0, rdma.nap.ticksPerUs(), if (e) |v| v.cpu else 0, asked)});
+        naps[n_naps] = .{ .how = how, .c = c, .failed = why };
+        n_naps += 1;
+    };
     try w_out.print("{{\"rank\": {d}, \"all_equal\": {}}}\n", .{ g, all_ok });
     try w_out.flush();
-    return if (all_ok) 0 else 1;
+    // the exit decision is runCheck's: every case's gather fold (gatherOk, the error path included) and every ring's
+    // nap and failure; rdma_nap.zig's main-tail test calls it with the same two application lines
+    return rdma.nap.runCheck(all_ok, asked, naps[0..n_naps]);
 }

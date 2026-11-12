@@ -1271,6 +1271,9 @@ test "the counter line names every counter the gates read" {
         try std.testing.expect(std.mem.indexOf(u8, text, k) != null);
 }
 
+    // The proxies are still running: a nap's cause is counted in steps (backstop_wakes, then deadline or early), so a reading
+    // taken between the steps shows one more backstop wake than causes. Read once they have stopped (the counters are plain).
+    joinProxies(net);
 // -- the device chain on a real driver (skipped without one) ---------------------------------------------------------
 
 const cuda = @import("cuda");

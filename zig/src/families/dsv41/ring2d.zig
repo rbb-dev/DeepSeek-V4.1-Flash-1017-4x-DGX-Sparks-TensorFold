@@ -43,10 +43,13 @@ pub const Rings = struct {
         }
         var s4 = s;
         s4.cpu = cpus[0];
+        s4.name = "the four nodes' ring";
         var sc = s;
         sc.cpu = cpus[1];
+        sc.name = "the column pair's ring";
         var sr = s;
         sr.cpu = cpus[2];
+        sr.name = "the row pair's ring";
         const all4 = try rdma.Ring.create(gpa, d, k, devices, g, 4, s4);
         errdefer all4.destroy(gpa);
         const col = try rdma.Ring.create(gpa, d, k, devices, p, 2, sc); // members (r, 0), (r, 1): ring rank = pair
